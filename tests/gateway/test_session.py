@@ -1367,6 +1367,29 @@ class TestRewriteTranscriptPreservesReasoning:
 
 
 class TestGatewaySessionDbRecovery:
+    def test_transcript_ingress_stamps_first_user_task_epoch(self, tmp_path):
+        import threading
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("checkpoint-session", source="gateway")
+        store = object.__new__(SessionStore)
+        store._db = db
+        store._transcript_drain_lock = threading.RLock()
+        store._transcript_retry_lock = threading.Lock()
+        store._dirty_transcripts = {}
+        store._transcript_append_failures = {}
+        store._fts_rebuild_attempted = False
+
+        store.append_to_transcript(
+            "checkpoint-session",
+            {"role": "user", "content": "Tessellate blue glass."},
+        )
+
+        restored = db.get_messages_as_conversation("checkpoint-session")
+        db.close()
+        assert restored[0]["task_epoch_id"] == "checkpoint-session"
+        assert restored[0]["task_boundary"] == "new-task"
+
     def test_transcript_append_persists_structured_task_metadata(self, tmp_path):
         db = SessionDB(db_path=tmp_path / "state.db")
         db.create_session("checkpoint-session", source="gateway")

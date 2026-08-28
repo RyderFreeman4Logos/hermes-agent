@@ -3879,6 +3879,12 @@ class SessionStore:
 
     def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
         """Write one transcript row. Caller handles retry queuing."""
+        if message.get("role") == "user" and not message.get("task_epoch_id"):
+            message = dict(message)
+            message["task_epoch_id"] = session_id
+            load_messages = getattr(self._db, "get_messages_as_conversation", None)
+            if callable(load_messages) and not load_messages(session_id):
+                message["task_boundary"] = "new-task"
         self._db.append_message(
             session_id=session_id,
             role=message.get("role", "unknown"),

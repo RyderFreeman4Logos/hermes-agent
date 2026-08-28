@@ -2051,6 +2051,58 @@ def test_exact_fact_with_disposition_survives_parse_and_reduce():
     assert engine._reduce(engine._extract_deterministic_lanes(messages), (shard,)).facts == shard.facts
 
 
+@pytest.mark.parametrize("status", ("deterministic_lane", "recent_tail", "duplicate"))
+def test_compress_rejects_uncovered_high_risk_dispositions(status):
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    class DispositionClient:
+        def complete(self, **kwargs):
+            payload = json.loads(kwargs["messages"][-1]["content"])
+            failed_id, fact_id, task_id = payload["source_event_ids"]
+            disposition = {"source_event_id": failed_id, "status": status}
+            if status == "duplicate":
+                disposition["duplicate_of"] = fact_id
+            return _map_response({
+                "schema_version": 2,
+                "source_event_ids": payload["source_event_ids"],
+                "facts": [{
+                    "fact_id": "valid-fact",
+                    "kind": "constraint",
+                    "text": "Must keep the valid fact.",
+                    "source_event_ids": [fact_id],
+                }],
+                "dispositions": [
+                    disposition,
+                    {
+                        "source_event_id": fact_id,
+                        "status": "represented",
+                        "fact_ids": ["valid-fact"],
+                    },
+                    {
+                        "source_event_id": task_id,
+                        "status": "reconstructible",
+                        "recovery_ref": f"session-event:{task_id}",
+                    },
+                ],
+            })
+
+    messages = [
+        {"role": "assistant", "content": "verification failed: " + "x" * 10_000},
+        {"role": "user", "content": "Must keep the valid fact."},
+        {"role": "user", "content": "Complete the migration."},
+    ]
+    engine = CheckpointContextEngine(
+        auxiliary_client=DispositionClient(),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        target_wire_tokens=2_000,
+        hard_max_wire_tokens=3_000,
+        output_reserve_tokens=0,
+    )
+
+    assert _compress(engine, messages, force=True) is messages
+
+
 def test_map_cache_rejects_entries_from_older_disposition_schema(monkeypatch):
     import agent.checkpoint_engine as checkpoint_engine
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
@@ -2278,7 +2330,7 @@ def test_oversized_artifact_round_trips_complete_durable_rows(monkeypatch, tmp_p
             "content": oversized_output,
             "effect_disposition": "failed",
         },
-        {"role": "user", "content": "continue"},
+        {"role": "user", "content": "Preserve the read result."},
     ]
     for message in source_messages:
         db.append_message("checkpoint-session", **message)
@@ -2358,7 +2410,7 @@ def test_oversized_state_changing_tool_keeps_receipt_and_artifact(monkeypatch, t
             }],
         },
         {"role": "tool", "tool_call_id": "call_1", "content": receipt},
-        {"role": "user", "content": "continue"},
+        {"role": "user", "content": "Preserve the state change."},
     ])
 
     assert result is not messages
@@ -2377,7 +2429,7 @@ def test_oversized_subagent_report_stays_recoverable_outside_recent_tail(monkeyp
     report = "subagent final: full investigation\n" + "x" * 80_000
     db, engine, messages, result = _artifactized_checkpoint(monkeypatch, tmp_path, [
         {"role": "assistant", "content": report},
-        {"role": "user", "content": "continue"},
+        {"role": "user", "content": "Preserve the subagent report."},
     ])
 
     assert result is not messages
@@ -2389,6 +2441,28 @@ def test_oversized_subagent_report_stays_recoverable_outside_recent_tail(monkeyp
     assert report not in json.dumps(result)
     assert json.loads(body)[0]["message"]["content"] == report
     assert f"recovery: checkpoint-artifact:{artifact.artifact_id}" in checkpoint
+
+
+def test_compaction_inherits_verified_checkpoint_artifacts(monkeypatch, tmp_path):
+    report = "subagent final: full investigation\n" + "x" * 80_000
+    db, engine, messages, first = _artifactized_checkpoint(monkeypatch, tmp_path, [
+        {"role": "assistant", "content": report},
+        {"role": "user", "content": "Preserve the investigation."},
+    ])
+
+    assert first is not messages
+    artifact_id = engine.last_map_externalized_artifacts[0].artifact_id
+    db.archive_and_compact("checkpoint-session", first)
+    db.append_message("checkpoint-session", "user", "Keep the artifact recoverable.")
+    second_messages = db.get_messages_as_conversation(
+        "checkpoint-session", include_row_ids=True
+    )
+
+    second = engine.compress(second_messages, force=True)
+
+    assert second is not second_messages
+    assert db.get_checkpoint_artifact(artifact_id) is not None
+    assert f"checkpoint-artifact:{artifact_id}" in engine.last_checkpoint_text
 
 
 def test_oversized_group_fails_closed_when_artifact_write_fails(monkeypatch, tmp_path):
@@ -2403,7 +2477,7 @@ def test_oversized_group_fails_closed_when_artifact_write_fails(monkeypatch, tmp
     )
     _db, engine, messages, result = _artifactized_checkpoint(monkeypatch, tmp_path, [
         {"role": "assistant", "content": "subagent final\n" + "x" * 80_000},
-        {"role": "user", "content": "continue"},
+        {"role": "user", "content": "Preserve the artifact."},
     ])
 
     assert result is messages
@@ -2425,7 +2499,7 @@ def test_checkpoint_rejects_an_artifact_that_disappears_before_publication(monke
     monkeypatch.setattr(SessionDB, "get_checkpoint_artifact", vanish_after_artifactization)
     _db, engine, messages, result = _artifactized_checkpoint(monkeypatch, tmp_path, [
         {"role": "assistant", "content": "subagent final\n" + "x" * 80_000},
-        {"role": "user", "content": "continue"},
+        {"role": "user", "content": "Preserve the artifact."},
     ])
 
     assert result is messages
@@ -2916,7 +2990,7 @@ def test_historical_map_kinds_parse_and_degrade_under_wire_pressure(historical_k
     )
 
     assert rendered is not None
-    _, _, steps, checkpoint = rendered
+    _, _, steps, checkpoint, _tail_source_event_ids = rendered
     assert steps[:3] == ("completed", "tool_bodies", "decisions")
     assert old_decision not in checkpoint
     assert f"{'x' * 157}..." in checkpoint
@@ -3322,6 +3396,24 @@ def test_acknowledgments_do_not_replace_actionable_root_task():
     assert "Ship the rename CLI; keep tests green." in lanes.active_intent.content
     assert "okay" not in lanes.active_intent.content.splitlines()[0]
     assert lanes.active_intent.event_indices[0] == 0
+
+
+@pytest.mark.parametrize(
+    "messages",
+    (
+        [{"role": "user", "content": "okay"}],
+        [{"role": "user", "content": "嗯，继续"}],
+        [{"role": "user", "content": "okay"}, {"role": "user", "content": "嗯，继续"}],
+    ),
+)
+def test_acknowledgment_only_transcripts_have_no_active_intent(messages):
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
+
+    assert lanes.active_intent is None
 
 
 @pytest.mark.parametrize(

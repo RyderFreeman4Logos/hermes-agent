@@ -179,6 +179,13 @@ class ExternalizedArtifact:
 
 
 @dataclass(frozen=True)
+class CheckpointArtifactRef:
+    """A verified artifact reference inherited from a prior checkpoint."""
+
+    artifact_id: str
+
+
+@dataclass(frozen=True)
 class DeterministicLanes:
     """Intent and effect facts extracted without model inference."""
 
@@ -231,6 +238,7 @@ class ReducedState:
     plans: tuple[MapFact, ...]
     externalized: tuple[ExternalizedArtifact, ...] = ()
     recovery_refs: tuple[str, ...] = ()
+    inherited_artifacts: tuple[CheckpointArtifactRef, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -721,19 +729,16 @@ class CheckpointContextEngine(ContextEngine):
         parts: list[str] = []
         indices: list[int] = []
         active_epoch = None
-        structured_no_active = False
         for index, text, normalized_text, epoch, boundary in turns:
             epoch_changed = epoch is not None and epoch != active_epoch
             if epoch_changed or boundary in {"new-task", "replace"}:
                 parts = []
                 indices = []
-                structured_no_active = True
                 if epoch is not None:
                     active_epoch = epoch
             if boundary == "cancel":
                 parts = []
                 indices = []
-                structured_no_active = True
                 if epoch is not None:
                     active_epoch = epoch
                 continue
@@ -743,7 +748,6 @@ class CheckpointContextEngine(ContextEngine):
             if not parts or cls._is_new_task(normalized_text):
                 parts = [projected]
                 indices = [index]
-                structured_no_active = False
                 if epoch is not None:
                     active_epoch = epoch
                 continue
@@ -752,14 +756,7 @@ class CheckpointContextEngine(ContextEngine):
             if epoch is not None:
                 active_epoch = epoch
         if not parts:
-            if structured_no_active:
-                return None
-            index, text, *_ = turns[-1]
-            return ActiveIntent(
-                cls._project_intent_text(text),
-                (index,),
-                (source_event_ids[index],) if source_event_ids else (),
-            )
+            return None
         return ActiveIntent(
             "\n".join(parts),
             tuple(indices),
@@ -1486,6 +1483,21 @@ class CheckpointContextEngine(ContextEngine):
         except Exception:
             return False
 
+    def _inherited_artifacts_are_recoverable(
+        self, artifacts: tuple[CheckpointArtifactRef, ...]
+    ) -> bool:
+        load = getattr(self._session_db, "get_checkpoint_artifact", None)
+        if not callable(load):
+            return not artifacts
+        try:
+            return all(
+                isinstance(body := load(artifact.artifact_id), bytes)
+                and hashlib.sha256(body).hexdigest() == artifact.artifact_id
+                for artifact in artifacts
+            )
+        except Exception:
+            return False
+
     @staticmethod
     def _configured_auxiliary_response(
         messages: List[Dict[str, str]], max_tokens: int,
@@ -2112,6 +2124,30 @@ class CheckpointContextEngine(ContextEngine):
             )
             for reference in re.findall(r"(?m)^- (session-event:[1-9]\d*)$", message["content"])
         }
+        inherited_artifacts = set()
+        load_artifact = getattr(self._session_db, "get_checkpoint_artifact", None)
+        if callable(load_artifact):
+            for message in self._source_messages or ():
+                content = message.get("content")
+                if (
+                    message.get("role") != "assistant"
+                    or not isinstance(content, str)
+                    or _CHECKPOINT_HISTORY_PREFIX not in content
+                    or not content.endswith(_CHECKPOINT_HISTORY_SUFFIX)
+                ):
+                    continue
+                for line in content.splitlines():
+                    marker = "recovery: checkpoint-artifact:"
+                    if marker not in line:
+                        continue
+                    artifact_id = line.partition(marker)[2].strip()
+                    if (
+                        len(artifact_id) == 64
+                        and all(character in "0123456789abcdef" for character in artifact_id)
+                        and isinstance(body := load_artifact(artifact_id), bytes)
+                        and hashlib.sha256(body).hexdigest() == artifact_id
+                    ):
+                        inherited_artifacts.add(CheckpointArtifactRef(artifact_id))
         recovery_refs = tuple(sorted({
             *inherited_recovery_refs,
             *(
@@ -2132,6 +2168,7 @@ class CheckpointContextEngine(ContextEngine):
             tuple(fact for fact in facts if fact.action_state == "planned"),
             externalized,
             recovery_refs,
+            tuple(sorted(inherited_artifacts, key=lambda artifact: artifact.artifact_id)),
         )
 
     @staticmethod
@@ -2292,6 +2329,11 @@ class CheckpointContextEngine(ContextEngine):
         if state.recovery_refs:
             details.append("Recovery references:\n" + "\n".join(
                 f"- {reference}" for reference in state.recovery_refs
+            ))
+        if state.inherited_artifacts:
+            details.append("Recovery references:\n" + "\n".join(
+                f"- recovery: checkpoint-artifact:{artifact.artifact_id}"
+                for artifact in state.inherited_artifacts
             ))
         return semantic_checkpoint if not details else f"{semantic_checkpoint}\n\n" + "\n".join(details)
 
@@ -2516,7 +2558,7 @@ class CheckpointContextEngine(ContextEngine):
         elif len(active) > 1:
             body = [active[0], checkpoint_message, *active[1:]]
         else:
-            body = active
+            body = [active[0], checkpoint_message]
         if len(body) > 1:
             from agent.agent_runtime_helpers import repair_message_sequence
 
@@ -2533,7 +2575,7 @@ class CheckpointContextEngine(ContextEngine):
         selected_source_event_ids: frozenset[int],
         source_event_ids: tuple[int, ...],
         real_user_source_event_ids: frozenset[int],
-    ) -> Optional[tuple[List[Dict[str, Any]], int, tuple[str, ...], str]]:
+    ) -> Optional[tuple[List[Dict[str, Any]], int, tuple[str, ...], str, frozenset[int]]]:
         if state.active_intent is None:
             return None
         tail_groups = self._adaptive_tail_groups(
@@ -2574,7 +2616,63 @@ class CheckpointContextEngine(ContextEngine):
             break
         if wire_tokens > self._hard_max_wire_tokens:
             return None
-        return candidate, wire_tokens, tuple(steps), checkpoint
+        return candidate, wire_tokens, tuple(steps), checkpoint, frozenset(
+            source_event_ids[index]
+            for group in tail_groups
+            for index in group.event_indices
+        )
+
+    @classmethod
+    def _final_dispositions_are_covered(
+        cls,
+        shards: tuple[MapShard, ...],
+        state: ReducedState,
+        messages: List[Dict[str, Any]],
+        source_event_ids: tuple[int, ...],
+        selected_source_event_ids: frozenset[int],
+        tail_source_event_ids: frozenset[int],
+    ) -> bool:
+        rows = dict(zip(source_event_ids, messages))
+        lane_ids = set(state.active_intent.source_event_ids if state.active_intent else ())
+        lane_ids.update(
+            event_id for effect in state.effects for event_id in effect.source_event_ids
+        )
+        recovery_refs = set(state.recovery_refs)
+        externalized_ids = {
+            event_id for artifact in state.externalized for event_id in artifact.source_event_ids
+        }
+        for disposition in (item for shard in shards for item in shard.dispositions):
+            covered = disposition.status == "noise" and not disposition.high_risk
+            if disposition.status == "represented":
+                covered = any(
+                    disposition.source_event_id in fact.source_event_ids
+                    and not selected_source_event_ids.isdisjoint(fact.source_event_ids)
+                    for fact in state.facts
+                )
+            elif disposition.status == "deterministic_lane":
+                covered = disposition.source_event_id in lane_ids
+            elif disposition.status == "recent_tail":
+                covered = disposition.source_event_id in tail_source_event_ids
+            elif disposition.status == "reconstructible":
+                covered = disposition.recovery_ref in recovery_refs
+            elif disposition.status == "externalized":
+                covered = disposition.source_event_id in externalized_ids
+            elif disposition.status == "duplicate":
+                covered = (
+                    disposition.duplicate_of in rows
+                    and disposition.source_event_id in rows
+                    and cls._provider_visible_sources([rows[disposition.source_event_id]])
+                    == cls._provider_visible_sources([rows[disposition.duplicate_of]])
+                )
+            if (
+                disposition.status in {
+                    "represented", "deterministic_lane", "recent_tail",
+                    "reconstructible", "externalized", "duplicate",
+                }
+                and not covered
+            ) or (disposition.high_risk and not covered):
+                return False
+        return True
 
     def compress(
         self,
@@ -2733,11 +2831,28 @@ class CheckpointContextEngine(ContextEngine):
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint artifact is unavailable"
             return messages
+        if not self._inherited_artifacts_are_recoverable(reduced.inherited_artifacts):
+            self._set_automatic_cooldown("artifact_unavailable")
+            self._last_compress_aborted = True
+            self._last_summary_error = "checkpoint artifact is unavailable"
+            return messages
         if not self._candidate_snapshot_is_current(
             messages, snapshot, commit_snapshot, lifecycle
         ):
             return messages
-        candidate, wire_tokens, steps, checkpoint_text = rendered
+        candidate, wire_tokens, steps, checkpoint_text, tail_source_event_ids = rendered
+        if not self._final_dispositions_are_covered(
+            mapped,
+            reduced,
+            source_messages,
+            source_event_ids,
+            selected_source_event_ids,
+            tail_source_event_ids,
+        ):
+            self._set_automatic_cooldown("uncovered_disposition")
+            self._last_compress_aborted = True
+            self._last_summary_error = "checkpoint disposition is not covered"
+            return messages
         self.last_reduced_state = reduced
         self.last_checkpoint_text = checkpoint_text
         self.last_candidate = candidate

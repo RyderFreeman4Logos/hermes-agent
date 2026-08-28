@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+import re
 import subprocess
 from threading import RLock
 import time
@@ -20,6 +21,7 @@ __all__ = [
     "CheckpointContextEngine",
     "DeterministicLanes",
     "Effect",
+    "ExternalizedArtifact",
     "MapDisposition",
     "MapFact",
     "MapShard",
@@ -149,6 +151,16 @@ class CausalGroup:
 
 
 @dataclass(frozen=True)
+class ExternalizedArtifact:
+    """A complete oversized causal group committed outside active context."""
+
+    source_event_ids: tuple[int, ...]
+    artifact_id: str
+    sha256: str
+    stub: str
+
+
+@dataclass(frozen=True)
 class DeterministicLanes:
     """Intent and effect facts extracted without model inference."""
 
@@ -198,6 +210,7 @@ class ReducedState:
     effects: tuple[Effect, ...]
     facts: tuple[MapFact, ...]
     plans: tuple[MapFact, ...]
+    externalized: tuple[ExternalizedArtifact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -308,6 +321,7 @@ class CheckpointContextEngine(ContextEngine):
         # ponytail: one lock keeps bounded cache bookkeeping simple; shard locks if throughput matters
         self._map_shard_cache_lock = RLock()
         self.last_map_externalized_groups: tuple[CausalGroup, ...] = ()
+        self.last_map_externalized_artifacts: tuple[ExternalizedArtifact, ...] = ()
         self.last_reduced_state: Optional[ReducedState] = None
         self.last_checkpoint_text: Optional[str] = None
         self.last_candidate: Optional[List[Dict[str, Any]]] = None
@@ -1309,6 +1323,109 @@ class CheckpointContextEngine(ContextEngine):
         return tuple(shards)
 
     @staticmethod
+    def _externalized_artifact_body(
+        messages: List[Dict[str, Any]],
+        group: CausalGroup,
+        source_event_ids: tuple[int, ...],
+    ) -> bytes:
+        events = [
+            {
+                "source_event_id": source_event_ids[index],
+                "message": messages[index],
+            }
+            for index in group.event_indices
+        ]
+        return json.dumps(
+            events, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+
+    @staticmethod
+    def _externalized_tool_details(
+        messages: List[Dict[str, Any]], group: CausalGroup
+    ) -> tuple[str, str, str, str]:
+        tool = "none"
+        command = "n/a"
+        status = "unknown"
+        output = []
+        for index in group.event_indices:
+            message = messages[index]
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if not isinstance(function, dict):
+                        continue
+                    tool = str(function.get("name") or tool)
+                    arguments = function.get("arguments")
+                    try:
+                        arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+                    except (TypeError, ValueError):
+                        arguments = None
+                    if isinstance(arguments, dict) and isinstance(arguments.get("command"), str):
+                        command = arguments["command"]
+            if message.get("role") == "tool" and isinstance(message.get("content"), str):
+                output.append(message["content"])
+        joined = "\n".join(output)
+        match = re.search(r"\b(?:exit[ _-]?status|exit code)\s*[:=]?\s*(-?\d+)", joined, re.I)
+        if match:
+            status = match.group(1)
+        signatures = sorted(set(re.findall(r"\bE\d{4}\b|\b[\w.-]+ failed\b", joined)))
+        return tool, command, status, ", ".join(signatures[:4]) or "none"
+
+    def _artifactize_externalized_groups(
+        self,
+        messages: List[Dict[str, Any]],
+        groups: tuple[CausalGroup, ...],
+        source_event_ids: tuple[int, ...],
+    ) -> Optional[tuple[ExternalizedArtifact, ...]]:
+        if not groups:
+            return ()
+        store = getattr(self._session_db, "store_checkpoint_artifact", None)
+        load = getattr(self._session_db, "get_checkpoint_artifact", None)
+        if not callable(store) or not callable(load):
+            return None
+        artifacts = []
+        try:
+            for group in groups:
+                body = self._externalized_artifact_body(messages, group, source_event_ids)
+                event_ids = tuple(source_event_ids[index] for index in group.event_indices)
+                artifact_id = store(self._session_id, event_ids, body)
+                sha256 = hashlib.sha256(body).hexdigest()
+                if not isinstance(artifact_id, str) or artifact_id != sha256 or load(artifact_id) != body:
+                    return None
+                tool, command, status, signatures = self._externalized_tool_details(messages, group)
+                stub = "\n".join((
+                    "[Externalized causal group]",
+                    f"source events: {','.join(str(event_id) for event_id in event_ids)}",
+                    f"tool: {tool}",
+                    f"command: {command}",
+                    f"exit status: {status}",
+                    f"bytes: {len(body)}",
+                    f"sha256: {sha256}",
+                    f"key error signatures: {signatures}",
+                    f"recovery: checkpoint-artifact:{artifact_id}",
+                ))
+                artifacts.append(ExternalizedArtifact(event_ids, artifact_id, sha256, stub))
+        except Exception:
+            return None
+        return tuple(artifacts)
+
+    def _externalized_artifacts_are_recoverable(
+        self, artifacts: tuple[ExternalizedArtifact, ...]
+    ) -> bool:
+        load = getattr(self._session_db, "get_checkpoint_artifact", None)
+        if not callable(load):
+            return not artifacts
+        try:
+            for artifact in artifacts:
+                body = load(artifact.artifact_id)
+                if not isinstance(body, bytes) or hashlib.sha256(body).hexdigest() != artifact.sha256:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def _configured_auxiliary_response(
         messages: List[Dict[str, str]], max_tokens: int,
     ) -> Any:
@@ -1541,9 +1658,12 @@ class CheckpointContextEngine(ContextEngine):
                     or recovery_ref is not None
                 ):
                     return None
-            elif status in {"reconstructible", "externalized"}:
+            elif status == "reconstructible":
                 if fact_refs or duplicate_of is not None or cls._recovery_event_id(recovery_ref, source_event_ids) is None:
                     return None
+            elif status == "externalized":
+                # Only the planner may externalize, after SessionDB commits the body.
+                return None
             elif fact_refs or duplicate_of is not None or recovery_ref is not None:
                 return None
             parsed_dispositions.append(
@@ -1759,13 +1879,15 @@ class CheckpointContextEngine(ContextEngine):
                     or disposition.recovery_ref is not None
                 ):
                     return False
-            elif disposition.status in {"reconstructible", "externalized"}:
+            elif disposition.status == "reconstructible":
                 if (
                     disposition.fact_ids
                     or disposition.duplicate_of is not None
                     or cls._recovery_event_id(disposition.recovery_ref, source_event_ids) is None
                 ):
                     return False
+            elif disposition.status == "externalized":
+                return False
             elif disposition.fact_ids or disposition.duplicate_of is not None or disposition.recovery_ref is not None:
                 return False
         return disposition_events == source_events
@@ -1861,7 +1983,10 @@ class CheckpointContextEngine(ContextEngine):
 
     @classmethod
     def _reduce(
-        cls, lanes: DeterministicLanes, shards: tuple[MapShard, ...]
+        cls,
+        lanes: DeterministicLanes,
+        shards: tuple[MapShard, ...],
+        externalized: tuple[ExternalizedArtifact, ...] = (),
     ) -> ReducedState:
         """Merge typed Map facts; plan prose never creates a tool effect."""
         records: Dict[str, MapFact] = {}
@@ -1907,6 +2032,7 @@ class CheckpointContextEngine(ContextEngine):
             lanes.effects,
             facts,
             tuple(fact for fact in facts if fact.action_state == "planned"),
+            externalized,
         )
 
     @staticmethod
@@ -2056,6 +2182,12 @@ class CheckpointContextEngine(ContextEngine):
                     f"- {effect.operation or 'tool'} [{effect.status}] "
                     f"(events: {','.join(str(event_id) for event_id in effect.source_event_ids)})"
                     for effect in state.effects
+                )
+            )
+        if state.externalized:
+            details.append(
+                "Durable recovery:\n" + "\n\n".join(
+                    artifact.stub for artifact in state.externalized
                 )
             )
         return semantic_checkpoint if not details else f"{semantic_checkpoint}\n\n" + "\n".join(details)
@@ -2416,6 +2548,7 @@ class CheckpointContextEngine(ContextEngine):
         )
         self.last_map_shards = ()
         self.last_map_externalized_groups = ()
+        self.last_map_externalized_artifacts = ()
         self.last_reduced_state = None
         self.last_checkpoint_text = None
         self.last_candidate = None
@@ -2435,6 +2568,15 @@ class CheckpointContextEngine(ContextEngine):
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint Map exceeded its token budget"
             return messages
+        externalized = self._artifactize_externalized_groups(
+            source_messages, self.last_map_externalized_groups, source_event_ids
+        )
+        if externalized is None:
+            self._set_automatic_cooldown("artifactization_failed")
+            self._last_compress_aborted = True
+            self._last_summary_error = "checkpoint artifactization failed"
+            return messages
+        self.last_map_externalized_artifacts = externalized
         mapped = self._map_shards(source_messages, map_groups, source_event_ids)
         if mapped is None:
             self._set_automatic_cooldown("map_failed")
@@ -2451,6 +2593,7 @@ class CheckpointContextEngine(ContextEngine):
                 durable_messages, source_event_ids, real_user_source_event_ids
             ),
             mapped,
+            externalized,
         )
         semantic_checkpoint = self._semantic_checkpoint(
             reduced,
@@ -2481,6 +2624,11 @@ class CheckpointContextEngine(ContextEngine):
             self._set_automatic_cooldown("candidate_rejected")
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint candidate exceeded its wire budget"
+            return messages
+        if not self._externalized_artifacts_are_recoverable(externalized):
+            self._set_automatic_cooldown("artifact_unavailable")
+            self._last_compress_aborted = True
+            self._last_summary_error = "checkpoint artifact is unavailable"
             return messages
         if not self._candidate_snapshot_is_current(
             messages, snapshot, commit_snapshot, lifecycle

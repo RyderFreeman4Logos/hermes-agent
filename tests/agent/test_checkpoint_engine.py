@@ -2149,6 +2149,199 @@ def test_map_planner_packs_consecutive_causal_units_without_splitting_tool_recei
     assert [shard.event_indices for shard in shards] == [(0, 1), (2,), (3, 4), (5,)]
 
 
+def test_oversized_read_only_tool_output_has_a_durable_recovery_index(monkeypatch, tmp_path):
+    from agent.checkpoint_engine import CheckpointContextEngine
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr("agent.checkpoint_engine._MAP_SHARD_MAX_INPUT_TOKENS", 16)
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-session", source="test")
+    oversized_output = "read-only output\n" + "x" * 80_000
+    source_messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": oversized_output},
+        {"role": "user", "content": "continue"},
+    ]
+    for message in source_messages:
+        db.append_message("checkpoint-session", **message)
+    messages = db.get_messages_as_conversation("checkpoint-session", include_row_ids=True)
+
+    def token_counter(prompt):
+        event_ids = json.loads(prompt[-1]["content"])["source_event_ids"]
+        return 20 if len(event_ids) == 2 else 6
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        token_counter=token_counter,
+        output_reserve_tokens=0,
+    )
+    engine.bind_session_state(db, "checkpoint-session")
+
+    result = engine.compress(messages, force=True)
+
+    assert result is not messages
+    artifact = engine.last_map_externalized_artifacts[0]
+    body = db.get_checkpoint_artifact(artifact.artifact_id)
+    expected = [
+        {"source_event_id": message["_row_id"], "message": source}
+        for message, source in zip(messages[:2], engine._provider_visible_sources(messages[:2]))
+    ]
+    assert body == json.dumps(
+        expected, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    assert artifact.artifact_id in engine.last_checkpoint_text
+    assert artifact.sha256 in engine.last_checkpoint_text
+    assert db.get_checkpoint_artifact_reference(
+        "checkpoint-session", artifact.source_event_ids
+    ) == artifact.artifact_id
+
+
+def _artifactized_checkpoint(monkeypatch, tmp_path, source_messages):
+    from agent.checkpoint_engine import CheckpointContextEngine
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr("agent.checkpoint_engine._MAP_SHARD_MAX_INPUT_TOKENS", 16)
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-session", source="test")
+    for message in source_messages:
+        db.append_message("checkpoint-session", **message)
+    messages = db.get_messages_as_conversation("checkpoint-session", include_row_ids=True)
+
+    def token_counter(value):
+        if isinstance(value, list):
+            events = json.loads(value[-1]["content"])["events"]
+            return 20 if any(
+                len(str(event["message"].get("content", ""))) > 16_000 for event in events
+            ) else 6
+        return 20 if len(str(value.get("content", ""))) > 16_000 else 6
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        token_counter=token_counter,
+        output_reserve_tokens=0,
+    )
+    engine.bind_session_state(db, "checkpoint-session")
+    return db, engine, messages, engine.compress(messages, force=True)
+
+
+def test_oversized_state_changing_tool_keeps_receipt_and_artifact(monkeypatch, tmp_path):
+    receipt = "exit status: 0\nmutation receipt: wrote config.toml\n" + "x" * 80_000
+    db, engine, messages, result = _artifactized_checkpoint(monkeypatch, tmp_path, [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": '{"command":"write config.toml"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": receipt},
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert result is not messages
+    artifact = engine.last_map_externalized_artifacts[0]
+    body = db.get_checkpoint_artifact(artifact.artifact_id)
+    checkpoint = engine.last_checkpoint_text
+    assert body is not None
+    assert checkpoint is not None
+    assert b"mutation receipt: wrote config.toml" in body
+    assert "tool: write_file" in checkpoint
+    assert "command: write config.toml" in checkpoint
+    assert "exit status: 0" in checkpoint
+
+
+def test_oversized_subagent_report_stays_recoverable_outside_recent_tail(monkeypatch, tmp_path):
+    report = "subagent final: full investigation\n" + "x" * 80_000
+    db, engine, messages, result = _artifactized_checkpoint(monkeypatch, tmp_path, [
+        {"role": "assistant", "content": report},
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert result is not messages
+    artifact = engine.last_map_externalized_artifacts[0]
+    body = db.get_checkpoint_artifact(artifact.artifact_id)
+    checkpoint = engine.last_checkpoint_text
+    assert body is not None
+    assert checkpoint is not None
+    assert report not in json.dumps(result)
+    assert json.loads(body)[0]["message"]["content"] == report
+    assert f"recovery: checkpoint-artifact:{artifact.artifact_id}" in checkpoint
+
+
+def test_oversized_group_fails_closed_when_artifact_write_fails(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(
+        SessionDB,
+        "store_checkpoint_artifact",
+        lambda _self, _session_id, _source_event_ids, _body: (
+            _ for _ in ()
+        ).throw(OSError("disk full")),
+    )
+    _db, engine, messages, result = _artifactized_checkpoint(monkeypatch, tmp_path, [
+        {"role": "assistant", "content": "subagent final\n" + "x" * 80_000},
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert result is messages
+    assert engine.last_candidate is None
+    assert engine._last_summary_error == "checkpoint artifactization failed"
+
+
+def test_checkpoint_rejects_an_artifact_that_disappears_before_publication(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    original_load = SessionDB.get_checkpoint_artifact
+    calls = 0
+
+    def vanish_after_artifactization(self, artifact_id):
+        nonlocal calls
+        calls += 1
+        return original_load(self, artifact_id) if calls == 1 else None
+
+    monkeypatch.setattr(SessionDB, "get_checkpoint_artifact", vanish_after_artifactization)
+    _db, engine, messages, result = _artifactized_checkpoint(monkeypatch, tmp_path, [
+        {"role": "assistant", "content": "subagent final\n" + "x" * 80_000},
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert result is messages
+    assert engine.last_candidate is None
+    assert engine._last_summary_error == "checkpoint artifact is unavailable"
+
+
+def test_map_cannot_claim_externalized_without_a_durable_artifact():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    engine = CheckpointContextEngine()
+    response = _map_response({
+        "schema_version": 2,
+        "source_event_ids": [1],
+        "facts": [],
+        "dispositions": [{
+            "source_event_id": 1,
+            "status": "externalized",
+            "recovery_ref": "session-event:1",
+        }],
+    })
+
+    assert engine._parse_map_shard(response, CausalGroup((0,)), (1,)) is None
+
+
 def test_map_planner_externalizes_an_oversized_causal_unit_without_tearing_it(
     monkeypatch,
 ):

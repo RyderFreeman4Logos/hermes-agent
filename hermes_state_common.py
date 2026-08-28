@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -364,6 +364,18 @@ CREATE TABLE IF NOT EXISTS schema_version (
 CREATE TABLE IF NOT EXISTS system_prompts (
     hash TEXT PRIMARY KEY,
     prompt TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS checkpoint_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    body BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS checkpoint_artifact_refs (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_event_ids TEXT NOT NULL,
+    artifact_id TEXT NOT NULL REFERENCES checkpoint_artifacts(artifact_id),
+    PRIMARY KEY (session_id, source_event_ids)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

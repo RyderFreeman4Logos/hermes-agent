@@ -11262,6 +11262,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             return self._active_message_revision(conn, session_id)
 
+    @staticmethod
+    def _checkpoint_artifact_reference_key(source_event_ids: Any) -> str:
+        if not isinstance(source_event_ids, (list, tuple)) or not source_event_ids:
+            raise ValueError("checkpoint artifact source events are required")
+        if any(isinstance(event_id, bool) or not isinstance(event_id, int) or event_id <= 0 for event_id in source_event_ids):
+            raise ValueError("checkpoint artifact source events must be positive integers")
+        return json.dumps(list(source_event_ids), separators=(",", ":"))
+
+    def store_checkpoint_artifact(
+        self, session_id: str, source_event_ids: Any, body: bytes
+    ) -> str:
+        """Commit one content-addressed checkpoint recovery body before use."""
+        if not isinstance(session_id, str) or not session_id or not isinstance(body, bytes) or not body:
+            raise ValueError("checkpoint artifact body must be non-empty bytes")
+        artifact_id = hashlib.sha256(body).hexdigest()
+        source_key = self._checkpoint_artifact_reference_key(source_event_ids)
+
+        def _do(conn):
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
+                raise RuntimeError("checkpoint artifact session is missing")
+            conn.execute(
+                "INSERT OR IGNORE INTO checkpoint_artifacts (artifact_id, body) VALUES (?, ?)",
+                (artifact_id, body),
+            )
+            row = conn.execute(
+                "SELECT body FROM checkpoint_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            if row is None or bytes(row["body"]) != body:
+                raise RuntimeError("checkpoint artifact durability verification failed")
+            conn.execute(
+                "INSERT INTO checkpoint_artifact_refs (session_id, source_event_ids, artifact_id) "
+                "VALUES (?, ?, ?) ON CONFLICT(session_id, source_event_ids) DO NOTHING",
+                (session_id, source_key, artifact_id),
+            )
+            reference = conn.execute(
+                "SELECT artifact_id FROM checkpoint_artifact_refs "
+                "WHERE session_id = ? AND source_event_ids = ?",
+                (session_id, source_key),
+            ).fetchone()
+            if reference is None or reference["artifact_id"] != artifact_id:
+                raise RuntimeError("checkpoint artifact recovery index conflict")
+
+        self._execute_write(_do)
+        return artifact_id
+
+    def get_checkpoint_artifact(self, artifact_id: str) -> Optional[bytes]:
+        """Load a checkpoint artifact only when its content address still verifies."""
+        if not isinstance(artifact_id, str) or len(artifact_id) != 64:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT body FROM checkpoint_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        if row is None or not isinstance(row["body"], bytes):
+            return None
+        body = row["body"]
+        return body if hashlib.sha256(body).hexdigest() == artifact_id else None
+
+    def get_checkpoint_artifact_reference(
+        self, session_id: str, source_event_ids: Any
+    ) -> Optional[str]:
+        """Return the durable artifact ID for one exact source-event range."""
+        if not isinstance(session_id, str) or not session_id:
+            return None
+        try:
+            source_key = self._checkpoint_artifact_reference_key(source_event_ids)
+        except ValueError:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT artifact_id FROM checkpoint_artifact_refs "
+                "WHERE session_id = ? AND source_event_ids = ?",
+                (session_id, source_key),
+            ).fetchone()
+        return row["artifact_id"] if row is not None else None
+
     def active_message_revision_is_current(
         self, revision: ActiveMessageRevision
     ) -> bool:

@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +24,46 @@ _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
 _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
     {"x-dynamo-parent-session-id", "x-dynamo-session-id"}
 )
+
+_TRANSPORT_CAPTURE_CONTEXT: contextvars.ContextVar[
+    tuple[str, str, dict[str, Any]] | None
+] = contextvars.ContextVar("relay_transport_capture_context", default=None)
+
+
+@contextmanager
+def _transport_capture_context(
+    *, name: str, model_name: str, metadata: dict[str, Any] | None
+):
+    token = _TRANSPORT_CAPTURE_CONTEXT.set((name, model_name, metadata or {}))
+    try:
+        yield
+    finally:
+        _TRANSPORT_CAPTURE_CONTEXT.reset(token)
+
+
+def capture_transport_request(request: dict[str, Any]) -> None:
+    """Capture the kwargs immediately before a provider SDK opener."""
+    context = _TRANSPORT_CAPTURE_CONTEXT.get()
+    if context is None:
+        return
+    name, model_name, metadata = context
+    request_id = str(metadata.get("api_request_id") or "").strip()
+    try:
+        retry = int(metadata.get("retry_count") or 0)
+    except (TypeError, ValueError):
+        retry = 0
+    cache_request_capture.capture_provider_request(
+        request,
+        api_mode=str(metadata.get("api_mode") or "unknown"),
+        route=str(metadata.get("route") or "unknown"),
+        provider=name,
+        model=str(request.get("model") or model_name),
+        correlation=request_id or None,
+        attempt_id=f"{request_id}:attempt:{retry}" if request_id else None,
+        retry=retry,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _RelayProtocol:
     operation: str
@@ -84,20 +125,9 @@ def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
 def _record_attempt(
     request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None
 ) -> None:
-    request_id = str((metadata or {}).get("api_request_id") or "").strip()
     retry = int((metadata or {}).get("retry_count") or 0)
     scope = physical_attempt_diagnostics.take_cache_scope(request)
     loop, correlation = _attempt_loop(metadata)
-    cache_request_capture.capture_provider_request(
-        request,
-        api_mode=str((metadata or {}).get("api_mode") or "unknown"),
-        route=str((metadata or {}).get("route") or "unknown"),
-        provider=name,
-        model=str(request.get("model") or model_name),
-        correlation=request_id or None,
-        attempt_id=f"{request_id}:attempt:{retry}" if request_id else None,
-        retry=retry,
-    )
     physical_attempt_diagnostics.start_attempt(
         request,
         api_mode=str((metadata or {}).get("api_mode") or "unknown"),
@@ -116,7 +146,10 @@ def _execute_attempt(
     model_name: str, metadata: dict[str, Any] | None,
 ) -> Any:
     _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
-    return callback(request)
+    with _transport_capture_context(
+        name=name, model_name=model_name, metadata=metadata
+    ):
+        return callback(request)
 
 
 async def _execute_attempt_async(
@@ -124,7 +157,10 @@ async def _execute_attempt_async(
     model_name: str, metadata: dict[str, Any] | None,
 ) -> Any:
     _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
-    return await callback(request)
+    with _transport_capture_context(
+        name=name, model_name=model_name, metadata=metadata
+    ):
+        return await callback(request)
 
 
 def _request_with_cache_scope(request: dict[str, Any], session_id: str) -> dict[str, Any]:
@@ -437,7 +473,10 @@ def stream_current(
     turn = relay_runtime.active_turn()
     if turn is None:
         _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
-        return stream_factory(request)
+        with _transport_capture_context(
+            name=name, model_name=model_name, metadata=metadata
+        ):
+            return stream_factory(request)
     if _has_running_event_loop():
         # Managed provider callbacks execute on the Relay session's event
         # loop. A nested ManagedLlmStream built here would be synchronously
@@ -449,7 +488,10 @@ def stream_current(
         # the MoA facade's auxiliary ``call_llm(stream=True)`` returning a
         # full response when an adapter ignores ``stream=True``).
         _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
-        return stream_factory(request)
+        with _transport_capture_context(
+            name=name, model_name=model_name, metadata=metadata
+        ):
+            return stream_factory(request)
     managed = stream(
         request,
         stream_factory,
@@ -558,12 +600,21 @@ class ManagedLlmStream(Iterator[Any]):
         def run_callback(callback: Callable[..., Any], *args: Any) -> Any:
             # Relay can invoke stream surfaces while another callback still
             # owns the captured Context. A fresh copy is safe to enter.
+            transport_context = _TRANSPORT_CAPTURE_CONTEXT.get()
+
             def guarded() -> Any:
                 # Hermes-side callbacks run while the native pipeline drives
                 # this stream; nested relay calls they make must bypass
                 # managed execution (#77244).
-                with relay_runtime.managed_callback_guard():
-                    return callback(*args)
+                token = None
+                if transport_context is not None:
+                    token = _TRANSPORT_CAPTURE_CONTEXT.set(transport_context)
+                try:
+                    with relay_runtime.managed_callback_guard():
+                        return callback(*args)
+                finally:
+                    if token is not None:
+                        _TRANSPORT_CAPTURE_CONTEXT.reset(token)
 
             return callback_context.copy().run(guarded)
 
@@ -574,7 +625,10 @@ class ManagedLlmStream(Iterator[Any]):
             or not runtime.managed_execution_enabled()
         ):
             _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
-            raw_stream = stream_factory(request)
+            with _transport_capture_context(
+                name=name, model_name=model_name, metadata=metadata
+            ):
+                raw_stream = stream_factory(request)
             if completed_response_predicate is not None and completed_response_predicate(
                 raw_stream
             ):
@@ -612,7 +666,10 @@ class ManagedLlmStream(Iterator[Any]):
                 _record_attempt(
                     final_request, name=name, model_name=model_name, metadata=metadata
                 )
-                raw_stream = run_callback(stream_factory, final_request)
+                with _transport_capture_context(
+                    name=name, model_name=model_name, metadata=metadata
+                ):
+                    raw_stream = run_callback(stream_factory, final_request)
                 if (
                     completed_response_predicate is not None
                     and run_callback(

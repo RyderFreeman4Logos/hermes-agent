@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -174,19 +175,129 @@ def test_capture_records_each_physical_attempt(monkeypatch, tmp_path):
     monkeypatch.setattr(physical_attempt_diagnostics, "start_attempt", lambda *args, **kwargs: None)
     request = {"model": "m", "messages": [{"role": "user", "content": "x"}]}
 
-    relay_llm._record_attempt(
-        dict(request),
-        name="provider",
-        model_name="m",
-        metadata={"api_request_id": "turn:api:0", "retry_count": 0},
-    )
-    relay_llm._record_attempt(
-        dict(request),
-        name="provider",
-        model_name="m",
-        metadata={"api_request_id": "turn:api:0", "retry_count": 1},
-    )
+    for retry_count in (0, 1):
+        relay_llm._execute_attempt(
+            dict(request),
+            lambda final_request: relay_llm.capture_transport_request(final_request),
+            name="provider",
+            model_name="m",
+            metadata={"api_request_id": "turn:api:0", "retry_count": retry_count},
+        )
 
     captures = _captures(tmp_path)
     assert len(captures) == 2
     assert [item["physical_attempt"]["retry"] for item in captures] == [0, 1]
+
+
+def test_openai_capture_matches_final_sdk_kwargs(monkeypatch):
+    from agent import chat_completion_helpers, relay_llm
+
+    opened = []
+    captured = []
+
+    class Completions:
+        def create(self, **kwargs):
+            opened.append(dict(kwargs))
+            return "response"
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions()),
+    )
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider="openai",
+        client=client,
+    )
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: captured.append(dict(request)),
+    )
+
+    request = {"model": "m", "messages": [{"role": "user", "content": "x"}]}
+    result = chat_completion_helpers._dispatch_nonstreaming_api_request(
+        agent, request, make_client=lambda *args, **kwargs: client
+    )
+
+    assert result == "response"
+    assert captured == opened
+
+
+def test_anthropic_capture_matches_stream_and_fallback_kwargs(monkeypatch):
+    from agent import anthropic_adapter, relay_llm
+
+    opened = []
+    captured = []
+
+    class Messages:
+        def stream(self, **kwargs):
+            opened.append(dict(kwargs))
+            raise RuntimeError("stream not supported")
+
+        def create(self, **kwargs):
+            opened.append(dict(kwargs))
+            return "response"
+
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: captured.append(dict(request)),
+    )
+    request = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "x"}],
+        "instructions": "drop",
+        "input": "drop",
+        "store": True,
+        "parallel_tool_calls": True,
+        "stream": True,
+    }
+
+    result = anthropic_adapter.create_anthropic_message(
+        SimpleNamespace(messages=Messages()), request
+    )
+
+    assert result == "response"
+    assert captured == opened
+    assert captured == [
+        {"model": "m", "messages": [{"role": "user", "content": "x"}]},
+        {"model": "m", "messages": [{"role": "user", "content": "x"}]},
+    ]
+
+
+def test_bedrock_stream_fallback_captures_each_final_opener(monkeypatch):
+    from agent import bedrock_adapter, relay_llm
+
+    opened = []
+    captured = []
+
+    class Client:
+        def converse_stream(self, **kwargs):
+            opened.append(dict(kwargs))
+            raise RuntimeError("access denied")
+
+        def converse(self, **kwargs):
+            opened.append(dict(kwargs))
+            return {"response": "ok"}
+
+    monkeypatch.setattr(
+        bedrock_adapter, "_get_bedrock_runtime_client", lambda region: Client()
+    )
+    monkeypatch.setattr(
+        bedrock_adapter, "is_streaming_access_denied_error", lambda exc: True
+    )
+    monkeypatch.setattr(
+        bedrock_adapter, "normalize_converse_response", lambda response: response
+    )
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: captured.append(dict(request)),
+    )
+
+    result = bedrock_adapter.call_converse_stream(
+        "us-east-1", "m", [{"role": "user", "content": [{"text": "x"}]}]
+    )
+
+    assert result == {"response": "ok"}
+    assert captured == opened

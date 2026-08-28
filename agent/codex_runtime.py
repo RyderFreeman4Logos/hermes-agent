@@ -1421,6 +1421,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 next_api_kwargs,
             )
             stream_kwargs["stream"] = True
+            relay_llm.capture_transport_request(stream_kwargs)
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:

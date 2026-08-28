@@ -89,6 +89,36 @@ def test_exact_capture_preserves_tool_reorder(monkeypatch, tmp_path):
     assert _first_difference(requests[0], requests[1]) == ("tools", 0, "name")
 
 
+def test_exact_capture_preserves_input_and_prompt_cache_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    first = {
+        "model": "grok-4.6",
+        "messages": [{"role": "system", "content": "A"}],
+        "input": "INPUT-A",
+        "tools": [{"name": "TOOL-A"}],
+        "prompt_cache_key": "PCK-A",
+    }
+    second = {
+        "model": "grok-4.6",
+        "messages": [{"role": "system", "content": "A"}],
+        "input": "INPUT-B",
+        "tools": [{"name": "TOOL-B"}],
+        "prompt_cache_key": "PCK-B",
+    }
+
+    capture.capture_provider_request(first)
+    capture.capture_provider_request(second)
+
+    requests = [item["request"] for item in _captures(tmp_path)]
+    assert requests[0]["input"] == "INPUT-A"
+    assert requests[1]["input"] == "INPUT-B"
+    assert requests[0]["prompt_cache_key"] == "PCK-A"
+    assert requests[1]["prompt_cache_key"] == "PCK-B"
+    assert requests[0]["tools"][0]["name"] == "TOOL-A"
+    assert requests[1]["tools"][0]["name"] == "TOOL-B"
+
+
 def test_only_transport_secrets_are_redacted(monkeypatch, tmp_path):
     monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
     _enable(monkeypatch)

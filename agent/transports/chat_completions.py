@@ -270,6 +270,10 @@ class ChatCompletionsTransport(ProviderTransport):
         that strict chat-completions providers reject with HTTP 400/422
         (or, in the case of some OpenAI-compatible gateways, 5xx):
 
+        - A non-leading ``system`` message — strict endpoints reject it with
+          HTTP 400 "System message must be at the beginning." It becomes a
+          ``user`` message in place so request-only timing stays after cache
+          breakpoints without changing durable history.
         - Codex Responses API fields: ``codex_reasoning_items`` /
           ``codex_message_items`` on the message, ``call_id`` /
           ``response_item_id`` on ``tool_calls`` entries.
@@ -303,9 +307,12 @@ class ChatCompletionsTransport(ProviderTransport):
             kwargs.get("model")
         )
         needs_sanitize = False
-        for msg in messages:
+        for msg_idx, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 continue
+            if msg_idx and msg.get("role") == "system":
+                needs_sanitize = True
+                break
             if (
                 "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
@@ -376,6 +383,12 @@ class ChatCompletionsTransport(ProviderTransport):
                     copied_msg = dict(msg)
                     sanitized[msg_idx] = copied_msg
                 return copied_msg
+
+            # Strict Chat Completions endpoints reject a system row after a
+            # conversation turn. Preserve the request position (including the
+            # timing suffix) but make it a regular user message at the wire.
+            if msg_idx and msg.get("role") == "system":
+                mutable_msg()["role"] = "user"
 
             if (
                 "codex_reasoning_items" in msg

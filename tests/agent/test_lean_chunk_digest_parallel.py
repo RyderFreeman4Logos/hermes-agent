@@ -1315,3 +1315,130 @@ def test_lean_chunk_digests_keep_slots_when_worker_raises_baseexception():
     assert "DIGEST-B" not in output
     assert "[digest unavailable for segment 2/3" in output
     assert "recover via session_search" in output
+
+
+def test_lean_chunk_digests_isolate_one_chunk_failure():
+    """One permanently failing chunk keeps its placeholder; others stay real."""
+    attempts = 0
+
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        nonlocal attempts
+        assert task == "compression"
+        if "MARKER-B" in messages[0]["content"]:
+            attempts += 1
+            raise RuntimeError("boom-middle")
+        return _response(_body(messages))
+
+    output = _run_retry_digest(fake_call_llm, {"max_concurrency": 2})
+
+    assert attempts == 2
+    assert _segment_headers(output) == [("1", "3"), ("2", "3"), ("3", "3")]
+    assert "DIGEST-A" in output
+    assert "DIGEST-B" not in output
+    assert "[digest unavailable for segment 2/3" in output
+    assert "recover via session_search" in output
+    assert "boom-middle" not in output
+
+
+def test_lean_chunk_digests_reuse_selected_fallback_route():
+    """Sibling chunks use the route selected after the primary model fails."""
+    calls = []
+
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        assert task == "compression"
+        calls.append(kwargs)
+        route = kwargs.get("provider"), kwargs.get("model")
+        route_info = kwargs.get("route_info")
+        if route_info is not None:
+            route_info.update(provider="openai-codex", model="gpt-5.6-luna")
+        label = "FALLBACK" if route == ("openai-codex", "gpt-5.6-luna") or len(calls) == 1 else "PRIMARY-REHIT"
+        return _response(label)
+
+    output = _run_retry_digest(fake_call_llm, {"max_concurrency": 2})
+
+    assert "provider" not in calls[0]
+    assert calls[0]["route_info"]["provider"] == "openai-codex"
+    assert calls[0]["route_info"]["model"] == "gpt-5.6-luna"
+    assert len(calls) > 1
+    assert all(
+        call.get("provider") == "openai-codex"
+        and call.get("model") == "gpt-5.6-luna"
+        for call in calls[1:]
+    )
+    assert "PRIMARY-REHIT" not in output
+    assert output.count("FALLBACK") == len(calls)
+
+
+def test_lean_harvest_cancel_keeps_slots_and_lean_recovery():
+    """Queued Future.cancel() still yields slots; augment keeps recovery sections."""
+    compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
+    turns = _turns() + [{"role": "user", "content": "MARKER-D " + ("D" * 70)}]
+    from concurrent.futures import ThreadPoolExecutor
+
+    two_started = threading.Event()
+    submitted_three = threading.Event()
+    hold = threading.Event()
+    futures = []
+    lock = threading.Lock()
+    in_flight = 0
+    orig_submit = ThreadPoolExecutor.submit
+
+    def tracking_submit(self, fn, *args, **kwargs):
+        future = orig_submit(self, fn, *args, **kwargs)
+        futures.append(future)
+        if len(futures) >= 3:
+            submitted_three.set()
+        return future
+
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        nonlocal in_flight
+        assert task == "compression"
+        content = messages[0]["content"]
+        if "MARKER-A" in content:
+            body = "DIGEST-A"
+        else:
+            with lock:
+                in_flight += 1
+                if in_flight >= 2:
+                    two_started.set()
+            assert hold.wait(timeout=2), "queued cancel never released workers"
+            with lock:
+                in_flight -= 1
+            body = _body(messages)
+        return _response(body)
+
+    def cancel_queued():
+        assert two_started.wait(timeout=2), "first two workers never started"
+        assert submitted_three.wait(timeout=2), "third future never submitted"
+        assert futures[2].cancel(), "later job was already running"
+        hold.set()
+
+    compressor._session_id = "sess-137-harvest"
+    canceler = threading.Thread(target=cancel_queued, daemon=True)
+    canceler.start()
+    try:
+        with (
+            patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", _CHUNK_CHARS),
+            patch("agent.auxiliary_client.call_llm", fake_call_llm),
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value={"max_concurrency": 2},
+            ),
+            patch.object(ThreadPoolExecutor, "submit", tracking_submit),
+        ):
+            output = compressor._augment_summary_lean("KEEP-SUMMARY", turns)
+    finally:
+        hold.set()
+        canceler.join(timeout=2)
+
+    assert output.startswith("KEEP-SUMMARY")
+    assert _segment_headers(output) == [("1", "4"), ("2", "4"), ("3", "4"), ("4", "4")]
+    assert "DIGEST-A" in output
+    assert "DIGEST-B" in output
+    assert "DIGEST-C" in output
+    assert "[digest unavailable for segment 4/4" in output
+    assert "recover via session_search" in output
+    assert "## User Messages (verbatim, newest first)" in output
+    assert "MARKER-D" in output
+    assert "## Context Recovery" in output
+    assert "session_id='sess-137-harvest'" in output

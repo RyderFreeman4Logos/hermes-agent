@@ -147,6 +147,17 @@ def test_due_prompt_fires_once_and_reanchors():
     assert mgr.due_prompt() is None
 
 
+def test_cache_warm_due_is_session_scoped_and_bodyless():
+    mgr = HeartbeatManager(session_id="hb-cache-warm-sid", purpose="cache_warm")
+    mgr.arm_cache_warm("openai:test-model", 600, now=100.0)
+
+    assert mgr.due_prompt(now=699.0) is None
+    assert mgr.due_prompt(now=700.0) == ""
+    assert mgr.state is not None
+    assert mgr.state.route == "openai:test-model"
+    assert mgr.state.fire_count == 1
+
+
 def test_missed_ticks_coalesce():
     mgr = HeartbeatManager(session_id="hb-coalesce-sid")
     mgr.set("tick", 600)

@@ -7176,7 +7176,7 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         process_registry._poll_observed.discard(event["session_id"])
 
 
-def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
+def test_run_prompt_submit_batches_post_turn_completions_with_real_threading(
     monkeypatch, tmp_path
 ):
     import queue as _queue_mod
@@ -7198,7 +7198,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         return thread
 
     class _BlockingNotificationAgent(_RecordingAgent):
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
             turns.append(prompt)
             if "proc_batch_1" in prompt:
                 nested_started.set()
@@ -7233,28 +7235,13 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
 
         assert nested_started.wait(timeout=5)
-        threads[0].join(timeout=5)
-        assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
-        queued: dict = {}
-        deadline = time.time() + 5.0
-        while time.time() < deadline and set(queued) != {
-            "proc_batch_2",
-            "proc_batch_3",
-        }:
-            try:
-                evt = isolated_queue.get(timeout=0.1)
-            except _queue_mod.Empty:
-                continue
-            queued[evt["session_id"]] = evt
-        assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        assert turns[0] == "session-a-turn"
+        assert len(turns) == 2
+        assert all(f"proc_batch_{index}" in turns[1] for index in range(1, 4))
+        assert isolated_queue.empty()
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
     finally:
         release_nested.set()
         for thread in threads:
@@ -7265,6 +7252,282 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         for event in events:
             process_registry._completion_consumed.discard(event["session_id"])
             process_registry._poll_observed.discard(event["session_id"])
+
+
+def test_run_prompt_submit_reconciles_durable_batch_settlement_failure(
+    monkeypatch, tmp_path
+):
+    """A settled batch member is not replayed when a later settle fails."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(
+        monkeypatch, tmp_path, immediate_threads=False
+    )
+    real_thread_class = threading.Thread
+    threads = []
+    nested_started = threading.Event()
+    allow_settlement = threading.Event()
+    release_nested = threading.Event()
+    turns = []
+    delivery_states = {
+        "deleg_retry_1": "pending",
+        "deleg_retry_2": "pending",
+        "deleg_retry_3": "pending",
+    }
+    settlements = []
+    releases = []
+
+    def _recording_thread(*args, **kwargs):
+        thread = real_thread_class(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    class _BlockingNotificationAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            turns.append(prompt)
+            if "deleg_retry_1" in prompt:
+                nested_started.set()
+                if not release_nested.wait(timeout=5):
+                    raise TimeoutError("notification turn was not released")
+            return {"final_response": "", "messages": []}
+
+    def _claim(event, _consumer):
+        delegation_id = event["delegation_id"]
+        if delivery_states[delegation_id] != "pending":
+            return None
+        return f"claim-{delegation_id}"
+
+    def _complete(delegation_id, _claim):
+        if delegation_id == "deleg_retry_1":
+            assert nested_started.wait(timeout=5)
+            assert allow_settlement.wait(timeout=5)
+        settlements.append(delegation_id)
+        if delegation_id == "deleg_retry_2":
+            raise RuntimeError("injected settlement failure")
+        delivery_states[delegation_id] = "delivered"
+
+    def _release(event, _claim):
+        releases.append(event["delegation_id"])
+
+    def _durable(delegation_id):
+        return {"delivery_state": delivery_states[delegation_id]}
+
+    monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", _complete)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", _release)
+    monkeypatch.setattr(async_delegation, "get_durable_delegation", _durable)
+    real_drain = process_registry.drain_notifications
+    drain_calls = 0
+
+    def _drain_once(*args, **kwargs):
+        nonlocal drain_calls
+        drain_calls += 1
+        if drain_calls > 1:
+            return []
+        return real_drain(*args, **kwargs)
+
+    monkeypatch.setattr(process_registry, "drain_notifications", _drain_once)
+    session = _session(
+        session_key="session-a",
+        agent=_BlockingNotificationAgent(turns),
+        running=True,
+    )
+    events = [
+        {
+            "type": "async_delegation",
+            "delegation_id": f"deleg_retry_{index}",
+            "session_key": "session-a",
+            "origin_ui_session_id": "sid_a",
+            "status": "completed",
+            "summary": f"owned-{index}",
+        }
+        for index in range(1, 4)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    server._sessions["sid_a"] = session
+
+    try:
+        server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
+
+        assert nested_started.wait(timeout=5), (
+            turns,
+            [thread.is_alive() for thread in threads],
+        )
+        assert isolated_queue.empty()
+        assert settlements == []
+        allow_settlement.set()
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        remaining = []
+        while not isolated_queue.empty():
+            remaining.append(isolated_queue.get_nowait()["delegation_id"])
+        assert remaining == ["deleg_retry_2", "deleg_retry_3"]
+        assert delivery_states == {
+            "deleg_retry_1": "delivered",
+            "deleg_retry_2": "pending",
+            "deleg_retry_3": "pending",
+        }
+        assert settlements == ["deleg_retry_1", "deleg_retry_2"]
+        assert releases == ["deleg_retry_2", "deleg_retry_3"]
+    finally:
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        server._sessions.pop("sid_a", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
+def test_run_prompt_submit_requeues_false_batch_settlement_only(
+    monkeypatch, tmp_path
+):
+    """A false settlement keeps only that pending member retryable."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(
+        monkeypatch, tmp_path, immediate_threads=False
+    )
+    real_thread_class = threading.Thread
+    threads = []
+    nested_started = threading.Event()
+    allow_settlement = threading.Event()
+    release_nested = threading.Event()
+    turns = []
+    delivery_states = {
+        "deleg_retry_1": "pending",
+        "deleg_retry_2": "pending",
+        "deleg_retry_3": "pending",
+    }
+    settlements = []
+    releases = []
+
+    def _recording_thread(*args, **kwargs):
+        thread = real_thread_class(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    class _BlockingNotificationAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            turns.append(prompt)
+            if "deleg_retry_1" in prompt:
+                nested_started.set()
+                if not release_nested.wait(timeout=5):
+                    raise TimeoutError("notification turn was not released")
+            return {"final_response": "", "messages": []}
+
+    def _claim(event, _consumer):
+        delegation_id = event["delegation_id"]
+        if delivery_states[delegation_id] != "pending":
+            return None
+        return f"claim-{delegation_id}"
+
+    def _complete(delegation_id, _claim):
+        if delegation_id == "deleg_retry_1":
+            assert nested_started.wait(timeout=5)
+            assert allow_settlement.wait(timeout=5)
+        settlements.append(delegation_id)
+        if delegation_id != "deleg_retry_2":
+            delivery_states[delegation_id] = "delivered"
+        return delegation_id != "deleg_retry_2"
+
+    def _release(event, _claim):
+        releases.append(event["delegation_id"])
+
+    def _durable(delegation_id):
+        return {"delivery_state": delivery_states[delegation_id]}
+
+    monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    monkeypatch.setattr(
+        async_delegation, "complete_completion_delivery", _complete
+    )
+    monkeypatch.setattr(async_delegation, "release_event_delivery", _release)
+    monkeypatch.setattr(async_delegation, "get_durable_delegation", _durable)
+    real_drain = process_registry.drain_notifications
+    drain_calls = 0
+
+    def _drain_once(*args, **kwargs):
+        nonlocal drain_calls
+        drain_calls += 1
+        if drain_calls > 1:
+            return []
+        return real_drain(*args, **kwargs)
+
+    monkeypatch.setattr(process_registry, "drain_notifications", _drain_once)
+    session = _session(
+        session_key="session-a",
+        agent=_BlockingNotificationAgent(turns),
+        running=True,
+    )
+    events = [
+        {
+            "type": "async_delegation",
+            "delegation_id": f"deleg_retry_{index}",
+            "session_key": "session-a",
+            "origin_ui_session_id": "sid_a",
+            "status": "completed",
+            "summary": f"owned-{index}",
+        }
+        for index in range(1, 4)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    server._sessions["sid_a"] = session
+
+    try:
+        server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
+
+        assert nested_started.wait(timeout=5), (
+            turns,
+            [thread.is_alive() for thread in threads],
+        )
+        assert isolated_queue.empty()
+        assert settlements == []
+        allow_settlement.set()
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        remaining = []
+        while not isolated_queue.empty():
+            remaining.append(isolated_queue.get_nowait()["delegation_id"])
+        assert remaining == ["deleg_retry_2"]
+        assert delivery_states == {
+            "deleg_retry_1": "delivered",
+            "deleg_retry_2": "pending",
+            "deleg_retry_3": "delivered",
+        }
+        assert settlements == [
+            "deleg_retry_1",
+            "deleg_retry_2",
+            "deleg_retry_3",
+        ]
+        assert releases == ["deleg_retry_2"]
+    finally:
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        server._sessions.pop("sid_a", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
 
 
 def test_run_prompt_submit_delivers_completion_owned_through_compression_lineage(
@@ -20886,3 +21149,143 @@ def test_prompt_submit_message_complete_preserves_cache_provenance(monkeypatch):
     assert record["request_index"] == 1
     assert isinstance(record["session"], str) and len(record["session"]) == 64
     assert isinstance(record["timestamp"], float)
+
+
+def test_run_prompt_submit_requeues_batch_when_durable_lookup_raises(
+    monkeypatch, tmp_path
+):
+    """A lookup error keeps unsettled batch members owned by the retry queue."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(
+        monkeypatch, tmp_path, immediate_threads=False
+    )
+    real_thread_class = threading.Thread
+    threads = []
+    nested_started = threading.Event()
+    allow_settlement = threading.Event()
+    release_nested = threading.Event()
+    turns = []
+    delivery_states = {
+        "deleg_retry_1": "pending",
+        "deleg_retry_2": "pending",
+        "deleg_retry_3": "pending",
+    }
+    settlements = []
+    releases = []
+    lookup_errors = []
+
+    def _recording_thread(*args, **kwargs):
+        thread = real_thread_class(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    class _BlockingNotificationAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            turns.append(prompt)
+            if "deleg_retry_1" in prompt:
+                nested_started.set()
+                if not release_nested.wait(timeout=5):
+                    raise TimeoutError("notification turn was not released")
+            return {"final_response": "", "messages": []}
+
+    def _claim(event, _consumer):
+        delegation_id = event["delegation_id"]
+        if delivery_states[delegation_id] != "pending":
+            return None
+        return f"claim-{delegation_id}"
+
+    def _complete(delegation_id, _claim):
+        if delegation_id == "deleg_retry_1":
+            assert nested_started.wait(timeout=5)
+            assert allow_settlement.wait(timeout=5)
+        settlements.append(delegation_id)
+        if delegation_id == "deleg_retry_2":
+            raise RuntimeError("injected settlement failure")
+        delivery_states[delegation_id] = "delivered"
+
+    def _release(event, _claim):
+        releases.append(event["delegation_id"])
+
+    def _durable(delegation_id):
+        if delegation_id == "deleg_retry_2":
+            lookup_errors.append(delegation_id)
+            raise RuntimeError("injected durable lookup failure")
+        return {"delivery_state": delivery_states[delegation_id]}
+
+    monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", _complete)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", _release)
+    monkeypatch.setattr(async_delegation, "get_durable_delegation", _durable)
+    real_drain = process_registry.drain_notifications
+    drain_calls = 0
+
+    def _drain_once(*args, **kwargs):
+        nonlocal drain_calls
+        drain_calls += 1
+        if drain_calls > 1:
+            return []
+        return real_drain(*args, **kwargs)
+
+    monkeypatch.setattr(process_registry, "drain_notifications", _drain_once)
+    session = _session(
+        session_key="session-a",
+        agent=_BlockingNotificationAgent(turns),
+        running=True,
+    )
+    events = [
+        {
+            "type": "async_delegation",
+            "delegation_id": f"deleg_retry_{index}",
+            "session_key": "session-a",
+            "origin_ui_session_id": "sid_a",
+            "status": "completed",
+            "summary": f"owned-{index}",
+        }
+        for index in range(1, 4)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    server._sessions["sid_a"] = session
+
+    try:
+        server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
+
+        assert nested_started.wait(timeout=5), (
+            turns,
+            [thread.is_alive() for thread in threads],
+        )
+        assert isolated_queue.empty()
+        assert settlements == []
+        allow_settlement.set()
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        remaining = []
+        while not isolated_queue.empty():
+            remaining.append(isolated_queue.get_nowait()["delegation_id"])
+        assert remaining == ["deleg_retry_2", "deleg_retry_3"]
+        assert delivery_states == {
+            "deleg_retry_1": "delivered",
+            "deleg_retry_2": "pending",
+            "deleg_retry_3": "pending",
+        }
+        assert settlements == ["deleg_retry_1", "deleg_retry_2"]
+        assert lookup_errors
+        assert releases == ["deleg_retry_2", "deleg_retry_3"]
+    finally:
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        server._sessions.pop("sid_a", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()

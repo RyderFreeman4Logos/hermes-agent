@@ -6813,6 +6813,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             total_messages, total_tool_calls = self._insert_message_rows(
                 conn, child_session_id, messages
             )
+            self._register_checkpoint_artifacts_for_messages(
+                conn, child_session_id, messages
+            )
             if watermark is not None:
                 # Clone the parent's concurrent tail (rows landed after the
                 # watermark, at or below the ceiling — see docstring) into the
@@ -11212,6 +11215,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             total_messages, total_tool_calls = self._insert_message_rows(
                 conn, session_id, messages
             )
+            if not active_only and not archive_dropped:
+                self._register_checkpoint_artifacts_for_messages(
+                    conn, session_id, messages, replace=True
+                )
+                self._delete_unreferenced_checkpoint_artifacts(conn)
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
@@ -11286,6 +11294,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if any(isinstance(event_id, bool) or not isinstance(event_id, int) or event_id <= 0 for event_id in source_event_ids):
             raise ValueError("checkpoint artifact source events must be positive integers")
         return json.dumps(list(source_event_ids), separators=(",", ":"))
+
+    @classmethod
+    def _register_checkpoint_artifacts_for_messages(
+        cls, conn, session_id: str, messages: List[Dict[str, Any]], *, replace: bool = False
+    ) -> None:
+        """Bind verified checkpoint markers to their newly persisted session."""
+        if replace:
+            conn.execute(
+                "DELETE FROM checkpoint_artifact_refs WHERE session_id = ?", (session_id,)
+            )
+        for message in messages:
+            row_id = message.get("_row_id") if isinstance(message, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(row_id, int) or row_id <= 0 or not isinstance(content, str):
+                continue
+            for ordinal, artifact_id in enumerate(
+                re.findall(r"recovery: checkpoint-artifact:([0-9a-f]{64})", content), 1
+            ):
+                row = conn.execute(
+                    "SELECT body FROM checkpoint_artifacts WHERE artifact_id = ?", (artifact_id,)
+                ).fetchone()
+                if row is None or hashlib.sha256(bytes(row["body"])).hexdigest() != artifact_id:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO checkpoint_artifact_refs "
+                    "(session_id, source_event_ids, artifact_id) VALUES (?, ?, ?)",
+                    (session_id, cls._checkpoint_artifact_reference_key((row_id, ordinal)), artifact_id),
+                )
 
     def store_checkpoint_artifact(
         self, session_id: str, source_event_ids: Any, body: bytes

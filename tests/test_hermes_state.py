@@ -1056,6 +1056,35 @@ class TestDeleteAndExport:
         assert db.delete_session("last") is True
         assert db.get_checkpoint_artifact(artifact_id) is None
 
+    def test_compression_child_owns_inherited_checkpoint_artifact(self, db):
+        body = b"oversized inherited body"
+        db.create_session("parent", "cli")
+        artifact_id = db.store_checkpoint_artifact("parent", (1,), body)
+        marker = f"[CONTEXT CHECKPOINT]\n- recovery: checkpoint-artifact:{artifact_id}\n[/CONTEXT CHECKPOINT]"
+
+        db.publish_compression_child(
+            parent_session_id="parent",
+            child_session_id="child",
+            source="cli",
+            messages=[{"role": "assistant", "content": marker}],
+            require_compression_lease=False,
+        )
+
+        assert db.delete_session("parent") is True
+        assert db.get_checkpoint_artifact(artifact_id) == body
+
+    def test_destructive_replace_reconciles_checkpoint_artifact_references(self, db):
+        body = b"stale checkpoint body"
+        db.create_session("rewrite", "cli")
+        artifact_id = db.store_checkpoint_artifact("rewrite", (1,), body)
+
+        db.replace_messages("rewrite", [{"role": "user", "content": "replacement"}])
+
+        assert db.get_checkpoint_artifact(artifact_id) is None
+        assert db._conn.execute(
+            "SELECT 1 FROM checkpoint_artifact_refs WHERE session_id = 'rewrite'"
+        ).fetchone() is None
+
     def test_checkpoint_artifact_gc_covers_bulk_delegate_and_prune(self, db):
         db.create_session("bulk", "cli")
         db.create_session("parent", "cli")

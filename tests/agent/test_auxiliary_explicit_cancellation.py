@@ -535,7 +535,7 @@ def test_isolated_provider_worker_inherits_protection_and_progress_hook() -> Non
     def _create(**_kwargs: Any) -> Any:
         observed["thread"] = threading.get_ident()
         observed["protected"] = aux._aux_interrupt_protected()
-        aux._notify_aux_progress()
+        aux._notify_aux_progress("provider progress")
         return SimpleNamespace(choices=[])
 
     client = SimpleNamespace(

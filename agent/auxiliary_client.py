@@ -47,11 +47,13 @@ Payment / credit exhaustion fallback:
 import contextlib
 import contextvars
 import copy
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import functools
 import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import string
@@ -446,19 +448,189 @@ class _AuxiliaryCancellationDecision:
 _aux_progress = threading.local()
 
 
-def _notify_aux_progress() -> None:
-    """Tick the installed forward-progress hook, if any. Never raises."""
+def _nonempty_aux_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _meaningful_aux_tool_delta(value: Any) -> bool:
+    if value is None:
+        return False
+    if any(
+        _nonempty_aux_text(getattr(value, field, None))
+        for field in (
+            "id",
+            "call_id",
+            "tool_use_id",
+            "name",
+            "arguments",
+            "partial_json",
+        )
+    ):
+        return True
+    function = getattr(value, "function", None)
+    return function is not None and any(
+        _nonempty_aux_text(getattr(function, field, None))
+        for field in ("name", "arguments")
+    )
+
+
+def _event_progress_parts(event: Any) -> tuple[Any, Any, Any]:
+    """Extract only known text/tool deltas from Codex/Anthropic events."""
+    event_type = str(getattr(event, "type", "") or "")
+    delta = getattr(event, "delta", None)
+    if event_type in {
+        "response.output_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.function_call_arguments.delta",
+        "response.custom_tool_call_input_delta",
+    }:
+        if isinstance(delta, str):
+            return delta, None, None
+        return getattr(delta, "text", None), None, delta
+    if event_type == "content_block_delta":
+        delta_type = str(getattr(delta, "type", "") or "")
+        if delta_type in {"text_delta", "thinking_delta", "input_json_delta"}:
+            return (
+                getattr(delta, "text", None) or getattr(delta, "thinking", None),
+                None,
+                delta if delta_type == "input_json_delta" else None,
+            )
+        return None, None, None
+    if event_type == "content_block_start":
+        block = getattr(event, "content_block", None)
+        return None, None, block if getattr(block, "type", None) == "tool_use" else None
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        item = getattr(event, "item", None)
+        if item is None:
+            return None, None, None
+        text = None
+        for part in getattr(item, "content", None) or []:
+            text = text or getattr(part, "text", None)
+        return text, None, item if getattr(item, "type", None) == "function_call" else None
+    return None, None, None
+
+
+def _is_meaningful_aux_progress(
+    progress: Any = None,
+    *,
+    text: Any = None,
+    reasoning: Any = None,
+    tool_deltas: Any = None,
+) -> bool:
+    """Return whether a protocol value is real text or nonempty tool progress."""
+    if _nonempty_aux_text(text) or _nonempty_aux_text(reasoning):
+        return True
+    if any(_meaningful_aux_tool_delta(delta) for delta in (tool_deltas or ())):
+        return True
+    if progress is None:
+        return False
+    if isinstance(progress, str):
+        return _nonempty_aux_text(progress)
+    choices = getattr(progress, "choices", None)
+    if choices:
+        delta = getattr(choices[0], "delta", None)
+        if delta is not None:
+            return _is_meaningful_aux_progress(
+                text=getattr(delta, "content", None),
+                reasoning=(
+                    getattr(delta, "reasoning", None)
+                    or getattr(delta, "reasoning_content", None)
+                ),
+                tool_deltas=getattr(delta, "tool_calls", None),
+            )
+    if any(
+        hasattr(progress, field)
+        for field in ("content", "reasoning", "reasoning_content", "tool_calls")
+    ):
+        return _is_meaningful_aux_progress(
+            text=getattr(progress, "content", None),
+            reasoning=(
+                getattr(progress, "reasoning", None)
+                or getattr(progress, "reasoning_content", None)
+            ),
+            tool_deltas=getattr(progress, "tool_calls", None),
+        )
+    if getattr(progress, "type", None) is not None:
+        event_text, event_reasoning, event_tool = _event_progress_parts(progress)
+        return _is_meaningful_aux_progress(
+            text=event_text, reasoning=event_reasoning, tool_deltas=[event_tool]
+        )
+    return False
+
+
+def _notify_aux_progress(progress: Any = None, *, fence: Any = None) -> bool:
+    """Mark and notify only for meaningful protocol progress."""
+    if not _is_meaningful_aux_progress(progress):
+        return False
+    target_fence = (
+        fence if fence is not None else getattr(_aux_progress, "fence", None)
+    )
     hook = getattr(_aux_progress, "hook", None)
+    if target_fence is not None:
+        try:
+            publication = target_fence.begin_progress_publication(hook is not None)
+        except Exception:
+            logger.debug("aux progress fence failed", exc_info=True)
+            return False
+        if publication is None:
+            return False
+    else:
+        publication = None
     if hook is None:
-        return
+        return True
     try:
         hook()
     except Exception:
         logger.debug("aux progress hook failed", exc_info=True)
+    finally:
+        if target_fence is not None:
+            target_fence.end_progress_publication(publication)
+    return True
 
 
 def _aux_progress_active() -> bool:
     return getattr(_aux_progress, "hook", None) is not None
+
+
+def _aux_candidate_deadline_active() -> bool:
+    return getattr(_aux_progress, "candidate_deadline", None) is not None
+
+
+def _aux_budget_fence() -> Any:
+    return getattr(_aux_progress, "fence", None)
+
+
+def _aux_thread_context() -> Dict[str, Any]:
+    return {
+        "hook": getattr(_aux_progress, "hook", None),
+        "candidate_deadline": getattr(_aux_progress, "candidate_deadline", None),
+        "total_deadline": getattr(_aux_progress, "total_deadline", None),
+        "idle_timeout": getattr(_aux_progress, "idle_timeout", None),
+        "fence": _aux_budget_fence(),
+        "interrupt_active": getattr(_aux_interrupt_protection, "active", False),
+        "interrupt_check": getattr(_aux_interrupt_protection, "cancel_check", None),
+        "interrupt_event": getattr(_aux_interrupt_protection, "cancel_event", None),
+    }
+
+
+def _run_aux_sync_inherited(
+    callback: Callable[..., Any], kwargs: Dict[str, Any], context: Dict[str, Any]
+) -> Any:
+    """Run an internal sync adapter with the caller's fence context."""
+    with aux_progress_hook(context["hook"]), aux_host_candidate_deadline(
+        context["candidate_deadline"],
+        total_deadline=context["total_deadline"],
+        idle_timeout=context["idle_timeout"],
+        fence=context["fence"],
+    ), aux_interrupt_protection(
+        active=context["interrupt_active"],
+        cancel_check=context["interrupt_check"],
+        cancel_event=context["interrupt_event"],
+    ):
+        fence = context["fence"]
+        if fence is not None and (fence.next_wait() or 0.0) <= 0:
+            raise _aux_timeout_error(0.0)
+        return callback(**kwargs)
 
 
 @contextlib.contextmanager
@@ -474,6 +646,115 @@ def aux_progress_hook(hook):
         yield
     finally:
         _aux_progress.hook = prev
+
+
+@contextlib.contextmanager
+def aux_host_candidate_deadline(
+    seconds,
+    *,
+    total_deadline=None,
+    idle_timeout=None,
+    fence=None,
+):
+    """Bind auxiliary work to one host fence and its current budgets."""
+    prev = getattr(_aux_progress, "candidate_deadline", None)
+    prev_total = getattr(_aux_progress, "total_deadline", None)
+    prev_idle = getattr(_aux_progress, "idle_timeout", None)
+    prev_fence = getattr(_aux_progress, "fence", None)
+    _aux_progress.candidate_deadline = seconds
+    _aux_progress.total_deadline = total_deadline
+    _aux_progress.idle_timeout = idle_timeout
+    _aux_progress.fence = fence
+    try:
+        yield
+    finally:
+        _aux_progress.candidate_deadline = prev
+        _aux_progress.total_deadline = prev_total
+        _aux_progress.idle_timeout = prev_idle
+        _aux_progress.fence = prev_fence
+
+def resolve_aux_attempt_deadline(
+    aux_timeout: Optional[float],
+    host_candidate_deadline: Optional[float] = None,
+) -> float:
+    """One finite attempt budget for host + aux + fallback progression.
+
+    Without a host bound, the configured auxiliary timeout is the operation
+    deadline. A positive host candidate deadline is the remaining operation
+    budget for this attempt and wins when shorter, so a still-open first route
+    cannot outlive the host and skip ``fallback_chain`` (#128, #193).
+    """
+    try:
+        timeout = float(aux_timeout) if aux_timeout is not None else 0.0
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if not math.isfinite(timeout) or timeout <= 0:
+        timeout = 0.0
+    candidate = timeout if timeout > 0 else _DEFAULT_AUX_TIMEOUT
+    if host_candidate_deadline is None:
+        host_candidate_deadline = getattr(_aux_progress, "candidate_deadline", None)
+    if callable(host_candidate_deadline):
+        try:
+            host_candidate_deadline = host_candidate_deadline()
+        except Exception:
+            host_candidate_deadline = None
+    try:
+        host = float(host_candidate_deadline) if host_candidate_deadline is not None else 0.0
+    except (TypeError, ValueError):
+        host = 0.0
+    if host_candidate_deadline is not None and (
+        not math.isfinite(host) or host <= 0
+    ):
+        # Host already spent its operation budget: expire this attempt now so
+        # fallback_chain can walk before the host fence-cancels (#128).
+        return 0.0
+    if host > 0:
+        return min(candidate, host)
+    return candidate
+
+
+def _aux_stream_idle_timeout(effective_timeout: Optional[float]) -> float:
+    """Return the fixed idle window used between streamed frames."""
+    try:
+        timeout = float(effective_timeout) if effective_timeout is not None else 0.0
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if not math.isfinite(timeout) or timeout <= 0:
+        timeout = _DEFAULT_AUX_TIMEOUT
+    host_idle = getattr(_aux_progress, "idle_timeout", None)
+    if host_idle is None:
+        return timeout
+    if callable(host_idle):
+        try:
+            host_idle = host_idle()
+        except Exception:
+            return timeout
+    try:
+        host_idle = float(host_idle)
+    except (TypeError, ValueError):
+        return timeout
+    if not math.isfinite(host_idle):
+        return timeout
+    if host_idle <= 0:
+        return 0.0
+    return min(timeout, host_idle)
+
+
+def classify_compression_watchdog(
+    idle: float,
+    waited: float,
+    ceiling: float,
+    since_progress: float,
+    had_meaningful_progress: bool,
+) -> str:
+    """Distinguish idle, total-ceiling, and candidate-fallback aborts."""
+    if waited >= ceiling and had_meaningful_progress:
+        return "total_ceiling"
+    if not had_meaningful_progress and since_progress >= idle:
+        return "idle"
+    if had_meaningful_progress:
+        return "candidate_fallback"
+    return "idle"
 
 
 def _run_protected_sync_provider_call(
@@ -507,13 +788,22 @@ def _run_protected_sync_provider_call(
         raise AuxiliaryExplicitCancellation()
 
     progress_hook = getattr(_aux_progress, "hook", None)
+    candidate_deadline = getattr(_aux_progress, "candidate_deadline", None)
+    total_deadline = getattr(_aux_progress, "total_deadline", None)
+    idle_timeout = getattr(_aux_progress, "idle_timeout", None)
+    budget_fence = _aux_budget_fence()
     provider_context = contextvars.copy_context()
     done = threading.Event()
     outcome: dict[str, Any] = {}
 
     def _provider_worker() -> None:
         try:
-            with aux_progress_hook(progress_hook), aux_interrupt_protection(
+            with aux_progress_hook(progress_hook), aux_host_candidate_deadline(
+                candidate_deadline,
+                total_deadline=total_deadline,
+                idle_timeout=idle_timeout,
+                fence=budget_fence,
+            ), aux_interrupt_protection(
                 cancel_check=cancel_check
             ):
                 outcome["result"] = callback(kwargs)
@@ -1564,6 +1854,11 @@ class _CodexCompletionsAdapter:
         timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
+        host_deadline = _aux_stream_total_ceiling(timeout)
+        if host_deadline > 0 and (
+            timeout is None or host_deadline < float(timeout)
+        ):
+            resp_kwargs["timeout"] = host_deadline
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -1822,7 +2117,7 @@ class _CodexCompletionsAdapter:
                 # Each SSE event is also forward progress for hosts watching
                 # a progress hook (gateway session hygiene): a reasoning
                 # model streaming a long summary must not look hung.
-                _notify_aux_progress()
+                _notify_aux_progress(_event)
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
@@ -1974,7 +2269,9 @@ class _AsyncCodexCompletionsAdapter:
 
     async def create(self, **kwargs) -> Any:
         import asyncio
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        return await asyncio.to_thread(
+            _run_aux_sync_inherited, self._sync.create, kwargs, _aux_thread_context()
+        )
 
 
 class _AsyncCodexChatShim:
@@ -2181,8 +2478,8 @@ class _AnthropicCompletionsAdapter:
             # slow-but-generating summary model. No-op when no hook is
             # installed (None keeps the fast get_final_message path).
             on_stream_event=(
-                (lambda _event: _notify_aux_progress())
-                if _aux_progress_active() else None
+                (lambda _event: _notify_aux_progress(_event))
+                if _aux_progress_active() or _aux_budget_fence() is not None else None
             ),
         )
         _transport = get_transport("anthropic_messages")
@@ -2251,7 +2548,9 @@ class _AsyncAnthropicCompletionsAdapter:
 
     async def create(self, **kwargs) -> Any:
         import asyncio
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        return await asyncio.to_thread(
+            _run_aux_sync_inherited, self._sync.create, kwargs, _aux_thread_context()
+        )
 
 
 class _AsyncAnthropicChatShim:
@@ -2352,7 +2651,9 @@ class _AsyncBedrockCompletionsAdapter:
 
     async def create(self, **kwargs) -> Any:
         import asyncio
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        return await asyncio.to_thread(
+            _run_aux_sync_inherited, self._sync.create, kwargs, _aux_thread_context()
+        )
 
 
 class _AsyncBedrockChatShim:
@@ -4359,12 +4660,12 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     ``_is_auth_error`` / ``_is_rate_limit_error`` which the except-chain
     handles by switching provider, refreshing creds, or rotating the pool.
     """
-    if _is_connection_error(exc):
-        return True
     status = getattr(exc, "status_code", None) or getattr(
         getattr(exc, "response", None), "status_code", None
     )
-    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
+    if isinstance(status, int):
+        return status == 408 or 500 <= status < 600
+    return _is_connection_error(exc)
 
 
 _DEFAULT_TRANSIENT_RETRIES = 2
@@ -4634,6 +4935,17 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     )
 
 
+def _should_advance_compression_fallback(task: Optional[str], exc: Exception) -> bool:
+    """Compression request failures walk fallback_chain even on explicit routes.
+
+    The host cannot treat a 401 / policy refusal as “compression done”:
+    the transcript is still oversized. Any remaining configured candidate
+    must run (#129). Other auxiliary tasks keep the historical
+    auto-or-capacity gate.
+    """
+    return task == "compression" and isinstance(exc, Exception)
+
+
 def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
     normalized = _normalize_aux_provider(provider)
@@ -4823,6 +5135,7 @@ def _retry_same_provider_sync(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    force_stream: bool = False,
 ) -> Any:
     if task == "vision":
         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
@@ -4875,6 +5188,9 @@ def _retry_same_provider_sync(
             retry_kwargs,
             provider=resolved_provider,
             api_mode=resolved_api_mode,
+            create=_aux_sync_create_callback(
+                retry_client, task, force_stream=force_stream,
+            ),
         ),
         task,
     )
@@ -4897,6 +5213,7 @@ async def _retry_same_provider_async(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    force_stream: bool = False,
 ) -> Any:
     if task == "vision":
         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
@@ -4948,6 +5265,9 @@ async def _retry_same_provider_async(
             retry_kwargs,
             provider=resolved_provider,
             api_mode=resolved_api_mode,
+            create=_aux_async_create_callback(
+                retry_client, task, force_stream=force_stream,
+            ),
         ),
         task,
     )
@@ -5084,7 +5404,9 @@ def _fallback_chain_entry(task: Optional[str], fb_label: str) -> Optional[Dict[s
     return entry if isinstance(entry, dict) else None
 
 
-def _fallback_entry_timeout(entry: Dict[str, Any]) -> Optional[float]:
+def _fallback_entry_timeout(
+    entry_or_task: Any, fb_label: Optional[str] = None,
+) -> Optional[float]:
     """Resolve a per-entry ``timeout`` for a configured fallback candidate.
 
     A fallback candidate previously inherited the exact timeout the primary
@@ -5096,18 +5418,42 @@ def _fallback_entry_timeout(entry: Dict[str, Any]) -> Optional[float]:
 
     Returns ``None`` when the entry has no valid positive timeout.
     """
+    entry = (
+        entry_or_task
+        if isinstance(entry_or_task, dict)
+        else _fallback_chain_entry(str(entry_or_task or ""), fb_label or "")
+    )
+    if not isinstance(entry, dict):
+        return None
     raw = entry.get("timeout")
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
-        return float(raw)
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        value = float(raw)
+        if math.isfinite(value) and value > 0:
+            return value
     return None
 
 
 def _fallback_entry_extra_body(
-    entry: Dict[str, Any],
+    entry_or_task: Any,
+    fb_label_or_base: Any = None,
     base: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Deep-detach fallback-owned request controls from mutable config."""
-    result = copy.deepcopy(base or {})
+    if isinstance(entry_or_task, dict):
+        entry = entry_or_task
+        inherited = (
+            fb_label_or_base
+            if isinstance(fb_label_or_base, dict)
+            else base
+        )
+    else:
+        entry = _fallback_chain_entry(
+            str(entry_or_task or ""), str(fb_label_or_base or "")
+        )
+        inherited = base
+    result = copy.deepcopy(inherited or {})
+    if not isinstance(entry, dict):
+        return result
     result = {
         key: value
         for key, value in result.items()
@@ -5553,6 +5899,14 @@ def _fallback_identity_from_entry(
         _freeze_fallback_identity_value(controls),
     )
 
+def _next_configured_fallback_index(label: str) -> Optional[int]:
+    """Return the next configured-chain index represented by *label*."""
+    match = re.match(r"fallback_chain\[(\d+)\]", label or "")
+    if not match:
+        return None
+    return int(match.group(1)) + 1
+
+
 
 def _complete_fallback_destination(
     provider: str,
@@ -5811,6 +6165,12 @@ def _call_fallback_candidate_sync_impl(
         tools,
         destination=destination,
     )
+    force_stream = _provider_requires_stream(
+        destination.provider, destination._base_url,
+    )
+    create = _aux_sync_create_callback(
+        fb_client, task, force_stream=force_stream,
+    )
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=max_tokens,
@@ -5824,12 +6184,14 @@ def _call_fallback_candidate_sync_impl(
                 fb_kwargs,
                 provider=destination.provider,
                 api_mode=destination.api_mode,
+                create=create,
             ),
             task,
         )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
+        auth_error = fb_err
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination._base_url
         )
@@ -5869,12 +6231,16 @@ def _call_fallback_candidate_sync_impl(
                             retry_kwargs,
                             provider=retry_destination.provider,
                             api_mode=retry_destination.api_mode,
+                            create=_aux_sync_create_callback(
+                                retry_client, task, force_stream=force_stream,
+                            ),
                         ),
                         task,
                     )
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
+                    auth_error = retry_err
         # Refresh unavailable or the refreshed credential still 401s —
         # the token is dead (expired setup token with no refresh token).
         # Quarantine the candidate so subsequent chain walks skip it, and
@@ -5885,6 +6251,8 @@ def _call_fallback_candidate_sync_impl(
             "credential (%s) — skipping to next fallback",
             task or "call", fb_label, fb_err,
         )
+        if task == "compression" and _next_configured_fallback_index(fb_label) is not None:
+            raise auth_error
         return None
 
 
@@ -5941,6 +6309,13 @@ async def _call_fallback_candidate_async_impl(
         tools,
         destination=destination,
     )
+    force_stream = (
+        _provider_requires_stream(destination.provider, destination._base_url)
+        and not _client_streams_internally(fb_client)
+    )
+    create = _aux_async_create_callback(
+        fb_client, task, force_stream=force_stream,
+    )
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=max_tokens,
@@ -5954,12 +6329,14 @@ async def _call_fallback_candidate_async_impl(
                 fb_kwargs,
                 provider=destination.provider,
                 api_mode=destination.api_mode,
+                create=create,
             ),
             task,
         )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
+        auth_error = fb_err
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination._base_url
         )
@@ -6001,18 +6378,24 @@ async def _call_fallback_candidate_async_impl(
                             retry_kwargs,
                             provider=retry_destination.provider,
                             api_mode=retry_destination.api_mode,
+                            create=_aux_async_create_callback(
+                                retry_client, task, force_stream=force_stream,
+                            ),
                         ),
                         task,
                     )
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
+                    auth_error = retry_err
         _mark_provider_unhealthy(fb_provider or fb_label)
         logger.warning(
             "Auxiliary %s (async): fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
             task or "call", fb_label, fb_err,
         )
+        if task == "compression" and _next_configured_fallback_index(fb_label) is not None:
+            raise auth_error
         return None
 
 
@@ -9145,6 +9528,16 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     if not isinstance(task_config, dict):
         task_config = {}
 
+    # Built-in tasks already have defaults in DEFAULT_CONFIG; avoid plugin
+    # discovery on their hot path. Plugin defaults are only relevant to keys
+    # outside that built-in task schema.
+    try:
+        from hermes_cli.config import DEFAULT_CONFIG
+        if task in (DEFAULT_CONFIG.get("auxiliary") or {}):
+            return task_config
+    except (ImportError, AttributeError):
+        pass
+
     # Layer plugin-declared defaults underneath user config so
     # ctx.register_auxiliary_task(defaults={...}) takes effect without
     # forcing the user to write config.yaml entries.
@@ -9173,7 +9566,9 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     raw = task_config.get("timeout")
     if raw is not None:
         try:
-            return float(raw)
+            value = float(raw)
+            if math.isfinite(value) and value > 0:
+                return value
         except (ValueError, TypeError):
             pass
     return default
@@ -9191,6 +9586,12 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     and it is a minimum (``max``), so a config value already above it is kept.
     """
     effective = timeout if timeout is not None else _get_task_timeout(task)
+    try:
+        effective = float(effective)
+    except (TypeError, ValueError):
+        effective = _DEFAULT_AUX_TIMEOUT
+    if not math.isfinite(effective) or effective <= 0:
+        effective = _DEFAULT_AUX_TIMEOUT
     if timeout is None and task == "compression":
         effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
     return effective
@@ -9925,22 +10326,45 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
 # A total ceiling still bounds the pathological 1-token-per-idle-window
 # stream; see _aux_stream_total_ceiling().
 
-_AUX_STREAM_CEILING_FLOOR_SECONDS = 600.0
-_AUX_STREAM_CEILING_MULTIPLIER = 4.0
+# The configured auxiliary timeout is the local inter-frame idle window.
+# The host supplies a separate absolute total deadline so progress can reset
+# only the idle budget while refresh/fallback reuse the same physical-attempt
+# ceiling.
 
 
 def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
-    """Absolute wall-clock bound for a progress-hooked streamed aux call.
+    """Return the fixed absolute deadline for a streamed aux call."""
+    fence = _aux_budget_fence()
+    if fence is not None:
+        remaining = fence.remaining_absolute_total()
+        if remaining is not None:
+            return remaining
+    total_deadline = getattr(_aux_progress, "total_deadline", None)
+    if total_deadline is None:
+        total_deadline = getattr(_aux_progress, "candidate_deadline", None)
+    return resolve_aux_attempt_deadline(effective_timeout, total_deadline)
 
-    Generous by design — the idle timeout is the real guard; this only stops
-    a degenerate stream that trickles one token per idle window forever.
-    """
-    try:
-        timeout = float(effective_timeout) if effective_timeout is not None else 0.0
-    except (TypeError, ValueError):
-        timeout = 0.0
-    return max(_AUX_STREAM_CEILING_FLOOR_SECONDS,
-               _AUX_STREAM_CEILING_MULTIPLIER * timeout)
+
+def _aux_next_wait(effective_timeout: Optional[float]) -> float:
+    """Return the one shared next wait for the current auxiliary attempt."""
+    fence = _aux_budget_fence()
+    if fence is not None:
+        remaining = fence.next_wait()
+        return max(0.0, float(remaining or 0.0))
+    budgets = [
+        _aux_stream_idle_timeout(effective_timeout),
+        _aux_stream_total_ceiling(effective_timeout),
+        resolve_aux_attempt_deadline(effective_timeout),
+    ]
+    return max(0.0, min(value for value in budgets if value >= 0))
+
+
+def _aux_timeout_error(timeout_s: float, *, async_call: bool = False) -> TimeoutError:
+    prefix = "Auxiliary async call" if async_call else "Auxiliary streamed call"
+    return TimeoutError(
+        f"{prefix} timed out after {max(0.0, timeout_s):.2f}s "
+        "(absolute total or current idle budget expired)"
+    )
 
 
 def _client_streams_internally(client: Any) -> bool:
@@ -9952,6 +10376,9 @@ def _client_streams_internally(client: Any) -> bool:
         CodexAuxiliaryClient,
         AnthropicAuxiliaryClient,
         BedrockAuxiliaryClient,
+        AsyncCodexAuxiliaryClient,
+        AsyncAnthropicAuxiliaryClient,
+        AsyncBedrockAuxiliaryClient,
     ))
 
 
@@ -10004,6 +10431,81 @@ def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
     return False
 
 
+def _create_bounded(create_fn, timeout_s: float) -> Any:
+    """Run a blocking provider call under the shared fence budget."""
+    try:
+        timeout_s = float(timeout_s)
+    except (TypeError, ValueError):
+        timeout_s = 0.0
+    if not math.isfinite(timeout_s):
+        timeout_s = 0.0
+    budget_fence = _aux_budget_fence()
+    if budget_fence is not None and (budget_fence.next_wait() or 0.0) <= 0:
+        raise _aux_timeout_error(0.0)
+    if timeout_s <= 0 and budget_fence is None:
+        raise _aux_timeout_error(timeout_s)
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    progress_hook = getattr(_aux_progress, "hook", None)
+    candidate_deadline = getattr(_aux_progress, "candidate_deadline", None)
+    total_deadline = getattr(_aux_progress, "total_deadline", None)
+    idle_timeout = getattr(_aux_progress, "idle_timeout", None)
+    interrupt_active = getattr(_aux_interrupt_protection, "active", False)
+    interrupt_check = getattr(_aux_interrupt_protection, "cancel_check", None)
+    interrupt_event = getattr(_aux_interrupt_protection, "cancel_event", None)
+
+    def _run() -> Any:
+        if budget_fence is not None and (budget_fence.next_wait() or 0.0) <= 0:
+            raise _aux_timeout_error(0.0)
+        with aux_progress_hook(progress_hook), aux_host_candidate_deadline(
+            candidate_deadline,
+            total_deadline=total_deadline,
+            idle_timeout=idle_timeout,
+            fence=budget_fence,
+        ), aux_interrupt_protection(
+            active=interrupt_active,
+            cancel_check=interrupt_check,
+            cancel_event=interrupt_event,
+        ):
+            return create_fn()
+
+    executor = DaemonThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="hermes-aux-attempt-deadline"
+    )
+    future = executor.submit(_run)
+
+    def _shutdown(_future=None) -> None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    future.add_done_callback(_shutdown)
+    try:
+        while True:
+            if budget_fence is not None:
+                remaining = budget_fence.next_wait()
+                wait = min(timeout_s, remaining) if timeout_s > 0 else remaining
+                wait = max(0.0, float(wait or 0.0))
+            else:
+                wait = timeout_s
+            if wait <= 0:
+                future.cancel()
+                _shutdown()
+                raise _aux_timeout_error(wait)
+            try:
+                return future.result(timeout=wait)
+            except FutureTimeoutError as exc:
+                if budget_fence is not None and (budget_fence.next_wait() or 0.0) > 0:
+                    # A meaningful event may have reset idle while the provider
+                    # call remained inside the daemon worker; keep the same
+                    # absolute deadline and wait only for its next budget.
+                    continue
+                future.cancel()
+                _shutdown()
+                raise _aux_timeout_error(wait) from exc
+    except BaseException:
+        _shutdown()
+        raise
+
+
 def _create_with_progress(
     client: Any,
     kwargs: Dict[str, Any],
@@ -10027,16 +10529,52 @@ def _create_with_progress(
     stream-only provider rejects the plain call by definition, so the
     original error is surfaced to the normal recovery chains instead.
     """
-    _notify_aux_progress()  # request dispatched counts as progress
-    if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        return client.chat.completions.create(**kwargs)
+    budget_fence = _aux_budget_fence()
+    # Dispatch is not summary progress. A plain call is direct only when no
+    # progress hook and no host budget are active.
+    if not _aux_progress_active() and not force_stream:
+        if not _aux_candidate_deadline_active():
+            return client.chat.completions.create(**kwargs)
+        wait = _aux_next_wait(kwargs.get("timeout"))
+        if wait <= 0:
+            raise _aux_timeout_error(wait)
+        request = dict(kwargs)
+        request["timeout"] = wait
+        return _create_bounded(
+            lambda: client.chat.completions.create(**request), wait
+        )
 
+    ttfb_ceiling = _aux_next_wait(kwargs.get("timeout"))
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
+    idle_timeout = _aux_stream_idle_timeout(kwargs.get("timeout"))
+    attempt_started = time.monotonic()
+    kwargs = dict(kwargs)
+    kwargs["timeout"] = idle_timeout if idle_timeout > 0 else ttfb_ceiling
+
+    def _remaining() -> float:
+        if budget_fence is not None:
+            return max(0.0, float(budget_fence.remaining_absolute_total() or 0.0))
+        return max(0.0, total_ceiling - (time.monotonic() - attempt_started))
+
+    if _client_streams_internally(client):
+        # Codex / Anthropic / Bedrock consume the stream inside create().
+        internal_kwargs = dict(kwargs)
+        internal_kwargs["timeout"] = _remaining()
+        return _create_bounded(
+            lambda: client.chat.completions.create(**internal_kwargs),
+            total_ceiling,
+        )
+
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
     try:
-        chunks = client.chat.completions.create(**stream_kwargs)
+        chunks = _create_bounded(
+            lambda: client.chat.completions.create(**stream_kwargs),
+            ttfb_ceiling,
+        )
+    except TimeoutError:
+        raise
     except Exception as exc:
         # Genuine provider failures (auth, credit, rate limit, network) are
         # not streaming's fault — surface them unchanged so the existing
@@ -10050,23 +10588,44 @@ def _create_with_progress(
             or _is_rate_limit_error(exc)
         ):
             raise
-        # Anything else may be a streaming-specific rejection (explicit
-        # "stream not supported", stream_options 400, or an idiosyncratic
-        # 4xx). Retry non-streaming once; if the request itself is bad the
-        # plain call reproduces the real error for the normal except-chains.
+        # Retry a rejected stream only inside the same current fence budget.
+        fallback_wait = _aux_next_wait(kwargs.get("timeout"))
+        if budget_fence is None:
+            fallback_wait = min(fallback_wait, _remaining())
+        if fallback_wait <= 0:
+            raise _aux_timeout_error(fallback_wait) from exc
         logger.debug(
             "Auxiliary %s: streamed request failed (%s); retrying "
             "non-streaming", task or "call", exc,
         )
-        return client.chat.completions.create(**kwargs)
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs["timeout"] = fallback_wait
+        return _create_bounded(
+            lambda: client.chat.completions.create(**fallback_kwargs), fallback_wait
+        )
 
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
     # return a complete response even when stream=True was requested.
     if hasattr(chunks, "choices"):
-        _notify_aux_progress()
+        _notify_aux_progress(chunks)
         return chunks
     return _aggregate_chat_stream(
-        chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
+        chunks,
+        model=str(kwargs.get("model") or ""),
+        idle_timeout=idle_timeout,
+        total_ceiling=_remaining(),
+        fence=budget_fence,
+    )
+
+
+def _aux_sync_create_callback(
+    client: Any,
+    task: Optional[str],
+    *,
+    force_stream: bool = False,
+):
+    return lambda request: _create_with_progress(
+        client, request, task, force_stream=force_stream,
     )
 
 
@@ -10074,7 +10633,9 @@ def _aggregate_chat_stream(
     chunks: Any,
     *,
     model: str = "",
+    idle_timeout: Optional[float] = None,
     total_ceiling: Optional[float] = None,
+    fence: Any = None,
 ) -> Any:
     """Consume a chat.completions chunk stream into a complete response.
 
@@ -10085,9 +10646,32 @@ def _aggregate_chat_stream(
     Accumulation is shared with the async mirror via
     :class:`_ChatStreamAccumulator`.
     """
-    acc = _ChatStreamAccumulator(model=model, total_ceiling=total_ceiling)
+    acc = _ChatStreamAccumulator(
+        model=model,
+        idle_timeout=idle_timeout,
+        total_ceiling=total_ceiling,
+        fence=fence,
+    )
+    iterator = iter(chunks)
     try:
-        for chunk in chunks:
+        while True:
+            try:
+                timeout = acc.remaining_timeout()
+                chunk = (
+                    next(iterator)
+                    if timeout is None
+                    else _create_bounded(lambda: next(iterator), timeout)
+                )
+            except StopIteration:
+                break
+            except TimeoutError as exc:
+                try:
+                    acc.check_timeout()
+                except TimeoutError:
+                    raise
+                raise TimeoutError(
+                    "Auxiliary streamed call timed out during idle wait"
+                ) from exc
             acc.feed(chunk)
     finally:
         close_fn = getattr(chunks, "close", None)
@@ -10107,9 +10691,22 @@ class _ChatStreamAccumulator:
     tool-call delta reassembly, same "timed out" ceiling phrasing).
     """
 
-    def __init__(self, model: str = "", total_ceiling: Optional[float] = None):
+    def __init__(
+        self,
+        model: str = "",
+        idle_timeout: Optional[float] = None,
+        total_ceiling: Optional[float] = None,
+        fence: Any = None,
+    ):
         self._started = time.monotonic()
+        try:
+            idle = float(idle_timeout) if idle_timeout is not None else 0.0
+        except (TypeError, ValueError):
+            idle = 0.0
+        self._idle_timeout = idle if math.isfinite(idle) and idle > 0 else None
         self._total_ceiling = total_ceiling
+        self._fence = fence
+        self._last_progress = self._started
         self.content_parts: List[str] = []
         self.reasoning_parts: List[str] = []
         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
@@ -10118,16 +10715,48 @@ class _ChatStreamAccumulator:
         self.resp_id = ""
         self.resp_model = model or ""
 
-    def feed(self, chunk: Any) -> None:
-        _notify_aux_progress()
-        if (
-            self._total_ceiling is not None
-            and (time.monotonic() - self._started) >= self._total_ceiling
-        ):
+    def check_timeout(self) -> None:
+        if self._fence is not None:
+            total = self._fence.remaining_absolute_total()
+            idle = self._fence.remaining_current_idle()
+            if total is not None and total <= 0:
+                raise TimeoutError(
+                    "Auxiliary streamed call timed out at absolute total deadline"
+                )
+            if idle is not None and idle <= 0:
+                raise TimeoutError(
+                    "Auxiliary streamed call timed out at current idle deadline"
+                )
+            return
+        now = time.monotonic()
+        elapsed = now - self._started
+        if self._total_ceiling is not None and elapsed >= self._total_ceiling:
             raise TimeoutError(
                 f"Auxiliary streamed call timed out after {self._total_ceiling:.0f}s "
                 "total ceiling (stream still open but over budget)"
             )
+        if (
+            self._idle_timeout is not None
+            and now - self._last_progress >= self._idle_timeout
+        ):
+            raise TimeoutError(
+                f"Auxiliary streamed call timed out after {self._idle_timeout:.2f}s "
+                "idle timeout (stream silent)"
+            )
+
+    def remaining_timeout(self) -> Optional[float]:
+        self.check_timeout()
+        if self._fence is not None:
+            return self._fence.next_wait()
+        remaining = []
+        if self._total_ceiling is not None:
+            remaining.append(self._total_ceiling - (time.monotonic() - self._started))
+        if self._idle_timeout is not None:
+            remaining.append(self._idle_timeout - (time.monotonic() - self._last_progress))
+        return min(remaining) if remaining else None
+
+    def feed(self, chunk: Any) -> None:
+        self.check_timeout()
         self.resp_id = getattr(chunk, "id", None) or self.resp_id
         self.resp_model = getattr(chunk, "model", None) or self.resp_model
         chunk_usage = getattr(chunk, "usage", None)
@@ -10150,7 +10779,8 @@ class _ChatStreamAccumulator:
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
-        for tc in (getattr(delta, "tool_calls", None) or []):
+        tool_deltas = getattr(delta, "tool_calls", None) or []
+        for tc in tool_deltas:
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
                 idx, {"id": "", "name": "", "arguments": []}
@@ -10163,6 +10793,10 @@ class _ChatStreamAccumulator:
                     acc["name"] = fn.name
                 if getattr(fn, "arguments", None):
                     acc["arguments"].append(fn.arguments)
+        # Keepalive / empty frames must not reset idle (#128).
+        if _is_meaningful_aux_progress(delta):
+            self._last_progress = time.monotonic()
+            _notify_aux_progress(delta, fence=self._fence)
 
     def finish(self) -> Any:
         tool_calls = None
@@ -10202,7 +10836,9 @@ async def _aggregate_chat_stream_async(
     chunks: Any,
     *,
     model: str = "",
+    idle_timeout: Optional[float] = None,
     total_ceiling: Optional[float] = None,
+    fence: Any = None,
 ) -> Any:
     """Async mirror of :func:`_aggregate_chat_stream` (``async for`` consumer).
 
@@ -10210,9 +10846,36 @@ async def _aggregate_chat_stream_async(
     the sync helper raises. Same accumulation and ceiling semantics via
     :class:`_ChatStreamAccumulator`.
     """
-    acc = _ChatStreamAccumulator(model=model, total_ceiling=total_ceiling)
+    import asyncio
+
+    acc = _ChatStreamAccumulator(
+        model=model,
+        idle_timeout=idle_timeout,
+        total_ceiling=total_ceiling,
+        fence=fence,
+    )
+    iterator = chunks.__aiter__()
     try:
-        async for chunk in chunks:
+        while True:
+            try:
+                timeout = acc.remaining_timeout()
+                chunk = (
+                    await iterator.__anext__()
+                    if timeout is None
+                    else await asyncio.wait_for(
+                        iterator.__anext__(), timeout=timeout
+                    )
+                )
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError as exc:
+                try:
+                    acc.check_timeout()
+                except TimeoutError:
+                    raise
+                raise TimeoutError(
+                    "Auxiliary streamed call timed out during idle wait"
+                ) from exc
             acc.feed(chunk)
     finally:
         close_fn = getattr(chunks, "close", None) or getattr(chunks, "aclose", None)
@@ -10237,18 +10900,113 @@ async def _acreate_with_stream(
     complete response (credit @kudi88, PR #60686 — async contract fixed to
     ``async for`` and tool-call deltas preserved per sweeper review).
     """
+    import asyncio
+
+    budget_fence = _aux_budget_fence()
+    ttfb_ceiling = _aux_next_wait(kwargs.get("timeout"))
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
+    idle_timeout = _aux_stream_idle_timeout(kwargs.get("timeout"))
+    attempt_started = time.monotonic()
+
+    def _remaining() -> float:
+        if budget_fence is not None:
+            return max(0.0, float(budget_fence.remaining_absolute_total() or 0.0))
+        return max(0.0, total_ceiling - (time.monotonic() - attempt_started))
+
     stream_kwargs = dict(kwargs)
+    stream_kwargs["timeout"] = idle_timeout if idle_timeout > 0 else ttfb_ceiling
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
-    chunks = await client.chat.completions.create(**stream_kwargs)
+    remaining = min(ttfb_ceiling, _remaining())
+    if remaining <= 0:
+        raise TimeoutError(
+            "Auxiliary streamed call timed out after 0s total ceiling "
+            "(host candidate deadline already expired)"
+        )
+    try:
+        chunks = await asyncio.wait_for(
+            client.chat.completions.create(**stream_kwargs), timeout=remaining
+        )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"Auxiliary streamed call timed out after {total_ceiling:.0f}s "
+            "total ceiling (stream still open but over budget)"
+        ) from exc
     # Defensive: shims may hand back a complete response despite stream=True.
     if hasattr(chunks, "choices"):
+        _notify_aux_progress(chunks)
         return chunks
-    return await _aggregate_chat_stream_async(
-        chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
-    )
+    remaining = _remaining()
+    if remaining <= 0:
+        raise TimeoutError(
+            f"Auxiliary streamed call timed out after {total_ceiling:.0f}s "
+            "total ceiling (stream still open but over budget)"
+        )
+    try:
+        return await asyncio.wait_for(
+            _aggregate_chat_stream_async(
+                chunks,
+                model=str(kwargs.get("model") or ""),
+                idle_timeout=idle_timeout,
+                total_ceiling=remaining,
+                fence=budget_fence,
+            ),
+            timeout=remaining,
+        )
+    except asyncio.TimeoutError as exc:
+        if str(exc):
+            raise
+        raise TimeoutError(
+            f"Auxiliary streamed call timed out after {total_ceiling:.0f}s "
+            "total ceiling (stream still open but over budget)"
+        ) from exc
 
+
+async def _acreate_bounded(client: Any, kwargs: Dict[str, Any]) -> Any:
+    """Run one async provider call under the shared fence budget."""
+    import asyncio
+
+    budget_fence = _aux_budget_fence()
+    wait = _aux_next_wait(kwargs.get("timeout"))
+    if wait <= 0:
+        raise _aux_timeout_error(wait, async_call=True)
+    request = dict(kwargs)
+    request["timeout"] = _aux_stream_total_ceiling(kwargs.get("timeout"))
+    task = asyncio.create_task(client.chat.completions.create(**request))
+    try:
+        while True:
+            wait = _aux_next_wait(kwargs.get("timeout"))
+            if wait <= 0:
+                task.cancel()
+                raise _aux_timeout_error(wait, async_call=True)
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=wait)
+            except asyncio.TimeoutError as exc:
+                if budget_fence is not None and (budget_fence.next_wait() or 0.0) > 0:
+                    continue
+                task.cancel()
+                raise _aux_timeout_error(wait, async_call=True) from exc
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+def _aux_async_create_callback(
+    client: Any,
+    task: Optional[str],
+    *,
+    force_stream: bool = False,
+):
+    async def _create(request: Dict[str, Any]) -> Any:
+        if _aux_progress_active() or force_stream:
+            if _client_streams_internally(client):
+                return await _acreate_bounded(client, request)
+            return await _acreate_with_stream(client, request, task)
+        if _aux_candidate_deadline_active():
+            return await _acreate_bounded(client, request)
+        return await client.chat.completions.create(**request)
+
+    return _create
 
 @_relay_auxiliary_call
 def call_llm(
@@ -10675,10 +11433,13 @@ def _call_llm_impl_unscoped(
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
+    request_extra_body = _fallback_entry_extra_body(
+        task, request_provider or "", effective_extra_body,
+    )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+        tools=tools, timeout=effective_timeout, extra_body=request_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     _merge_auxiliary_extra_headers(kwargs, extra_headers)
@@ -10687,6 +11448,13 @@ def _call_llm_impl_unscoped(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    _force_stream_sync = _provider_requires_stream(
+        request_provider, _base_info or resolved_base_url,
+    )
+    _create_sync = _aux_sync_create_callback(
+        client, task, force_stream=_force_stream_sync,
+    )
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips
@@ -10743,14 +11511,7 @@ def _call_llm_impl_unscoped(
                     kwargs,
                     provider=request_provider,
                     api_mode=resolved_api_mode,
-                    create=lambda request: _create_with_progress(
-                        client,
-                        request,
-                        task,
-                        force_stream=_provider_requires_stream(
-                            request_provider, _base_info or resolved_base_url,
-                        ),
-                    ),
+                    create=_create_sync,
                 ),
                 task,
                 provider=request_provider, base_url=_base_info)
@@ -10790,15 +11551,7 @@ def _call_llm_impl_unscoped(
                             kwargs,
                             provider=request_provider,
                             api_mode=resolved_api_mode,
-                            create=lambda request: _create_with_progress(
-                                client,
-                                request,
-                                task,
-                                force_stream=_provider_requires_stream(
-                                    request_provider,
-                                    _base_info or resolved_base_url,
-                                ),
-                            ),
+                            create=_create_sync,
                         ),
                         task)
                 except Exception as retry_transient:
@@ -10822,6 +11575,7 @@ def _call_llm_impl_unscoped(
                         retry_kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_create_sync,
                     ), task)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
@@ -10856,6 +11610,7 @@ def _call_llm_impl_unscoped(
                             retry_kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_create_sync,
                         ), task)
                 except Exception as retry_err:
                     # Same contract as the temperature rung: fall through to
@@ -10898,6 +11653,7 @@ def _call_llm_impl_unscoped(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_create_sync,
                     ), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
@@ -10933,6 +11689,7 @@ def _call_llm_impl_unscoped(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_create_sync,
                         ), task)
                 except Exception as retry_err:
                     first_err = retry_err
@@ -10971,6 +11728,11 @@ def _call_llm_impl_unscoped(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_aux_sync_create_callback(
+                                refreshed_client,
+                                task,
+                                force_stream=_force_stream_sync,
+                            ),
                         ), task)
                 except Exception as retry_err:
                     if not (
@@ -11004,6 +11766,11 @@ def _call_llm_impl_unscoped(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_aux_sync_create_callback(
+                            refreshed_client,
+                            task,
+                            force_stream=_force_stream_sync,
+                        ),
                     ), task)
 
         # ── Auth refresh retry ───────────────────────────────────────
@@ -11038,6 +11805,7 @@ def _call_llm_impl_unscoped(
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     extra_headers=extra_headers,
+                    force_stream=_force_stream_sync,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -11059,6 +11827,7 @@ def _call_llm_impl_unscoped(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_create_sync,
                         ), task)
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
@@ -11087,6 +11856,7 @@ def _call_llm_impl_unscoped(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
                         extra_headers=extra_headers,
+                        force_stream=_force_stream_sync,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
@@ -11133,6 +11903,7 @@ def _call_llm_impl_unscoped(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _should_advance_compression_fallback(task, first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -11157,7 +11928,11 @@ def _call_llm_impl_unscoped(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        if should_fallback and (
+            is_auto
+            or is_capacity_error
+            or _should_advance_compression_fallback(task, first_err)
+        ):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -11175,6 +11950,8 @@ def _call_llm_impl_unscoped(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _should_advance_compression_fallback(task, first_err):
+                reason = "request error"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -11737,10 +12514,13 @@ async def _async_call_llm_impl_unscoped(
         if selected_destination is not None
         else str(getattr(client, "base_url", "") or "")
     )
+    request_extra_body = _fallback_entry_extra_body(
+        task, request_provider or "", effective_extra_body,
+    )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+        tools=tools, timeout=effective_timeout, extra_body=request_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
 
@@ -11748,26 +12528,24 @@ async def _async_call_llm_impl_unscoped(
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    _force_stream_async = (
+        _provider_requires_stream(
+            request_provider, _client_base or resolved_base_url,
+        )
+        and not isinstance(client, (
+            AsyncCodexAuxiliaryClient,
+            AsyncAnthropicAuxiliaryClient,
+            AsyncBedrockAuxiliaryClient,
+        ))
+    )
+    _create_async = _aux_async_create_callback(
+        client, task, force_stream=_force_stream_async,
+    )
+
     try:
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
         # for the rationale. (PR #16587)
-        _force_stream_async = (
-            _provider_requires_stream(
-                request_provider, _client_base or resolved_base_url,
-            )
-            and not isinstance(client, (
-                AsyncCodexAuxiliaryClient,
-                AsyncAnthropicAuxiliaryClient,
-                AsyncBedrockAuxiliaryClient,
-            ))
-        )
-
-        async def _acreate(_kwargs: Dict[str, Any]) -> Any:
-            if _force_stream_async:
-                return await _acreate_with_stream(client, _kwargs, task)
-            return await client.chat.completions.create(**_kwargs)
-
         try:
             return _validate_llm_response(
                 await _relay_async_completion(
@@ -11775,7 +12553,7 @@ async def _async_call_llm_impl_unscoped(
                     kwargs,
                     provider=request_provider,
                     api_mode=resolved_api_mode,
-                    create=_acreate,
+                    create=_create_async,
                 ),
                 task,
                 provider=request_provider, base_url=_client_base)
@@ -11803,7 +12581,7 @@ async def _async_call_llm_impl_unscoped(
                     kwargs,
                     provider=request_provider,
                     api_mode=resolved_api_mode,
-                    create=_acreate,
+                    create=_create_async,
                 ),
                 task)
     except Exception as first_err:
@@ -11821,6 +12599,7 @@ async def _async_call_llm_impl_unscoped(
                         retry_kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_create_async,
                     ), task)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
@@ -11852,6 +12631,7 @@ async def _async_call_llm_impl_unscoped(
                             retry_kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_create_async,
                         ), task)
                 except Exception as retry_err:
                     # Same contract as the temperature rung: fall through to
@@ -11894,6 +12674,7 @@ async def _async_call_llm_impl_unscoped(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_create_async,
                     ), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
@@ -11928,6 +12709,7 @@ async def _async_call_llm_impl_unscoped(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_create_async,
                         ), task)
                 except Exception as retry_err:
                     first_err = retry_err
@@ -11965,6 +12747,11 @@ async def _async_call_llm_impl_unscoped(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_aux_async_create_callback(
+                                refreshed_client,
+                                task,
+                                force_stream=_force_stream_async,
+                            ),
                         ), task)
                 except Exception as retry_err:
                     if not (
@@ -11997,6 +12784,11 @@ async def _async_call_llm_impl_unscoped(
                         kwargs,
                         provider=resolved_provider,
                         api_mode=resolved_api_mode,
+                        create=_aux_async_create_callback(
+                            refreshed_client,
+                            task,
+                            force_stream=_force_stream_async,
+                        ),
                     ), task)
 
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────
@@ -12029,6 +12821,7 @@ async def _async_call_llm_impl_unscoped(
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
+                    force_stream=_force_stream_async,
                 )
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
@@ -12046,6 +12839,7 @@ async def _async_call_llm_impl_unscoped(
                             kwargs,
                             provider=resolved_provider,
                             api_mode=resolved_api_mode,
+                            create=_create_async,
                         ), task)
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
@@ -12072,6 +12866,7 @@ async def _async_call_llm_impl_unscoped(
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
+                        force_stream=_force_stream_async,
                     )
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
@@ -12093,6 +12888,7 @@ async def _async_call_llm_impl_unscoped(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _should_advance_compression_fallback(task, first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -12109,7 +12905,11 @@ async def _async_call_llm_impl_unscoped(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        if should_fallback and (
+            is_auto
+            or is_capacity_error
+            or _should_advance_compression_fallback(task, first_err)
+        ):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -12123,6 +12923,8 @@ async def _async_call_llm_impl_unscoped(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _should_advance_compression_fallback(task, first_err):
+                reason = "request error"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
@@ -12231,6 +13033,12 @@ async def _async_call_llm_impl_unscoped(
                     route_info=route_info,
                     candidate_destinations=fallback_destinations,
                     codex_only=codex_only_fallback)
+                if fb_client is None:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason=reason,
+                        route_info=route_info,
+                        candidate_destinations=fallback_destinations,
+                        codex_only=codex_only_fallback)
 
             if fb_client is not None:
                 async_fb, async_fb_model = _to_async_client(

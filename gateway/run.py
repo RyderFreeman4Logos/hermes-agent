@@ -57,6 +57,7 @@ from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    resolve_context_compression_timeouts,
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.compaction_display import project_compaction_message_for_display
@@ -19535,6 +19536,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             except (TypeError, ValueError):
                                 pass
 
+                _hyg_timeout_seconds, _hyg_total_ceiling_seconds = (
+                    resolve_context_compression_timeouts(
+                        {
+                            "context_timeout_seconds": _hyg_timeout_seconds,
+                            "context_total_ceiling_seconds": _hyg_total_ceiling_seconds,
+                            "auxiliary": (
+                                _hyg_data.get("auxiliary", {})
+                                if isinstance(_hyg_data, dict)
+                                else {}
+                            ),
+                        }
+                    )
+                )
+
                 _hyg_configured_model = _hyg_model
                 _hyg_configured_provider = _hyg_provider
                 _hyg_configured_base_url = _hyg_base_url
@@ -19768,6 +19783,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
+                                    _hyg_commit_fence.configure_host_budget(
+                                        idle_timeout_seconds=_hyg_timeout_seconds,
+                                        total_ceiling_seconds=_hyg_total_ceiling_seconds,
+                                    )
                                     _hyg_future = loop.run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(
@@ -19790,16 +19809,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # the turn forever.
                                         _hyg_wait_started = time.monotonic()
                                         while True:
-                                            # #76354 S3: charge the idle budget
-                                            # from the LAST PROGRESS event, not
-                                            # from the start of this wait slice —
-                                            # otherwise silence can approach 2x
-                                            # the configured timeout.
-                                            _slice = max(
-                                                _hyg_timeout_seconds
-                                                - _hyg_commit_fence.seconds_since_progress(),
-                                                0.005,
-                                            )
+                                            _slice = _hyg_commit_fence.next_wait()
+                                            if _slice is None or _slice <= 0:
+                                                raise asyncio.TimeoutError
                                             try:
                                                 _compressed, _ = await asyncio.wait_for(
                                                     asyncio.shield(_hyg_future),
@@ -19809,10 +19821,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             except asyncio.TimeoutError:
                                                 _hyg_waited = time.monotonic() - _hyg_wait_started
                                                 _idle = _hyg_commit_fence.seconds_since_progress()
-                                                if (
-                                                    _idle < _hyg_timeout_seconds
-                                                    and _hyg_waited < _hyg_total_ceiling_seconds
-                                                ):
+                                                if (_hyg_commit_fence.next_wait() or 0.0) > 0:
                                                     logger.info(
                                                         "Session hygiene compression for "
                                                         "session %s still streaming after "

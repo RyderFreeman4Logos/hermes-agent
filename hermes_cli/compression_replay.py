@@ -324,7 +324,7 @@ class ReplayRunner:
             "export_manifest_hash": hashlib.sha256((self.corpus / "manifest.json").read_bytes()).hexdigest(),
             "provenance": _git_provenance(),
             "started_at": time.time(),
-            "completed_points": len(results),
+            "completed_points": sum(result.get("status") == "completed" for result in results),
             "failed_points": sum(result.get("status") != "completed" for result in results),
             "points": results,
         }
@@ -343,7 +343,12 @@ def compare_replays(run_a: Path, run_b: Path, output: Path) -> Dict[str, Any]:
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     rows = []
-    for left, right in zip(manifest_a.get("points", []), manifest_b.get("points", [])):
+    points_a, points_b = manifest_a.get("points", []), manifest_b.get("points", [])
+    if len(points_a) != len(points_b):
+        raise ValueError("replay reports have different compression-point counts")
+    for left, right in zip(points_a, points_b):
+        if left.get("generation") != right.get("generation"):
+            raise ValueError("replay reports are not paired by generation")
         rows.append({"generation": left.get("generation"), "a_status": left.get("status"), "b_status": right.get("status")})
     summary = {"run_a": manifest_a.get("run_id"), "run_b": manifest_b.get("run_id"), "paired_points": len(rows), "note": "Replay report contains structural outcomes; continuation quality requires an evaluator."}
     _atomic_json(output / "summary.json", summary)

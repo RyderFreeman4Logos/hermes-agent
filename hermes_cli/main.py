@@ -14463,6 +14463,46 @@ def main():
     sessions_parser.set_defaults(func=_dispatch_sessions)
 
     # =========================================================================
+    # compression trace/replay commands (read-only corpus tooling)
+    # =========================================================================
+    from hermes_cli.compression_cmd import cmd_compression_replay, cmd_compression_sessions, cmd_compression_trace
+
+    compression_trace_parser = subparsers.add_parser(
+        "compression-trace", help="Export a read-only compression trace corpus"
+    )
+    compression_trace_parser.add_argument("session_id")
+    compression_trace_parser.add_argument("output")
+    compression_trace_parser.add_argument("--db", help="Source SessionDB path")
+    compression_trace_parser.add_argument("--redaction", choices=["default", "none"], default="default")
+    compression_trace_parser.set_defaults(func=cmd_compression_trace)
+
+    compression_sessions_parser = subparsers.add_parser(
+        "compression-sessions", help="List or inspect sessions with compression traces"
+    )
+    compression_sessions_parser.add_argument("--db", help="Source SessionDB path")
+    compression_sessions_parser.add_argument("--session-id")
+    compression_sessions_parser.add_argument("--min-compressions", type=int, default=0)
+    compression_sessions_parser.set_defaults(func=cmd_compression_sessions)
+
+    compression_replay_parser = subparsers.add_parser(
+        "compression-replay", help="Replay an exported compression corpus without real tools"
+    )
+    compression_replay_parser.add_argument("corpus")
+    compression_replay_parser.add_argument("--mode", choices=["A", "B", "C"], default="A")
+    compression_replay_parser.add_argument("--output")
+    compression_replay_parser.add_argument("--provider")
+    compression_replay_parser.add_argument("--model")
+    compression_replay_parser.add_argument("--reasoning")
+    compression_replay_parser.add_argument(
+        "--fallback-policy", choices=["strict-single-route", "configured-only", "configured-fallback", "production", "production-fallback"], default="strict-single-route"
+    )
+    compression_replay_parser.add_argument("--timeout", type=float)
+    compression_replay_parser.add_argument("--repetitions", type=int, default=1)
+    compression_replay_parser.add_argument("--rerun", action="store_true")
+    compression_replay_parser.add_argument("--execute-real-tools", action="store_true")
+    compression_replay_parser.set_defaults(func=cmd_compression_replay)
+
+    # =========================================================================
     # insights command  (parser built in hermes_cli/subcommands/insights.py)
     # =========================================================================
     build_insights_parser(subparsers, cmd_insights=cmd_insights)

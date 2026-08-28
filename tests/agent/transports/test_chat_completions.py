@@ -741,6 +741,39 @@ class TestPromptCacheKeyCapability:
         assert key("rebuilt volatile suffix", tools=self._tools()) != first_after_compress
         assert key("rebuilt volatile suffix", session="different-session") != first_after_compress
 
+    def test_post_compress_request_reuses_unchanged_stable_prefix_key(
+        self, transport
+    ):
+        """List-form prompts keep the explicit stable key after compression."""
+        def request(volatile_suffix):
+            messages = [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "stable prefix"},
+                        {"type": "text", "text": volatile_suffix},
+                    ],
+                },
+                {"role": "user", "content": "next request"},
+            ]
+            return transport.build_kwargs(
+                model="cache-model",
+                messages=messages,
+                tools=[],
+                session_id="session-after-compress",
+                supports_prompt_cache_key=True,
+                cache_key_instructions="stable prefix",
+            )
+
+        before_compress = request("volatile before compression")
+        first_after_compress = request("rebuilt volatile suffix")
+
+        assert first_after_compress["prompt_cache_key"] == before_compress["prompt_cache_key"]
+        assert first_after_compress["messages"][0]["content"] == [
+            {"type": "text", "text": "stable prefix"},
+            {"type": "text", "text": "rebuilt volatile suffix"},
+        ]
+
     def test_profile_capability_emits_content_key_in_nonstream_request_body(self, transport):
         from providers.base import ProviderProfile
 

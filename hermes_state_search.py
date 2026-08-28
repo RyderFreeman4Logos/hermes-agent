@@ -467,7 +467,7 @@ class SessionSearchMixin:
             # uses executescript(), which implicitly commits any pending
             # transaction and must not run inside _execute_write's BEGIN
             # IMMEDIATE. Sets fresh backfill markers on a populated DB.
-            with self._lock:
+            with self._write_guard():  # type: ignore[attr-defined]
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
 
@@ -731,7 +731,7 @@ class SessionSearchMixin:
         # commits any pending transaction and must not run inside
         # ``_execute_write``'s BEGIN IMMEDIATE (same rule as the CJK recreate
         # path above). Markers are already durable.
-        with self._lock:
+        with self._write_guard():  # type: ignore[attr-defined]
             base_ok = self._ensure_fts_schema(self._conn, "messages_fts", FTS_SQL)
             trigram_ok = self._ensure_fts_schema(
                 self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
@@ -784,7 +784,7 @@ class SessionSearchMixin:
             # Resume mid-demote: markers exist, empty v23 tables may still be
             # missing if the process died between the staged demote commit and
             # schema ensure. Re-ensure is IF NOT EXISTS and cheap.
-            with self._lock:
+            with self._write_guard():  # type: ignore[attr-defined]
                 base_ok = self._ensure_fts_schema(
                     self._conn, "messages_fts", FTS_SQL
                 )
@@ -809,7 +809,7 @@ class SessionSearchMixin:
         # legacy work left, tokenizer newly installed): ensure the table +
         # markers exist so the backfill phase has work to claim.
         if self._fts_cjk_loaded:
-            with self._lock:
+            with self._write_guard():  # type: ignore[attr-defined]
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
 
@@ -897,7 +897,7 @@ class SessionSearchMixin:
         if vacuum:
             _emit("vacuum")
             try:
-                with self._lock:
+                with self._write_guard():  # type: ignore[attr-defined]
                     self._conn.execute("VACUUM")
                 vacuum_ok = True
             except sqlite3.OperationalError as exc:
@@ -919,7 +919,7 @@ class SessionSearchMixin:
             # SQLITE_BUSY while the gateway holds a read-mark, per the note
             # above; PASSIVE removes the reset attempt entirely.)
             try:
-                with self._lock:
+                with self._write_guard():  # type: ignore[attr-defined]
                     self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception as exc:
                 logger.debug(
@@ -2373,7 +2373,7 @@ class SessionSearchMixin:
         Returns the number of FTS indexes that were optimized.
         """
         optimized = 0
-        with self._lock:
+        with self._write_guard():  # type: ignore[attr-defined]
             for tbl in self._FTS_TABLES:
                 if not self._fts_table_exists(tbl):
                     continue
@@ -2404,7 +2404,7 @@ class SessionSearchMixin:
         Returns the number of FTS indexes that were rebuilt.
         """
         rebuilt = 0
-        with self._lock:
+        with self._write_guard():  # type: ignore[attr-defined]
             for tbl in self._FTS_TABLES:
                 if not self._fts_table_exists(tbl):
                     continue
@@ -2467,7 +2467,7 @@ class SessionSearchMixin:
             raise ValueError("max_commands must be greater than zero")
 
         executed = 0
-        with self._lock:
+        with self._write_guard():  # type: ignore[attr-defined]
             for tbl in self._FTS_TABLES:
                 if not self._fts_table_exists(tbl):
                     continue

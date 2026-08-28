@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
 _SCHEMA_VERSION = "compression-trace-export-v1"
+_COMPACTION_PREFIXES = ("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]:")
 _SECRET_KEY = re.compile(r"(?:api[_-]?key|access[_-]?token|auth(?:orization)?|cookie|password|secret|credential)", re.I)
 _SECRET_VALUE = re.compile(
     r"(?i)\b(?:bearer\s+|sk-|gh[opsu]_)[A-Za-z0-9_./+=:-]{12,}"
@@ -69,6 +71,20 @@ def _artifact_body(db: Any, artifact_id: Optional[str]) -> Optional[bytes]:
 
 def _session_events(db: Any, session_id: str) -> List[Dict[str, Any]]:
     return db.get_messages(session_id, include_inactive=True)
+
+
+def _is_reconstructed_boundary(event: Mapping[str, Any]) -> bool:
+    content = str(event.get("content") or "").lstrip()
+    return bool(event.get("_compressed_summary")) or any(
+        content.startswith(prefix) for prefix in _COMPACTION_PREFIXES
+    )
+
+
+def _reconstructed_boundary_indexes(events: List[Mapping[str, Any]]) -> List[int]:
+    boundaries = [index for index, event in enumerate(events) if _is_reconstructed_boundary(event)]
+    if not boundaries and any(event.get("compacted") for event in events):
+        boundaries.append(len(events) - 1)
+    return boundaries
 
 
 def _session_content_hash(
@@ -132,21 +148,34 @@ def discover_compression_sessions(
     db_path = Path(db_path)
     db = SessionDB(db_path, read_only=True)
     try:
-        with db._read_ctx() as conn:
-            rows = conn.execute(
-                """SELECT s.*, COUNT(cr.run_id) AS compression_count,
-                          MAX(cr.run_id) AS last_compression_run
-                     FROM sessions s LEFT JOIN compression_runs cr ON cr.session_id = s.id
-                    GROUP BY s.id ORDER BY s.started_at DESC"""
-            ).fetchall()
+        legacy_schema = False
+        try:
+            with db._read_ctx() as conn:
+                rows = conn.execute(
+                    """SELECT s.*, COUNT(cr.run_id) AS compression_count,
+                              MAX(cr.run_id) AS last_compression_run
+                         FROM sessions s LEFT JOIN compression_runs cr ON cr.session_id = s.id
+                        GROUP BY s.id ORDER BY s.started_at DESC"""
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if str(exc).lower().strip() != "no such table: compression_runs":
+                raise
+            legacy_schema = True
+            with db._read_ctx() as conn:
+                rows = conn.execute(
+                    "SELECT s.*, 0 AS compression_count, NULL AS last_compression_run "
+                    "FROM sessions s ORDER BY s.started_at DESC"
+                ).fetchall()
         result = []
         for row in rows:
             item = dict(row)
             item["compression_count"] = int(item.get("compression_count") or 0)
+            events = _session_events(db, str(item["id"]))
+            if legacy_schema and not item["compression_count"]:
+                item["compression_count"] = len(_reconstructed_boundary_indexes(events))
             if item["compression_count"] < min_compressions:
                 continue
             if item["compression_count"]:
-                events = _session_events(db, str(item["id"]))
                 event_by_id = {
                     int(event["id"]): event
                     for event in events

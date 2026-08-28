@@ -58,6 +58,16 @@ def _legacy_source(tmp_path):
     return path
 
 
+def test_discovery_reconstructs_legacy_missing_compression_runs_table(tmp_path):
+    source = _legacy_source(tmp_path)
+
+    discovered = discover_compression_sessions(source)
+
+    assert [item["id"] for item in discovered] == ["legacy-session"]
+    assert discovered[0]["compression_count"] == 0
+    assert discovered[0]["trace_classification"] != "exact"
+
+
 def test_export_reconstructs_legacy_missing_compression_runs_table(tmp_path):
     source = _legacy_source(tmp_path)
 

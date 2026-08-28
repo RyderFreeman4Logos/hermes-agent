@@ -229,6 +229,7 @@ class ReducedState:
     facts: tuple[MapFact, ...]
     plans: tuple[MapFact, ...]
     externalized: tuple[ExternalizedArtifact, ...] = ()
+    recovery_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2038,12 +2039,19 @@ class CheckpointContextEngine(ContextEngine):
         facts = tuple(
             sorted(records.values(), key=lambda fact: (cls._fact_position(fact), cls._fact_identity(fact)))
         )
+        recovery_refs = tuple(sorted({
+            disposition.recovery_ref
+            for shard in shards
+            for disposition in shard.dispositions
+            if disposition.status == "reconstructible" and disposition.recovery_ref is not None
+        }))
         return ReducedState(
             lanes.active_intent,
             lanes.effects,
             facts,
             tuple(fact for fact in facts if fact.action_state == "planned"),
             externalized,
+            recovery_refs,
         )
 
     @staticmethod
@@ -2201,6 +2209,10 @@ class CheckpointContextEngine(ContextEngine):
                     artifact.stub for artifact in state.externalized
                 )
             )
+        if state.recovery_refs:
+            details.append("Recovery references:\n" + "\n".join(
+                f"- {reference}" for reference in state.recovery_refs
+            ))
         return semantic_checkpoint if not details else f"{semantic_checkpoint}\n\n" + "\n".join(details)
 
     @staticmethod

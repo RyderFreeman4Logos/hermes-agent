@@ -265,6 +265,87 @@ def test_rejected_codex_continues_to_remaining_codex_only(async_mode):
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
+def test_rejected_codex_continues_to_remaining_configured_fallback(async_mode):
+    """A rejected Codex must continue through remaining configured entries."""
+    chain = [
+        {"provider": "openai-codex", "model": "codex-model"},
+        {"provider": "pm", "model": "pm-model"},
+        {"provider": "custom:localrouter", "model": "grok-model"},
+    ]
+    task_config = {"fallback_chain": chain}
+    primary_seen = []
+    codex_seen = []
+    pm_seen = []
+    localrouter_seen = []
+    completions = _AsyncCompletions if async_mode else _SyncCompletions
+    primary = _client(
+        completions(fail=True, seen=primary_seen, text="primary"),
+        "https://qwen.invalid/v1",
+    )
+    codex = _client(
+        completions(fail=True, seen=codex_seen, text="codex"),
+        "https://chatgpt.com/backend-api",
+    )
+    pm = _client(
+        completions(seen=pm_seen, text="pm"),
+        "https://pm.invalid/v1",
+    )
+    localrouter = _client(
+        completions(seen=localrouter_seen, text="grok"),
+        "https://local.invalid/v1",
+    )
+    resolved = []
+
+    def resolve_entry(entry):
+        provider = entry["provider"]
+        resolved.append(provider)
+        return {
+            "pm": pm,
+            "openai-codex": codex,
+            "custom:localrouter": localrouter,
+        }[provider], entry["model"]
+
+    route_info = {}
+    patches = [
+        patch.object(aux, "_get_auxiliary_task_config", return_value=task_config),
+        patch.object(
+            aux,
+            "_resolve_task_provider_model",
+            return_value=("auto", "qwen-primary", None, None, None),
+        ),
+        patch.object(aux, "_get_cached_client", return_value=(primary, "qwen-primary")),
+        patch.object(aux, "_resolve_fallback_entry", side_effect=resolve_entry),
+        patch.object(aux, "_try_main_agent_model_fallback", return_value=(None, None, "")),
+        patch.object(aux, "_provider_requires_stream", return_value=False),
+    ]
+    if async_mode:
+        patches.append(
+            patch.object(
+                aux,
+                "_to_async_client",
+                side_effect=lambda client, model, is_vision=False: (client, model),
+            )
+        )
+
+    response = _run_fallback_call(
+        async_mode, task="moa_reference", route_info=route_info, patches=patches,
+    )
+
+    assert response is not None
+    assert response.choices[0].message.content == "pm"
+    assert resolved == ["openai-codex", "pm"]
+    assert len(codex_seen) == 1
+    assert len(pm_seen) == 1
+    assert localrouter_seen == []
+    assert route_info == {
+        "provider": "pm",
+        "model": "pm-model",
+        "fallback_label": "fallback_chain[1](pm)",
+        "codex_skip_reason": "rejected",
+    }
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
 def test_all_codex_rejected_fails_closed_without_non_codex(async_mode):
     """Exhausted Codex candidates must not fall through to pm or Grok."""
     chain = [

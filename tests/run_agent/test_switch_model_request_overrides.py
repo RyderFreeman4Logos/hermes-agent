@@ -1203,3 +1203,31 @@ def test_pr41_r09_recovery_rejection_precedes_client_retirement():
     agent._retire_shared_openai_client.assert_not_called()
     assert agent.client is safe_client
     assert agent.request_overrides is safe_map
+
+
+def test_failed_switch_restores_original_request_overrides():
+    agent = _make_zai_agent()
+    overrides_seen_during_rebuild = []
+
+    def fail_client_rebuild(*_args, **_kwargs):
+        overrides_seen_during_rebuild.append(dict(agent.request_overrides))
+        raise RuntimeError("simulated client build failure")
+
+    agent._create_openai_client = fail_client_rebuild
+
+    with (
+        patch("agent.credential_pool.load_pool", return_value=None),
+        patch("hermes_cli.config.load_config_readonly", return_value={}),
+        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
+        pytest.raises(RuntimeError, match="simulated client build failure"),
+    ):
+        agent.switch_model(
+            new_model="gpt-5.6-luna",
+            new_provider="openai-codex",
+            api_key="codex-key",
+            base_url=_CODEX_BASE_URL,
+            api_mode="codex_responses",
+        )
+
+    assert overrides_seen_during_rebuild == [{}]
+    assert agent.request_overrides == _STALE_OVERRIDES

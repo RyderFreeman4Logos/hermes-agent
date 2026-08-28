@@ -135,6 +135,79 @@ class TestSetupLogging:
         ]
         assert agent_handlers[0].level == logging.WARNING
 
+    def test_enospc_on_agent_log_propagates(self, hermes_home, monkeypatch):
+        """Only EROFS on agent.log is startup-safe; ENOSPC is actionable."""
+        import errno
+
+        original_handler = hermes_logging._ManagedRotatingFileHandler
+
+        def _enospc_agent_handler(path, *args, **kwargs):
+            if Path(path).name == "agent.log":
+                raise OSError(errno.ENOSPC, "No space left on device", path)
+            return original_handler(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            hermes_logging, "_ManagedRotatingFileHandler", _enospc_agent_handler
+        )
+
+        with pytest.raises(OSError) as exc_info:
+            hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert exc_info.value.errno == errno.ENOSPC
+
+    def test_eacces_on_errors_log_propagates(self, hermes_home, monkeypatch):
+        """A writable agent.log must not mask errors.log permission failures."""
+        import errno
+
+        original_handler = hermes_logging._ManagedRotatingFileHandler
+
+        def _eacces_errors_handler(path, *args, **kwargs):
+            if Path(path).name == "errors.log":
+                raise OSError(errno.EACCES, "Permission denied", path)
+            return original_handler(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            hermes_logging, "_ManagedRotatingFileHandler", _eacces_errors_handler
+        )
+
+        with pytest.raises(OSError) as exc_info:
+            hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert exc_info.value.errno == errno.EACCES
+        assert [
+            h for h in hermes_logging.rotating_file_handlers()
+            if Path(getattr(h, "baseFilename", "")).name == "agent.log"
+        ]
+
+    def test_non_directory_log_path_propagates(self, hermes_home):
+        """A file at logs/ is a configuration error, not an optional log."""
+        import errno
+
+        log_path = hermes_home / "logs"
+        log_path.write_text("not a directory")
+
+        with pytest.raises(OSError) as exc_info:
+            hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert exc_info.value.errno == errno.EEXIST
+
+    def test_readonly_agent_log_skips_file_handlers(self, hermes_home, monkeypatch):
+        """EROFS on agent.log keeps startup alive without partial handlers."""
+        import errno
+
+        original_handler = hermes_logging._ManagedRotatingFileHandler
+
+        def _erofs_agent_handler(path, *args, **kwargs):
+            if Path(path).name == "agent.log":
+                raise OSError(errno.EROFS, "Read-only file system", path)
+            return original_handler(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            hermes_logging, "_ManagedRotatingFileHandler", _erofs_agent_handler
+        )
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert log_dir == hermes_home / "logs"
+        assert hermes_logging.rotating_file_handlers() == []
+        assert not (log_dir / "errors.log").exists()
+
 
 
 class TestGatewayMode:

@@ -29,6 +29,7 @@ Session context:
 
 import atexit
 import copy
+import errno
 import io
 import logging
 import os
@@ -302,7 +303,12 @@ def setup_logging(
     global _logging_initialized
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if exc.errno != errno.EROFS:
+            raise
+        return log_dir
 
     # Read config defaults (best-effort — config may not be loaded yet).
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
@@ -318,14 +324,19 @@ def setup_logging(
     root = logging.getLogger()
 
     # --- agent.log (INFO+) — the main activity log -------------------------
-    _add_rotating_handler(
-        root,
-        log_dir / "agent.log",
-        level=level,
-        max_bytes=max_bytes,
-        backup_count=backups,
-        formatter=RedactingFormatter(_LOG_FORMAT),
-    )
+    try:
+        _add_rotating_handler(
+            root,
+            log_dir / "agent.log",
+            level=level,
+            max_bytes=max_bytes,
+            backup_count=backups,
+            formatter=RedactingFormatter(_LOG_FORMAT),
+        )
+    except OSError as exc:
+        if exc.errno != errno.EROFS:
+            raise
+        return log_dir
 
     # --- errors.log (WARNING+) — quick triage log --------------------------
     _add_rotating_handler(

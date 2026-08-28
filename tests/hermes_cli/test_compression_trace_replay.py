@@ -34,6 +34,37 @@ def _source(tmp_path):
     return path
 
 
+def _add_session(db, session_id, content):
+    db.create_session(session_id, "cli", model="stored-model")
+    db.append_message(session_id, "user", content)
+    db.append_message(session_id, "assistant", "I will inspect it.")
+
+
+def test_export_source_hash_ignores_other_session_growth(tmp_path):
+    source = _source(tmp_path)
+    first = export_compression_trace(source, "source-session", tmp_path / "first")
+
+    db = SessionDB(source)
+    _add_session(db, "other-session", "Other session content.")
+    db.close()
+
+    second = export_compression_trace(source, "source-session", tmp_path / "second")
+
+    assert second["source_content_hash"] == first["source_content_hash"]
+
+
+def test_export_source_hash_differs_between_sessions(tmp_path):
+    source = _source(tmp_path)
+    db = SessionDB(source)
+    _add_session(db, "other-session", "Keep the branch and run tests.")
+    db.close()
+
+    source_manifest = export_compression_trace(source, "source-session", tmp_path / "source")
+    other_manifest = export_compression_trace(source, "other-session", tmp_path / "other")
+
+    assert other_manifest["source_content_hash"] != source_manifest["source_content_hash"]
+
+
 def test_discovery_only_labels_committed_evidenced_traces_exact(tmp_path):
     source = _source(tmp_path)
     db = SessionDB(source)

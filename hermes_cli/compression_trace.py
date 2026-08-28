@@ -52,15 +52,6 @@ def _write(path: Path, body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
-def _db_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
-        if candidate.exists():
-            digest.update(candidate.name.encode())
-            digest.update(candidate.read_bytes())
-    return digest.hexdigest()
-
-
 def _rows_jsonl(rows: Iterable[Mapping[str, Any]], *, redact: bool) -> bytes:
     return b"".join(_json_bytes(_redact(dict(row), enabled=redact)) for row in rows)
 
@@ -78,6 +69,20 @@ def _artifact_body(db: Any, artifact_id: Optional[str]) -> Optional[bytes]:
 
 def _session_events(db: Any, session_id: str) -> List[Dict[str, Any]]:
     return db.get_messages(session_id, include_inactive=True)
+
+
+def _session_content_hash(
+    session: Mapping[str, Any],
+    events: Iterable[Mapping[str, Any]],
+    compression_runs: Iterable[Mapping[str, Any]],
+) -> str:
+    source = {
+        "session": dict(session),
+        "events": [dict(event) for event in events],
+        "compression_runs": [dict(run) for run in compression_runs],
+    }
+    body = json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
 
 
 def _export_artifact_body(body: bytes, *, redact: bool) -> bytes:
@@ -216,7 +221,6 @@ def export_compression_trace(
 
     from hermes_state import SessionDB
 
-    source_hash = _db_hash(db_path)
     db = SessionDB(db_path, read_only=True)
     files: Dict[str, str] = {}
     try:
@@ -226,6 +230,7 @@ def export_compression_trace(
             raise ValueError(f"session not found: {session_id}")
         runs = db.list_compression_runs(resolved)
         all_events = _session_events(db, resolved)
+        source_hash = _session_content_hash(session, all_events, runs)
         if not runs and all_events:
             # ponytail: one conservative projection when no durable boundary exists;
             # retain events rather than inventing a generation split.

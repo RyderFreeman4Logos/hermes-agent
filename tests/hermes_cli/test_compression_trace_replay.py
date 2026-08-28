@@ -58,6 +58,34 @@ def _legacy_source(tmp_path):
     return path
 
 
+def _legacy_source_without_compressed_summary_column(tmp_path):
+    path = tmp_path / "legacy-no-summary-column.db"
+    with sqlite3.connect(path) as legacy:
+        legacy.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                message_count INTEGER DEFAULT 0
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                content TEXT,
+                compacted INTEGER DEFAULT 0
+            );
+            INSERT INTO sessions(id, source, started_at, message_count)
+            VALUES ('legacy-no-summary-column', 'cli', 1, 2);
+            INSERT INTO messages(id, session_id, content, compacted)
+            VALUES
+                (1, 'legacy-no-summary-column', 'Historical user turn.', 0),
+                (2, 'legacy-no-summary-column', '[CONTEXT COMPACTION] historical boundary', 1);
+            """
+        )
+    return path
+
+
 def _legacy_multi_boundary_source(tmp_path):
     path = tmp_path / "legacy-multi-state.db"
     db = SessionDB(path)
@@ -95,6 +123,16 @@ def test_discovery_reconstructs_legacy_missing_compression_runs_table(tmp_path):
 
     assert [item["id"] for item in discovered] == ["legacy-session"]
     assert discovered[0]["compression_count"] == 0
+    assert discovered[0]["trace_classification"] != "exact"
+
+
+def test_discovery_accepts_legacy_messages_without_compressed_summary_column(tmp_path):
+    source = _legacy_source_without_compressed_summary_column(tmp_path)
+
+    discovered = discover_compression_sessions(source)
+
+    assert [item["id"] for item in discovered] == ["legacy-no-summary-column"]
+    assert discovered[0]["compression_count"] == 1
     assert discovered[0]["trace_classification"] != "exact"
 
 

@@ -164,8 +164,7 @@ def discover_compression_sessions(
             with db._read_ctx() as conn:
                 rows = conn.execute(
                     """SELECT s.*,
-                              SUM(CASE WHEN m._compressed_summary = 1
-                                           OR ltrim(COALESCE(m.content, '')) LIKE '[CONTEXT COMPACTION%'
+                              SUM(CASE WHEN ltrim(COALESCE(m.content, '')) LIKE '[CONTEXT COMPACTION%'
                                            OR ltrim(COALESCE(m.content, '')) LIKE '[CONTEXT SUMMARY]:%'
                                         THEN 1 ELSE 0 END) AS reconstructed_boundary_count,
                               MAX(CASE WHEN m.compacted = 1 THEN 1 ELSE 0 END) AS has_compacted,

@@ -98,6 +98,35 @@ def test_discovery_reconstructs_legacy_missing_compression_runs_table(tmp_path):
     assert discovered[0]["trace_classification"] != "exact"
 
 
+def test_discovery_never_labels_reconstructed_legacy_trace_exact(tmp_path):
+    source, _ = _legacy_multi_boundary_source(tmp_path)
+
+    discovered = discover_compression_sessions(source)
+
+    assert discovered[0]["compression_count"] == 3
+    assert discovered[0]["trace_classification"] != "exact"
+
+
+def test_discovery_filters_modern_zero_compression_before_loading_history(tmp_path, monkeypatch):
+    source = _source(tmp_path)
+    db = SessionDB(source)
+    db.create_session("zero-compression-session", "cli", model="stored-model")
+    db.close()
+    calls = []
+    original = SessionDB.get_messages
+
+    def spy(self, session_id, *args, **kwargs):
+        calls.append(session_id)
+        return original(self, session_id, *args, **kwargs)
+
+    monkeypatch.setattr(SessionDB, "get_messages", spy)
+
+    discovered = discover_compression_sessions(source, min_compressions=1)
+
+    assert [item["id"] for item in discovered] == ["source-session"]
+    assert "zero-compression-session" not in calls
+
+
 def test_export_reconstructs_one_point_per_historical_boundary(tmp_path):
     source, full_event_count = _legacy_multi_boundary_source(tmp_path)
 

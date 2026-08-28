@@ -163,18 +163,28 @@ def discover_compression_sessions(
             legacy_schema = True
             with db._read_ctx() as conn:
                 rows = conn.execute(
-                    "SELECT s.*, 0 AS compression_count, NULL AS last_compression_run "
-                    "FROM sessions s ORDER BY s.started_at DESC"
+                    """SELECT s.*,
+                              SUM(CASE WHEN m._compressed_summary = 1
+                                           OR ltrim(COALESCE(m.content, '')) LIKE '[CONTEXT COMPACTION%'
+                                           OR ltrim(COALESCE(m.content, '')) LIKE '[CONTEXT SUMMARY]:%'
+                                        THEN 1 ELSE 0 END) AS reconstructed_boundary_count,
+                              MAX(CASE WHEN m.compacted = 1 THEN 1 ELSE 0 END) AS has_compacted,
+                              0 AS compression_count, NULL AS last_compression_run
+                         FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
+                        GROUP BY s.id ORDER BY s.started_at DESC"""
                 ).fetchall()
         result = []
         for row in rows:
             item = dict(row)
-            item["compression_count"] = int(item.get("compression_count") or 0)
-            events = _session_events(db, str(item["id"]))
-            if legacy_schema and not item["compression_count"]:
-                item["compression_count"] = len(_reconstructed_boundary_indexes(events))
+            if legacy_schema:
+                marker_count = int(item.pop("reconstructed_boundary_count") or 0)
+                has_compacted = bool(item.pop("has_compacted") or 0)
+                item["compression_count"] = marker_count or int(has_compacted)
+            else:
+                item["compression_count"] = int(item.get("compression_count") or 0)
             if item["compression_count"] < min_compressions:
                 continue
+            events = _session_events(db, str(item["id"])) if item["compression_count"] else []
             if item["compression_count"]:
                 event_by_id = {
                     int(event["id"]): event
@@ -184,7 +194,7 @@ def discover_compression_sessions(
                 runs = db.list_compression_runs(str(item["id"]))
                 item["trace_classification"] = (
                     "exact"
-                    if all(
+                    if runs and all(
                         _compression_run_is_exact(run, _compression_run_evidence(db, run, event_by_id))
                         for run in runs
                     )

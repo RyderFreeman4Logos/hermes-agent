@@ -2592,7 +2592,7 @@ class CheckpointContextEngine(ContextEngine):
             self._last_summary_error = "checkpoint Map exceeded its token budget"
             return messages
         externalized = self._artifactize_externalized_groups(
-            source_messages, self.last_map_externalized_groups, source_event_ids
+            durable_messages, self.last_map_externalized_groups, source_event_ids
         )
         if externalized is None:
             self._set_automatic_cooldown("artifactization_failed")

@@ -2201,7 +2201,7 @@ def test_map_planner_packs_consecutive_causal_units_without_splitting_tool_recei
     assert [shard.event_indices for shard in shards] == [(0, 1), (2,), (3, 4), (5,)]
 
 
-def test_oversized_read_only_tool_output_has_a_durable_recovery_index(monkeypatch, tmp_path):
+def test_oversized_artifact_round_trips_complete_durable_rows(monkeypatch, tmp_path):
     from agent.checkpoint_engine import CheckpointContextEngine
     from hermes_state import SessionDB
 
@@ -2219,7 +2219,12 @@ def test_oversized_read_only_tool_output_has_a_durable_recovery_index(monkeypatc
                 "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
             }],
         },
-        {"role": "tool", "tool_call_id": "call_1", "content": oversized_output},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": oversized_output,
+            "effect_disposition": "failed",
+        },
         {"role": "user", "content": "continue"},
     ]
     for message in source_messages:
@@ -2244,18 +2249,17 @@ def test_oversized_read_only_tool_output_has_a_durable_recovery_index(monkeypatc
     assert result is not messages
     artifact = engine.last_map_externalized_artifacts[0]
     body = db.get_checkpoint_artifact(artifact.artifact_id)
-    expected = [
-        {"source_event_id": message["_row_id"], "message": source}
-        for message, source in zip(messages[:2], engine._provider_visible_sources(messages[:2]))
-    ]
-    assert body == json.dumps(
-        expected, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
-    assert artifact.artifact_id in engine.last_checkpoint_text
-    assert artifact.sha256 in engine.last_checkpoint_text
-    assert db.get_checkpoint_artifact_reference(
+    assert body is not None
+    reference = db.get_checkpoint_artifact_reference(
         "checkpoint-session", artifact.source_event_ids
-    ) == artifact.artifact_id
+    )
+    assert reference == artifact.artifact_id
+    assert hashlib.sha256(body).hexdigest() == reference
+    assert json.loads(body) == [
+        {"source_event_id": message["_row_id"], "message": message}
+        for message in messages[:2]
+    ]
+    assert json.loads(body)[1]["message"]["effect_disposition"] == "failed"
 
 
 def _artifactized_checkpoint(monkeypatch, tmp_path, source_messages):

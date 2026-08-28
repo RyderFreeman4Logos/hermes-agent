@@ -101,6 +101,8 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
 
 logger = logging.getLogger(__name__)
 
+_BILLING_MODE_UNSET = object()
+
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
 
@@ -7710,13 +7712,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         provider: str,
         base_url: str,
-        billing_mode: Optional[str] = None,
+        billing_mode: Any = _BILLING_MODE_UNSET,
     ) -> None:
         """Unconditionally update the billing provider/base_url for a session.
 
         Unlike ``update_token_counts`` which uses ``COALESCE(billing_provider, ?)``
         (only filling in NULL), this unconditionally sets the billing fields so
         that the dashboard reflects the user's latest /model switch.
+
+        ``billing_mode`` is omitted by default so callers can leave it unchanged;
+        passing ``None`` explicitly clears it for rollback to a NULL preimage.
 
         Also nulls ``system_prompt`` so the cached snapshot (which embeds a
         stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
@@ -7726,15 +7731,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.flush_token_counts()
 
         def _do(conn):
+            billing_mode_clause = (
+                ", billing_mode = ?"
+                if billing_mode is not _BILLING_MODE_UNSET
+                else ""
+            )
+            params = (
+                (provider, base_url, billing_mode, session_id)
+                if billing_mode is not _BILLING_MODE_UNSET
+                else (provider, base_url, session_id)
+            )
             conn.execute(
-                """UPDATE sessions SET
+                f"""UPDATE sessions SET
                    billing_provider = ?,
-                   billing_base_url = ?,
-                   billing_mode = COALESCE(?, billing_mode),
+                   billing_base_url = ?{billing_mode_clause},
                    system_prompt = NULL,
                    system_prompt_hash = NULL
                    WHERE id = ?""",
-                (provider, base_url, billing_mode, session_id),
+                params,
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)

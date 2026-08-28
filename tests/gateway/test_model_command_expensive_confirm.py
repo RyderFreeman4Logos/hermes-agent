@@ -22,6 +22,10 @@ from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from hermes_cli.model_switch import (
+    apply_model_switch_after_compression,
+    get_model_switch_after_compression,
+)
 
 
 def _make_runner():
@@ -166,3 +170,129 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
     assert evicted == []
     # The agent stayed on its old model (rolled back).
     assert agent.model == "old-model"
+
+
+@pytest.mark.anyio
+async def test_gateway_provider_only_after_compression_passes_configured_provider(
+    tmp_path, monkeypatch
+):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    captured = []
+
+    def fake_switch(**kwargs):
+        captured.append(kwargs)
+        return ModelSwitchResult(
+            success=True,
+            new_model="configured/model",
+            target_provider="pm",
+            api_key="[REDACTED]",
+            base_url="https://pm.invalid/v1",
+            api_mode="codex_responses",
+            provider_label="Configured Provider",
+        )
+
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"default": "old-model", "provider": "pm"},
+                "providers": {
+                    "pm": {
+                        "base_url": "https://pm.invalid/v1",
+                        "default_model": "configured/model",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    for raw in (
+        "/model --after-compression --provider pm",
+        "/model --provider pm --after-compression",
+    ):
+        runner = _make_runner()
+
+        class Agent:
+            model = "old-model"
+            provider = "pm"
+
+            def __init__(self):
+                self.calls = []
+
+            def switch_model(self, **kwargs):
+                self.calls.append(kwargs)
+                self.model = kwargs["new_model"]
+                self.provider = kwargs["new_provider"]
+
+        import threading
+
+        agent = Agent()
+        runner._agent_cache = {}
+        runner._agent_cache_lock = threading.Lock()
+        runner._session_db = None
+        runner._evict_cached_agent = lambda _key: None
+        event = _make_event(raw)
+        session_key = runner._session_key_for_source(event.source)
+        runner._agent_cache[session_key] = (agent, None)
+
+        reply = await runner._handle_model_command(event)
+
+        assert "after compression" in reply
+        assert agent.calls == []
+
+    assert [call["raw_input"] for call in captured] == ["", ""]
+    assert [call["explicit_provider"] for call in captured] == ["pm", "pm"]
+
+
+@pytest.mark.anyio
+async def test_gateway_deferred_switch_waits_for_compression_boundary(
+    tmp_path, monkeypatch
+):
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    runner = _make_runner()
+
+    class _Agent:
+        def __init__(self):
+            self.model = "old-model"
+            self.provider = "openrouter"
+            self.calls = []
+
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.calls.append((new_model, new_provider))
+            self.model = new_model
+            self.provider = new_provider
+
+    import threading
+
+    agent = _Agent()
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_db = None
+    runner._evict_cached_agent = lambda _key: None
+    event = _make_event(
+        "/model openai/gpt-5.5-pro --after-compression --provider openrouter"
+    )
+    session_key = runner._session_key_for_source(event.source)
+    runner._agent_cache[session_key] = (agent, None)
+
+    reply = await runner._handle_model_command(event)
+
+    assert "after compression" in reply
+    assert agent.calls == []
+    pending = get_model_switch_after_compression(agent)
+    assert pending is not None
+    assert pending.new_model == "openai/gpt-5.5-pro"
+    assert pending.target_provider == "openrouter"
+
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert agent.calls == [("openai/gpt-5.5-pro", "openrouter")]
+    assert get_model_switch_after_compression(agent) is None

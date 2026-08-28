@@ -19907,3 +19907,261 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        apply_model_switch_after_compression,
+        get_model_switch_after_compression,
+    )
+
+    class Agent:
+        def __init__(self):
+            self.model = "old/model"
+            self.provider = "openrouter"
+            self.api_key = "[REDACTED]"
+            self.base_url = "https://old.example/v1"
+            self.api_mode = "chat_completions"
+            self.calls = []
+
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.calls.append((new_model, new_provider))
+            self.model = new_model
+            self.provider = new_provider
+            self.api_key = api_key
+            self.base_url = base_url
+            self.api_mode = api_mode
+
+    result = ModelSwitchResult(
+        success=True,
+        new_model="next/model",
+        target_provider="anthropic",
+        api_key="[REDACTED]",
+        base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages",
+        provider_label="Anthropic",
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: result)
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_persist_model_switch",
+        lambda _r: pytest.fail("deferred switch must stay session-scoped"),
+    )
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *a: None)
+    agent = Agent()
+    session = {
+        "agent": agent,
+        "model_override": {
+            "model": "old/model",
+            "provider": "openrouter",
+        },
+    }
+
+    out = server._apply_model_switch(
+        "sid",
+        session,
+        "next/model --after-compression --provider anthropic",
+    )
+
+    assert out["deferred"] is True
+    assert agent.calls == []
+    assert session["model_override"]["model"] == "old/model"
+    assert get_model_switch_after_compression(agent) is result
+
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert agent.calls == [("next/model", "anthropic")]
+    assert get_model_switch_after_compression(agent) is None
+
+
+def test_tui_provider_only_after_compression_passes_to_switch_model(monkeypatch):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    captured = []
+
+    class Agent:
+        model = "old/model"
+        provider = "openrouter"
+        api_key = "[REDACTED]"
+        base_url = "https://openrouter.ai/api/v1"
+        api_mode = "chat_completions"
+
+        def __init__(self):
+            self.calls = []
+
+        def switch_model(self, **kwargs):
+            self.calls.append(kwargs)
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+
+    def fake_switch(**kwargs):
+        captured.append(kwargs)
+        return ModelSwitchResult(
+            success=True,
+            new_model="configured/model",
+            target_provider="pm",
+            api_key="[REDACTED]",
+            base_url="https://pm.invalid/v1",
+            api_mode="codex_responses",
+            provider_label="Configured Provider",
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    monkeypatch.setattr(
+        server,
+        "_persist_model_switch",
+        lambda _result: pytest.fail("deferred switch must stay session-scoped"),
+    )
+    for raw in (
+        "--after-compression --provider pm",
+        "--provider pm --after-compression",
+    ):
+        agent = Agent()
+        session = {"agent": agent, "model_override": {"model": "old/model"}}
+        out = server._apply_model_switch("sid", session, raw)
+        assert out["deferred"] is True
+        assert agent.calls == []
+
+    assert [call["raw_input"] for call in captured] == ["", ""]
+    assert [call["explicit_provider"] for call in captured] == ["pm", "pm"]
+
+
+def test_tui_reasoning_only_after_compression_keeps_route(monkeypatch):
+    from hermes_cli.model_switch import ModelSwitchResult, get_model_switch_after_compression
+
+    class Agent:
+        model = "old/model"
+        provider = "openrouter"
+        api_key = "[REDACTED]"
+        base_url = "https://openrouter.ai/api/v1"
+        api_mode = "chat_completions"
+
+        def __init__(self):
+            self.calls = []
+
+        def switch_model(self, **kwargs):
+            self.calls.append(kwargs)
+
+    def fake_switch(**kwargs):
+        return ModelSwitchResult(
+            success=True,
+            new_model=kwargs["current_model"],
+            target_provider=kwargs["current_provider"],
+            api_key="[REDACTED]",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    monkeypatch.setattr(
+        server,
+        "_persist_model_switch",
+        lambda _result: pytest.fail("deferred switch must stay session-scoped"),
+    )
+    agent = Agent()
+    session = {"agent": agent}
+
+    out = server._apply_model_switch(
+        "sid",
+        session,
+        "--after-compression --reasoning low",
+        confirm_expensive_model=True,
+    )
+
+    assert out["deferred"] is True
+    pending = get_model_switch_after_compression(agent)
+    assert pending is not None
+    assert (pending.new_model, pending.target_provider) == ("old/model", "openrouter")
+    assert pending.reasoning_config == {"enabled": True, "effort": "low"}
+    assert agent.calls == []
+
+
+def test_tui_deferred_reasoning_survives_compression_rebuild(monkeypatch):
+    """The first rebuilt TUI agent must keep explicit ``low`` reasoning."""
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        apply_model_switch_after_compression,
+        get_model_switch_after_compression,
+    )
+
+    class Agent:
+        model = "old/model"
+        provider = "openrouter"
+        api_key = "[REDACTED]"
+        base_url = "https://openrouter.ai/api/v1"
+        api_mode = "chat_completions"
+
+        def switch_model(self, new_model, new_provider, _api_key, _base_url, _api_mode):
+            self.model = new_model
+            self.provider = new_provider
+
+    def fake_switch(**kwargs):
+        return ModelSwitchResult(
+            success=True,
+            new_model=kwargs["current_model"],
+            target_provider=kwargs["current_provider"],
+            api_key="[REDACTED]",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    agent = Agent()
+    session = {"agent": agent}
+
+    server._apply_model_switch(
+        "sid",
+        session,
+        "--after-compression --reasoning low",
+        confirm_expensive_model=True,
+    )
+    pending = get_model_switch_after_compression(agent)
+    assert pending is not None
+    assert pending.reasoning_config == {"enabled": True, "effort": "low"}
+    assert apply_model_switch_after_compression(agent) == "applied"
+
+    stored = server._stored_session_runtime_overrides(
+        {
+            "model": agent.model,
+            "billing_provider": agent.provider,
+            "model_config": json.dumps(
+                getattr(agent, "_session_init_model_config", {})
+            ),
+        }
+    )
+    assert stored["reasoning_config_override"] == {
+        "enabled": True,
+        "effort": "low",
+    }
+
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.setattr(
+        server,
+        "_load_reasoning_config",
+        lambda _model="": {"enabled": True, "effort": "medium"},
+    )
+    with patch("run_agent.AIAgent") as mock_agent:
+        server._make_agent(
+            "sid",
+            "key",
+            model_override=stored["model_override"],
+            reasoning_config_override=stored["reasoning_config_override"],
+        )
+
+    assert mock_agent.call_args.kwargs["reasoning_config"] == {
+        "enabled": True,
+        "effort": "low",
+    }

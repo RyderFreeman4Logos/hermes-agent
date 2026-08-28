@@ -557,6 +557,7 @@ def _chat_messages_to_responses_input(
     # `function_call_output` wrapper) that no longer carries it (#90976).
     item_sources: List[Optional[Dict[str, Any]]] = []
     seen_item_ids: set = set()
+    first_message = True
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -566,7 +567,12 @@ def _chat_messages_to_responses_input(
             # The leading system prompt is extracted into ``instructions`` by
             # the transport. Later system messages are request-local developer
             # context (for example loop timing) and belong in ``input``.
+            if first_message:
+                first_message = False
+                continue
             role = "developer"
+        else:
+            first_message = False
 
         if role in {"user", "assistant", "developer"}:
             content = msg.get("content", "")

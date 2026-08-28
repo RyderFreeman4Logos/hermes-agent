@@ -1962,6 +1962,9 @@ DEFAULT_CONFIG = {
         "hard_max_wire_tokens": 60000,
         "map_concurrency": 2,
         "max_map_shards": 32,
+        "map": {
+            "max_output_tokens": 1100,
+        },
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt

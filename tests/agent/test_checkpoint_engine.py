@@ -282,8 +282,14 @@ def test_checkpoint_uses_focus_memory_and_complete_request_estimate():
     assert semantic_payload["memory_context"] == sanitize_memory_context(memory_context)
 
 
-def test_long_session_replay_sanitizes_and_bounds_memory_context():
+def test_long_session_replay_sanitizes_and_bounds_memory_context(monkeypatch):
     from agent.checkpoint_engine import CheckpointContextEngine
+
+    monkeypatch.setattr(
+        CheckpointContextEngine,
+        "_checkpoint_config",
+        staticmethod(lambda: {"map": {"max_output_tokens": 1101}}),
+    )
 
     class _ReplayAuxiliaryClient:
         def __init__(self):
@@ -291,7 +297,7 @@ def test_long_session_replay_sanitizes_and_bounds_memory_context():
 
         def complete(self, **kwargs):
             self.calls.append(kwargs)
-            if kwargs["max_tokens"] == 1024:
+            if kwargs["max_tokens"] == 1101:
                 payload = json.loads(kwargs["messages"][-1]["content"])
                 return _map_response({
                     "source_event_ids": payload["source_event_ids"],
@@ -335,6 +341,9 @@ def test_long_session_replay_sanitizes_and_bounds_memory_context():
         and sentinel not in payload["memory_context"]
         for payload in semantic_payloads
     )
+    assert [
+        call["max_tokens"] for call in auxiliary.calls if call["max_tokens"] != 2048
+    ] == [1101, 1101]
 
 
 def test_shadow_compress_is_noop():
@@ -2245,7 +2254,7 @@ def test_checkpoint_map_and_reduce_use_the_public_auxiliary_chain(monkeypatch):
 
     def complete_configured_chain(**kwargs):
         calls.append(kwargs)
-        if kwargs["max_tokens"] == 1024:
+        if kwargs["max_tokens"] == 1101:
             payload = json.loads(kwargs["messages"][-1]["content"])
             return _map_response({"source_event_ids": payload["source_event_ids"], "facts": []})
         payload = json.loads(kwargs["messages"][-1]["content"])
@@ -2254,10 +2263,15 @@ def test_checkpoint_map_and_reduce_use_the_public_auxiliary_chain(monkeypatch):
     monkeypatch.setattr(
         auxiliary_client, "call_configured_auxiliary_chain", complete_configured_chain,
     )
+    monkeypatch.setattr(
+        CheckpointContextEngine,
+        "_checkpoint_config",
+        staticmethod(lambda: {"map": {"max_output_tokens": 1101}}),
+    )
     engine = CheckpointContextEngine(token_counter=lambda _value: 1, output_reserve_tokens=0)
 
     assert _compress(engine, [{"role": "user", "content": "finish the migration"}])
-    assert [call["max_tokens"] for call in calls] == [1024, 2048]
+    assert [call["max_tokens"] for call in calls] == [1101, 2048]
     assert all(call["task"] == "compression" and call["tools"] == [] for call in calls)
 
 
@@ -2770,12 +2784,12 @@ def test_map_planner_fails_closed_when_its_total_output_budget_is_exceeded(monke
     from agent.checkpoint_engine import CheckpointContextEngine
 
     monkeypatch.setattr(checkpoint_engine, "_MAP_SHARD_TARGET_INPUT_TOKENS", 6)
-    monkeypatch.setattr(checkpoint_engine, "_MAP_TOTAL_OUTPUT_TOKENS", 1_500)
 
     def token_counter(prompt):
         return 6 * len(json.loads(prompt[-1]["content"])["source_event_ids"])
 
     engine = CheckpointContextEngine(token_counter=token_counter)
+    monkeypatch.setattr(engine, "_map_total_output_tokens", 1_500)
     messages = [
         {"role": "user", "content": "first"},
         {"role": "assistant", "content": "first response"},
@@ -2792,6 +2806,7 @@ def test_map_planner_has_a_bounded_default_shard_cap():
     from agent.checkpoint_engine import CheckpointContextEngine
 
     assert DEFAULT_CONFIG["checkpoint"]["max_map_shards"] == 32
+    assert DEFAULT_CONFIG["checkpoint"]["map"]["max_output_tokens"] == 1100
     assert CheckpointContextEngine().max_map_shards == 32
     assert CheckpointContextEngine(max_map_shards=33).max_map_shards == 32
 

@@ -30,7 +30,7 @@ __all__ = [
 
 
 _MAP_CONCURRENCY_CAP = 2
-_MAP_MAX_TOKENS = 1024
+_DEFAULT_MAP_MAX_OUTPUT_TOKENS = 1100
 _MAP_PROMPT_VERSION = "map-prompt-v2"
 _MAP_SCHEMA_VERSION = "map-schema-v2"
 _MAP_EXTRACTOR_VERSION = "map-extractor-v1"
@@ -45,7 +45,6 @@ _MAP_MAX_FACTS = 64
 _MAP_FACT_TEXT_MAX_BYTES = 2_048
 _MAP_FACT_TEXT_TOTAL_MAX_BYTES = 8_192
 _MAP_TOTAL_INPUT_TOKENS = _MAP_SHARD_TARGET_INPUT_TOKENS * _DEFAULT_MAX_MAP_SHARDS
-_MAP_TOTAL_OUTPUT_TOKENS = _MAP_MAX_TOKENS * _DEFAULT_MAX_MAP_SHARDS
 _SEMANTIC_REDUCE_MAX_TOKENS = 2048
 _MAP_TASK = "compression"
 _DEFAULT_TARGET_WIRE_TOKENS = 48_000
@@ -281,6 +280,14 @@ class CheckpointContextEngine(ContextEngine):
         self._auxiliary_client = auxiliary_client
         self._map_concurrency = self._bounded_map_concurrency(map_concurrency)
         self._max_map_shards = self._bounded_max_map_shards(max_map_shards)
+        map_config = checkpoint_config.get("map", {})
+        self._map_max_output_tokens = self._positive_int(
+            map_config.get("max_output_tokens") if isinstance(map_config, dict) else None,
+            _DEFAULT_MAP_MAX_OUTPUT_TOKENS,
+        )
+        self._map_total_output_tokens = (
+            self._map_max_output_tokens * _DEFAULT_MAX_MAP_SHARDS
+        )
         self._semantic_reducer = semantic_reducer
         configured_mode = checkpoint_config.get("mode", "shadow")
         self._mode = mode if mode in {"shadow", "live"} else configured_mode
@@ -1430,7 +1437,7 @@ class CheckpointContextEngine(ContextEngine):
         if (
             len(shards) > self._max_map_shards
             or total_input > _MAP_TOTAL_INPUT_TOKENS
-            or len(shards) * _MAP_MAX_TOKENS > _MAP_TOTAL_OUTPUT_TOKENS
+            or len(shards) * self._map_max_output_tokens > self._map_total_output_tokens
         ):
             return None
         return tuple(shards)
@@ -1572,10 +1579,10 @@ class CheckpointContextEngine(ContextEngine):
         if self._auxiliary_client is not None:
             return self._auxiliary_client.complete(
                 messages=messages,
-                max_tokens=_MAP_MAX_TOKENS,
+                max_tokens=self._map_max_output_tokens,
                 tools=[],
             )
-        return self._configured_auxiliary_response(messages, _MAP_MAX_TOKENS)
+        return self._configured_auxiliary_response(messages, self._map_max_output_tokens)
 
     def _call_semantic_reduce(self, messages: List[Dict[str, str]]) -> Any:
         if self._auxiliary_client is not None:

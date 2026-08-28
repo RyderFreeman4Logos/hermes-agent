@@ -3268,6 +3268,84 @@ def test_acknowledgments_do_not_replace_actionable_root_task():
     assert lanes.active_intent.event_indices[0] == 0
 
 
+@pytest.mark.parametrize(
+    ("boundary", "expected"),
+    (("new-task", "Tessellate blue glass."), ("replace", "Tessellate blue glass."), ("cancel", None)),
+)
+def test_structured_task_boundaries_override_language_heuristics(boundary, expected):
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        [
+            {
+                "role": "user",
+                "content": "Calibrate the old apparatus.",
+                "task_epoch_id": "epoch-a",
+            },
+            {
+                "role": "user",
+                "content": "Tessellate blue glass.",
+                "task_epoch_id": "epoch-b",
+                "task_boundary": boundary,
+            },
+        ],
+        (101, 102),
+    )
+
+    assert (lanes.active_intent.content if lanes.active_intent else None) == expected
+    assert (lanes.active_intent.source_event_ids if lanes.active_intent else ()) == (
+        (102,) if expected else ()
+    )
+
+
+def test_structured_new_task_command_resets_without_phrase_matching():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        [
+            {"role": "user", "content": "Calibrate the old apparatus."},
+            {"role": "user", "content": "/new-task Tessellate blue glass."},
+        ],
+        (101, 102),
+    )
+
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.content == "/new-task Tessellate blue glass."
+    assert lanes.active_intent.source_event_ids == (102,)
+
+
+def test_durable_task_epoch_metadata_drives_intent_boundaries(tmp_path):
+    from agent.checkpoint_engine import CheckpointContextEngine
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-session", source="test")
+    db.append_message(
+        "checkpoint-session",
+        "user",
+        "Calibrate the old apparatus.",
+        task_epoch_id="epoch-a",
+    )
+    db.append_message(
+        "checkpoint-session",
+        "user",
+        "Tessellate blue glass.",
+        task_epoch_id="epoch-b",
+        task_boundary="replace",
+    )
+    messages = db.get_messages_as_conversation(
+        "checkpoint-session", include_row_ids=True
+    )
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        messages, tuple(message["_row_id"] for message in messages)
+    )
+
+    assert messages[1]["task_epoch_id"] == "epoch-b"
+    assert messages[1]["task_boundary"] == "replace"
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.content == "Tessellate blue glass."
+
+
 def test_chinese_and_mixed_language_intent_epochs():
     from agent.checkpoint_engine import CheckpointContextEngine
 

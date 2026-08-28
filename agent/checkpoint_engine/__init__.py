@@ -638,6 +638,22 @@ class CheckpointContextEngine(ContextEngine):
             or normalized_text.startswith(_NEW_TASK_PREFIXES)
         )
 
+    @staticmethod
+    def _task_epoch_id(message: Dict[str, Any]) -> Optional[str]:
+        value = message.get("task_epoch_id")
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _task_boundary(message: Dict[str, Any], normalized_text: str) -> Optional[str]:
+        boundary = message.get("task_boundary")
+        if boundary in {"new-task", "replace", "cancel"}:
+            return boundary
+        return (
+            "new-task"
+            if normalized_text == "/new-task" or normalized_text.startswith("/new-task ")
+            else None
+        )
+
     @classmethod
     def _constraint_spans(cls, text: str) -> tuple[str, ...]:
         spans = []
@@ -679,7 +695,7 @@ class CheckpointContextEngine(ContextEngine):
     ) -> Optional[ActiveIntent]:
         from agent.conversation_compression import _is_real_user_message
 
-        turns: list[tuple[int, str, str]] = []
+        turns: list[tuple[int, str, str, Optional[str], Optional[str]]] = []
         for index, message in enumerate(messages):
             if real_user_source_event_ids is not None:
                 if (
@@ -691,24 +707,47 @@ class CheckpointContextEngine(ContextEngine):
                 continue
             text = cls._user_text(message)
             if text is not None:
-                turns.append((index, text, cls._normalized_user_text(text)))
+                normalized_text = cls._normalized_user_text(text)
+                turns.append((
+                    index,
+                    text,
+                    normalized_text,
+                    cls._task_epoch_id(message),
+                    cls._task_boundary(message, normalized_text),
+                ))
         if not turns:
             return None
 
         parts: list[str] = []
         indices: list[int] = []
-        for index, text, normalized_text in turns:
+        active_epoch = None
+        for index, text, normalized_text, epoch, boundary in turns:
+            if boundary == "cancel":
+                parts = []
+                indices = []
+                active_epoch = epoch
+                continue
             if cls._is_ack_only(normalized_text):
                 continue
             projected = cls._project_intent_text(text)
-            if not parts or cls._is_new_task(normalized_text):
+            if (
+                not parts
+                or boundary in {"new-task", "replace"}
+                or (epoch is not None and active_epoch is not None and epoch != active_epoch)
+                or cls._is_new_task(normalized_text)
+            ):
                 parts = [projected]
                 indices = [index]
+                active_epoch = epoch
                 continue
             parts.append(projected)
             indices.append(index)
+            if epoch is not None:
+                active_epoch = epoch
         if not parts:
-            index, text, _normalized_text = turns[-1]
+            index, text, _normalized_text, _epoch, boundary = turns[-1]
+            if boundary == "cancel":
+                return None
             return ActiveIntent(
                 cls._project_intent_text(text),
                 (index,),

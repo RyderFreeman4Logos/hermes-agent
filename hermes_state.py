@@ -10562,6 +10562,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         api_content: Optional[str] = None,
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
+        task_epoch_id: Optional[str] = None,
+        task_boundary: Optional[str] = None,
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
@@ -10589,6 +10591,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
+        task_epoch_id = (
+            _scrub_surrogates(task_epoch_id)
+            if isinstance(task_epoch_id, str) and task_epoch_id
+            else None
+        )
+        task_boundary = task_boundary if task_boundary in {"new-task", "replace", "cancel"} else None
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = self._reasoning_json_text(reasoning_details)
         codex_items_json = self._reasoning_json_text(codex_reasoning_items)
@@ -10633,8 +10641,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata, task_epoch_id, task_boundary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -10658,6 +10666,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    task_epoch_id,
+                    task_boundary,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -11065,8 +11075,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata, task_epoch_id, task_boundary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -11090,6 +11100,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
+                    _scrub_surrogates(msg["task_epoch_id"])
+                    if isinstance(msg.get("task_epoch_id"), str) and msg["task_epoch_id"]
+                    else None,
+                    msg.get("task_boundary")
+                    if msg.get("task_boundary") in {"new-task", "replace", "cancel"}
+                    else None,
                 ),
             )
             if isinstance(msg, dict) and cur.lastrowid is not None:
@@ -12001,7 +12017,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
         "_compressed_summary, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, task_epoch_id, task_boundary"
     )
 
     def _rows_to_conversation(
@@ -12066,6 +12082,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 decoded = self._decode_display_metadata(row["display_metadata"])
                 if decoded is not None:
                     msg["display_metadata"] = decoded
+            if row["task_epoch_id"]:
+                msg["task_epoch_id"] = row["task_epoch_id"]
+            if row["task_boundary"]:
+                msg["task_boundary"] = row["task_boundary"]
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
             if row["timestamp"]:

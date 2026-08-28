@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 
 import pytest
 
@@ -90,3 +91,16 @@ def test_replay_defaults_are_safe():
     assert config.read_only is True
     assert config.max_concurrency == 2
     assert config.execute_real_tools is False
+
+
+def test_export_and_replay_leave_source_and_worktree_unchanged(tmp_path):
+    source = _source(tmp_path)
+    corpus = tmp_path / "corpus"
+    before_db = source.read_bytes()
+    before_status = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+
+    export_compression_trace(source, "source-session", corpus)
+    ReplayRunner(corpus).run(mode="A")
+
+    assert source.read_bytes() == before_db
+    assert subprocess.check_output(["git", "status", "--porcelain"], text=True) == before_status

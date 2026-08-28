@@ -8912,6 +8912,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
                 )
+                self._delete_unreferenced_checkpoint_artifacts(conn)
                 self._delete_unreferenced_system_prompts(conn)
             return ids
 
@@ -11356,6 +11357,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return row["artifact_id"] if row is not None else None
 
+    @staticmethod
+    def _delete_unreferenced_checkpoint_artifacts(conn) -> None:
+        conn.execute(
+            "DELETE FROM checkpoint_artifacts WHERE NOT EXISTS ("
+            "SELECT 1 FROM checkpoint_artifact_refs "
+            "WHERE checkpoint_artifact_refs.artifact_id = checkpoint_artifacts.artifact_id)"
+        )
+
     def active_message_revision_is_current(
         self, revision: ActiveMessageRevision
     ) -> bool:
@@ -13194,6 +13203,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            self._delete_unreferenced_checkpoint_artifacts(conn)
             self._delete_unreferenced_system_prompts(conn)
             return True
 
@@ -13240,6 +13250,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             if cursor.rowcount > 0:
+                self._delete_unreferenced_checkpoint_artifacts(conn)
                 self._delete_unreferenced_system_prompts(conn)
             return cursor.rowcount > 0
 
@@ -13321,6 +13332,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
                 existing,
             )
+            self._delete_unreferenced_checkpoint_artifacts(conn)
             self._delete_unreferenced_system_prompts(conn)
             removed_ids.extend(existing)
             return len(existing)
@@ -13417,6 +13429,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            self._delete_unreferenced_checkpoint_artifacts(conn)
             self._delete_unreferenced_system_prompts(conn)
             return len(session_ids)
 
@@ -13806,6 +13819,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
+            self._delete_unreferenced_checkpoint_artifacts(conn)
             self._delete_unreferenced_system_prompts(conn)
             return len(session_ids)
 

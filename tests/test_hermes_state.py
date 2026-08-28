@@ -1044,6 +1044,53 @@ class TestDeleteAndExport:
         assert db.get_session("s1") is None
         assert db.message_count(session_id="s1") == 0
 
+    def test_last_checkpoint_artifact_reference_collects_its_body(self, db):
+        body = b"oversized causal body"
+        db.create_session("first", "cli")
+        db.create_session("last", "cli")
+        artifact_id = db.store_checkpoint_artifact("first", (1,), body)
+        assert db.store_checkpoint_artifact("last", (2,), body) == artifact_id
+
+        assert db.delete_session("first") is True
+        assert db.get_checkpoint_artifact(artifact_id) == body
+        assert db.delete_session("last") is True
+        assert db.get_checkpoint_artifact(artifact_id) is None
+
+    def test_checkpoint_artifact_gc_covers_bulk_delegate_and_prune(self, db):
+        db.create_session("bulk", "cli")
+        db.create_session("parent", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.create_session("prune", "cli")
+        db.end_session("prune", "done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 100 * 86400, "prune"),
+        )
+        db._conn.commit()
+        artifact_ids = {
+            "bulk": db.store_checkpoint_artifact("bulk", (1,), b"bulk body"),
+            "delegate": db.store_checkpoint_artifact("delegate", (2,), b"delegate body"),
+            "prune": db.store_checkpoint_artifact("prune", (3,), b"prune body"),
+        }
+
+        assert db.delete_sessions(["bulk"]) == 1
+        assert db.delete_session("parent") is True
+        assert db.prune_sessions(older_than_days=90) == 1
+        assert all(db.get_checkpoint_artifact(artifact_id) is None for artifact_id in artifact_ids.values())
+
+    def test_empty_session_cleanup_collects_checkpoint_artifacts(self, db):
+        db.create_session("empty", "cli")
+        db.end_session("empty", "done")
+        artifact_id = db.store_checkpoint_artifact("empty", (1,), b"empty session body")
+
+        assert db.delete_empty_sessions() == 1
+        assert db.get_checkpoint_artifact(artifact_id) is None
+
 
 
 

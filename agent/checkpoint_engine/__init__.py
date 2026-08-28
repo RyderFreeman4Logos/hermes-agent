@@ -2089,7 +2089,6 @@ class CheckpointContextEngine(ContextEngine):
             for disposition in shard.dispositions
             if (
                 disposition.status == "reconstructible"
-                and disposition.high_risk
                 and disposition.recovery_ref is not None
             )
         }))

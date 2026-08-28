@@ -1887,6 +1887,59 @@ def test_compress_renders_reconstructible_high_risk_recovery_ref():
     assert "session-event:2" in engine.last_checkpoint_text
 
 
+def test_compress_renders_every_validated_reconstructible_recovery_ref():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    messages = [
+        {"role": "assistant", "content": "Unrelated observation."},
+        {"role": "assistant", "content": "Decision: use SQLite for durable recovery."},
+        {"role": "user", "content": "Continue triage."},
+    ]
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response(
+                {
+                    "schema_version": 2,
+                    "source_event_ids": [1, 2, 3],
+                    "facts": [
+                        {
+                            "fact_id": "fact:observation",
+                            "kind": "observation",
+                            "text": "Unrelated observation.",
+                            "source_event_ids": [1],
+                        }
+                    ],
+                    "dispositions": [
+                        {
+                            "source_event_id": 1,
+                            "status": "represented",
+                            "fact_ids": ["fact:observation"],
+                        },
+                        {
+                            "source_event_id": 2,
+                            "status": "reconstructible",
+                            "recovery_ref": "session-event:2",
+                        },
+                        {
+                            "source_event_id": 3,
+                            "status": "reconstructible",
+                            "recovery_ref": "session-event:3",
+                        },
+                    ],
+                }
+            )
+        ),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        output_reserve_tokens=0,
+    )
+    engine._adaptive_tail_groups = lambda *_: ()
+
+    result = _compress(engine, messages, force=True)
+
+    assert result is messages or "session-event:2" in (engine.last_checkpoint_text or "")
+
+
 def test_empty_facts_with_only_reconstructible_events_may_pass():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 

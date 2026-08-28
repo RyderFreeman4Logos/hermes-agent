@@ -20813,3 +20813,100 @@ def test_prompt_submit_message_complete_preserves_cache_provenance(monkeypatch):
     assert record["request_index"] == 1
     assert isinstance(record["session"], str) and len(record["session"]) == 64
     assert isinstance(record["timestamp"], float)
+
+
+def test_message_complete_event_includes_completion_timestamp(monkeypatch):
+    emitted = []
+    payload = {"text": "done"}
+    monkeypatch.setattr(server, "write_json", emitted.append)
+    monkeypatch.setattr(server.time, "time", lambda: 1_700_000_000.25)
+
+    server._emit("message.complete", "sid", payload)
+
+    assert emitted[0]["params"]["payload"] == {
+        "completed_at": 1_700_000_000.25,
+        "text": "done",
+    }
+    assert payload == {"text": "done"}
+
+
+def test_prompt_submit_message_complete_prefers_first_call_cache_usage(monkeypatch):
+    emitted: list[tuple[str, str, dict]] = []
+
+    class _Agent:
+        _first_turn_usage = {
+            "cache_read_tokens": 1_740,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 2_000,
+        }
+        _last_turn_usage = {
+            "cache_read_tokens": 4_000,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 4_000,
+        }
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["cache-info-sid"] = _session(agent=_Agent())
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(
+            server,
+            "_emit",
+            lambda event_type, sid, payload=None: emitted.append(
+                (event_type, sid, payload)
+            ),
+        )
+
+        response = server.handle_request(
+            {
+                "id": "cache-info",
+                "method": "prompt.submit",
+                "params": {"session_id": "cache-info-sid", "text": "hi"},
+            }
+        )
+        assert response.get("result")
+    finally:
+        server._sessions.pop("cache-info-sid", None)
+
+    complete = [
+        payload for event, _sid, payload in emitted if event == "message.complete"
+    ]
+    assert complete[-1]["cache_info"]["pct"] == 87
+
+
+def test_tui_cache_callback_emits_first_call_cache_status(monkeypatch):
+    agent = types.SimpleNamespace(
+        session_id="cache-agent-session",
+        _tui_first_provider_response_record_enabled=True,
+    )
+    emitted: list[tuple[str, str, dict]] = []
+    sid = "cache-sid"
+    monkeypatch.setitem(server._sessions, sid, {"agent": agent})
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, session_id, payload: emitted.append(
+            (event_type, session_id, payload)
+        ),
+    )
+
+    assert server._attach_tui_cache_callback(agent, sid) is agent
+    agent._tui_cache_callback("hit", 87, 1_740, 2_000)
+
+    assert emitted == [
+        ("status.update", "cache-sid", {"kind": "cache_hit", "text": "cache 87%"})
+    ]

@@ -11477,10 +11477,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def list_compression_runs(self, session_id: str) -> List[Dict[str, Any]]:
         if not isinstance(session_id, str) or not session_id:
             return []
-        with self._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT * FROM compression_runs WHERE session_id = ? ORDER BY run_id", (session_id,)
-            ).fetchall()
+        try:
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM compression_runs WHERE session_id = ? ORDER BY run_id", (session_id,)
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if str(exc).lower().strip() != "no such table: compression_runs":
+                raise
+            return []
         return [self._compression_run_row(row) for row in rows]
 
     def complete_compression_run(

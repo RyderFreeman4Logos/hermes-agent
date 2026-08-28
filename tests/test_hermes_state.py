@@ -1120,6 +1120,13 @@ class TestDeleteAndExport:
         assert db.delete_empty_sessions() == 1
         assert db.get_checkpoint_artifact(artifact_id) is None
 
+    def test_list_compression_runs_missing_table_returns_empty(self, db):
+        db.create_session("legacy", "cli")
+        db._conn.execute("DROP TABLE compression_runs")
+        db._conn.commit()
+
+        assert db.list_compression_runs("legacy") == []
+
     def test_compression_run_trace_uses_cas_and_cascades_with_its_session(self, db):
         db.create_session("trace", "cli")
 

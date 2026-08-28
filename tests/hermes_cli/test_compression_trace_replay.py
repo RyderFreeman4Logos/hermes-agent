@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 import subprocess
 
 import pytest
@@ -38,6 +39,35 @@ def _add_session(db, session_id, content):
     db.create_session(session_id, "cli", model="stored-model")
     db.append_message(session_id, "user", content)
     db.append_message(session_id, "assistant", "I will inspect it.")
+
+
+def _legacy_source(tmp_path):
+    path = tmp_path / "legacy-state.db"
+    db = SessionDB(path)
+    db.create_session("legacy-session", "cli", model="stored-model")
+    db.append_message("legacy-session", "user", "Keep the branch and run tests.")
+    db.append_message("legacy-session", "assistant", "I will inspect it.")
+    db.close()
+
+    legacy = sqlite3.connect(path)
+    try:
+        legacy.execute("DROP TABLE compression_runs")
+        legacy.commit()
+    finally:
+        legacy.close()
+    return path
+
+
+def test_export_reconstructs_legacy_missing_compression_runs_table(tmp_path):
+    source = _legacy_source(tmp_path)
+
+    manifest = export_compression_trace(source, "legacy-session", tmp_path / "corpus")
+
+    assert manifest["compression_count"] == 1
+    assert manifest["trace_classification"] == "partial"
+    assert manifest["trace_classification"] != "exact"
+    metadata = json.loads((tmp_path / "corpus" / "points" / "1" / "metadata.json").read_text())
+    assert metadata["status"] == "reconstructed"
 
 
 def test_export_source_hash_ignores_other_session_growth(tmp_path):

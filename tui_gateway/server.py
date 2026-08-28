@@ -28,6 +28,11 @@ from agent.memory_provider import (
     normalize_memory_provider_mode,
     persisted_memory_provider_mode,
 )
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    POST_COMPRESSION_CACHE_NOTE,
+    cache_hit_percent,
+)
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
     INDICATOR_STYLES,
@@ -5448,6 +5453,13 @@ def _compress_session_history(
     )
 
     agent = session["agent"]
+    compressor = getattr(agent, "context_compressor", None)
+    cache_attribution_pending_before = bool(
+        getattr(agent, "_awaiting_cache_usage_after_compression", False)
+    )
+    real_usage_pending_before = bool(
+        getattr(compressor, "awaiting_real_usage_after_compression", False)
+    )
     # Snapshot history under the lock so the LLM-bound compression call
     # below does NOT hold history_lock for the duration of the request —
     # otherwise other handlers acquiring the lock (prompt.submit etc.)
@@ -5536,6 +5548,13 @@ def _compress_session_history(
                 agent,
                 committed=False,
             )
+            agent._awaiting_cache_usage_after_compression = (
+                cache_attribution_pending_before
+            )
+            if compressor is not None and hasattr(
+                compressor, "awaiting_real_usage_after_compression"
+            ):
+                compressor.awaiting_real_usage_after_compression = real_usage_pending_before
             usage = _get_usage(agent)
             return 0, usage
         session["history"] = compressed
@@ -5724,7 +5743,7 @@ def _cache_counter_snapshot(agent) -> dict[str, int | None]:
 def _cache_info_for_turn(agent, baseline: dict[str, int | None] | None) -> dict[str, int | str]:
     current = _cache_counter_snapshot(agent)
     if current["read_tokens"] is None or current["write_tokens"] is None:
-        return {"state": "unavailable", "pct": 0}
+        return {"state": "unavailable", "pct": 0, "level": "error"}
     before = baseline or {key: 0 for key in current}
     delta = {
         key: max(0, int(current[key] or 0) - int(before.get(key, 0) or 0))
@@ -5734,14 +5753,15 @@ def _cache_info_for_turn(agent, baseline: dict[str, int | None] | None) -> dict[
     read_tokens = delta["read_tokens"]
     write_tokens = delta["write_tokens"]
     if delta["calls"] == 0 or prompt_tokens == 0:
-        return {"state": "unavailable", "pct": 0}
-    pct = round(100 * read_tokens / prompt_tokens)
+        return {"state": "unavailable", "pct": 0, "level": "error"}
+    pct = cache_hit_percent(read_tokens, prompt_tokens)
     state = "hit" if read_tokens else "cold_write" if write_tokens else "miss"
     return {
         "state": state,
         "pct": pct,
         "read_tokens": read_tokens,
         "prompt_tokens": prompt_tokens,
+        "level": _cache_level(pct),
     }
 
 
@@ -5755,13 +5775,21 @@ def _cache_status_text(info: dict[str, int | str]) -> str:
     if "read_tokens" in info and "prompt_tokens" in info:
         counts = f" {int(info['read_tokens'])}/{int(info['prompt_tokens'])}"
     if state == "cold_write":
-        return f"cache COLD_WRITE{counts}"
-    return f"cache {label}{counts}"
+        text = f"cache COLD_WRITE{counts}"
+    else:
+        text = f"cache {label}{counts}"
+    if info.get("attribution") == "post_compression":
+        text += f" · {POST_COMPRESSION_CACHE_NOTE}"
+    return text
+
+
+def _cache_level(pct: int) -> str:
+    return "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info"
 
 
 def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
     if not isinstance(record, dict):
-        return {"state": "unavailable", "pct": 0}
+        return {"state": "unavailable", "pct": 0, "level": "error"}
     info: dict[str, int | str] = {
         "state": str(record.get("state") or "unavailable"),
         "pct": int(record.get("pct") or 0),
@@ -5774,38 +5802,45 @@ def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
                 pass
     if info["state"] == "no_field":
         info["state"] = "unavailable"
+    info["level"] = _cache_level(int(info["pct"]))
+    if record.get("attribution") == "post_compression":
+        info["attribution"] = "post_compression"
     return info
 
 
 def _cache_info_from_usage(usage: Any) -> dict[str, int | str]:
     if not isinstance(usage, dict):
-        return {"state": "unavailable", "pct": 0}
+        return {"state": "unavailable", "pct": 0, "level": "error"}
     try:
         read_tokens = max(0, int(usage.get("cache_read_tokens", 0) or 0))
         write_tokens = max(0, int(usage.get("cache_write_tokens", 0) or 0))
         prompt_tokens = max(0, int(usage.get("prompt_tokens", 0) or 0))
     except (TypeError, ValueError):
-        return {"state": "unavailable", "pct": 0}
+        return {"state": "unavailable", "pct": 0, "level": "error"}
     telemetry = usage.get("cache_telemetry")
     if telemetry is None and (read_tokens or write_tokens):
         telemetry = "reported"
     if telemetry != "reported":
-        return {"state": "unavailable", "pct": 0}
+        return {"state": "unavailable", "pct": 0, "level": "error"}
     if read_tokens:
         state = "hit"
-        pct = round(100 * read_tokens / prompt_tokens) if prompt_tokens else 0
+        pct = cache_hit_percent(read_tokens, prompt_tokens)
     elif write_tokens:
         state = "cold_write"
         pct = 0
     else:
         state = "miss"
         pct = 0
-    return {
+    cache_info: dict[str, int | str] = {
         "read_tokens": read_tokens,
         "prompt_tokens": prompt_tokens,
         "pct": pct,
         "state": state,
+        "level": _cache_level(pct),
     }
+    if usage.get("cache_attribution") == "post_compression":
+        cache_info["attribution"] = "post_compression"
+    return cache_info
 
 
 def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
@@ -5820,7 +5855,11 @@ def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
         and "prompt_tokens" not in info
         and agent is not None
     ):
-        info = _cache_info_for_turn(agent, session.get("_cache_counter_baseline"))
+        usage_info = _cache_info_from_usage(getattr(agent, "_first_turn_usage", None))
+        if usage_info["state"] != "unavailable":
+            info = usage_info
+        else:
+            info = _cache_info_for_turn(agent, session.get("_cache_counter_baseline"))
     session["first_provider_response"] = {
         **info,
         "owner": "tui_gateway",
@@ -5837,7 +5876,7 @@ def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
             "status.update",
             sid,
             {
-                "kind": "cache_hit",
+                "kind": "error" if info.get("level") == "error" else "cache_hit",
                 "text": _cache_status_text(info),
                 "cache_record": session["first_provider_response"],
             },
@@ -5863,14 +5902,34 @@ def _attach_tui_cache_callback(agent, sid: str):
         if getattr(agent, "_tui_first_provider_response_recorded", False):
             return
         agent._tui_first_provider_response_recorded = True
-        text = (
-            f"cache {pct}%"
-            if state == "hit"
-            else "cache unavailable"
-            if state == "no_field"
-            else f"cache {state.upper()}"
+        cache_info = _cache_info_from_usage(
+            getattr(agent, "_first_turn_usage", None)
         )
-        payload: dict[str, Any] = {"kind": "cache_hit", "text": text}
+        if cache_info["state"] == "unavailable":
+            cache_info = {
+                "read_tokens": _read,
+                "prompt_tokens": _prompt,
+                "pct": pct,
+                "state": state,
+                "level": _cache_level(pct),
+            }
+        if isinstance(record, dict) and record.get("attribution") == "post_compression":
+            cache_info["attribution"] = "post_compression"
+        cache_state = str(cache_info.get("state") or state)
+        cache_pct = int(cache_info.get("pct") or 0)
+        text = (
+            f"cache {cache_pct}%"
+            if cache_state == "hit"
+            else "cache unavailable"
+            if cache_state in {"no_field", "unavailable"}
+            else f"cache {cache_state.upper()}"
+        )
+        if cache_info.get("attribution") == "post_compression":
+            text += f" · {POST_COMPRESSION_CACHE_NOTE}"
+        payload: dict[str, Any] = {
+            "kind": "error" if cache_info.get("level") == "error" else "cache_hit",
+            "text": text,
+        }
         if isinstance(record, dict):
             cache_record = {key: value for key, value in record.items() if value is not None}
             for key, raw in (("read_tokens", _read), ("prompt_tokens", _prompt)):
@@ -5883,11 +5942,16 @@ def _attach_tui_cache_callback(agent, sid: str):
                 if count >= 0:
                     cache_record[key] = count
             cache_record.update(
+                state=cache_state,
+                pct=cache_pct if cache_state == "hit" else None,
+                level=cache_info.get("level", _cache_level(cache_pct)),
                 owner="tui_gateway",
                 session=hashlib.sha256(
                     f"{sid}:{getattr(agent, 'session_id', '')}".encode()
                 ).hexdigest(),
             )
+            if cache_info.get("attribution") == "post_compression":
+                cache_record["attribution"] = "post_compression"
             session["first_provider_response"] = cache_record
             session["_cache_status_emitted"] = True
             payload["cache_record"] = cache_record

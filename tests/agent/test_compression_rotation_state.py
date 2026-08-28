@@ -52,6 +52,7 @@ def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegr
     compressor.compression_count = 1
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0
+    compressor.awaiting_real_usage_after_compression = False
     compressor._last_summary_error = None
     compressor._last_compress_aborted = False
     compressor._last_summary_auth_failure = False
@@ -112,6 +113,10 @@ class TestGoalMigratesOnRotation:
                 agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
                 child = agent.session_id
                 assert child != parent  # rotation happened
+                assert getattr(
+                    agent, "context_compressor"
+                ).awaiting_real_usage_after_compression is True
+                assert getattr(agent, "_awaiting_cache_usage_after_compression") is True
 
                 migrated = goals.load_goal(child)
                 assert migrated is not None
@@ -155,6 +160,10 @@ class TestOrphanRollbackOnCreateFailure:
         assert parent_row is not None
         assert parent_row["ended_at"] is None
         assert db.find_live_compression_child(parent) is None
+        assert getattr(
+            agent, "context_compressor"
+        ).awaiting_real_usage_after_compression is False
+        assert not getattr(agent, "_awaiting_cache_usage_after_compression", False)
 
 
 class TestWorkspaceMetadataFollowsRotation:

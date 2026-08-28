@@ -2268,7 +2268,7 @@ describe('createGatewayEventHandler', () => {
         expect(appended).toEqual([
           { role: 'assistant', text: 'final answer' },
           {
-            eventTone: 'warn',
+            tone: 'error',
             kind: 'event',
             role: 'system',
             text: 'agent loop stop at 14:23:05  cache <1% 3/4000'
@@ -2321,7 +2321,7 @@ describe('createGatewayEventHandler', () => {
         expect(appended).toEqual([
           { role: 'assistant', text: 'final answer' },
           {
-            eventTone: 'warn',
+            tone: 'error',
             kind: 'event',
             role: 'system',
             text: 'agent loop stop at 14:23:05  cache 49% 1960/4000'
@@ -2350,7 +2350,7 @@ describe('createGatewayEventHandler', () => {
         expect(appended).toEqual([
           { role: 'assistant', text: 'final answer' },
           {
-            eventTone: 'warn',
+            tone: 'error',
             kind: 'event',
             role: 'system',
             text: 'agent loop stop at 14:23:05  cache miss 0/4000'

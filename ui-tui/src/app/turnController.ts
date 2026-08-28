@@ -30,6 +30,8 @@ const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
 type CacheInfo = {
+  attribution?: 'post_compression'
+  level?: 'error' | 'info'
   pct?: number
   prompt_tokens?: number
   read_tokens?: number
@@ -46,19 +48,22 @@ const cacheFootnote = (cacheInfo?: CacheInfo): null | string => {
   if (cacheInfo.state === 'hit') {
     const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
     const pair = hasCounts ? ` ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : ''
+    const attribution = cacheInfo.attribution === 'post_compression' ? ' · post-compression cold prefix (expected)' : ''
 
     return hasCounts && cacheInfo.read_tokens! * 100 < cacheInfo.prompt_tokens!
-      ? `cache <1%${pair}`
-      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}`
+      ? `cache <1%${pair}${attribution}`
+      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}${attribution}`
   }
 
   if (cacheInfo.state === 'miss') {
     const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
+    const miss = hasCounts ? `cache miss ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : 'cache miss'
 
-    return hasCounts ? `cache miss ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : 'cache miss'
+    return `${miss}${cacheInfo.attribution === 'post_compression' ? ' · post-compression cold prefix (expected)' : ''}`
   }
 
-  return cacheInfo.state === 'cold_write' ? 'cache COLD_WRITE' : `cache ${cacheInfo.state}`
+  const state = cacheInfo.state === 'cold_write' ? 'cache COLD_WRITE' : `cache ${cacheInfo.state}`
+  return `${state}${cacheInfo.attribution === 'post_compression' ? ' · post-compression cold prefix (expected)' : ''}`
 }
 
 const isLowCacheHit = (cacheInfo?: CacheInfo): boolean => {
@@ -67,7 +72,9 @@ const isLowCacheHit = (cacheInfo?: CacheInfo): boolean => {
   }
 
   return (
-    cacheInfo.state === 'miss' || (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50)
+    cacheInfo.level === 'error' ||
+    cacheInfo.state === 'miss' ||
+    (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50)
   )
 }
 
@@ -100,7 +107,7 @@ const turnCompletionLine = (payload: { cache_info?: CacheInfo; completed_at?: nu
     kind: 'event',
     role: 'system',
     text: [completion, cache].filter(Boolean).join('  '),
-    ...(isLowCacheHit(payload.cache_info) ? { eventTone: 'warn' as const } : {})
+    ...(isLowCacheHit(payload.cache_info) ? { tone: 'error' as const } : {})
   }
 }
 

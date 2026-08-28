@@ -13,6 +13,8 @@ from utils import base_url_host_matches, base_url_hostname
 logger = logging.getLogger(__name__)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
+CACHE_HIT_ERROR_THRESHOLD = 95
+POST_COMPRESSION_CACHE_NOTE = "post-compression cold prefix (expected)"
 
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
@@ -68,6 +70,10 @@ CostSource = Literal[
     "custom_contract",
     "none",
 ]
+
+
+def cache_hit_percent(cache_read_tokens: int, prompt_tokens: int) -> int:
+    return round(100 * cache_read_tokens / prompt_tokens) if prompt_tokens > 0 else 0
 
 
 @dataclass(frozen=True)

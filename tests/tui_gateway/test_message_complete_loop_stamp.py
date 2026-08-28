@@ -181,7 +181,7 @@ def test_cache_info_omits_tokens_when_counts_missing():
 
 def test_usage_without_cache_telemetry_does_not_fake_token_counts():
     info = server._cache_info_from_usage({"prompt_tokens": 4_000})
-    assert info == {"state": "unavailable", "pct": 0}
+    assert info == {"state": "unavailable", "pct": 0, "level": "error"}
 
 
 def test_message_complete_does_not_reuse_prior_loop_cache_info(frames, turn_env):

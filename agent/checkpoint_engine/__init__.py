@@ -209,6 +209,7 @@ class MapDisposition:
     fact_ids: tuple[str, ...] = ()
     duplicate_of: Optional[int] = None
     recovery_ref: Optional[str] = None
+    high_risk: bool = field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -1732,6 +1733,7 @@ class CheckpointContextEngine(ContextEngine):
                 continue
             validated.append(fact)
         validated_by_id = {fact.fact_id: fact for fact in validated}
+        validated_dispositions = []
         for disposition in shard.dispositions:
             if disposition.status == "represented" and (
                 not set(disposition.fact_ids) <= set(validated_by_id)
@@ -1757,7 +1759,10 @@ class CheckpointContextEngine(ContextEngine):
                 or (high_risk and disposition.status == "noise")
             ):
                 return None
-        return MapShard(shard.source_event_ids, tuple(validated), shard.dispositions)
+            validated_dispositions.append(replace(disposition, high_risk=high_risk))
+        return MapShard(
+            shard.source_event_ids, tuple(validated), tuple(validated_dispositions)
+        )
 
     @staticmethod
     def _map_shard_cache_key(
@@ -2043,7 +2048,11 @@ class CheckpointContextEngine(ContextEngine):
             disposition.recovery_ref
             for shard in shards
             for disposition in shard.dispositions
-            if disposition.status == "reconstructible" and disposition.recovery_ref is not None
+            if (
+                disposition.status == "reconstructible"
+                and disposition.high_risk
+                and disposition.recovery_ref is not None
+            )
         }))
         return ReducedState(
             lanes.active_intent,

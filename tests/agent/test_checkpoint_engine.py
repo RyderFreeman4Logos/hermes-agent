@@ -3212,6 +3212,61 @@ def test_acknowledgments_do_not_replace_actionable_root_task():
     assert lanes.active_intent.event_indices[0] == 0
 
 
+def test_chinese_and_mixed_language_intent_epochs():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    english_root = "Implement the checkpoint engine."
+    chinese_correction = "另外，不要使用主模型作为fallback"
+    chinese_constraint = "必须保持并发默认值为2"
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        [
+            {"role": "user", "content": english_root},
+            {"role": "user", "content": "嗯，继续"},
+            {"role": "user", "content": chinese_correction},
+            {"role": "user", "content": chinese_constraint},
+        ],
+        (101, 102, 103, 104),
+    )
+
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.content.splitlines() == [
+        english_root,
+        chinese_correction,
+        chinese_constraint,
+    ]
+    assert lanes.active_intent.source_event_ids == (101, 103, 104)
+    assert CheckpointContextEngine._constraint_spans(chinese_constraint) == (
+        chinese_constraint,
+    )
+
+    chinese_root = "实现检查点引擎。"
+    english_correction = "Also, do not use the main model as fallback."
+    mixed_lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        [
+            {"role": "user", "content": chinese_root},
+            {"role": "user", "content": english_correction},
+        ],
+        (201, 202),
+    )
+    assert mixed_lanes.active_intent is not None
+    assert mixed_lanes.active_intent.content.splitlines() == [
+        chinese_root,
+        english_correction,
+    ]
+
+    replacement = "现在换一个任务：文档化 API。"
+    epoch_lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        [
+            {"role": "user", "content": chinese_root},
+            {"role": "user", "content": replacement},
+        ],
+        (301, 302),
+    )
+    assert epoch_lanes.active_intent is not None
+    assert epoch_lanes.active_intent.content == replacement
+    assert epoch_lanes.active_intent.source_event_ids == (302,)
+
+
 def test_synthetic_compression_handoff_never_enters_active_intent():
     from agent.checkpoint_engine import CheckpointContextEngine
     from agent.conversation_compression import _is_real_user_message

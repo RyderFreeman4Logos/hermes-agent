@@ -103,7 +103,23 @@ _ACK_ONLY = frozenset(
         "lgtm",
         "please continue",
         "keep going",
+        "嗯",
+        "好",
+        "继续",
+        "嗯，继续",
     }
+)
+_NEW_TASK_MARKERS = ("new task:",)
+_NEW_TASK_PREFIXES = (
+    "cancel the current task",
+    "cancel the previous task",
+    "forget the current task",
+    "forget the previous task",
+    "ignore the current task",
+    "ignore the previous task",
+    "replace the current task",
+    "replace the previous task",
+    "现在换一个任务",
 )
 _INTENT_OVERFLOW_CHARS = 1200
 _CONSTRAINT_LINE_PREFIXES = (
@@ -116,6 +132,8 @@ _CONSTRAINT_LINE_PREFIXES = (
     "acceptance ",
     "constraint:",
     "hard constraint",
+    "必须",
+    "不要",
 )
 _CHECKPOINT_BASE64_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
@@ -605,26 +623,17 @@ class CheckpointContextEngine(ContextEngine):
 
     @staticmethod
     def _normalized_user_text(text: str) -> str:
-        return " ".join(text.lower().split())
+        return " ".join(text.casefold().split())
 
     @classmethod
-    def _is_ack_only(cls, text: str) -> bool:
-        return cls._normalized_user_text(text).rstrip(".!") in _ACK_ONLY
+    def _is_ack_only(cls, normalized_text: str) -> bool:
+        return normalized_text.rstrip(".!。！？") in _ACK_ONLY
 
     @classmethod
-    def _is_new_task(cls, text: str) -> bool:
-        lowered = cls._normalized_user_text(text)
-        return "new task:" in lowered or lowered.startswith(
-            (
-                "cancel the current task",
-                "cancel the previous task",
-                "forget the current task",
-                "forget the previous task",
-                "ignore the current task",
-                "ignore the previous task",
-                "replace the current task",
-                "replace the previous task",
-            )
+    def _is_new_task(cls, normalized_text: str) -> bool:
+        return (
+            any(marker in normalized_text for marker in _NEW_TASK_MARKERS)
+            or normalized_text.startswith(_NEW_TASK_PREFIXES)
         )
 
     @classmethod
@@ -634,8 +643,10 @@ class CheckpointContextEngine(ContextEngine):
             stripped = line.strip()
             if not stripped:
                 continue
-            probe = stripped.lower()
-            if any(probe.startswith(prefix) for prefix in _CONSTRAINT_LINE_PREFIXES):
+            if any(
+                cls._normalized_user_text(stripped).startswith(prefix)
+                for prefix in _CONSTRAINT_LINE_PREFIXES
+            ):
                 spans.append(stripped)
         return tuple(spans)
 
@@ -666,7 +677,7 @@ class CheckpointContextEngine(ContextEngine):
     ) -> Optional[ActiveIntent]:
         from agent.conversation_compression import _is_real_user_message
 
-        turns: list[tuple[int, str]] = []
+        turns: list[tuple[int, str, str]] = []
         for index, message in enumerate(messages):
             if real_user_source_event_ids is not None:
                 if (
@@ -678,24 +689,24 @@ class CheckpointContextEngine(ContextEngine):
                 continue
             text = cls._user_text(message)
             if text is not None:
-                turns.append((index, text))
+                turns.append((index, text, cls._normalized_user_text(text)))
         if not turns:
             return None
 
         parts: list[str] = []
         indices: list[int] = []
-        for index, text in turns:
-            if cls._is_ack_only(text):
+        for index, text, normalized_text in turns:
+            if cls._is_ack_only(normalized_text):
                 continue
             projected = cls._project_intent_text(text)
-            if not parts or cls._is_new_task(text):
+            if not parts or cls._is_new_task(normalized_text):
                 parts = [projected]
                 indices = [index]
                 continue
             parts.append(projected)
             indices.append(index)
         if not parts:
-            index, text = turns[-1]
+            index, text, _normalized_text = turns[-1]
             return ActiveIntent(
                 cls._project_intent_text(text),
                 (index,),

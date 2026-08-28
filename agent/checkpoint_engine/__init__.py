@@ -721,16 +721,19 @@ class CheckpointContextEngine(ContextEngine):
         parts: list[str] = []
         indices: list[int] = []
         active_epoch = None
+        structured_no_active = False
         for index, text, normalized_text, epoch, boundary in turns:
             epoch_changed = epoch is not None and epoch != active_epoch
             if epoch_changed or boundary in {"new-task", "replace"}:
                 parts = []
                 indices = []
+                structured_no_active = True
                 if epoch is not None:
                     active_epoch = epoch
             if boundary == "cancel":
                 parts = []
                 indices = []
+                structured_no_active = True
                 if epoch is not None:
                     active_epoch = epoch
                 continue
@@ -740,6 +743,7 @@ class CheckpointContextEngine(ContextEngine):
             if not parts or cls._is_new_task(normalized_text):
                 parts = [projected]
                 indices = [index]
+                structured_no_active = False
                 if epoch is not None:
                     active_epoch = epoch
                 continue
@@ -748,7 +752,14 @@ class CheckpointContextEngine(ContextEngine):
             if epoch is not None:
                 active_epoch = epoch
         if not parts:
-            return None
+            if structured_no_active:
+                return None
+            index, text, *_ = turns[-1]
+            return ActiveIntent(
+                cls._project_intent_text(text),
+                (index,),
+                (source_event_ids[index],) if source_event_ids else (),
+            )
         return ActiveIntent(
             "\n".join(parts),
             tuple(indices),
@@ -2035,9 +2046,8 @@ class CheckpointContextEngine(ContextEngine):
                 return existing
         return candidate if cls._fact_position(candidate) >= cls._fact_position(existing) else existing
 
-    @classmethod
     def _reduce(
-        cls,
+        self,
         lanes: DeterministicLanes,
         shards: tuple[MapShard, ...],
         externalized: tuple[ExternalizedArtifact, ...] = (),
@@ -2045,7 +2055,7 @@ class CheckpointContextEngine(ContextEngine):
         """Merge typed Map facts; plan prose never creates a tool effect."""
         records: Dict[str, MapFact] = {}
         for shard in shards:
-            for fact in sorted(shard.facts, key=cls._fact_position):
+            for fact in sorted(shard.facts, key=self._fact_position):
                 if not fact.source_event_ids:
                     if fact.action_state is None:
                         continue
@@ -2059,7 +2069,7 @@ class CheckpointContextEngine(ContextEngine):
                         "blocked",
                         fact.fact_id,
                     )
-                identity = cls._fact_identity(fact)
+                identity = self._fact_identity(fact)
                 authoritative = fact.kind.casefold() in _AUTHORITATIVE_MAP_KINDS
                 for superseded in fact.supersedes:
                     existing = records.get(superseded)
@@ -2076,19 +2086,44 @@ class CheckpointContextEngine(ContextEngine):
                     or previous.kind.casefold() not in _AUTHORITATIVE_MAP_KINDS
                 ):
                     records[identity] = (
-                        fact if previous is None else cls._newer_fact(previous, fact)
+                        fact if previous is None else self._newer_fact(previous, fact)
                     )
         facts = tuple(
-            sorted(records.values(), key=lambda fact: (cls._fact_position(fact), cls._fact_identity(fact)))
+            sorted(records.values(), key=lambda fact: (self._fact_position(fact), self._fact_identity(fact)))
         )
-        recovery_refs = tuple(sorted({
-            disposition.recovery_ref
-            for shard in shards
-            for disposition in shard.dispositions
+        checkpoint_refs = {
+            f"session-event:{message['_row_id']}"
+            for message in self._source_messages or ()
             if (
-                disposition.status == "reconstructible"
-                and disposition.recovery_ref is not None
+                isinstance(message.get("_row_id"), int)
+                and message.get("role") == "assistant"
+                and isinstance(message.get("content"), str)
+                and _CHECKPOINT_HISTORY_PREFIX in message["content"]
             )
+        }
+        inherited_recovery_refs = {
+            reference
+            for message in self._source_messages or ()
+            if (
+                message.get("role") == "assistant"
+                and isinstance(message.get("content"), str)
+                and _CHECKPOINT_HISTORY_PREFIX in message["content"]
+                and message["content"].endswith(_CHECKPOINT_HISTORY_SUFFIX)
+            )
+            for reference in re.findall(r"(?m)^- (session-event:[1-9]\d*)$", message["content"])
+        }
+        recovery_refs = tuple(sorted({
+            *inherited_recovery_refs,
+            *(
+                disposition.recovery_ref
+                for shard in shards
+                for disposition in shard.dispositions
+                if (
+                    disposition.status == "reconstructible"
+                    and disposition.recovery_ref is not None
+                    and disposition.recovery_ref not in checkpoint_refs
+                )
+            ),
         }))
         return ReducedState(
             lanes.active_intent,

@@ -2949,7 +2949,10 @@ def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
     assert engine.last_candidate is not None
     assert engine.last_candidate != messages
     assert engine.last_checkpoint_text is not None
-    assert engine.last_checkpoint_text == "Validated historical source records."
+    assert engine.last_checkpoint_text == (
+        "Validated historical source records.\n\nRecovery references:\n"
+        "- session-event:1\n- session-event:2\n- session-event:3"
+    )
     assert engine.last_wire_tokens is not None
     assert engine.last_wire_tokens > 0
     assert engine.last_map_shards

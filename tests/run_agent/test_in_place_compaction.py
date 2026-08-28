@@ -322,6 +322,64 @@ moa:
             assert agent.session_id == sid
             assert [row["content"] for row in db.get_messages(sid)] == ["msg 0", "msg 1"]
 
+    def test_checkpoint_moa_fails_closed_without_a_bound_prepared_request(self):
+        """A fitting probe cannot authorize a commit before a fresh oversized send."""
+        from types import SimpleNamespace
+
+        from agent.checkpoint_engine import CheckpointContextEngine
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_115900_wirecap_moa_unbound"
+            _seed(db, sid, "wire-cap", n=2)
+            agent = _make_agent(db, sid, in_place=False)
+            agent._build_system_prompt = lambda _message: ""
+            agent._cached_system_prompt = None
+            agent.tools = []
+            checkpoint = CheckpointContextEngine(hard_max_wire_tokens=500, output_reserve_tokens=0)
+            checkpoint.compress = lambda *_args, **_kwargs: [
+                {"role": "user", "content": "short checkpoint"}
+            ]
+            checkpoint._last_compress_aborted = False
+            checkpoint._last_summary_error = None
+            checkpoint.compression_count = 1
+            checkpoint.commit_snapshot_is_current = lambda *_args, **_kwargs: True
+            agent.context_compressor = checkpoint
+            fitting_request = [{"role": "user", "content": "short checkpoint"}]
+            fresh_oversized_request = [{"role": "user", "content": "x " * 10_000}]
+            assert not checkpoint.final_request_exceeds_hard_wire_budget(fitting_request)
+            assert checkpoint.final_request_exceeds_hard_wire_budget(fresh_oversized_request)
+            prepared_calls = []
+
+            def prepare(_messages):
+                prepared_calls.append(None)
+                return {
+                    "messages": (
+                        fitting_request
+                        if len(prepared_calls) == 1
+                        else fresh_oversized_request
+                    )
+                }
+
+            agent.provider = "moa"
+            agent.client = SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(prepare=prepare))
+            )
+            original = [
+                {"role": "user", "content": "msg 0"},
+                {"role": "assistant", "content": "msg 1"},
+            ]
+
+            compressed, _ = compress_context(
+                agent, original, approx_tokens=100_000, system_message="sys"
+            )
+
+            assert compressed is original
+            assert prepared_calls == []
+            assert [row["content"] for row in db.get_messages(sid)] == ["msg 0", "msg 1"]
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB

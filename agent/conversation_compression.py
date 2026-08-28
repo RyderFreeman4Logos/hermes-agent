@@ -2376,14 +2376,9 @@ def _materialize_checkpoint_provider_request(
         )
         final_messages, final_tools = cache_plan.messages, cache_plan.tools
     if agent.provider == "moa":
-        completions = getattr(getattr(agent.client, "chat", None), "completions", None)
-        prepare = getattr(completions, "prepare", None)
-        if not callable(prepare):
-            raise RuntimeError("MoA provider request cannot be prepared")
-        prepared = prepare(final_messages)
-        if not isinstance(prepared, dict) or not isinstance(prepared.get("messages"), list):
-            raise RuntimeError("MoA provider returned an invalid prepared request")
-        final_messages = prepared["messages"]
+        # Generic callers cannot hand this object to their next aggregator call.
+        # Refuse rather than probe-and-discard advisor output before a durable commit.
+        raise RuntimeError("MoA checkpoint request cannot be bound to its next aggregator call")
     return final_messages, final_tools
 
 

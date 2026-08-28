@@ -304,4 +304,7 @@ def export_compression_trace(
 # Short aliases keep the module pleasant for callers and CLI adapters.
 discover_sessions = discover_compression_sessions
 inspect_session = inspect_compression_session
+inspect_trace = inspect_compression_session
+list_compression_sessions = discover_compression_sessions
 export_trace = export_compression_trace
+export_session = export_compression_trace

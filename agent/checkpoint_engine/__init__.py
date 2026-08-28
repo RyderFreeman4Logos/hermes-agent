@@ -270,6 +270,7 @@ class CheckpointContextEngine(ContextEngine):
         max_map_shards: Optional[int] = None,
         semantic_reducer: Optional[Callable[[ReducedState], Any]] = None,
         mode: Optional[str] = None,
+        trace: Optional[bool] = None,
         target_wire_tokens: Optional[int] = None,
         hard_max_wire_tokens: Optional[int] = None,
         token_counter: Optional[Callable[[Any], int]] = None,
@@ -285,6 +286,8 @@ class CheckpointContextEngine(ContextEngine):
         self._mode = mode if mode in {"shadow", "live"} else configured_mode
         if self._mode not in {"shadow", "live"}:
             self._mode = "shadow"
+        configured_trace = checkpoint_config.get("trace", False)
+        self._trace_enabled = trace if isinstance(trace, bool) else configured_trace is True
         configured_hard_max = checkpoint_config.get(
             "hard_max_wire_tokens", _DEFAULT_HARD_MAX_WIRE_TOKENS
         )
@@ -355,6 +358,8 @@ class CheckpointContextEngine(ContextEngine):
         self.last_candidate: Optional[List[Dict[str, Any]]] = None
         self.last_wire_tokens: Optional[int] = None
         self.last_degradation_steps: tuple[str, ...] = ()
+        self.last_compression_run_id: Optional[int] = None
+        self._pending_compression_run_id: Optional[int] = None
         self._session_db = None
         self._session_id = ""
         self._commit_snapshot: Optional[CheckpointCommitSnapshot] = None
@@ -509,7 +514,55 @@ class CheckpointContextEngine(ContextEngine):
         self._source_snapshot = None
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        run_id = self._pending_compression_run_id
+        if kwargs.get("boundary_reason") == "compression" and run_id is not None:
+            session_db = kwargs.get("session_db", self._session_db)
+            old_session_id = kwargs.get("old_session_id")
+            try:
+                complete = getattr(session_db, "complete_compression_run", None)
+                if callable(complete):
+                    complete(
+                        run_id,
+                        session_id,
+                        "in_place" if session_id == old_session_id else "rotated",
+                    )
+            finally:
+                self._pending_compression_run_id = None
         self.bind_session_state(kwargs.get("session_db", self._session_db), session_id)
+
+    def _trace_config_snapshot(self) -> Dict[str, Any]:
+        return {
+            "mode": self._mode,
+            "target_wire_tokens": self._target_wire_tokens,
+            "hard_max_wire_tokens": self._hard_max_wire_tokens,
+            "map_concurrency": self._map_concurrency,
+            "max_map_shards": self._max_map_shards,
+        }
+
+    def _record_compression_trace(
+        self,
+        source_event_ids: tuple[int, ...],
+        pre_projection: List[Dict[str, Any]],
+        post_projection: List[Dict[str, Any]],
+    ) -> None:
+        if not self._trace_enabled:
+            return
+        store = getattr(self._session_db, "store_compression_run", None)
+        if not self._session_id or not callable(store):
+            return
+        try:
+            run_id = store(
+                self._session_id,
+                source_event_ids,
+                self._trace_config_snapshot(),
+                pre_projection,
+                post_projection,
+            )
+        except Exception:
+            return
+        if isinstance(run_id, int) and not isinstance(run_id, bool) and run_id > 0:
+            self.last_compression_run_id = run_id
+            self._pending_compression_run_id = run_id
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         super().on_session_end(session_id, messages)
@@ -2883,6 +2936,7 @@ class CheckpointContextEngine(ContextEngine):
         if candidate == messages:
             self.last_trigger_reason = "replay_unchanged"
             return messages
+        self._record_compression_trace(source_event_ids, durable_messages, candidate)
         self._commit_snapshot = publication_snapshot
         self.compression_count += 1
         self._last_compression_made_progress = True

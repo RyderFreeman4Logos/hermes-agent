@@ -1120,6 +1120,40 @@ class TestDeleteAndExport:
         assert db.delete_empty_sessions() == 1
         assert db.get_checkpoint_artifact(artifact_id) is None
 
+    def test_compression_run_trace_uses_cas_and_cascades_with_its_session(self, db):
+        db.create_session("trace", "cli")
+
+        run_id = db.store_compression_run(
+            "trace",
+            (11, 12),
+            {"mode": "live", "target_wire_tokens": 48_000},
+            [{"role": "user", "content": "before"}],
+            [{"role": "user", "content": "after"}],
+        )
+        trace = db.get_compression_run(run_id)
+
+        assert trace["source_event_ids"] == [11, 12]
+        assert trace["status"] == "prepared"
+        assert json.loads(db.get_checkpoint_artifact(trace["config_artifact_id"])) == {
+            "mode": "live", "target_wire_tokens": 48_000
+        }
+        assert json.loads(db.get_checkpoint_artifact(trace["pre_projection_artifact_id"]))[0]["content"] == "before"
+        assert json.loads(db.get_checkpoint_artifact(trace["post_projection_artifact_id"]))[0]["content"] == "after"
+
+        db.complete_compression_run(run_id, "trace", "in_place")
+        assert db.get_compression_run(run_id)["continuation_session_id"] == "trace"
+        assert db.get_compression_run(run_id)["status"] == "committed"
+
+        assert db.delete_session("trace") is True
+        assert all(
+            db.get_checkpoint_artifact(trace[key]) is None
+            for key in (
+                "config_artifact_id",
+                "pre_projection_artifact_id",
+                "post_projection_artifact_id",
+            )
+        )
+
 
 
 
@@ -1804,6 +1838,31 @@ class TestSchemaInit:
                     f"Column {col_name} declared in SCHEMA_SQL for {table_name} "
                     f"but missing from live DB. Live columns: {live_cols}"
                 )
+
+    def test_compression_trace_schema_migrates_without_touching_existing_cas(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path)
+        db.create_session("existing", "cli")
+        artifact_id = db.store_checkpoint_artifact("existing", (1,), b"existing body")
+        db.close()
+
+        legacy = sqlite3.connect(db_path)
+        try:
+            legacy.execute("DROP INDEX idx_compression_runs_session")
+            legacy.execute("DROP TABLE compression_runs")
+            legacy.execute("UPDATE schema_version SET version = 27")
+            legacy.commit()
+        finally:
+            legacy.close()
+
+        migrated = SessionDB(db_path)
+        try:
+            assert migrated.get_checkpoint_artifact(artifact_id) == b"existing body"
+            assert migrated._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compression_runs'"
+            ).fetchone() is not None
+        finally:
+            migrated.close()
 
 
 class TestReconcileColumnsErrorHandling:

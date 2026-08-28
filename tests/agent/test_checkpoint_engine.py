@@ -2540,6 +2540,72 @@ def test_oversized_group_fails_closed_when_artifact_write_fails(monkeypatch, tmp
     assert engine._last_summary_error == "checkpoint artifactization failed"
 
 
+def test_durable_compression_trace_records_projection_and_boundary(tmp_path):
+    from agent.checkpoint_engine import CheckpointContextEngine
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-session", source="test")
+    for message in (
+        {"role": "user", "content": "must preserve this"},
+        {"role": "assistant", "content": "acknowledged"},
+        {"role": "user", "content": "continue"},
+    ):
+        db.append_message("checkpoint-session", **message)
+    messages = db.get_messages_as_conversation("checkpoint-session", include_row_ids=True)
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        trace=True,
+        output_reserve_tokens=0,
+    )
+    engine.bind_session_state(db, "checkpoint-session")
+
+    result = engine.compress(messages, force=True)
+
+    assert result is not messages
+    trace = db.get_compression_run(engine.last_compression_run_id)
+    assert trace["status"] == "prepared"
+    assert trace["source_event_ids"] == [message["_row_id"] for message in messages]
+    assert json.loads(db.get_checkpoint_artifact(trace["pre_projection_artifact_id"]))[0]["content"] == "must preserve this"
+    assert json.loads(db.get_checkpoint_artifact(trace["post_projection_artifact_id"])) == result
+
+    engine.on_session_start(
+        "checkpoint-session",
+        boundary_reason="compression",
+        old_session_id="checkpoint-session",
+        session_db=db,
+    )
+    assert db.get_compression_run(engine.last_compression_run_id)["status"] == "committed"
+
+
+def test_durable_compression_trace_is_off_by_default(tmp_path):
+    from agent.checkpoint_engine import CheckpointContextEngine
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-session", source="test")
+    for message in (
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old response"},
+        {"role": "user", "content": "continue"},
+    ):
+        db.append_message("checkpoint-session", **message)
+    messages = db.get_messages_as_conversation("checkpoint-session", include_row_ids=True)
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        output_reserve_tokens=0,
+    )
+    engine.bind_session_state(db, "checkpoint-session")
+
+    assert engine.compress(messages, force=True) is not messages
+    assert engine.last_compression_run_id is None
+    assert db.list_compression_runs("checkpoint-session") == []
+
+
 def test_checkpoint_rejects_an_artifact_that_disappears_before_publication(monkeypatch, tmp_path):
     from hermes_state import SessionDB
 

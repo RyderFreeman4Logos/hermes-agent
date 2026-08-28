@@ -11403,11 +11403,132 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return row["artifact_id"] if row is not None else None
 
     @staticmethod
+    def _compression_trace_body(value: Any, *, name: str) -> bytes:
+        try:
+            return json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"compression trace {name} must be JSON serializable") from exc
+
+    def store_compression_run(
+        self,
+        session_id: str,
+        source_event_ids: Any,
+        config_snapshot: Any,
+        pre_projection: Any,
+        post_projection: Any,
+    ) -> int:
+        """Store one prepared compression projection with CAS-backed evidence."""
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("compression trace session is required")
+        source_key = self._checkpoint_artifact_reference_key(source_event_ids)
+        bodies = tuple(
+            self._compression_trace_body(value, name=name)
+            for name, value in (
+                ("config", config_snapshot),
+                ("pre projection", pre_projection),
+                ("post projection", post_projection),
+            )
+        )
+        artifact_ids = tuple(hashlib.sha256(body).hexdigest() for body in bodies)
+
+        def _do(conn):
+            if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
+                raise RuntimeError("compression trace session is missing")
+            for artifact_id, body in zip(artifact_ids, bodies):
+                conn.execute(
+                    "INSERT OR IGNORE INTO checkpoint_artifacts (artifact_id, body) VALUES (?, ?)",
+                    (artifact_id, body),
+                )
+                row = conn.execute(
+                    "SELECT body FROM checkpoint_artifacts WHERE artifact_id = ?", (artifact_id,)
+                ).fetchone()
+                if row is None or bytes(row["body"]) != body:
+                    raise RuntimeError("compression trace artifact durability verification failed")
+            cursor = conn.execute(
+                "INSERT INTO compression_runs "
+                "(session_id, source_event_ids, config_artifact_id, pre_projection_artifact_id, "
+                "post_projection_artifact_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, source_key, *artifact_ids, time.time()),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _compression_run_row(row: Any) -> Dict[str, Any]:
+        result = dict(row)
+        try:
+            result["source_event_ids"] = json.loads(result["source_event_ids"])
+        except (TypeError, ValueError):
+            result["source_event_ids"] = []
+        return result
+
+    def get_compression_run(self, run_id: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT * FROM compression_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return self._compression_run_row(row) if row is not None else None
+
+    def list_compression_runs(self, session_id: str) -> List[Dict[str, Any]]:
+        if not isinstance(session_id, str) or not session_id:
+            return []
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM compression_runs WHERE session_id = ? ORDER BY run_id", (session_id,)
+            ).fetchall()
+        return [self._compression_run_row(row) for row in rows]
+
+    def complete_compression_run(
+        self, run_id: Any, continuation_session_id: str, boundary_kind: str
+    ) -> None:
+        if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+            raise ValueError("compression trace run is required")
+        if not isinstance(continuation_session_id, str) or not continuation_session_id:
+            raise ValueError("compression trace continuation session is required")
+        if boundary_kind not in {"in_place", "rotated"}:
+            raise ValueError("compression trace boundary kind is invalid")
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT status, continuation_session_id, boundary_kind FROM compression_runs "
+                "WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("compression trace run is missing")
+            if row["status"] == "committed":
+                if (
+                    row["continuation_session_id"] == continuation_session_id
+                    and row["boundary_kind"] == boundary_kind
+                ):
+                    return
+                raise RuntimeError("compression trace boundary conflict")
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (continuation_session_id,)
+            ).fetchone() is None:
+                raise RuntimeError("compression trace continuation session is missing")
+            conn.execute(
+                "UPDATE compression_runs SET status = 'committed', continuation_session_id = ?, "
+                "boundary_kind = ?, committed_at = ? WHERE run_id = ?",
+                (continuation_session_id, boundary_kind, time.time(), run_id),
+            )
+
+        self._execute_write(_do)
+
+    @staticmethod
     def _delete_unreferenced_checkpoint_artifacts(conn) -> None:
         conn.execute(
             "DELETE FROM checkpoint_artifacts WHERE NOT EXISTS ("
             "SELECT 1 FROM checkpoint_artifact_refs "
-            "WHERE checkpoint_artifact_refs.artifact_id = checkpoint_artifacts.artifact_id)"
+            "WHERE checkpoint_artifact_refs.artifact_id = checkpoint_artifacts.artifact_id) "
+            "AND artifact_id NOT IN ("
+            "SELECT config_artifact_id FROM compression_runs UNION "
+            "SELECT pre_projection_artifact_id FROM compression_runs UNION "
+            "SELECT post_projection_artifact_id FROM compression_runs)"
         )
 
     def active_message_revision_is_current(

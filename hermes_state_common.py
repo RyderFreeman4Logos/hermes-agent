@@ -326,7 +326,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -376,6 +376,20 @@ CREATE TABLE IF NOT EXISTS checkpoint_artifact_refs (
     source_event_ids TEXT NOT NULL,
     artifact_id TEXT NOT NULL REFERENCES checkpoint_artifacts(artifact_id),
     PRIMARY KEY (session_id, source_event_ids)
+);
+
+CREATE TABLE IF NOT EXISTS compression_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_event_ids TEXT NOT NULL,
+    config_artifact_id TEXT NOT NULL REFERENCES checkpoint_artifacts(artifact_id),
+    pre_projection_artifact_id TEXT NOT NULL REFERENCES checkpoint_artifacts(artifact_id),
+    post_projection_artifact_id TEXT NOT NULL REFERENCES checkpoint_artifacts(artifact_id),
+    status TEXT NOT NULL DEFAULT 'prepared' CHECK (status IN ('prepared', 'committed')),
+    continuation_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    boundary_kind TEXT,
+    created_at REAL NOT NULL,
+    committed_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -561,6 +575,7 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_compression_runs_session ON compression_runs(session_id, run_id DESC);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """

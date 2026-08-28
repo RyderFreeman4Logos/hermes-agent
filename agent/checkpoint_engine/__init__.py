@@ -1803,6 +1803,11 @@ class CheckpointContextEngine(ContextEngine):
                 )
             ):
                 return None
+            if disposition.status == "noise":
+                # Map output has no authority to discard a source event.  Until a
+                # deterministic disposal proof exists, retain it via one of the
+                # explicit carrier statuses instead.
+                return None
             row = rows[disposition.source_event_id]
             content = row.get("content")
             text = content.casefold() if isinstance(content, str) else ""

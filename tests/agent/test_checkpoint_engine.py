@@ -1835,6 +1835,61 @@ def test_sparse_facts_omitting_failed_verification_fail_closed():
     ) is None
 
 
+@pytest.mark.parametrize(
+    "content",
+    (
+        "Decision: retain blue deployment.",
+        "Repository identity: issue #213, branch feat/checkpoint, worktree /tmp/pr213-clean, commit 809da87b, PR #213, file agent/checkpoint_engine/__init__.py.",
+    ),
+)
+def test_compress_rejects_noise_for_binding_decision_or_repository_identity(content):
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    class NoiseClient:
+        def complete(self, **kwargs):
+            payload = json.loads(kwargs["messages"][-1]["content"])
+            return _map_response({
+                "schema_version": 2,
+                "source_event_ids": payload["source_event_ids"],
+                "facts": [
+                    {
+                        "fact_id": "continue",
+                        "kind": "constraint",
+                        "text": "Continue.",
+                        "source_event_ids": [payload["source_event_ids"][-1]],
+                    }
+                ],
+                "dispositions": [
+                    (
+                        {"source_event_id": event["source_event_id"], "status": "noise"}
+                        if event["message"].get("content") == content
+                        else {
+                            "source_event_id": event["source_event_id"],
+                            "status": "reconstructible",
+                            "recovery_ref": f"session-event:{event['source_event_id']}",
+                        }
+                    )
+                    for event in payload["events"]
+                ],
+            })
+
+    messages = [
+        {"role": "assistant", "content": content},
+        {"role": "user", "content": "Continue."},
+    ]
+    engine = CheckpointContextEngine(
+        auxiliary_client=NoiseClient(),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        target_wire_tokens=1_000_000,
+        hard_max_wire_tokens=1_200_000,
+        output_reserve_tokens=0,
+    )
+
+    assert _compress(engine, messages, force=True) is messages
+    assert engine.last_map_shards == ()
+
+
 def test_compress_renders_reconstructible_high_risk_recovery_ref():
     from agent.checkpoint_engine import CheckpointContextEngine
 

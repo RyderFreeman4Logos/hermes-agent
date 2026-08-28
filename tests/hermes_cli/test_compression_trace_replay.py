@@ -5,7 +5,7 @@ import subprocess
 import pytest
 
 from hermes_state import SessionDB
-from hermes_cli.compression_trace import export_compression_trace
+from hermes_cli.compression_trace import discover_compression_sessions, export_compression_trace
 from hermes_cli.compression_replay import (
     ReplayConfig,
     ReplaySafetyError,
@@ -32,6 +32,44 @@ def _source(tmp_path):
     db.complete_compression_run(run_id, "source-session", "in_place")
     db.close()
     return path
+
+
+def test_discovery_only_labels_committed_evidenced_traces_exact(tmp_path):
+    source = _source(tmp_path)
+    db = SessionDB(source)
+    db.create_session("prepared-session", "cli", model="stored-model")
+    prepared_id = db.append_message("prepared-session", "user", "Prepared only.")
+    db.store_compression_run(
+        "prepared-session",
+        [prepared_id],
+        {"engine": "lean"},
+        {"messages": []},
+        {"messages": []},
+    )
+
+    db.create_session("partial-session", "cli", model="stored-model")
+    partial_run_id = db.store_compression_run(
+        "partial-session",
+        [999999],
+        {"engine": "lean"},
+        {"messages": []},
+        {"messages": []},
+    )
+    db.complete_compression_run(partial_run_id, "partial-session", "in_place")
+
+    db.create_session("reconstructed-session", "cli", model="stored-model")
+    db.append_message("reconstructed-session", "assistant", "Reconstructed.", _compressed_summary=True)
+    db.close()
+
+    discovered = {
+        item["id"]: item
+        for item in discover_compression_sessions(source)
+    }
+
+    assert discovered["source-session"]["trace_classification"] == "exact"
+    assert discovered["prepared-session"]["trace_classification"] != "exact"
+    assert discovered["partial-session"]["trace_classification"] != "exact"
+    assert discovered["reconstructed-session"]["trace_classification"] != "exact"
 
 
 def test_export_manifest_hash_round_trip_and_source_is_read_only(tmp_path):

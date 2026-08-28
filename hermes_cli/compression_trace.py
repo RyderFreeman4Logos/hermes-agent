@@ -93,6 +93,31 @@ def _artifact_export_path(artifact_id: str, body: bytes, *, redact: bool) -> Pat
     return Path("artifacts") / (f"{artifact_id}.redacted" if redact and _export_artifact_body(body, redact=True) != body else artifact_id)
 
 
+def _compression_run_evidence(
+    db: Any, run: Mapping[str, Any], event_by_id: Mapping[int, Mapping[str, Any]]
+) -> tuple:
+    source_ids = [int(i) for i in run.get("source_event_ids") or [] if isinstance(i, int) and i > 0]
+    return (
+        source_ids,
+        [event_by_id[i] for i in source_ids if i in event_by_id],
+        _artifact_body(db, run.get("config_artifact_id")),
+        _artifact_body(db, run.get("pre_projection_artifact_id")),
+        _artifact_body(db, run.get("post_projection_artifact_id")),
+    )
+
+
+def _compression_run_is_exact(run: Mapping[str, Any], evidence: tuple) -> bool:
+    source_ids, raw_events, config_body, pre_body, post_body = evidence
+    return bool(
+        source_ids
+        and len(raw_events) == len(source_ids)
+        and config_body
+        and pre_body
+        and post_body
+        and run.get("status") == "committed"
+    )
+
+
 def discover_compression_sessions(
     db_path: Path, *, min_compressions: int = 0, sort: str = "compression-count-desc"
 ) -> List[Dict[str, Any]]:
@@ -115,7 +140,24 @@ def discover_compression_sessions(
             item["compression_count"] = int(item.get("compression_count") or 0)
             if item["compression_count"] < min_compressions:
                 continue
-            item["trace_classification"] = "exact" if item["compression_count"] else ("partial" if item.get("message_count") else "unusable")
+            if item["compression_count"]:
+                events = _session_events(db, str(item["id"]))
+                event_by_id = {
+                    int(event["id"]): event
+                    for event in events
+                    if event.get("id") is not None
+                }
+                runs = db.list_compression_runs(str(item["id"]))
+                item["trace_classification"] = (
+                    "exact"
+                    if all(
+                        _compression_run_is_exact(run, _compression_run_evidence(db, run, event_by_id))
+                        for run in runs
+                    )
+                    else "partial"
+                )
+            else:
+                item["trace_classification"] = "partial" if item.get("message_count") else "unusable"
             result.append(item)
         if sort == "compression-count-desc":
             result.sort(key=lambda item: (-item["compression_count"], -(item.get("started_at") or 0)))
@@ -208,13 +250,13 @@ def export_compression_trace(
         classification = "exact"
         points = []
         for generation, run in enumerate(runs, 1):
-            source_ids = [int(i) for i in run.get("source_event_ids") or [] if isinstance(i, int) and i > 0]
-            config_body = _artifact_body(db, run.get("config_artifact_id"))
-            pre_body = _artifact_body(db, run.get("pre_projection_artifact_id"))
-            post_body = _artifact_body(db, run.get("post_projection_artifact_id"))
-            raw_events = [event_by_id[i] for i in source_ids if i in event_by_id]
+            source_ids, raw_events, config_body, pre_body, post_body = _compression_run_evidence(
+                db, run, event_by_id
+            )
             point_class = run.get("_reconstructed_classification") or (
-                "exact" if source_ids and len(raw_events) == len(source_ids) and config_body and pre_body and post_body and run.get("status") == "committed" else "partial"
+                "exact" if _compression_run_is_exact(
+                    run, (source_ids, raw_events, config_body, pre_body, post_body)
+                ) else "partial"
             )
             if point_class == "partial":
                 classification = "partial"

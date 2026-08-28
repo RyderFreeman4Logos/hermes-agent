@@ -74,6 +74,44 @@ def _process_status(emitted: list) -> list:
     return [args for args in emitted if args and args[0] == "status.update"]
 
 
+def test_notification_turn_releases_claim_when_prompt_admission_fails(monkeypatch):
+    import tools.async_delegation as async_delegation
+
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_admission_false",
+    }
+    sess = _session(running=True)
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda *_args: "claim-token",
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        lambda *args: calls.append(("complete", args)),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda *args: calls.append(("release", args)),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: False,
+    )
+
+    assert (
+        server._submit_process_notification_turn("sid", sess, evt, "completion")
+        is False
+    )
+    assert calls == [("release", (evt, "claim-token"))]
+
+
 def test_midloop_routine_child_successes_are_silent_before_batch_projection(monkeypatch):
     agent = _SteerAgent()
     child_events = [

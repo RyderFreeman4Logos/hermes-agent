@@ -10455,7 +10455,7 @@ def _submit_process_notification_turn(sid: str, session: dict, evt: dict, text: 
     try:
         _emit("message.start", sid)
         if evt.get("type") == "async_delegation":
-            _run_prompt_submit(
+            accepted = _run_prompt_submit(
                 rid,
                 sid,
                 session,
@@ -10464,9 +10464,12 @@ def _submit_process_notification_turn(sid: str, session: dict, evt: dict, text: 
                 display_metadata=_async_delegation_display_metadata(evt),
             )
         else:
-            _run_prompt_submit(
+            accepted = _run_prompt_submit(
                 rid, sid, session, text
             )
+        if accepted is False:
+            release_event_delivery(evt, _claim)
+            return False
         complete_event_delivery(evt, _claim)
         return True
     except Exception as exc:

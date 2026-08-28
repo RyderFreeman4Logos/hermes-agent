@@ -1539,6 +1539,49 @@ def test_invalid_or_truncated_map_json_rejects_candidate():
     assert engine.last_map_shards == ()
     assert "[digest unavailable]" not in str(result)
     assert engine.compression_count == 0
+    assert engine._automatic_cooldown_reason_now() == "cooldown:map_failed"
+
+
+def test_map_unwraps_complete_json_fence_and_aliases_disposition_keys():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    payload = {
+        "schema_version": 2,
+        "source_event_ids": [1],
+        "facts": [],
+        "dispositions": [{
+            "event_id": 1,
+            "disposition": "reconstructible",
+            "recovery_ref": "session-event:1",
+        }],
+    }
+    engine = CheckpointContextEngine()
+    group = CausalGroup((0,))
+    unfenced = engine._parse_map_shard(_map_response(payload), group, (1,))
+    fenced = _map_response(payload)
+    fenced.choices[0].message.content = f"```json\n{fenced.choices[0].message.content}\n```"
+
+    shard = engine._parse_map_shard(fenced, group, (1,))
+
+    assert shard == unfenced
+    assert shard is not None
+    assert shard.dispositions[0].source_event_id == 1
+    assert shard.dispositions[0].status == "reconstructible"
+    unknown = deepcopy(payload)
+    unknown["dispositions"][0]["disposition"] = "unknown"
+    assert engine._parse_map_shard(_map_response(unknown), group, (1,)) is None
+
+
+def test_map_prompt_requires_unfenced_json_and_canonical_disposition_keys():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    prompt = CheckpointContextEngine()._map_prompt(
+        [{"role": "user", "content": "continue"}], CausalGroup((0,)), (1,)
+    )[0]["content"]
+
+    assert "JSON only (no Markdown fences)" in prompt
+    assert "source_event_id" in prompt
+    assert "status" in prompt
 
 
 def test_map_rejects_one_million_character_response_before_parsing(monkeypatch):

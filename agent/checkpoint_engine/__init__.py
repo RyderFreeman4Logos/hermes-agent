@@ -1373,12 +1373,12 @@ class CheckpointContextEngine(ContextEngine):
             {
                 "role": "system",
                 "content": (
-                    "Return only JSON with exactly schema_version, source_event_ids, facts, "
+                    "Return JSON only (no Markdown fences) with exactly schema_version, source_event_ids, facts, "
                     "and dispositions. schema_version must be 2. source_event_ids must cover "
                     "this shard exactly. Each fact needs a unique fact_id, kind "
                     f"({', '.join(sorted(_MAP_KINDS))}), exact text, and source_event_ids from "
-                    "this shard. Give every source event exactly one disposition: "
-                    f"{', '.join(sorted(_MAP_DISPOSITIONS))}. represented names existing fact_ids; "
+                    "this shard. Give every source event exactly one disposition with source_event_id and "
+                    f"status ({', '.join(sorted(_MAP_DISPOSITIONS))}). represented names existing fact_ids; "
                     "duplicate names an existing duplicate_of event; reconstructible and "
                     "externalized use a session-event:<id> recovery_ref. Do not call tools."
                 ),
@@ -1655,6 +1655,8 @@ class CheckpointContextEngine(ContextEngine):
             or len(content.encode("utf-8")) > _MAP_RESPONSE_MAX_BYTES
         ):
             return None
+        if content.startswith("```json\n") and content.endswith("\n```"):
+            content = content[len("```json\n"):-len("\n```")]
         try:
             payload = json.loads(content)
         except (TypeError, ValueError):
@@ -1665,6 +1667,13 @@ class CheckpointContextEngine(ContextEngine):
             return None
         if payload["schema_version"] != 2:
             return None
+        if isinstance(payload["dispositions"], list):
+            for disposition in payload["dispositions"]:
+                if isinstance(disposition, dict):
+                    if "event_id" in disposition and "source_event_id" not in disposition:
+                        disposition["source_event_id"] = disposition.pop("event_id")
+                    if "disposition" in disposition and "status" not in disposition:
+                        disposition["status"] = disposition.pop("disposition")
         expected_source_ids = tuple(
             source_event_ids[index] for index in group.event_indices
         )

@@ -1367,6 +1367,27 @@ class TestRewriteTranscriptPreservesReasoning:
 
 
 class TestGatewaySessionDbRecovery:
+    def test_transcript_append_persists_structured_task_metadata(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("checkpoint-session", source="gateway")
+        store = object.__new__(SessionStore)
+        store._db = db
+
+        store._append_transcript_message(
+            "checkpoint-session",
+            {
+                "role": "user",
+                "content": "Tessellate blue glass.",
+                "task_epoch_id": "epoch-b",
+                "task_boundary": "replace",
+            },
+        )
+
+        restored = db.get_messages_as_conversation("checkpoint-session")
+        db.close()
+        assert restored[0]["task_epoch_id"] == "epoch-b"
+        assert restored[0]["task_boundary"] == "replace"
+
     def test_compression_closed_parent_reroutes_without_retry_queue(self, tmp_path):
         import threading
         from types import SimpleNamespace

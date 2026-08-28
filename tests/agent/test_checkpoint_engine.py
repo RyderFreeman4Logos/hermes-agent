@@ -3399,6 +3399,60 @@ def test_durable_task_epoch_metadata_drives_intent_boundaries(tmp_path):
     assert lanes.active_intent.content == "Tessellate blue glass."
 
 
+def test_first_structured_epoch_replaces_legacy_active_intent():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        [
+            {"role": "user", "content": "Calibrate the old apparatus."},
+            {
+                "role": "user",
+                "content": "Tessellate blue glass.",
+                "task_epoch_id": "epoch-b",
+            },
+        ],
+        (101, 102),
+    )
+
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.content == "Tessellate blue glass."
+    assert lanes.active_intent.source_event_ids == (102,)
+
+
+def test_structured_cancel_stays_canceled_through_acknowledgments():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        [
+            {"role": "user", "content": "Calibrate the old apparatus.", "task_epoch_id": "epoch-a"},
+            {
+                "role": "user",
+                "content": "cancel this task",
+                "task_epoch_id": "epoch-b",
+                "task_boundary": "cancel",
+            },
+            {"role": "user", "content": "okay", "task_epoch_id": "epoch-b"},
+        ],
+        (101, 102, 103),
+    )
+
+    assert lanes.active_intent is None
+
+
+def test_first_acknowledgment_in_a_new_epoch_does_not_keep_the_old_root():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(
+        [
+            {"role": "user", "content": "Calibrate the old apparatus.", "task_epoch_id": "epoch-a"},
+            {"role": "user", "content": "okay", "task_epoch_id": "epoch-b"},
+        ],
+        (101, 102),
+    )
+
+    assert lanes.active_intent is None
+
+
 def test_chinese_and_mixed_language_intent_epochs():
     from agent.checkpoint_engine import CheckpointContextEngine
 

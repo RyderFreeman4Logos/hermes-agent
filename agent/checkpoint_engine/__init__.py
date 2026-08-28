@@ -722,37 +722,33 @@ class CheckpointContextEngine(ContextEngine):
         indices: list[int] = []
         active_epoch = None
         for index, text, normalized_text, epoch, boundary in turns:
+            epoch_changed = epoch is not None and epoch != active_epoch
+            if epoch_changed or boundary in {"new-task", "replace"}:
+                parts = []
+                indices = []
+                if epoch is not None:
+                    active_epoch = epoch
             if boundary == "cancel":
                 parts = []
                 indices = []
-                active_epoch = epoch
+                if epoch is not None:
+                    active_epoch = epoch
                 continue
             if cls._is_ack_only(normalized_text):
                 continue
             projected = cls._project_intent_text(text)
-            if (
-                not parts
-                or boundary in {"new-task", "replace"}
-                or (epoch is not None and active_epoch is not None and epoch != active_epoch)
-                or cls._is_new_task(normalized_text)
-            ):
+            if not parts or cls._is_new_task(normalized_text):
                 parts = [projected]
                 indices = [index]
-                active_epoch = epoch
+                if epoch is not None:
+                    active_epoch = epoch
                 continue
             parts.append(projected)
             indices.append(index)
             if epoch is not None:
                 active_epoch = epoch
         if not parts:
-            index, text, _normalized_text, _epoch, boundary = turns[-1]
-            if boundary == "cancel":
-                return None
-            return ActiveIntent(
-                cls._project_intent_text(text),
-                (index,),
-                (source_event_ids[index],) if source_event_ids else (),
-            )
+            return None
         return ActiveIntent(
             "\n".join(parts),
             tuple(indices),

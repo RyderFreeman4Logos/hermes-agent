@@ -3552,6 +3552,35 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        final_wire_over_budget = getattr(
+            agent.context_compressor, "final_request_exceeds_hard_wire_budget", None
+        )
+        if callable(final_wire_over_budget) and final_wire_over_budget(
+            compressed,
+            system_prompt=new_system_prompt,
+            tools=getattr(agent, "tools", None),
+        ):
+            logger.warning(
+                "Compression refused: final provider request exceeds the checkpoint hard cap "
+                "(session=%s); keeping the original transcript unchanged",
+                agent.session_id or "none",
+            )
+            _restore_compressor_attempt_state(
+                agent.context_compressor,
+                _compressor_attempt_snapshot,
+                durable_cooldown_authoritative=_durable_cooldown_authoritative,
+                durable_cooldown_state=_durable_cooldown_state,
+            )
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="final_wire_budget",
+            )
+            _release_lock()
+            return messages, new_system_prompt
+
         _session_commit_succeeded = False
         split_status = "not_applicable"
         if agent._session_db:

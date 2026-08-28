@@ -2441,6 +2441,20 @@ class CheckpointContextEngine(ContextEngine):
             candidate, output_reserve_tokens=self._output_reserve_tokens
         ) + fixed_wire_tokens
 
+    def final_request_exceeds_hard_wire_budget(
+        self, messages: List[Dict[str, Any]], *, system_prompt: str = "", tools: Any = None
+    ) -> bool:
+        """Check the host's final provider-visible request against the hard cap."""
+        from agent.model_metadata import estimate_request_tokens_rough
+
+        return (
+            estimate_request_tokens_rough(
+                messages, system_prompt=system_prompt, tools=tools
+            )
+            + self._output_reserve_tokens
+            > self._hard_max_wire_tokens
+        )
+
     @staticmethod
     def _tail_groups(
         messages: List[Dict[str, Any]],

@@ -1465,20 +1465,6 @@ def normalize_usage(
         reasoning_tokens=reasoning_tokens,
         cache_telemetry=cache_telemetry,
     )
-    try:
-        from agent.cache_lowhit_request_dump import maybe_dump_on_usage
-
-        maybe_dump_on_usage(
-            usage,
-            route=route,
-            provider=provider,
-            model=model,
-            api_mode=api_mode,
-            correlation=correlation,
-            attempt_id=attempt_id,
-        )
-    except Exception:
-        logger.debug("cache low-hit dump failed", exc_info=True)
     return usage
 
 

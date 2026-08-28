@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from agent import cache_lowhit_request_dump, physical_attempt_diagnostics, relay_runtime
+from agent import cache_request_capture, physical_attempt_diagnostics, relay_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -86,20 +86,18 @@ def _record_attempt(
 ) -> None:
     request_id = str((metadata or {}).get("api_request_id") or "").strip()
     retry = int((metadata or {}).get("retry_count") or 0)
-    try:
-        cache_lowhit_request_dump.remember_sent_request(
-            request,
-            api_mode=str((metadata or {}).get("api_mode") or "unknown"),
-            route=str((metadata or {}).get("route") or "unknown"),
-            provider=name,
-            model=str(request.get("model") or model_name),
-            correlation=request_id or None,
-            attempt_id=f"{request_id}:attempt:{retry}" if request_id else None,
-        )
-    except Exception:
-        logger.debug("cache low-hit remember failed", exc_info=True)
     scope = physical_attempt_diagnostics.take_cache_scope(request)
     loop, correlation = _attempt_loop(metadata)
+    cache_request_capture.capture_provider_request(
+        request,
+        api_mode=str((metadata or {}).get("api_mode") or "unknown"),
+        route=str((metadata or {}).get("route") or "unknown"),
+        provider=name,
+        model=str(request.get("model") or model_name),
+        correlation=request_id or None,
+        attempt_id=f"{request_id}:attempt:{retry}" if request_id else None,
+        retry=retry,
+    )
     physical_attempt_diagnostics.start_attempt(
         request,
         api_mode=str((metadata or {}).get("api_mode") or "unknown"),
@@ -360,7 +358,9 @@ def execute_current(
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
-        return callback(request)
+        return _execute_attempt(
+            request, callback, name=name, model_name=model_name, metadata=metadata
+        )
     return execute(
         request,
         callback,
@@ -384,7 +384,9 @@ async def execute_current_async(
     """Run an async provider attempt under the inherited turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
-        return await callback(request)
+        return await _execute_attempt_async(
+            request, callback, name=name, model_name=model_name, metadata=metadata
+        )
     return await execute_async(
         request,
         callback,
@@ -434,6 +436,7 @@ def stream_current(
     """
     turn = relay_runtime.active_turn()
     if turn is None:
+        _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
         return stream_factory(request)
     if _has_running_event_loop():
         # Managed provider callbacks execute on the Relay session's event
@@ -445,6 +448,7 @@ def stream_current(
         # own completed_response_predicate traps a completed response (e.g.
         # the MoA facade's auxiliary ``call_llm(stream=True)`` returning a
         # full response when an adapter ignores ``stream=True``).
+        _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
         return stream_factory(request)
     managed = stream(
         request,

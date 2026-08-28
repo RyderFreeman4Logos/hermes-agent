@@ -45,6 +45,12 @@ DEFAULT_CONFIG = {
     "observability": {
         "physical_attempt_digests": {"enabled": False},
     },
+    "debug": {
+        "cache_requests": {
+            "enabled": False,
+            "strict_write": False,
+        },
+    },
     "agent": {
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a

@@ -824,15 +824,29 @@ def test_authoritative_manager_fails_closed_without_provider():
     assert "current_entries" not in result
 
 
-def test_mempal_without_provider_mode_defaults_authoritative_when_markdown_off():
-    memory_config = {
-        "provider": "mempal",
-        "memory_enabled": False,
-        "user_profile_enabled": False,
-    }
+def test_mempal_without_provider_mode_defaults_authoritative_when_markdown_off(
+    monkeypatch, tmp_path
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "memory:\n"
+        "  provider: mempal\n"
+        "  memory_enabled: false\n"
+        "  user_profile_enabled: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from hermes_cli.config import load_config
+
+    config = load_config()
+    memory_config = config["memory"]
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
 
     assert "provider_mode" not in memory_config
     assert get_memory_provider_mode(memory_config) == "authoritative"
+    assert check_memory_requirements() is True
 
 
 def test_authoritative_mode_keeps_memory_tool_available_when_markdown_off():

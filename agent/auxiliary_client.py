@@ -10426,8 +10426,27 @@ def _call_llm_impl(
             # manager iterate the completed SimpleNamespace itself (#55933).
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its
-            # boundary.
-            return client.chat.completions.create(**kwargs)
+            # boundary. Keep the physical opener inside Relay's request-local
+            # capture context without routing the completed response through
+            # generic stream management.
+            direct_route = _relay_auxiliary_metadata(
+                provider=request_provider,
+                api_mode=resolved_api_mode,
+                model=kwargs.get("model"),
+                route=str(getattr(client, "base_url", "") or ""),
+            )
+            if direct_route is None:
+                return client.chat.completions.create(**kwargs)
+            provider_name, fallback_model, metadata = direct_route
+            from agent import relay_llm
+
+            return relay_llm._execute_attempt(
+                kwargs,
+                lambda request: client.chat.completions.create(**request),
+                name=provider_name,
+                model_name=str(kwargs.get("model") or fallback_model),
+                metadata=metadata,
+            )
         return _relay_sync_stream(
             client,
             kwargs,

@@ -265,7 +265,89 @@ def test_anthropic_capture_matches_stream_and_fallback_kwargs(monkeypatch):
     ]
 
 
-def test_bedrock_stream_fallback_captures_each_final_opener(monkeypatch):
+
+def test_codex_direct_auxiliary_stream_captures_once(monkeypatch, tmp_path):
+    from agent import auxiliary_client as auxiliary
+    from agent import physical_attempt_diagnostics
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    monkeypatch.setattr(
+        physical_attempt_diagnostics,
+        "start_attempt",
+        lambda *args, **kwargs: None,
+    )
+    opened = []
+    base_url = "https://chatgpt.com/backend-api/codex"
+
+    class Responses:
+        def create(self, **kwargs):
+            opened.append(dict(kwargs))
+            return SimpleNamespace(output=[], usage=None)
+
+    real_client = SimpleNamespace(
+        api_key="[REDACTED]",
+        base_url=base_url,
+        responses=Responses(),
+        close=lambda: None,
+    )
+    client = auxiliary.CodexAuxiliaryClient(real_client, "gpt-5.4")
+    monkeypatch.setattr(
+        auxiliary,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "openai-codex",
+            "gpt-5.4",
+            base_url,
+            "[REDACTED]",
+            "codex_responses",
+        ),
+    )
+    monkeypatch.setattr(
+        auxiliary,
+        "_get_cached_client",
+        lambda *args, **kwargs: (client, "gpt-5.4"),
+    )
+    monkeypatch.setattr(auxiliary, "_get_task_extra_body", lambda task: {})
+    monkeypatch.setattr(auxiliary, "_effective_provider_for_client", lambda *args: "openai-codex")
+    monkeypatch.setattr(auxiliary, "_acquire_sync_aux_semaphore", lambda task: None)
+    monkeypatch.setattr(
+        auxiliary,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+    result = auxiliary.call_llm(
+        task="moa_aggregator",
+        provider="openai-codex",
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+
+    assert result.choices
+    assert len(opened) == 1
+    captures = _captures(tmp_path)
+    assert len(captures) == 1
+    saved = captures[0]
+    assert saved["route"] == {
+        "api_mode": "codex_responses",
+        "model": "gpt-5.4",
+        "provider": "openai-codex",
+        "route": base_url,
+    }
+    assert saved["physical_attempt"]["correlation"].startswith("aux-")
+    assert saved["physical_attempt"] == {
+        "attempt_id": f"{saved['physical_attempt']['correlation']}:attempt:0",
+        "correlation": saved["physical_attempt"]["correlation"],
+        "retry": 0,
+    }
+    assert saved["request"] == opened[0]
+
+
+def test_bedrock_stream_fallback_captures_each_final_opener(monkeypatch, tmp_path):
     from agent import bedrock_adapter, relay_llm
 
     opened = []

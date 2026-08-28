@@ -135,6 +135,121 @@ class TestInPlaceCompaction:
             assert compressed is original
             assert [row["content"] for row in db.get_messages(sid)] == ["msg 0", "msg 1"]
 
+    def test_checkpoint_final_wire_cap_aborts_before_moa_prepared_commit(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from agent.checkpoint_engine import CheckpointContextEngine
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        def response(content):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=content, tool_calls=[]),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+                model="test/model",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / ".hermes"
+            home.mkdir()
+            (home / "config.yaml").write_text(
+                """
+moa:
+  default_preset: review
+  presets:
+    review:
+      reference_models:
+        - provider: openrouter
+          model: reference
+      aggregator:
+        provider: openrouter
+        model: aggregator
+""".strip(),
+                encoding="utf-8",
+            )
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_115700_wirecap_moa"
+            db.create_session(sid, "cli", model="review")
+            db.set_session_title(sid, "wire-cap")
+            for role, content in (
+                ("user", "old question"),
+                ("assistant", "old answer"),
+            ):
+                db.append_message(session_id=sid, role=role, content=content)
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="moa://local",
+                model="review",
+                provider="moa",
+                quiet_mode=True,
+                session_db=db,
+                session_id=sid,
+                skip_context_files=True,
+                skip_memory=True,
+                max_iterations=1,
+            )
+            agent.compression_in_place = False
+            agent._disable_streaming = True
+            agent.tools = []
+            monkeypatch.setattr(agent, "_build_system_prompt", lambda _message: "")
+            checkpoint = CheckpointContextEngine(
+                hard_max_wire_tokens=40,
+                output_reserve_tokens=0,
+            )
+            compression_checks = []
+
+            def should_compress(_tokens=None):
+                compression_checks.append(_tokens)
+                return len(compression_checks) > 1
+
+            checkpoint.should_compress = should_compress
+            checkpoint.should_defer_preflight_to_real_usage = lambda _tokens: False
+            checkpoint.get_active_compression_failure_cooldown = lambda: None
+            checkpoint.commit_snapshot_is_current = lambda _agent=None: True
+            checkpoint.compress = lambda *_args, **_kwargs: [
+                {"role": "user", "content": "short checkpoint"}
+            ]
+            checkpoint._last_compress_aborted = False
+            checkpoint._last_summary_error = None
+            checkpoint.compression_count = 1
+            agent.context_compressor = checkpoint
+            calls = []
+
+            def fake_call_llm(**kwargs):
+                calls.append(kwargs["task"])
+                return response("x" * 1_000 if kwargs["task"] == "moa_reference" else "done")
+
+            monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+            rebase_calls = []
+            completions = agent.client.chat.completions
+            rebase = completions.rebase_prepared_request
+
+            def record_rebase(prepared, messages):
+                rebase_calls.append(messages)
+                return rebase(prepared, messages)
+
+            monkeypatch.setattr(completions, "rebase_prepared_request", record_rebase)
+            result = agent.run_conversation(
+                "current",
+                conversation_history=[
+                    {"role": "user", "content": "old question"},
+                    {"role": "assistant", "content": "old answer"},
+                ],
+            )
+
+            assert result["final_response"] == "done"
+            assert calls == ["moa_reference", "moa_aggregator"]
+            assert rebase_calls[0][0]["content"] == "short checkpoint"
+            assert "short checkpoint" not in [
+                row["content"] for row in db.get_messages(sid)
+            ]
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB

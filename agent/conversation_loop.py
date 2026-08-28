@@ -2790,6 +2790,17 @@ def run_conversation(
                         direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
                     )
                     final_messages, final_tools = cache_plan.messages, cache_plan.tools
+                if agent.provider == "moa" and _moa_prepared_request is not None:
+                    moa_completions = getattr(
+                        getattr(agent.client, "chat", None), "completions", None
+                    )
+                    rebase_prepared_request = getattr(
+                        moa_completions, "rebase_prepared_request", None
+                    )
+                    if callable(rebase_prepared_request):
+                        final_messages = rebase_prepared_request(
+                            _moa_prepared_request, final_messages
+                        )["messages"]
                 return final_messages, final_tools
 
             messages, active_system_prompt = agent._compress_context(

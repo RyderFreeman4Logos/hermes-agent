@@ -360,6 +360,36 @@ class TestRotationPathWatermark:
         parent_info = db.get_session("sess1")
         assert parent_info["end_reason"] == "compression"
 
+    def test_parent_delete_keeps_artifact_from_foreign_tail_in_child(self, db: SessionDB) -> None:
+        _seed(db)
+        artifact_body = b"foreign concurrent-tail checkpoint body"
+        artifact_id = db.store_checkpoint_artifact("sess1", (1,), artifact_body)
+        watermark = db.get_active_message_watermark("sess1")
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        db.append_message(
+            "sess1",
+            role="user",
+            content=(
+                "[CONTEXT CHECKPOINT]\\n"
+                f"- recovery: checkpoint-artifact:{artifact_id}\\n"
+                "[/CONTEXT CHECKPOINT]"
+            ),
+        )
+        ceiling = db.get_active_message_watermark("sess1")
+
+        db.publish_compression_child(
+            parent_session_id="sess1",
+            child_session_id="child1",
+            source="test",
+            messages=SUMMARY,
+            compression_lock_holder="rotator",
+            watermark=watermark,
+            watermark_ceiling=ceiling,
+        )
+
+        assert db.delete_session("sess1") is True
+        assert db.get_checkpoint_artifact(artifact_id) == artifact_body
+
     def test_ceiling_excludes_the_rotators_own_flush(self, db: SessionDB) -> None:
         """Rows the rotation path flushes AFTER the ceiling (its own input
         transcript, already inside the handoff) must NOT be cloned."""

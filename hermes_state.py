@@ -6846,6 +6846,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         f"WHERE id IN ({placeholders}) ORDER BY id",
                         [child_session_id, *tail_ids],
                     )
+                    child_tail_rows = conn.execute(
+                        "SELECT id AS _row_id, content FROM messages "
+                        "WHERE session_id = ? AND active = 1 "
+                        "ORDER BY id DESC LIMIT ?",
+                        (child_session_id, len(tail_ids)),
+                    ).fetchall()
+                    self._register_checkpoint_artifacts_for_messages(
+                        conn, child_session_id, [dict(row) for row in child_tail_rows]
+                    )
                     total_messages += len(tail_ids)
                     for r in tail_rows:
                         raw = r["tool_calls"]

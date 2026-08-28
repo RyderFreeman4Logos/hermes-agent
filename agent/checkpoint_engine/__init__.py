@@ -1169,6 +1169,8 @@ class CheckpointContextEngine(ContextEngine):
             "observed",
             "timestamp",
             "tool_name",
+            "task_epoch_id",
+            "task_boundary",
         }
         sources = []
         for message in messages:

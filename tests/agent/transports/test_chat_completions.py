@@ -140,6 +140,27 @@ class TestChatCompletionsBasic:
         # Original list untouched (deepcopy-on-demand)
         assert msgs[0]["timestamp"] == 1781976577.0
 
+    def test_convert_messages_strips_durable_task_metadata(self, transport, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("checkpoint-session", source="test")
+        db.append_message(
+            "checkpoint-session",
+            "user",
+            "continue",
+            task_epoch_id="epoch-b",
+            task_boundary="replace",
+        )
+        restored = db.get_messages_as_conversation("checkpoint-session")
+        wire = transport.convert_messages(restored)
+        db.close()
+
+        assert "task_epoch_id" not in wire[0]
+        assert "task_boundary" not in wire[0]
+        assert restored[0]["task_epoch_id"] == "epoch-b"
+        assert restored[0]["task_boundary"] == "replace"
+
     def test_convert_messages_no_copy_without_timestamp(self, transport):
         """A timestamp-free message list needs no sanitize pass and is
         returned by identity (preserves the deepcopy-on-demand contract)."""

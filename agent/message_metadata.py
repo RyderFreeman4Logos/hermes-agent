@@ -8,7 +8,11 @@ from typing import Any, MutableMapping, Optional, TypeVar
 
 # These fields describe Hermes' durable record, not provider-visible message
 # content. They must not influence context-pressure decisions.
-PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp"})
+PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({
+    "timestamp",
+    "task_epoch_id",
+    "task_boundary",
+})
 
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
 

@@ -3608,6 +3608,26 @@ def test_projection_excludes_runtime_synthetic_users_after_metadata_strip(
     assert synthetic_text not in projected_user_text
 
 
+def test_provider_visible_sources_strip_task_metadata_after_intent_extraction():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    messages = [
+        {
+            "role": "user",
+            "content": "Tessellate blue glass.",
+            "task_epoch_id": "epoch-b",
+            "task_boundary": "replace",
+        }
+    ]
+    lanes = CheckpointContextEngine._extract_deterministic_lanes(messages, (101,))
+    sources = CheckpointContextEngine()._provider_visible_sources(messages)
+
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.content == "Tessellate blue glass."
+    assert "task_epoch_id" not in sources[0]
+    assert "task_boundary" not in sources[0]
+
+
 def test_plain_imperative_correction_preserves_root_across_a_long_tail():
     engine = load_context_engine("checkpoint")
     assert engine is not None

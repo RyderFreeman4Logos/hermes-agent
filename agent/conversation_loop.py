@@ -2257,6 +2257,8 @@ def run_conversation(
             # event row enters the live history.
             _display_kind = api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+            api_msg.pop("task_epoch_id", None)
+            api_msg.pop("task_boundary", None)
 
             # Legacy hidden redirect placeholders (#88955): rows persisted
             # BEFORE the writer-side api_content stamp in

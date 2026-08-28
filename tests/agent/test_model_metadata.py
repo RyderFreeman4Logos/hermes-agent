@@ -84,6 +84,18 @@ class TestEstimateMessagesTokensRough:
             estimate_messages_tokens_rough([msg])
         )
 
+    def test_task_epoch_metadata_does_not_change_estimate(self):
+        msg = {"role": "user", "content": "continue"}
+        durable = {
+            **msg,
+            "task_epoch_id": "epoch-b",
+            "task_boundary": "replace",
+        }
+
+        assert estimate_messages_tokens_rough([durable]) == (
+            estimate_messages_tokens_rough([msg])
+        )
+
     def test_message_with_list_content(self):
         """Vision messages with multimodal content arrays.
 

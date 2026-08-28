@@ -58,6 +58,36 @@ def _legacy_source(tmp_path):
     return path
 
 
+def _legacy_multi_boundary_source(tmp_path):
+    path = tmp_path / "legacy-multi-state.db"
+    db = SessionDB(path)
+    db.create_session("legacy-multi-session", "cli", model="stored-model")
+    db.append_message("legacy-multi-session", "user", "First historical turn.")
+    db.append_message("legacy-multi-session", "assistant", "First historical reply.")
+    for index in range(1, 4):
+        db.archive_and_compact(
+            "legacy-multi-session",
+            [
+                {
+                    "role": "user",
+                    "content": f"[CONTEXT COMPACTION] historical boundary {index}",
+                    "_compressed_summary": True,
+                },
+                {"role": "assistant", "content": f"Boundary {index} continuation."},
+            ],
+        )
+    full_event_count = len(db.get_messages("legacy-multi-session", include_inactive=True))
+    db.close()
+
+    legacy = sqlite3.connect(path)
+    try:
+        legacy.execute("DROP TABLE compression_runs")
+        legacy.commit()
+    finally:
+        legacy.close()
+    return path, full_event_count
+
+
 def test_discovery_reconstructs_legacy_missing_compression_runs_table(tmp_path):
     source = _legacy_source(tmp_path)
 
@@ -66,6 +96,20 @@ def test_discovery_reconstructs_legacy_missing_compression_runs_table(tmp_path):
     assert [item["id"] for item in discovered] == ["legacy-session"]
     assert discovered[0]["compression_count"] == 0
     assert discovered[0]["trace_classification"] != "exact"
+
+
+def test_export_reconstructs_one_point_per_historical_boundary(tmp_path):
+    source, full_event_count = _legacy_multi_boundary_source(tmp_path)
+
+    manifest = export_compression_trace(source, "legacy-multi-session", tmp_path / "corpus")
+
+    assert manifest["compression_count"] == 3
+    assert manifest["trace_classification"] != "exact"
+    for generation in range(1, 4):
+        pre_context = json.loads(
+            (tmp_path / "corpus" / "points" / str(generation) / "pre-context.json").read_text()
+        )
+        assert len(pre_context["messages"]) < full_event_count
 
 
 def test_export_reconstructs_legacy_missing_compression_runs_table(tmp_path):

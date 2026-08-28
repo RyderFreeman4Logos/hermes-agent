@@ -261,25 +261,47 @@ def export_compression_trace(
         all_events = _session_events(db, resolved)
         source_hash = _session_content_hash(session, all_events, runs)
         if not runs and all_events:
-            # ponytail: one conservative projection when no durable boundary exists;
-            # retain events rather than inventing a generation split.
             reconstructed_class = (
                 "exact-events-projection-reconstructed"
                 if any(event.get("compacted") or event.get("_compressed_summary") for event in all_events)
                 else "partial"
             )
-            runs = [{
-                "run_id": "reconstructed-1",
-                "session_id": resolved,
-                "source_event_ids": [int(event["id"]) for event in all_events if event.get("id") is not None],
-                "config_artifact_id": None,
-                "pre_projection_artifact_id": None,
-                "post_projection_artifact_id": None,
-                "status": "reconstructed",
-                "boundary_kind": "reconstructed",
-                "continuation_session_id": resolved,
-                "_reconstructed_classification": reconstructed_class,
-            }]
+            boundaries = _reconstructed_boundary_indexes(all_events)
+            if boundaries:
+                runs = []
+                start = 0
+                for generation, boundary in enumerate(boundaries, 1):
+                    source_events = all_events[start:boundary]
+                    runs.append({
+                        "run_id": f"reconstructed-{generation}",
+                        "session_id": resolved,
+                        "source_event_ids": [
+                            int(event["id"]) for event in source_events if event.get("id") is not None
+                        ],
+                        "config_artifact_id": None,
+                        "pre_projection_artifact_id": None,
+                        "post_projection_artifact_id": None,
+                        "status": "reconstructed",
+                        "boundary_kind": "reconstructed",
+                        "continuation_session_id": resolved,
+                        "_reconstructed_classification": reconstructed_class,
+                    })
+                    start = boundary
+            else:
+                # ponytail: one conservative projection when no durable boundary exists;
+                # retain events rather than inventing a generation split.
+                runs = [{
+                    "run_id": "reconstructed-1",
+                    "session_id": resolved,
+                    "source_event_ids": [int(event["id"]) for event in all_events if event.get("id") is not None],
+                    "config_artifact_id": None,
+                    "pre_projection_artifact_id": None,
+                    "post_projection_artifact_id": None,
+                    "status": "reconstructed",
+                    "boundary_kind": "reconstructed",
+                    "continuation_session_id": resolved,
+                    "_reconstructed_classification": reconstructed_class,
+                }]
         event_by_id = {int(event["id"]): event for event in all_events if event.get("id") is not None}
         classification = "exact"
         points = []

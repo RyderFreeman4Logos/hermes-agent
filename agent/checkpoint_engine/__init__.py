@@ -528,6 +528,8 @@ class CheckpointContextEngine(ContextEngine):
                     )
             finally:
                 self._pending_compression_run_id = None
+                self.bind_session_state(kwargs.get("session_db", self._session_db), session_id)
+            return
         self.bind_session_state(kwargs.get("session_db", self._session_db), session_id)
 
     def _trace_config_snapshot(self) -> Dict[str, Any]:

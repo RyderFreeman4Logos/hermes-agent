@@ -2606,6 +2606,62 @@ def test_durable_compression_trace_is_off_by_default(tmp_path):
     assert db.list_compression_runs("checkpoint-session") == []
 
 
+def test_failed_trace_completion_rebinds_before_observer_returns_false(
+    monkeypatch, tmp_path
+):
+    from agent.checkpoint_engine import CheckpointContextEngine
+    from agent.conversation_compression import _notify_context_engine_compression_complete
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("old-session", source="test")
+    db.create_session("new-session", source="test")
+    engine = CheckpointContextEngine(trace=True)
+    engine.bind_session_state(db, "old-session")
+    engine._record_compression_trace(
+        (1,),
+        [{"role": "user", "content": "old"}],
+        [{"role": "user", "content": "summary"}],
+    )
+    first_run_id = engine.last_compression_run_id
+    assert first_run_id is not None
+
+    completion_calls = []
+
+    def fail_completion(*args):
+        completion_calls.append(args)
+        raise RuntimeError("trace store unavailable")
+
+    monkeypatch.setattr(db, "complete_compression_run", fail_completion)
+    agent = SimpleNamespace(
+        context_compressor=engine,
+        _session_db=db,
+        platform="cli",
+        _gateway_session_key=None,
+    )
+
+    assert not _notify_context_engine_compression_complete(
+        agent,
+        new_session_id="new-session",
+        old_session_id="old-session",
+    )
+    assert completion_calls
+    assert engine._session_id == "new-session"
+    assert db.get_compression_run(first_run_id)["status"] == "prepared"
+
+    engine._record_compression_trace(
+        (2,),
+        [{"role": "user", "content": "new"}],
+        [{"role": "user", "content": "new summary"}],
+    )
+    second_run_id = engine.last_compression_run_id
+    assert second_run_id != first_run_id
+    assert db.get_compression_run(second_run_id)["session_id"] == "new-session"
+    assert db.list_compression_runs("old-session") == [
+        db.get_compression_run(first_run_id)
+    ]
+
+
 def test_checkpoint_rejects_an_artifact_that_disappears_before_publication(monkeypatch, tmp_path):
     from hermes_state import SessionDB
 

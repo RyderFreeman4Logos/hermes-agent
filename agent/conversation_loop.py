@@ -2728,11 +2728,76 @@ def run_conversation(
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
+
+            def _final_provider_request(candidate, rebuilt_system_prompt):
+                final_messages = []
+                for candidate_message in candidate:
+                    final_message = _clone_message_for_send(candidate_message)
+                    api_content = final_message.pop("api_content", None)
+                    final_message.pop("_row_id", None)
+                    final_message.pop("display_kind", None)
+                    final_message.pop("display_metadata", None)
+                    final_message.pop("task_epoch_id", None)
+                    final_message.pop("task_boundary", None)
+                    if (
+                        isinstance(api_content, str)
+                        and api_content
+                        and final_message.get("role") in ("user", "assistant")
+                    ):
+                        final_message["content"] = api_content
+                    final_messages.append(final_message)
+                effective_system = rebuilt_system_prompt or ""
+                if agent.ephemeral_system_prompt:
+                    effective_system = (
+                        effective_system + "\n\n" + agent.ephemeral_system_prompt
+                    ).strip()
+                if effective_system:
+                    final_messages.insert(0, {"role": "system", "content": effective_system})
+                if agent.prefill_messages:
+                    system_offset = int(bool(effective_system))
+                    final_messages[system_offset:system_offset] = [
+                        _clone_message_for_send(message) for message in agent.prefill_messages
+                    ]
+                incoming = next(
+                    (message for message in reversed(candidate) if message.get("role") == "user"),
+                    None,
+                )
+                final_messages = _apply_context_engine_selection(
+                    agent, final_messages, candidate, incoming, logger=request_logger
+                )
+                final_messages = agent._sanitize_api_messages(final_messages)
+                final_messages = agent._drop_thinking_only_and_merge_users(
+                    final_messages,
+                    drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+                )
+                for message in final_messages:
+                    if isinstance(message.get("content"), str):
+                        message["content"] = message["content"].strip()
+                _canonicalize_api_tool_calls(final_messages)
+                _sanitize_messages_surrogates(final_messages)
+                final_tools = agent.tools
+                if agent._use_prompt_caching and agent.provider != "moa":
+                    cache_plan = build_prompt_cache_plan(
+                        final_messages,
+                        final_tools,
+                        cache_ttl=effective_cache_ttl(
+                            agent._cache_ttl, provider=agent.provider, model=agent.model
+                        ),
+                        native_anthropic=agent._use_native_cache_layout,
+                        static_system_prefix=getattr(
+                            agent, "_cached_system_prompt_static", None
+                        ),
+                        direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
+                    )
+                    final_messages, final_tools = cache_plan.messages, cache_plan.tools
+                return final_messages, final_tools
+
             messages, active_system_prompt = agent._compress_context(
                 messages,
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
+                final_provider_request=_final_provider_request,
             )
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's

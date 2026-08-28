@@ -96,6 +96,45 @@ class TestInPlaceCompaction:
             assert compressed is original
             assert [row["content"] for row in db.get_messages(sid)] == ["msg 0", "msg 1"]
 
+    def test_checkpoint_final_wire_cap_aborts_before_in_place_commit_after_prefill(self, monkeypatch):
+        from agent.checkpoint_engine import CheckpointContextEngine
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_115600_wirecap_prefill"
+            _seed(db, sid, "wire-cap", n=2)
+            agent = _make_agent(db, sid, in_place=True)
+            checkpoint = CheckpointContextEngine(
+                hard_max_wire_tokens=40,
+                output_reserve_tokens=0,
+            )
+            candidate = [{"role": "user", "content": "short checkpoint"}]
+            checkpoint.compress = lambda *_args, **_kwargs: candidate
+            checkpoint._last_compress_aborted = False
+            checkpoint._last_summary_error = None
+            checkpoint.compression_count = 1
+            agent.context_compressor = checkpoint
+            agent.prefill_messages = [{"role": "system", "content": "x" * 1_000}]
+            original = [
+                {"role": "user", "content": "msg 0"},
+                {"role": "assistant", "content": "msg 1"},
+            ]
+
+            compressed, _ = compress_context(
+                agent,
+                original,
+                approx_tokens=100_000,
+                system_message="sys",
+                final_provider_request=lambda messages, _prompt: (
+                    [*agent.prefill_messages, *messages], None
+                ),
+            )
+
+            assert compressed is original
+            assert [row["content"] for row in db.get_messages(sid)] == ["msg 0", "msg 1"]
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB

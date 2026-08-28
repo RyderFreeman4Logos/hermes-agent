@@ -2315,6 +2315,7 @@ def compress_context(
     force: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    final_provider_request: Optional[Callable[[list, str], Tuple[list, Any]]] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -3555,10 +3556,32 @@ def compress_context(
         final_wire_over_budget = getattr(
             agent.context_compressor, "final_request_exceeds_hard_wire_budget", None
         )
-        if callable(final_wire_over_budget) and final_wire_over_budget(
-            compressed,
-            system_prompt=new_system_prompt,
-            tools=getattr(agent, "tools", None),
+        final_wire_messages = compressed
+        final_wire_system_prompt = new_system_prompt
+        final_wire_tools = getattr(agent, "tools", None)
+        if final_provider_request is not None:
+            try:
+                final_wire_messages, final_wire_tools = final_provider_request(
+                    compressed, new_system_prompt
+                )
+                final_wire_system_prompt = ""
+            except Exception:
+                logger.exception(
+                    "Compression refused: could not build the final provider request "
+                    "for checkpoint hard-cap validation (session=%s)",
+                    agent.session_id or "none",
+                )
+                final_wire_messages = None
+        if (
+            final_wire_messages is None
+            or (
+                callable(final_wire_over_budget)
+                and final_wire_over_budget(
+                    final_wire_messages,
+                    system_prompt=final_wire_system_prompt,
+                    tools=final_wire_tools,
+                )
+            )
         ):
             logger.warning(
                 "Compression refused: final provider request exceeds the checkpoint hard cap "

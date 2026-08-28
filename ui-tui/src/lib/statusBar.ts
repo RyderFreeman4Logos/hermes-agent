@@ -6,7 +6,6 @@ export const STATUS_BAR_SEGMENTS = [
   'context_bar',
   'context_percent',
   'focus',
-  'heartbeat',
   'session_duration',
   'idle',
   'compressions',

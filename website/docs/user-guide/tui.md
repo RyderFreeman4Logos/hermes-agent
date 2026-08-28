@@ -190,7 +190,7 @@ display:
   tui_statusbar_segments: [indicator, model, context_tokens, cwd]
 ```
 
-Available IDs are `battery`, `indicator`, `model`, `context_tokens`, `context_bar`, `context_percent`, `focus`, `heartbeat`, `session_duration`, `idle`, `compressions`, `voice`, `sessions`, `bg_tasks`, `subagents`, `resume`, `dev_credits`, `spawn_hud`, and `cwd`. The legacy ID `context` expands to all three context fields. Unknown entries are ignored; an explicit empty list hides the status bar, while missing, non-list, or all-unknown values keep the default fields.
+Available IDs are `battery`, `indicator`, `model`, `context_tokens`, `context_bar`, `context_percent`, `focus`, `session_duration`, `idle`, `compressions`, `voice`, `sessions`, `bg_tasks`, `subagents`, `resume`, `dev_credits`, `spawn_hud`, and `cwd`. The legacy ID `context` expands to all three context fields. Unknown entries are ignored; an explicit empty list hides the status bar, while missing, non-list, or all-unknown values keep the default fields.
 
 ## Auto-resume
 

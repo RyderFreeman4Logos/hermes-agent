@@ -2,6 +2,7 @@ import React from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { StatusRule } from '../components/appChrome.js'
+import { normalizeStatusBarSegments, STATUS_BAR_SEGMENTS } from '../lib/statusBar.js'
 import { DEFAULT_THEME } from '../theme.js'
 
 type ReactNodeLike = React.ReactNode
@@ -120,6 +121,27 @@ describe('StatusRule session title', () => {
     expect(rendered).toContain('weekly-digest')
     expect(rendered).not.toContain('ready')
     expect(rendered).not.toContain('50k')
+  })
+
+  it('keeps every accepted segment backed by a renderer item', () => {
+    const element = StatusRule({
+      ...baseProps,
+      battery: { available: true, category: 'good', percent: 80, plugged: false },
+      bgCount: 1,
+      cols: 1000,
+      focusView: true,
+      lastTurnEndedAt: Date.now() - 1000,
+      liveSessionCount: 1,
+      sessionStartedAt: Date.now() - 1000,
+      statusBarSegments: [...STATUS_BAR_SEGMENTS].reverse(),
+      usage: { ...baseProps.usage, active_subagents: 1, compressions: 1, dev_credits_spent_micros: 1 },
+      voiceLabel: 'voice on'
+    })
+    const props = (element as React.ReactElement<{ items: Array<{ id: string }>; showSpawnHud: boolean }>).props
+    const renderedIds = [...props.items.map(item => item.id), ...(props.showSpawnHud ? ['spawn_hud'] : [])]
+
+    expect(new Set(renderedIds)).toEqual(new Set(STATUS_BAR_SEGMENTS))
+    expect(normalizeStatusBarSegments(['heartbeat'])).not.toContain('heartbeat')
   })
 
   it('keeps all present narrow status fields instead of dropping the tail', () => {

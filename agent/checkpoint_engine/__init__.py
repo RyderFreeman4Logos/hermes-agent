@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import subprocess
@@ -20,6 +20,7 @@ __all__ = [
     "CheckpointContextEngine",
     "DeterministicLanes",
     "Effect",
+    "MapDisposition",
     "MapFact",
     "MapShard",
     "ReducedState",
@@ -28,8 +29,8 @@ __all__ = [
 
 _MAP_CONCURRENCY_CAP = 2
 _MAP_MAX_TOKENS = 1024
-_MAP_PROMPT_VERSION = "map-prompt-v1"
-_MAP_SCHEMA_VERSION = "map-schema-v1"
+_MAP_PROMPT_VERSION = "map-prompt-v2"
+_MAP_SCHEMA_VERSION = "map-schema-v2"
 _MAP_EXTRACTOR_VERSION = "map-extractor-v1"
 _MAP_SHARD_TARGET_INPUT_TOKENS = 12_000
 _MAP_SHARD_MAX_INPUT_TOKENS = 16_000
@@ -71,6 +72,17 @@ _MAP_KINDS = _AUTHORITATIVE_MAP_KINDS | {
     "tool_result",
 }
 _AUTHORITATIVE_ROLES = frozenset({"system", "developer", "user"})
+_MAP_DISPOSITIONS = frozenset(
+    {
+        "represented",
+        "deterministic_lane",
+        "recent_tail",
+        "reconstructible",
+        "externalized",
+        "duplicate",
+        "noise",
+    }
+)
 
 
 _ACK_ONLY = frozenset(
@@ -155,6 +167,18 @@ class MapFact:
     identity: Optional[str] = None
     supersedes: tuple[str, ...] = ()
     action_state: Optional[str] = None
+    fact_id: Optional[str] = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class MapDisposition:
+    """One closed disposition for a planned source event."""
+
+    source_event_id: int
+    status: str
+    fact_ids: tuple[str, ...] = ()
+    duplicate_of: Optional[int] = None
+    recovery_ref: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +187,7 @@ class MapShard:
 
     source_event_ids: tuple[int, ...]
     facts: tuple[MapFact, ...]
+    dispositions: tuple[MapDisposition, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -1214,11 +1239,14 @@ class CheckpointContextEngine(ContextEngine):
             {
                 "role": "system",
                 "content": (
-                    "Return only JSON with exactly source_event_ids and facts. "
-                    "source_event_ids must cover this shard exactly. Each fact "
-                    f"needs kind ({', '.join(sorted(_MAP_KINDS))}), text, and "
-                    "source_event_ids from this shard, or "
-                    "uncertain: true when it has no source. Do not call tools."
+                    "Return only JSON with exactly schema_version, source_event_ids, facts, "
+                    "and dispositions. schema_version must be 2. source_event_ids must cover "
+                    "this shard exactly. Each fact needs a unique fact_id, kind "
+                    f"({', '.join(sorted(_MAP_KINDS))}), exact text, and source_event_ids from "
+                    "this shard. Give every source event exactly one disposition: "
+                    f"{', '.join(sorted(_MAP_DISPOSITIONS))}. represented names existing fact_ids; "
+                    "duplicate names an existing duplicate_of event; reconstructible and "
+                    "externalized use a session-event:<id> recovery_ref. Do not call tools."
                 ),
             },
             {
@@ -1350,6 +1378,16 @@ class CheckpointContextEngine(ContextEngine):
         identities = tuple(value)
         return identities if len(set(identities)) == len(identities) else None
 
+    @staticmethod
+    def _recovery_event_id(value: Any, source_event_ids: tuple[int, ...]) -> Optional[int]:
+        if not isinstance(value, str) or not value.startswith("session-event:"):
+            return None
+        try:
+            event_id = int(value.removeprefix("session-event:"))
+        except ValueError:
+            return None
+        return event_id if event_id in source_event_ids else None
+
     @classmethod
     def _parse_map_shard(
         cls,
@@ -1369,7 +1407,11 @@ class CheckpointContextEngine(ContextEngine):
             payload = json.loads(content)
         except (TypeError, ValueError):
             return None
-        if not isinstance(payload, dict) or set(payload) != {"source_event_ids", "facts"}:
+        if not isinstance(payload, dict) or set(payload) != {
+            "schema_version", "source_event_ids", "facts", "dispositions"
+        }:
+            return None
+        if payload["schema_version"] != 2:
             return None
         expected_source_ids = tuple(
             source_event_ids[index] for index in group.event_indices
@@ -1388,6 +1430,7 @@ class CheckpointContextEngine(ContextEngine):
                 return None
             if set(fact) - {
                 "kind",
+                "fact_id",
                 "text",
                 "source_event_ids",
                 "uncertain",
@@ -1397,6 +1440,7 @@ class CheckpointContextEngine(ContextEngine):
             }:
                 return None
             kind = fact["kind"]
+            fact_id = fact.get("fact_id")
             text = fact["text"]
             uncertain = fact.get("uncertain", False)
             if not isinstance(kind, str):
@@ -1404,6 +1448,8 @@ class CheckpointContextEngine(ContextEngine):
             kind = kind.casefold()
             if (
                 kind not in _MAP_KINDS
+                or not isinstance(fact_id, str)
+                or not fact_id.strip()
                 or (
                     kind == "observation"
                     and fact.get("action_state") not in (None, "blocked")
@@ -1452,9 +1498,60 @@ class CheckpointContextEngine(ContextEngine):
                     identity,
                     supersedes,
                     action_state,
+                    fact_id,
                 )
             )
-        return MapShard(expected_source_ids, tuple(parsed_facts))
+        fact_ids = {fact.fact_id for fact in parsed_facts}
+        if len(fact_ids) != len(parsed_facts):
+            return None
+        dispositions = payload["dispositions"]
+        if not isinstance(dispositions, list) or len(dispositions) != len(expected_source_ids):
+            return None
+        parsed_dispositions = []
+        for disposition in dispositions:
+            if not isinstance(disposition, dict) or set(disposition) - {
+                "source_event_id", "status", "fact_ids", "duplicate_of", "recovery_ref"
+            }:
+                return None
+            event_id = disposition.get("source_event_id")
+            status = disposition.get("status")
+            fact_refs = cls._identities(disposition.get("fact_ids", []))
+            duplicate_of = disposition.get("duplicate_of")
+            recovery_ref = disposition.get("recovery_ref")
+            if (
+                isinstance(event_id, bool)
+                or not isinstance(event_id, int)
+                or not isinstance(status, str)
+                or fact_refs is None
+            ):
+                return None
+            status = status.casefold()
+            if status not in _MAP_DISPOSITIONS:
+                return None
+            if status == "represented":
+                if not fact_refs or not set(fact_refs) <= fact_ids or duplicate_of is not None or recovery_ref is not None:
+                    return None
+            elif status == "duplicate":
+                if (
+                    fact_refs
+                    or isinstance(duplicate_of, bool)
+                    or not isinstance(duplicate_of, int)
+                    or duplicate_of == event_id
+                    or duplicate_of not in source_event_ids
+                    or recovery_ref is not None
+                ):
+                    return None
+            elif status in {"reconstructible", "externalized"}:
+                if fact_refs or duplicate_of is not None or cls._recovery_event_id(recovery_ref, source_event_ids) is None:
+                    return None
+            elif fact_refs or duplicate_of is not None or recovery_ref is not None:
+                return None
+            parsed_dispositions.append(
+                MapDisposition(event_id, status, fact_refs, duplicate_of, recovery_ref)
+            )
+        if {disposition.source_event_id for disposition in parsed_dispositions} != set(expected_source_ids):
+            return None
+        return MapShard(expected_source_ids, tuple(parsed_facts), tuple(parsed_dispositions))
 
     @classmethod
     def _validate_map_shard_sources(
@@ -1463,7 +1560,7 @@ class CheckpointContextEngine(ContextEngine):
         messages: List[Dict[str, Any]],
         group: CausalGroup,
         source_event_ids: tuple[int, ...],
-    ) -> MapShard:
+    ) -> Optional[MapShard]:
         """Keep only source-backed facts with executable authority."""
         rows = {
             source_event_ids[index]: messages[index]
@@ -1502,7 +1599,33 @@ class CheckpointContextEngine(ContextEngine):
             ) and not any(row.get("role") in _AUTHORITATIVE_ROLES for row in supporting):
                 continue
             validated.append(fact)
-        return MapShard(shard.source_event_ids, tuple(validated))
+        validated_by_id = {fact.fact_id: fact for fact in validated}
+        for disposition in shard.dispositions:
+            if disposition.status == "represented" and (
+                not set(disposition.fact_ids) <= set(validated_by_id)
+                or any(
+                    disposition.source_event_id not in validated_by_id[fact_id].source_event_ids
+                    for fact_id in disposition.fact_ids
+                )
+            ):
+                return None
+            row = rows[disposition.source_event_id]
+            content = row.get("content")
+            text = content.casefold() if isinstance(content, str) else ""
+            hard_constraint = row.get("role") == "user" and any(
+                marker in text for marker in ("must ", "must not", "do not", "never ")
+            )
+            high_risk = hard_constraint or any(marker in text for marker in (
+                "failed", "failure", "error", "unknown side effect",
+                "subagent final", "next action", "acceptance",
+            ))
+            if (
+                (row.get("role") == "user" and disposition.status == "noise")
+                or (high_risk and not validated and disposition.status != "externalized")
+                or (high_risk and disposition.status == "noise")
+            ):
+                return None
+        return MapShard(shard.source_event_ids, tuple(validated), shard.dispositions)
 
     @staticmethod
     def _map_shard_cache_key(
@@ -1553,6 +1676,7 @@ class CheckpointContextEngine(ContextEngine):
             return False
         source_events = set(shard_source_ids)
         total_fact_text_bytes = 0
+        fact_ids = set()
         for fact in shard.facts:
             if not isinstance(fact, MapFact):
                 return False
@@ -1562,8 +1686,11 @@ class CheckpointContextEngine(ContextEngine):
                 or not isinstance(fact.text, str)
                 or not fact.text
                 or not isinstance(fact.uncertain, bool)
+                or not isinstance(fact.fact_id, str)
+                or not fact.fact_id.strip()
             ):
                 return False
+            fact_ids.add(fact.fact_id)
             if len(fact.text) > _MAP_FACT_TEXT_MAX_BYTES:
                 return False
             text_bytes = len(fact.text.encode("utf-8"))
@@ -1605,7 +1732,43 @@ class CheckpointContextEngine(ContextEngine):
                     return False
             elif not fact.uncertain:
                 return False
-        return True
+        if len(fact_ids) != len(shard.facts) or not isinstance(shard.dispositions, tuple):
+            return False
+        if len(shard.dispositions) != len(shard_source_ids):
+            return False
+        disposition_events = set()
+        for disposition in shard.dispositions:
+            if not isinstance(disposition, MapDisposition):
+                return False
+            if (
+                disposition.source_event_id not in source_events
+                or disposition.source_event_id in disposition_events
+                or disposition.status not in _MAP_DISPOSITIONS
+                or not isinstance(disposition.fact_ids, tuple)
+            ):
+                return False
+            disposition_events.add(disposition.source_event_id)
+            if disposition.status == "represented":
+                if not disposition.fact_ids or not set(disposition.fact_ids) <= fact_ids:
+                    return False
+            elif disposition.status == "duplicate":
+                if (
+                    disposition.fact_ids
+                    or disposition.duplicate_of not in source_event_ids
+                    or disposition.duplicate_of == disposition.source_event_id
+                    or disposition.recovery_ref is not None
+                ):
+                    return False
+            elif disposition.status in {"reconstructible", "externalized"}:
+                if (
+                    disposition.fact_ids
+                    or disposition.duplicate_of is not None
+                    or cls._recovery_event_id(disposition.recovery_ref, source_event_ids) is None
+                ):
+                    return False
+            elif disposition.fact_ids or disposition.duplicate_of is not None or disposition.recovery_ref is not None:
+                return False
+        return disposition_events == source_events
 
     def _map_group(
         self,
@@ -1715,6 +1878,7 @@ class CheckpointContextEngine(ContextEngine):
                         fact.identity,
                         fact.supersedes,
                         "blocked",
+                        fact.fact_id,
                     )
                 identity = cls._fact_identity(fact)
                 authoritative = fact.kind.casefold() in _AUTHORITATIVE_MAP_KINDS

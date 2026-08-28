@@ -2304,6 +2304,89 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+def _materialize_checkpoint_provider_request(
+    agent: Any, candidate: list, rebuilt_system_prompt: str
+) -> Tuple[list, Any]:
+    """Build the next provider request before a checkpoint can be committed."""
+    # Keep this at the durable-commit boundary: automatic and manual callers
+    # all reach it, while a failure leaves the transcript untouched.
+    from agent.conversation_loop import (
+        _apply_context_engine_selection,
+        _canonicalize_api_tool_calls,
+        _clone_message_for_send,
+    )
+    from agent.message_sanitization import _sanitize_messages_surrogates
+    from agent.prompt_caching import build_prompt_cache_plan, effective_cache_ttl
+
+    final_messages = []
+    for candidate_message in candidate:
+        final_message = _clone_message_for_send(candidate_message)
+        api_content = final_message.pop("api_content", None)
+        for key in (
+            "_row_id", "display_kind", "display_metadata", "task_epoch_id", "task_boundary"
+        ):
+            final_message.pop(key, None)
+        if (
+            isinstance(api_content, str)
+            and api_content
+            and final_message.get("role") in ("user", "assistant")
+        ):
+            final_message["content"] = api_content
+        final_messages.append(final_message)
+    effective_system = rebuilt_system_prompt or ""
+    ephemeral_system = getattr(agent, "ephemeral_system_prompt", None)
+    if ephemeral_system:
+        effective_system = (effective_system + "\n\n" + ephemeral_system).strip()
+    if effective_system:
+        final_messages.insert(0, {"role": "system", "content": effective_system})
+    prefill_messages = getattr(agent, "prefill_messages", None) or []
+    if prefill_messages:
+        offset = int(bool(effective_system))
+        final_messages[offset:offset] = [
+            _clone_message_for_send(message) for message in prefill_messages
+        ]
+    incoming = next(
+        (message for message in reversed(candidate) if message.get("role") == "user"),
+        None,
+    )
+    final_messages = _apply_context_engine_selection(
+        agent, final_messages, candidate, incoming, logger=logger
+    )
+    final_messages = agent._sanitize_api_messages(final_messages)
+    final_messages = agent._drop_thinking_only_and_merge_users(
+        final_messages,
+        drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+    )
+    for message in final_messages:
+        if isinstance(message.get("content"), str):
+            message["content"] = message["content"].strip()
+    _canonicalize_api_tool_calls(final_messages)
+    _sanitize_messages_surrogates(final_messages)
+    final_tools = getattr(agent, "tools", None)
+    if getattr(agent, "_use_prompt_caching", False) and agent.provider != "moa":
+        cache_plan = build_prompt_cache_plan(
+            final_messages,
+            final_tools,
+            cache_ttl=effective_cache_ttl(
+                agent._cache_ttl, provider=agent.provider, model=agent.model
+            ),
+            native_anthropic=agent._use_native_cache_layout,
+            static_system_prefix=getattr(agent, "_cached_system_prompt_static", None),
+            direct_native_tool_cache=agent._direct_native_anthropic_tool_cache_capability(),
+        )
+        final_messages, final_tools = cache_plan.messages, cache_plan.tools
+    if agent.provider == "moa":
+        completions = getattr(getattr(agent.client, "chat", None), "completions", None)
+        prepare = getattr(completions, "prepare", None)
+        if not callable(prepare):
+            raise RuntimeError("MoA provider request cannot be prepared")
+        prepared = prepare(final_messages)
+        if not isinstance(prepared, dict) or not isinstance(prepared.get("messages"), list):
+            raise RuntimeError("MoA provider returned an invalid prepared request")
+        final_messages = prepared["messages"]
+    return final_messages, final_tools
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -3559,9 +3642,14 @@ def compress_context(
         final_wire_messages = compressed
         final_wire_system_prompt = new_system_prompt
         final_wire_tools = getattr(agent, "tools", None)
-        if final_provider_request is not None:
+        if callable(final_wire_over_budget):
             try:
-                final_wire_messages, final_wire_tools = final_provider_request(
+                materialize = final_provider_request or (
+                    lambda candidate, prompt: _materialize_checkpoint_provider_request(
+                        agent, candidate, prompt
+                    )
+                )
+                final_wire_messages, final_wire_tools = materialize(
                     compressed, new_system_prompt
                 )
                 final_wire_system_prompt = ""

@@ -154,6 +154,34 @@ class TestModelPoolRouting:
             payload = json.loads(delegate_task(goal="do work", parent_agent=parent()))
         assert "error" in payload and "standard" in payload["error"].lower()
 
+    def test_explicit_profile_missing_standard_fails_before_child_construction(self):
+        cfg = {"model_pool": {"fast": STANDARD_POOL["test"]}}
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", side_effect=AssertionError("must not construct")
+        ):
+            payload = json.loads(
+                delegate_task(goal="do work", model_profile="fast", parent_agent=parent())
+            )
+        assert "error" in payload and "standard" in payload["error"].lower()
+
+    def test_per_task_profile_missing_standard_fails_before_child_construction(self):
+        cfg = {"model_pool": {"fast": STANDARD_POOL["test"]}}
+        tasks = [
+            {"goal": "use fast profile", "model_profile": "fast"},
+            {"goal": "use the inherited profile"},
+        ]
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", side_effect=AssertionError("must not construct")
+        ):
+            payload = json.loads(
+                delegate_task(
+                    tasks=tasks,
+                    model_profile="fast",
+                    parent_agent=parent(),
+                )
+            )
+        assert "error" in payload and "standard" in payload["error"].lower()
+
 
 class TestBuildChildFallbackOverride:
     def test_profile_chain_beats_parent_chain(self):

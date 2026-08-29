@@ -8,9 +8,12 @@ the manager's single serialized background worker.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from typing import Any, Dict, List
+
+import pytest
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
@@ -52,6 +55,9 @@ class _RecordingProvider(MemoryProvider):
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
         self.calls.append(("switch", new_session_id, kwargs.get("reset")))
+
+    def shutdown(self) -> None:
+        self.calls.append(("shutdown",))
 
 
 def _make_manager(provider: _RecordingProvider) -> MemoryManager:
@@ -112,5 +118,177 @@ def test_boundary_commit_switch_still_fires_when_end_raises():
     assert mm.flush_pending(timeout=5)
 
     assert ("switch", "new-sid", True) in provider.calls
+
+
+def test_resume_boundary_uses_reset_false():
+    provider = _RecordingProvider()
+    mm = _make_manager(provider)
+
+    mm.commit_session_boundary_async(
+        [], new_session_id="target", reset=False, reason="resume"
+    )
+    assert mm.flush_pending(timeout=5)
+
+    assert provider.calls == [("end", []), ("switch", "target", False)]
+
+
+def test_retirement_cuts_admission_and_orders_write_end_shutdown():
+    started = threading.Event()
+    release_write = threading.Event()
+    release_retirement = threading.Event()
+
+    class _BlockingProvider(_RecordingProvider):
+        def sync_turn(self, user_content, assistant_content, **kwargs):
+            if user_content == "first":
+                started.set()
+                assert release_write.wait(timeout=5)
+            self.calls.append(("write", user_content))
+
+    provider = _BlockingProvider()
+    mm = _make_manager(provider)
+    mm.sync_all("first", "response")
+    assert started.wait(timeout=2)
+    mm.sync_all("second", "response")
+
+    ticket = mm.commit_session_boundary_async(
+        [{"role": "user", "content": "outgoing"}],
+        new_session_id="",
+        retire=True,
+        release_event=release_retirement,
+    )
+    mm.sync_all("late", "response")
+    release_write.set()
+    release_retirement.set()
+    assert ticket.result(timeout=5) is None
+
+    assert provider.calls == [
+        ("write", "first"),
+        ("write", "second"),
+        ("end", [{"role": "user", "content": "outgoing"}]),
+        ("shutdown",),
+    ]
+
+
+def test_retirement_shutdown_runs_when_end_raises():
+    class _ExplodingEndProvider(_RecordingProvider):
+        def on_session_end(self, messages):
+            self.calls.append(("end", list(messages)))
+            raise RuntimeError("boom")
+
+    provider = _ExplodingEndProvider()
+    mm = _make_manager(provider)
+    release = threading.Event()
+    ticket = mm.commit_session_boundary_async(
+        [], new_session_id="", retire=True, release_event=release
+    )
+    release.set()
+    assert ticket.result(timeout=5) is None
+    assert provider.calls == [("end", []), ("shutdown",)]
+
+
+class _ShutdownFailureProvider(_RecordingProvider):
+    def __init__(self, name: str, calls: list, failure: BaseException | None = None):
+        super().__init__()
+        self._name = name
+        self._all_calls = calls
+        self._failure = failure
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def shutdown(self) -> None:
+        self._all_calls.append(self._name)
+        if self._failure is not None:
+            raise self._failure
+
+
+@pytest.mark.parametrize("failure_index", [0, 1, 2])
+def test_shutdown_attempts_every_provider_after_ordinary_failure(failure_index):
+    calls = []
+    providers = [
+        _ShutdownFailureProvider(
+            str(index),
+            calls,
+            RuntimeError("ordinary shutdown failure") if index == failure_index else None,
+        )
+        for index in range(3)
+    ]
+    mm = MemoryManager()
+    mm._providers = providers
+
+    mm._shutdown_providers()
+
+    assert calls == ["2", "1", "0"]
+
+
+@pytest.mark.parametrize("failure_index", [0, 1, 2])
+@pytest.mark.parametrize(
+    "failure",
+    [KeyboardInterrupt(), SystemExit(2), asyncio.CancelledError()],
+    ids=["keyboard-interrupt", "system-exit", "cancelled-error"],
+)
+def test_shutdown_attempts_every_provider_then_reraises_baseexception(
+    failure_index, failure
+):
+    calls = []
+    providers = [
+        _ShutdownFailureProvider(
+            str(index), calls, failure if index == failure_index else None
+        )
+        for index in range(3)
+    ]
+    mm = MemoryManager()
+    mm._providers = providers
+
+    with pytest.raises(type(failure)) as raised:
+        mm._shutdown_providers()
+
+    assert raised.value is failure
+    assert calls == ["2", "1", "0"]
+
+
+def test_shutdown_reraises_first_baseexception_after_all_attempts():
+    calls = []
+    failures = [KeyboardInterrupt(), SystemExit(2), asyncio.CancelledError()]
+    mm = MemoryManager()
+    mm._providers = [
+        _ShutdownFailureProvider(str(index), calls, failure)
+        for index, failure in enumerate(failures)
+    ]
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        mm._shutdown_providers()
+
+    assert raised.value is failures[2]
+    assert calls == ["2", "1", "0"]
+
+
+def test_retirement_baseexception_reports_drained_after_sibling_cleanup():
+    calls = []
+    failure = KeyboardInterrupt()
+    mm = MemoryManager()
+    mm._providers = [
+        _ShutdownFailureProvider("first", calls),
+        _ShutdownFailureProvider("fatal", calls, failure),
+        _ShutdownFailureProvider("last", calls),
+    ]
+    release = threading.Event()
+    ticket = mm.commit_session_boundary_async(
+        [], new_session_id="", retire=True, release_event=release
+    )
+    release.set()
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        ticket.result(timeout=5)
+
+    assert raised.value is failure
+    assert calls == ["last", "fatal", "first"]
+    assert mm.shutdown_drain_state == {
+        "status": "drained",
+        "abandoned_writes": 0,
+        "abandoned_prefetches": 0,
+        "active_tasks": 0,
+    }
 
 

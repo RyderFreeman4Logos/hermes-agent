@@ -354,6 +354,8 @@ def get_tool_definitions(
     # invalidate hook on every config-writer.
     cache_key = None
     if quiet_mode:
+        from tools.memory_tool import memory_surface_cache_key
+
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -374,6 +376,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                memory_surface_cache_key(),
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None

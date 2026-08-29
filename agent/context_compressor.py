@@ -4741,8 +4741,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         ``_LEAN_DIGEST_MAX_CHUNKS`` — beyond that, earliest chunks are merged
         coarser) and digests each with the compression LLM. Any chunk failure
         degrades to a placeholder naming the message range; the whole call
-        never raises. Chunks run sequentially on the same transport as the
-        main summary.
+        never raises. Reuse the first selected fallback route for siblings.
         """
         text = _serialize_turns_for_digest(
             turns, getattr(self, "_lean_pristine_tools", None),
@@ -4754,26 +4753,49 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if n_chunks > _LEAN_DIGEST_MAX_CHUNKS:
             chunk_size = (len(text) + _LEAN_DIGEST_MAX_CHUNKS - 1) // _LEAN_DIGEST_MAX_CHUNKS
             n_chunks = _LEAN_DIGEST_MAX_CHUNKS
-        digests: list[str] = []
-        for ci in range(n_chunks):
-            segment = text[ci * chunk_size:(ci + 1) * chunk_size]
-            if not segment.strip():
-                continue
+        jobs = [
+            (ci, text[ci * chunk_size:(ci + 1) * chunk_size])
+            for ci in range(n_chunks)
+            if text[ci * chunk_size:(ci + 1) * chunk_size].strip()
+        ]
+        if not jobs:
+            return ""
+
+        def _unavailable(ci: int, exc: BaseException | None = None) -> str:
+            if exc is not None:
+                logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
+            body = (
+                f"[digest unavailable for segment {ci + 1}/{n_chunks} "
+                "— recover via session_search]"
+            )
+            return f"### Segment {ci + 1}/{n_chunks}\n{body}"
+
+        def _digest_one(
+            ci: int,
+            segment: str,
+            *,
+            route: dict[str, Any] | None = None,
+            route_info: dict[str, Any] | None = None,
+        ) -> str:
             try:
                 from agent.auxiliary_client import call_llm
 
                 # During a stall-fallback retry, follow the summary onto the
                 # pinned healthy route (non-consuming read) instead of
                 # re-addressing the stalled task backend (#96634 follow-up).
-                resp = call_llm(
-                    messages=[{
+                call_kwargs = {
+                    "messages": [{
                         "role": "user",
                         "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
                     }],
-                    task="compression",
-                    max_tokens=_LEAN_DIGEST_MAX_TOKENS,
-                    **attempt_summary_route_kwargs(),
-                )
+                    "task": "compression",
+                    "max_tokens": _LEAN_DIGEST_MAX_TOKENS,
+                }
+                if route:
+                    call_kwargs.update(route)
+                elif route_info is not None:
+                    call_kwargs["route_info"] = route_info
+                resp = call_llm(**call_kwargs)
                 body = (
                     resp.choices[0].message.content
                     if hasattr(resp, "choices") else str(resp)
@@ -4781,12 +4803,36 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 from agent.agent_runtime_helpers import strip_think_blocks
 
                 body = strip_think_blocks(None, body).strip()
-            except Exception as exc:
-                logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
-                body = f"[digest unavailable for segment {ci + 1}/{n_chunks} — recover via session_search]"
-            digests.append(f"### Segment {ci + 1}/{n_chunks}\n{body}")
-        if not digests:
-            return ""
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                return _unavailable(ci, exc)
+            return f"### Segment {ci + 1}/{n_chunks}\n{body}"
+
+        first_ci, first_segment = jobs[0]
+        route_info: dict[str, Any] = {}
+        first_digest = _digest_one(
+            first_ci, first_segment, route_info=route_info,
+        )
+        provider = str(route_info.get("provider") or "").strip()
+        model = str(route_info.get("model") or "").strip()
+        selected_route: dict[str, Any] | None = None
+        if provider and model and model not in {"default", "unknown"}:
+            selected_route = {"provider": provider, "model": model}
+            fallback_label = route_info.get("fallback_label")
+            if fallback_label:
+                selected_route["route_info"] = {
+                    "fallback_label": str(fallback_label),
+                }
+
+        digests = [first_digest]
+        for ci, segment in jobs[1:]:
+            try:
+                digests.append(_digest_one(ci, segment, route=selected_route))
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                digests.append(_unavailable(ci, exc))
         return (
             "\n\n" + _LEAN_DIGESTS_HEADING + "\n"
             + "\n\n".join(digests)

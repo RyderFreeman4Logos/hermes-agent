@@ -1678,6 +1678,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 ),
                 metadata={
                     "api_mode": "codex_responses",
+                    "route": str(getattr(agent, "base_url", "") or ""),
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
                     "call_role": (
                         "delegated"

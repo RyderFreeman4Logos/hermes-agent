@@ -1305,6 +1305,50 @@ def test_empty_represented_assistant_does_not_poison_covered_tool_shard():
     )
 
 
+def test_empty_represented_assistant_requires_source_backed_survivor():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response(
+                {
+                    "schema_version": 2,
+                    "source_event_ids": [101],
+                    "facts": [
+                        {
+                            "fact_id": "fact:plan",
+                            "kind": "plan",
+                            "text": "Plan the requested work.",
+                            "source_event_ids": [101],
+                        },
+                        {
+                            "fact_id": "fact:uncertain",
+                            "kind": "observation",
+                            "text": "Possibly relevant context.",
+                            "uncertain": True,
+                        },
+                    ],
+                    "dispositions": [
+                        {
+                            "source_event_id": 101,
+                            "status": "represented",
+                            "fact_ids": ["fact:plan"],
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    shard = engine._map_group(
+        [{"role": "assistant", "content": "Plan the requested work."}],
+        CausalGroup((0,)),
+        (101,),
+    )
+
+    assert shard is None
+
+
 @pytest.mark.parametrize("kind", ("task", "instruction", "command", "goal"))
 def test_map_rejects_unknown_imperative_sibling_kinds_at_parse_time(kind):
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine

@@ -1964,8 +1964,9 @@ class CheckpointContextEngine(ContextEngine):
                 "subagent final", "next action", "acceptance",
             ))
             binding_identity = text.startswith(("decision:", "repository identity:"))
+            has_source_backed_fact = any(fact.source_event_ids for fact in validated)
             if disposition.status == "represented" and not fact_ids:
-                if row.get("role") == "user" or high_risk or binding_identity or not validated:
+                if row.get("role") == "user" or high_risk or binding_identity or not has_source_backed_fact:
                     return None
                 disposition = replace(disposition, status="noise", fact_ids=())
             if (

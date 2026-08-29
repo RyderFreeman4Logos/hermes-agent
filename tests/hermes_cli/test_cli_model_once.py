@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from hermes_cli.model_switch import ModelSwitchResult
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    apply_model_switch_after_compression,
+    get_model_switch_after_compression,
+)
 
 
 class _FakeAgent:
@@ -148,4 +152,176 @@ def test_cli_restore_model_runtime_prefers_primary_runtime():
 
     assert stub.agent.model == "old/model"
     assert stub.agent.provider == "openrouter"
+    assert stub.agent.calls == []
+
+
+def test_cli_provider_only_after_compression_passes_provider_to_switch(monkeypatch):
+    import cli as cli_mod
+
+    captured = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+
+    def fake_switch(**kwargs):
+        captured.append(kwargs)
+        return ModelSwitchResult(
+            success=True,
+            new_model="configured/model",
+            target_provider="anthropic",
+            api_key="[REDACTED]",
+            base_url="https://api.anthropic.com",
+            api_mode="anthropic_messages",
+            provider_label="Anthropic",
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    for raw in (
+        "/model --after-compression --provider anthropic",
+        "/model --provider anthropic --after-compression",
+    ):
+        stub = _StubCLI()
+        stub.agent = _FakeAgent()
+        cli_mod.HermesCLI._handle_model_switch(stub, raw)
+
+    assert [call["raw_input"] for call in captured] == ["", ""]
+    assert [call["explicit_provider"] for call in captured] == [
+        "anthropic",
+        "anthropic",
+    ]
+
+
+def test_cli_model_after_compression_resolves_now_without_mutating_route(monkeypatch):
+    import cli as cli_mod
+
+    class DeferredAgent(_FakeAgent):
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.calls.append(
+                {
+                    "new_model": new_model,
+                    "new_provider": new_provider,
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "api_mode": api_mode,
+                }
+            )
+            self.model = new_model
+            self.provider = new_provider
+
+    stub = _StubCLI()
+    stub.agent = DeferredAgent()
+    printed = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: printed.append(str(s)))
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not persist")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_: ModelSwitchResult(
+            success=True,
+            new_model="next/model",
+            target_provider="anthropic",
+            api_key="[REDACTED]",
+            base_url="https://api.anthropic.com",
+            api_mode="anthropic_messages",
+            provider_label="Anthropic",
+            reasoning_config={"enabled": True, "effort": "low"},
+        ),
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(
+        stub,
+        "/model next/model --after-compression --provider anthropic --reasoning low",
+    )
+
+    assert stub.model == "old/model"
+    assert stub.provider == "openrouter"
+    assert stub.agent.calls == []
+    assert get_model_switch_after_compression(stub.agent).new_model == "next/model"
+    assert get_model_switch_after_compression(stub.agent).reasoning_config == {
+        "enabled": True,
+        "effort": "low",
+    }
+    assert any("scheduled after compression" in line for line in printed)
+
+    assert apply_model_switch_after_compression(stub.agent) == "applied"
+    assert stub.agent.model == "next/model"
+    assert stub.agent.provider == "anthropic"
+    assert stub.agent.calls[-1]["new_model"] == "next/model"
+
+
+def test_cli_reasoning_only_after_compression_keeps_route(monkeypatch):
+    import cli as cli_mod
+
+    scheduled = []
+    stub = _StubCLI()
+    stub.agent = _FakeAgent()
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+
+    def fake_switch(**kwargs):
+        return ModelSwitchResult(
+            success=True,
+            new_model=kwargs["current_model"],
+            target_provider=kwargs["current_provider"],
+            api_key="[REDACTED]",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.schedule_model_switch_after_compression",
+        lambda agent, result: scheduled.append((agent, result)),
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(
+        stub,
+        "/model --after-compression --reasoning low",
+    )
+
+    pending = scheduled[0][1]
+    assert pending is not None
+    assert (pending.new_model, pending.target_provider) == ("old/model", "openrouter")
+    assert pending.reasoning_config == {"enabled": True, "effort": "low"}
     assert stub.agent.calls == []

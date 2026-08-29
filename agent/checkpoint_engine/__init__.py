@@ -1799,6 +1799,8 @@ class CheckpointContextEngine(ContextEngine):
                 return None
             event_id = disposition.get("source_event_id")
             status = disposition.get("status")
+            if status == "duplicate_of":
+                status = "duplicate"
             fact_refs = cls._identities(disposition.get("fact_ids", []))
             duplicate_of = disposition.get("duplicate_of")
             recovery_ref = disposition.get("recovery_ref")

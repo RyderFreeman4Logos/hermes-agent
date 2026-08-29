@@ -1879,6 +1879,44 @@ def test_map_accepts_getting_status_alias_but_rejects_conflict():
     ) is None
 
 
+def test_map_accepts_duplicate_of_status_alias_but_preserves_duplicate_validation():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    payload = {
+        "schema_version": 2,
+        "source_event_ids": [1, 2],
+        "facts": [],
+        "dispositions": [
+            {"source_event_id": 1, "status": "duplicate_of", "duplicate_of": 2},
+            {
+                "source_event_id": 2,
+                "status": "reconstructible",
+                "recovery_ref": "session-event:2",
+            },
+        ],
+    }
+    engine = CheckpointContextEngine()
+    group = CausalGroup((0, 1))
+
+    alias = engine._parse_map_shard(_map_response(payload), group, (1, 2))
+    canonical_payload = deepcopy(payload)
+    canonical_payload["dispositions"][0]["status"] = "duplicate"
+    canonical = engine._parse_map_shard(
+        _map_response(canonical_payload), group, (1, 2)
+    )
+
+    assert alias is not None
+    assert alias == canonical
+    assert alias.dispositions[0].duplicate_of == 2
+    missing_target = deepcopy(payload)
+    missing_target["dispositions"][0].pop("duplicate_of")
+    assert engine._parse_map_shard(_map_response(missing_target), group, (1, 2)) is None
+    for status in ("unknown", "DUPLICATE_OF"):
+        unknown = deepcopy(payload)
+        unknown["dispositions"][0]["status"] = status
+        assert engine._parse_map_shard(_map_response(unknown), group, (1, 2)) is None
+
+
 def test_map_accepts_fact_event_ids_alias_but_rejects_conflicts_and_unknown_keys():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 

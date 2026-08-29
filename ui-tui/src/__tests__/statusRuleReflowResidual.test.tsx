@@ -89,6 +89,55 @@ describe('retained status-rule reflow', () => {
     }
   })
 
+  it('reflows every configured field across a constrained normal-width terminal', async () => {
+    const props: StatusRuleProps = {
+      ...baseProps,
+      cols: 72,
+      cwdLabel: 'repo-branch',
+      focusView: true,
+      statusBarSegments: [
+        'indicator',
+        'model',
+        'context_tokens',
+        'focus',
+        'compressions',
+        'voice',
+        'sessions',
+        'bg_tasks',
+        'subagents',
+        'resume',
+        'cwd'
+      ]
+    }
+    const mounted = mount(props, 72)
+
+    try {
+      await flush()
+      const lines = mounted.lines()
+      const output = lines.join('\\n')
+
+      expect(lines.length).toBeGreaterThan(1)
+      expect(lines.every(line => stringWidth(line) <= 72)).toBe(true)
+      for (const needle of [
+        'ready',
+        'qwen 长',
+        '32k/128k',
+        '◉ focus',
+        'cmp 3',
+        'voice off',
+        '3 sessions',
+        '2 bg',
+        '⛓ 2',
+        'resumes when 2 subagents finish',
+        'repo-branch'
+      ]) {
+        expect(output).toContain(needle)
+      }
+    } finally {
+      mounted.cleanup()
+    }
+  })
+
   it('bounds an over-wide clickable session count without losing its click path', async () => {
     const onSessionCountClick = vi.fn()
     const props: StatusRuleProps = {

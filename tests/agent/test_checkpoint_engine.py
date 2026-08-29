@@ -1773,6 +1773,50 @@ def test_map_accepts_complete_stop_sized_synthetic_response_but_remains_bounded(
     assert engine._parse_map_shard(oversized, CausalGroup((0,)), (1,)) is None
 
 
+def test_map_accepts_observed_stop_fact_lengths_but_rejects_larger_fact():
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    texts = ("x" * 8_849, "y" * 6_551)
+    fact_ids = [f"fact:{index}" for index in range(len(texts))]
+    payload = {
+        "schema_version": 2,
+        "source_event_ids": [1],
+        "facts": [
+            {
+                "fact_id": fact_id,
+                "kind": "observation",
+                "text": text,
+                "source_event_ids": [1],
+            }
+            for fact_id, text in zip(fact_ids, texts)
+        ],
+        "dispositions": [{
+            "source_event_id": 1,
+            "status": "represented",
+            "fact_ids": fact_ids,
+        }],
+    }
+    engine = CheckpointContextEngine()
+
+    assert checkpoint_engine._MAP_FACT_TEXT_MAX_BYTES >= max(
+        len(text.encode("utf-8")) for text in texts
+    )
+    assert checkpoint_engine._MAP_FACT_TEXT_TOTAL_MAX_BYTES >= sum(
+        len(text.encode("utf-8")) for text in texts
+    )
+    assert engine._parse_map_shard(
+        _map_response(payload), CausalGroup((0,)), (1,)
+    ) is not None
+    oversized = deepcopy(payload)
+    oversized["facts"][0]["text"] = "z" * (
+        checkpoint_engine._MAP_FACT_TEXT_MAX_BYTES + 1
+    )
+    assert engine._parse_map_shard(
+        _map_response(oversized), CausalGroup((0,)), (1,)
+    ) is None
+
+
 def test_map_cache_resumes_only_missing_shards():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine, MapShard
 

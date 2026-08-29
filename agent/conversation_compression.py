@@ -4627,7 +4627,14 @@ def compress_context(
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
-        agent.context_compressor.awaiting_real_usage_after_compression = True
+        # A failed session publication can roll ``compressed`` back to the
+        # original transcript. Only a real rewrite owns the next cache reading.
+        if compressed != messages_before_compression:
+            agent._awaiting_cache_usage_after_compression = True
+            if hasattr(
+                agent.context_compressor, "awaiting_real_usage_after_compression"
+            ):
+                agent.context_compressor.awaiting_real_usage_after_compression = True
         # Compaction rewrote the transcript, so the usage anchor's base
         # message-list snapshot no longer describes what will be sent —
         # invalidate it. Context checks fall back to full estimation until
@@ -4811,7 +4818,11 @@ def _compress_context_via_codex_app_server(
         # Codex turn supplies usage. Minimal external test engines may not expose
         # the ContextEngine update hook; preserve their existing bookkeeping.
         if hasattr(agent.context_compressor, "update_from_response"):
-            _record_codex_app_server_usage(agent, result)
+            _record_codex_app_server_usage(
+                agent,
+                result,
+                consume_post_compression_attribution=False,
+            )
     except Exception:
         logger.debug("codex compaction bookkeeping failed", exc_info=True)
 

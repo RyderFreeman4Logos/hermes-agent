@@ -3500,7 +3500,9 @@ def _relay_sync_completion(
         callback = _default_callback
     else:
         callback = create
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(
+        provider=provider, api_mode=api_mode, route=str(getattr(client, "base_url", "") or "")
+    )
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
@@ -3532,13 +3534,16 @@ async def _relay_async_completion(
         async def _default_callback(request: dict[str, Any]) -> Any:
             from agent import relay_llm
 
-            relay_llm.capture_transport_request(request)
+            if not _client_streams_internally(client):
+                relay_llm.capture_transport_request(request)
             return await client.chat.completions.create(**request)
 
         callback = _default_callback
     else:
         callback = create
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(
+        provider=provider, api_mode=api_mode, route=str(getattr(client, "base_url", "") or "")
+    )
     if route is None:
         return await callback(kwargs)
     provider_name, fallback_model, metadata = route
@@ -3568,7 +3573,9 @@ def _relay_sync_stream(
             relay_llm.capture_transport_request(request)
         return client.chat.completions.create(**request)
 
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(
+        provider=provider, api_mode=api_mode, route=str(getattr(client, "base_url", "") or "")
+    )
     if route is None:
         return _stream_callback(kwargs)
     provider_name, fallback_model, metadata = route
@@ -10063,6 +10070,9 @@ def _client_streams_internally(client: Any) -> bool:
         CodexAuxiliaryClient,
         AnthropicAuxiliaryClient,
         BedrockAuxiliaryClient,
+        AsyncCodexAuxiliaryClient,
+        AsyncAnthropicAuxiliaryClient,
+        AsyncBedrockAuxiliaryClient,
     ))
 
 

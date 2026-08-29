@@ -166,3 +166,40 @@ def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, 
     assert "queued" not in calls
     assert "abandoning 1 queued memory write" in caplog.text
     release.set()
+
+
+def test_retirement_timeout_leaves_boundary_to_finish_once():
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class _WedgedRetirementProvider(_SlowProvider):
+        def sync_turn(self, user_content, assistant_content, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            calls.append("write")
+
+        def on_session_end(self, messages):
+            calls.append("end")
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    mgr = MemoryManager()
+    mgr.add_provider(_WedgedRetirementProvider(delay=0))
+    mgr.sync_all("active", "response")
+    assert started.wait(timeout=2)
+    publish = threading.Event()
+    ticket = mgr.commit_session_boundary_async(
+        [], new_session_id="", retire=True, release_event=publish
+    )
+    publish.set()
+
+    assert mgr.wait_for_retirement(ticket, timeout=0.05) is False
+    assert mgr.shutdown_drain_state["status"] == "timed_out"
+    assert "shutdown" not in calls
+
+    release.set()
+    assert ticket.result(timeout=5) is None
+    assert calls == ["write", "end", "shutdown"]
+    assert mgr.shutdown_drain_state["status"] == "drained"

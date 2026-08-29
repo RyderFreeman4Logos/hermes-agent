@@ -6288,6 +6288,7 @@ def _try_configured_fallback_chain(
     attempted_identities: Optional[set[tuple]] = None,
     candidate_destinations: Optional[Dict[str, _FallbackDestination]] = None,
     codex_only: bool = False,
+    async_mode: bool = False,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -6422,7 +6423,12 @@ def _try_configured_fallback_chain(
 
         token = _fallback_resolution_destination.set(selected_destination)
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            if async_mode:
+                fb_client, resolved_model = _resolve_fallback_entry(
+                    entry, async_mode=True,
+                )
+            else:
+                fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception:
             fb_client, resolved_model = None, None
         finally:
@@ -6481,7 +6487,7 @@ def _next_configured_fallback_index(label: str) -> Optional[int]:
 
 
 def _selected_configured_fallback(
-    task: Optional[str], label: str,
+    task: Optional[str], label: str, *, async_mode: bool = False,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Re-resolve a recorded configured route before retrying a sibling call."""
     next_index = _next_configured_fallback_index(label)
@@ -6493,6 +6499,7 @@ def _selected_configured_fallback(
         "",
         start_index=selected_index,
         attempted_indices=set(range(selected_index)),
+        async_mode=async_mode,
     )
 
 
@@ -11526,7 +11533,7 @@ async def _async_call_llm_impl(
         final_model = resolved_model
         if fallback_label:
             client, selected_model, selected_label = _selected_configured_fallback(
-                task, fallback_label,
+                task, fallback_label, async_mode=True,
             )
             if client is not None:
                 final_model = selected_model or resolved_model or ""

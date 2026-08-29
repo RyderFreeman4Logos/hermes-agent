@@ -1664,6 +1664,17 @@ class CheckpointContextEngine(ContextEngine):
                 content = content[: -len("\n```")]
         try:
             payload = json.loads(content)
+        except json.JSONDecodeError as error:
+            if error.msg != "Extra data":
+                return None
+            try:
+                stripped = content.lstrip()
+                payload, index = json.JSONDecoder().raw_decode(stripped)
+            except (TypeError, ValueError):
+                return None
+            remainder = stripped[index:].strip()
+            if not isinstance(payload, dict) or not remainder or set(remainder) - {"}"}:
+                return None
         except (TypeError, ValueError):
             return None
         if not isinstance(payload, dict) or set(payload) != {

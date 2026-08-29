@@ -1743,6 +1743,40 @@ def test_map_unwraps_complete_json_fence_and_aliases_disposition_keys():
     assert engine._parse_map_shard(_map_response(unknown), group, (1,)) is None
 
 
+def test_map_accepts_one_trailing_json_brace():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    engine = CheckpointContextEngine()
+    group = CausalGroup((0,))
+    response = _map_response({"source_event_ids": [1], "facts": []})
+    expected = engine._parse_map_shard(response, group, (1,))
+    assert expected is not None
+
+    response.choices[0].message.content += "}"
+
+    assert engine._parse_map_shard(response, group, (1,)) == expected
+
+
+def test_map_rejects_trailing_prose_after_valid_json():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    engine = CheckpointContextEngine()
+    response = _map_response({"source_event_ids": [1], "facts": []})
+    response.choices[0].message.content += "\ntrailing prose"
+
+    assert engine._parse_map_shard(response, CausalGroup((0,)), (1,)) is None
+
+
+def test_map_rejects_extra_data_beyond_trailing_braces():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    engine = CheckpointContextEngine()
+    response = _map_response({"source_event_ids": [1], "facts": []})
+    response.choices[0].message.content += "}x"
+
+    assert engine._parse_map_shard(response, CausalGroup((0,)), (1,)) is None
+
+
 def test_map_unwraps_pretty_printed_json_fence_without_closing_fence():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 

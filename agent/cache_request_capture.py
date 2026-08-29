@@ -11,41 +11,22 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent.redact import _redact_url_userinfo, redact_sensitive_text
+from agent.redact import _SENSITIVE_BODY_KEYS, _redact_url_userinfo, redact_sensitive_text
 from hermes_constants import get_hermes_home
 
 __all__ = ["capture_provider_request", "enabled", "strict_write_enabled"]
 
 _SCHEMA = "hermes.cache_request.v1"
 _REDACTED = "[REDACTED]"
-_SECRET_KEY = re.compile(r"[^a-z0-9]+")
+_NORMALIZE_KEY = re.compile(r"[^a-z0-9]+")
+_SECRET_KEY_TOKEN = re.compile(
+    r"(?:^|[_-])(?:secrets?|tokens?|passwords?|credentials?|authorization|cookies?)(?:[_-]|$)",
+    re.IGNORECASE,
+)
+_API_OR_ACCESS_KEY_TOKEN = re.compile(
+    r"(?:^|[_-])(?:api|access)[_-]key(?:[_-]|$)", re.IGNORECASE
+)
 _URI_USERINFO = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@]*@", re.IGNORECASE)
-_SECRET_KEYS = {
-    "authorization",
-    "apikey",
-    "apikeys",
-    "cookie",
-    "cookies",
-    "refreshtoken",
-    "refreshtokens",
-    "setcookie",
-    "password",
-    "passwords",
-    "token",
-    "tokens",
-    "accesstoken",
-    "clientsecret",
-    "secret",
-    "secrets",
-    "privatekey",
-    "privatekeys",
-    "secretkey",
-    "secretkeys",
-    "credential",
-    "credentials",
-    "key",
-    "keys",
-}
 _PRESERVE_KEYS = {
     "body",
     "cachecontrol",
@@ -142,7 +123,7 @@ def _redact(value: Any, *, preserve: bool = False) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, child in value.items():
-            normalized = _SECRET_KEY.sub("", str(key).lower())
+            normalized = _NORMALIZE_KEY.sub("", str(key).lower())
             if _is_secret_key(key):
                 result[str(key)] = _REDACTED
             elif preserve or normalized in _PRESERVE_KEYS:
@@ -167,21 +148,12 @@ def _redact_scalar(value: str) -> str:
 
 
 def _is_secret_key(key: Any) -> bool:
-    normalized = _SECRET_KEY.sub("", str(key).lower())
+    name = str(key)
+    normalized = name.lower().replace("-", "_")
     return (
-        normalized in _SECRET_KEYS
-        or normalized.startswith("xapikey")
-        or normalized.endswith(
-            (
-                "authorization",
-                "apikey",
-                "apikeys",
-                "cookie",
-                "cookies",
-                "refreshtoken",
-                "refreshtokens",
-            )
-        )
+        normalized in _SENSITIVE_BODY_KEYS
+        or bool(_SECRET_KEY_TOKEN.search(name))
+        or bool(_API_OR_ACCESS_KEY_TOKEN.search(name))
     )
 
 

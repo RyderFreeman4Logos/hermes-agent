@@ -163,7 +163,60 @@ async def test_async_stale_selected_fallback_continues_without_reopening_primary
         )
 
     assert result is response
-    selected.assert_called_once_with("compression", labels[0])
+    selected.assert_called_once_with("compression", labels[0], async_mode=True)
     cached.assert_not_called()
     assert configured.call_args.args[:2] == ("compression", labels[0])
     assert fallback.call_args.args[2] == labels[1]
+
+
+@pytest.mark.asyncio
+async def test_async_stale_selected_fallback_resolves_an_async_client():
+    sync_client = _client(MagicMock(return_value=_response("sync")), "https://chatgpt.com/backend-api")
+    async_create = AsyncMock(return_value=_response("async"))
+    async_client = _client(async_create, "https://chatgpt.com/backend-api")
+    entry = {
+        "provider": "openai-codex",
+        "model": "codex-model",
+        "base_url": "https://chatgpt.com/backend-api",
+    }
+    resolved_async_modes = []
+
+    def resolve_provider(provider, model=None, async_mode=False, **_kwargs):
+        resolved_async_modes.append(async_mode)
+        client = async_client if async_mode else sync_client
+        return client, model
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "primary-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": [entry]},
+        ),
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api",
+                "api_mode": "codex_responses",
+                "api_key": "focused-bound-key",
+                "model": "codex-model",
+            },
+        ),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=resolve_provider,
+        ),
+        patch("agent.auxiliary_client._provider_requires_stream", return_value=False),
+    ):
+        result = await async_call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "digest"}],
+            route_info={"fallback_label": "fallback_chain[0](openai-codex)"},
+        )
+
+    assert result.choices[0].message.content == "async"
+    assert resolved_async_modes == [True]
+    async_create.assert_awaited_once()

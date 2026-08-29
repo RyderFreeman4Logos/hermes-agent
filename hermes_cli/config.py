@@ -1480,7 +1480,7 @@ def _normalize_custom_provider_entry(
         "models_discovered",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body", "extra_headers",
+        "discover_models", "extra_body", "extra_headers", "send_session_id",
         "ssl_ca_cert", "ssl_verify",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -1628,6 +1628,10 @@ def _normalize_custom_provider_entry(
     if normalized_headers:
         normalized["extra_headers"] = normalized_headers
 
+    send_session_id = entry.get("send_session_id")
+    if isinstance(send_session_id, bool):
+        normalized["send_session_id"] = send_session_id
+
     ssl_ca_cert = entry.get("ssl_ca_cert")
     if isinstance(ssl_ca_cert, str) and ssl_ca_cert.strip():
         normalized["ssl_ca_cert"] = ssl_ca_cert.strip()
@@ -1667,6 +1671,7 @@ def _custom_provider_entry_to_provider_config(
         "discover_models",
         "extra_body",
         "extra_headers",
+        "send_session_id",
         "ssl_ca_cert",
         "ssl_verify",
     ):
@@ -2106,7 +2111,7 @@ _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 # Valid fields inside a custom_providers list entry
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
-    "context_length", "rate_limit_delay", "extra_body",
+    "context_length", "rate_limit_delay", "extra_body", "send_session_id",
     "ssl_ca_cert", "ssl_verify",
     # key_env is read at runtime by runtime_provider.py and auxiliary_client.py
     # — include it here so the set accurately describes the supported schema.

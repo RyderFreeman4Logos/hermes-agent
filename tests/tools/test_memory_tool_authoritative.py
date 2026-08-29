@@ -148,6 +148,26 @@ def test_authoritative_accepts_exact_targets_and_enum_values(target, expected):
     assert provider.calls[0][0]["target"] == expected
 
 
+@pytest.mark.parametrize("bad_action", [[], {}], ids=["list", "dict"])
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+def test_authoritative_rejects_unhashable_actions(bad_action, batch):
+    provider = RecordingAuthoritativeProvider()
+    manager = MemoryManager(provider_mode="authoritative")
+    manager.add_provider(provider)
+    request = (
+        {"operations": [{"action": bad_action}]}
+        if batch
+        else {"action": bad_action}
+    )
+
+    result = json.loads(manager.authoritative_memory_write(request))
+
+    assert result["success"] is False
+    assert result["error_class"] == "invalid_action"
+    assert provider.calls == []
+
+
+
 @pytest.mark.parametrize("target", ["", " ", False, 0, [], {}, "other"])
 def test_builtin_target_validation_rejects_before_store_access(target):
     store_calls = []

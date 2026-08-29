@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agent.redact import _redact_url_userinfo, redact_sensitive_text
 from hermes_constants import get_hermes_home
 
 __all__ = ["capture_provider_request", "enabled", "strict_write_enabled"]
@@ -150,7 +151,9 @@ def _redact(value: Any, *, preserve: bool = False) -> Any:
         return result
     if isinstance(value, (list, tuple)):
         return [_redact(child, preserve=preserve) for child in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str):
+        return _redact_url_userinfo(redact_sensitive_text(value))
+    if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)
 
@@ -209,7 +212,9 @@ def _open_private_dir_chain(path: Path) -> int:
 
 def _persist(payload: dict[str, Any]) -> None:
     rootfd = _open_private_dir_chain(get_hermes_home() / "debug" / "cache-requests")
-    data = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    data = (
+        json.dumps(_redact(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
     temp_name: str | None = None
     fd: int | None = None
     try:

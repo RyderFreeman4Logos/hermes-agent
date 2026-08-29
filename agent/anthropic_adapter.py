@@ -3239,6 +3239,8 @@ def create_anthropic_message(
     in particular. Only fires on the streaming path, which is the one the main
     turn loop takes.
     """
+    from agent import relay_llm
+
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
     messages_api = getattr(client, "messages", None)
@@ -3247,6 +3249,7 @@ def create_anthropic_message(
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
         try:
+            relay_llm.capture_transport_request(stream_kwargs)
             with stream_fn(**stream_kwargs) as stream:
                 if callable(on_response):
                     try:
@@ -3281,4 +3284,5 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
+    relay_llm.capture_transport_request(create_kwargs)
     return messages_api.create(**create_kwargs)

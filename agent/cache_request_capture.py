@@ -141,7 +141,7 @@ def _redact(value: Any, *, preserve: bool = False) -> Any:
         result: dict[str, Any] = {}
         for key, child in value.items():
             normalized = _SECRET_KEY.sub("", str(key).lower())
-            if _is_secret_key(key) and not (preserve and isinstance(child, dict)):
+            if _is_secret_key(key):
                 result[str(key)] = _REDACTED
             elif preserve or normalized in _PRESERVE_KEYS:
                 result[str(key)] = _redact(child, preserve=True)

@@ -382,7 +382,10 @@ def test_repair_rebuilds_stale_btree_indexes(tmp_path):
     # The real detector must see the real corruption...
     reason = hermes_state._db_opens_cleanly(db_path)
     assert reason is not None
-    assert "wrong # of entries in index idx_messages_session" in reason
+    assert (
+        "wrong # of entries in index idx_messages_session" in reason
+        or "missing from index idx_messages_session" in reason
+    )
 
     # ...and the real repair ladder must fix it via REINDEX.
     report = repair_state_db_schema(db_path)

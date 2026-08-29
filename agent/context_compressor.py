@@ -6345,6 +6345,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             if (
                 self._is_actionable_user_turn(msg)
                 and not self._is_synthetic_compression_user_turn(msg)
+                and not _synthetic_user_row(_content_text_for_contains(msg.get("content")))
             ):
                 return i
         return -1

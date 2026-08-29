@@ -73,6 +73,8 @@ _MAP_KINDS = _AUTHORITATIVE_MAP_KINDS | {
     "tool_result",
 }
 _AUTHORITATIVE_ROLES = frozenset({"system", "developer", "user"})
+_HARD_CONSTRAINT_MARKERS = ("must ", "must not", "do not", "never ")
+_NEGATION_MARKERS = ("must not", "do not", "never ")
 _MAP_DISPOSITIONS = frozenset(
     {
         "represented",
@@ -1860,6 +1862,23 @@ class CheckpointContextEngine(ContextEngine):
                 fact.kind.casefold() in _AUTHORITATIVE_MAP_KINDS
                 or fact.action_state is not None
             )
+            if executable and any(
+                (
+                    any(marker in content for marker in _NEGATION_MARKERS)
+                    and not any(marker in probe for marker in _NEGATION_MARKERS)
+                )
+                or (
+                    "must " in content
+                    and not any(marker in content for marker in _NEGATION_MARKERS)
+                    and "must " not in probe
+                )
+                for content in (
+                    " ".join(row["content"].split()).casefold()
+                    for row in supporting
+                    if row.get("role") == "user"
+                )
+            ):
+                continue
             if executable and not any(
                 row.get("role") in _AUTHORITATIVE_ROLES
                 and probe in " ".join(row["content"].split()).casefold()
@@ -1889,7 +1908,7 @@ class CheckpointContextEngine(ContextEngine):
             content = row.get("content")
             text = content.casefold() if isinstance(content, str) else ""
             hard_constraint = row.get("role") == "user" and any(
-                marker in text for marker in ("must ", "must not", "do not", "never ")
+                marker in text for marker in _HARD_CONSTRAINT_MARKERS
             )
             high_risk = hard_constraint or any(marker in text for marker in (
                 "failed", "failure", "error", "unknown side effect",

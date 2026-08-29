@@ -1309,6 +1309,10 @@ def test_map_rejects_executable_observation_state_at_parse_time(action_state):
             {"kind": "policy", "text": "rotate credentials"},
         ),
         (
+            "Must not prune audit logs.",
+            {"kind": "todo", "text": "prune audit logs"},
+        ),
+        (
             "Never delete config files.",
             {"kind": "constraint", "text": "delete config files"},
         ),
@@ -1335,7 +1339,7 @@ def test_map_rejects_executable_observation_state_at_parse_time(action_state):
         ),
     ),
 )
-def test_executable_map_facts_accept_authoritative_source_substrings(source, fact):
+def test_executable_map_facts_reject_hard_constraint_substrings(source, fact):
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 
     fact = {**fact, "source_event_ids": [101]}
@@ -1346,9 +1350,32 @@ def test_executable_map_facts_accept_authoritative_source_substrings(source, fac
     )
     messages = [{"role": "user", "content": source}]
 
-    shard = engine._map_group(messages, CausalGroup((0,)), (101,))
+    assert engine._map_group(messages, CausalGroup((0,)), (101,)) is None
 
-    assert shard is not None
+
+def test_executable_map_facts_accept_ordinary_request_substrings():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    source = (
+        "Prepare the release plan, verify the staging checklist, update the deployment "
+        "notes, then delete stale cache files before the staging rollout begins."
+    )
+    fact = {
+        "kind": "action",
+        "text": "delete stale cache files",
+        "source_event_ids": [101],
+        "identity": "cache:delete-stale",
+        "action_state": "planned",
+    }
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response({"source_event_ids": [101], "facts": [fact]})
+        )
+    )
+
+    assert engine._map_group(
+        [{"role": "user", "content": source}], CausalGroup((0,)), (101,)
+    ) is not None
 
 
 @pytest.mark.parametrize(

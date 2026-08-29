@@ -1335,7 +1335,7 @@ def test_map_rejects_executable_observation_state_at_parse_time(action_state):
         ),
     ),
 )
-def test_executable_map_facts_require_full_authoritative_source_span(source, fact):
+def test_executable_map_facts_accept_authoritative_source_substrings(source, fact):
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 
     fact = {**fact, "source_event_ids": [101]}
@@ -1348,7 +1348,7 @@ def test_executable_map_facts_require_full_authoritative_source_span(source, fac
 
     shard = engine._map_group(messages, CausalGroup((0,)), (101,))
 
-    assert shard is None
+    assert shard is not None
 
 
 @pytest.mark.parametrize(
@@ -1386,7 +1386,7 @@ def test_executable_map_facts_require_exact_authority_on_one_source_row(
 ):
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 
-    fact = {**fact, "source_event_ids": [101, 102]}
+    fact = {**fact, "source_event_ids": [102]}
     engine = CheckpointContextEngine(
         auxiliary_client=_FakeAuxiliaryClient(
             _map_response({"source_event_ids": [101, 102], "facts": [fact]})
@@ -1572,6 +1572,46 @@ def test_map_unwraps_complete_json_fence_and_aliases_disposition_keys():
     assert engine._parse_map_shard(_map_response(unknown), group, (1,)) is None
 
 
+@pytest.mark.parametrize(
+    "aliases",
+    (
+        ("represented_by",),
+        ("represented_fact_ids",),
+        ("ref",),
+        ("represented_by", "represented_fact_ids", "ref"),
+    ),
+)
+def test_map_accepts_legacy_represented_fact_id_aliases(aliases):
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    payload = {
+        "schema_version": 2,
+        "source_event_ids": [1],
+        "facts": [{
+            "fact_id": "fact:request",
+            "kind": "request",
+            "text": "Continue.",
+            "source_event_ids": [1],
+        }],
+        "dispositions": [{
+            "source_event_id": 1,
+            "status": "represented",
+            **{alias: ["fact:request"] for alias in aliases},
+        }],
+    }
+    engine = CheckpointContextEngine()
+
+    shard = engine._parse_map_shard(_map_response(payload), CausalGroup((0,)), (1,))
+
+    assert shard is not None
+    assert shard.dispositions[0].fact_ids == ("fact:request",)
+    conflicting = deepcopy(payload)
+    conflicting["dispositions"][0]["fact_ids"] = ["other"]
+    assert engine._parse_map_shard(
+        _map_response(conflicting), CausalGroup((0,)), (1,)
+    ) is None
+
+
 def test_map_prompt_requires_unfenced_json_and_canonical_disposition_keys():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 
@@ -1582,6 +1622,8 @@ def test_map_prompt_requires_unfenced_json_and_canonical_disposition_keys():
     assert "JSON only (no Markdown fences)" in prompt
     assert "source_event_id" in prompt
     assert "status" in prompt
+    assert "fact_ids" in prompt
+    assert '{"source_event_id":1,"status":"represented","fact_ids":["fact:1"]}' in prompt
 
 
 def test_map_rejects_one_million_character_response_before_parsing(monkeypatch):
@@ -1691,6 +1733,44 @@ def test_map_fact_content_limits_fail_closed_without_cache(
         [{"role": "user", "content": "abcde"}], CausalGroup((0,)), (1,)
     ) is None
     assert not engine._map_shard_cache
+
+
+def test_map_accepts_complete_stop_sized_synthetic_response_but_remains_bounded():
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    text = "x" * 3_995
+    fact_ids = [f"fact:{index}" for index in range(7)]
+    payload = {
+        "schema_version": 2,
+        "source_event_ids": [1],
+        "facts": [
+            {
+                "fact_id": fact_id,
+                "kind": "observation",
+                "text": text,
+                "source_event_ids": [1],
+            }
+            for fact_id in fact_ids
+        ],
+        "dispositions": [{
+            "source_event_id": 1,
+            "status": "represented",
+            "fact_ids": fact_ids,
+        }],
+    }
+    response = _map_response(payload)
+    content = response.choices[0].message.content
+    engine = CheckpointContextEngine()
+
+    assert checkpoint_engine._MAP_FACT_TEXT_MAX_BYTES >= len(text.encode("utf-8"))
+    assert checkpoint_engine._MAP_RESPONSE_MAX_BYTES > 25_689
+    assert checkpoint_engine._MAP_FACT_TEXT_TOTAL_MAX_BYTES >= len(text.encode("utf-8")) * len(fact_ids)
+    assert len(content.encode("utf-8")) > 25_689
+    assert engine._parse_map_shard(response, CausalGroup((0,)), (1,)) is not None
+    oversized = _map_response(payload)
+    oversized.choices[0].message.content += " " * checkpoint_engine._MAP_RESPONSE_MAX_BYTES
+    assert engine._parse_map_shard(oversized, CausalGroup((0,)), (1,)) is None
 
 
 def test_map_cache_resumes_only_missing_shards():
@@ -1885,6 +1965,27 @@ def test_sparse_facts_omitting_failed_verification_fail_closed():
         CausalGroup((0, 1)),
         (101, 102),
     ) is None
+
+
+def test_map_allows_non_user_non_high_risk_noise():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response(
+                {
+                    "schema_version": 2,
+                    "source_event_ids": [101],
+                    "facts": [],
+                    "dispositions": [{"source_event_id": 101, "status": "noise"}],
+                }
+            )
+        )
+    )
+
+    assert engine._map_group(
+        [{"role": "system", "content": "Map timing: 20ms."}], CausalGroup((0,)), (101,)
+    ) is not None
 
 
 @pytest.mark.parametrize(

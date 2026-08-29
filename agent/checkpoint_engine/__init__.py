@@ -31,19 +31,19 @@ __all__ = [
 
 _MAP_CONCURRENCY_CAP = 2
 _DEFAULT_MAP_MAX_OUTPUT_TOKENS = 1100
-_MAP_PROMPT_VERSION = "map-prompt-v2"
-_MAP_SCHEMA_VERSION = "map-schema-v2"
-_MAP_EXTRACTOR_VERSION = "map-extractor-v1"
+_MAP_PROMPT_VERSION = "map-prompt-v3"
+_MAP_SCHEMA_VERSION = "map-schema-v3"
+_MAP_EXTRACTOR_VERSION = "map-extractor-v2"
 _MAP_SHARD_TARGET_INPUT_TOKENS = 12_000
 _MAP_SHARD_MAX_INPUT_TOKENS = 16_000
 _MAP_MAX_SHARDS_CAP = 32
 _DEFAULT_MAX_MAP_SHARDS = 32
 _MAP_SHARD_CACHE_MAX = 128
 # ponytail: fixed shard ceilings bound this LRU; add a byte-LRU only if normal shards hit them.
-_MAP_RESPONSE_MAX_BYTES = 16_384
+_MAP_RESPONSE_MAX_BYTES = 32_768
 _MAP_MAX_FACTS = 64
-_MAP_FACT_TEXT_MAX_BYTES = 2_048
-_MAP_FACT_TEXT_TOTAL_MAX_BYTES = 8_192
+_MAP_FACT_TEXT_MAX_BYTES = 4_096
+_MAP_FACT_TEXT_TOTAL_MAX_BYTES = 32_768
 _MAP_TOTAL_INPUT_TOKENS = _MAP_SHARD_TARGET_INPUT_TOKENS * _DEFAULT_MAX_MAP_SHARDS
 _SEMANTIC_REDUCE_MAX_TOKENS = 2048
 _MAP_TASK = "compression"
@@ -1379,6 +1379,7 @@ class CheckpointContextEngine(ContextEngine):
                     f"({', '.join(sorted(_MAP_KINDS))}), exact text, and source_event_ids from "
                     "this shard. Give every source event exactly one disposition with source_event_id and "
                     f"status ({', '.join(sorted(_MAP_DISPOSITIONS))}). represented names existing fact_ids; "
+                    "example: {\"schema_version\":2,\"source_event_ids\":[1],\"facts\":[{\"fact_id\":\"fact:1\",\"kind\":\"observation\",\"text\":\"noted\",\"source_event_ids\":[1]}],\"dispositions\":[{\"source_event_id\":1,\"status\":\"represented\",\"fact_ids\":[\"fact:1\"]}]}. "
                     "duplicate names an existing duplicate_of event; reconstructible and "
                     "externalized use a session-event:<id> recovery_ref. Do not call tools."
                 ),
@@ -1674,6 +1675,16 @@ class CheckpointContextEngine(ContextEngine):
                         disposition["source_event_id"] = disposition.pop("event_id")
                     if "disposition" in disposition and "status" not in disposition:
                         disposition["status"] = disposition.pop("disposition")
+                    aliases = [
+                        disposition.pop(key)
+                        for key in ("represented_by", "represented_fact_ids", "ref")
+                        if key in disposition
+                    ]
+                    if aliases:
+                        fact_ids = disposition.get("fact_ids", aliases[0])
+                        if any(alias != fact_ids for alias in aliases):
+                            return None
+                        disposition["fact_ids"] = fact_ids
         expected_source_ids = tuple(
             source_event_ids[index] for index in group.event_indices
         )
@@ -1851,7 +1862,7 @@ class CheckpointContextEngine(ContextEngine):
             )
             if executable and not any(
                 row.get("role") in _AUTHORITATIVE_ROLES
-                and probe == " ".join(row["content"].split()).casefold()
+                and probe in " ".join(row["content"].split()).casefold()
                 for row in supporting
             ):
                 continue
@@ -1874,11 +1885,6 @@ class CheckpointContextEngine(ContextEngine):
                 )
             ):
                 return None
-            if disposition.status == "noise":
-                # Map output has no authority to discard a source event.  Until a
-                # deterministic disposal proof exists, retain it via one of the
-                # explicit carrier statuses instead.
-                return None
             row = rows[disposition.source_event_id]
             content = row.get("content")
             text = content.casefold() if isinstance(content, str) else ""
@@ -1889,10 +1895,12 @@ class CheckpointContextEngine(ContextEngine):
                 "failed", "failure", "error", "unknown side effect",
                 "subagent final", "next action", "acceptance",
             ))
+            binding_identity = text.startswith(("decision:", "repository identity:"))
             if (
                 (row.get("role") == "user" and disposition.status == "noise")
                 or (high_risk and not validated and disposition.status != "externalized")
                 or (high_risk and disposition.status == "noise")
+                or (binding_identity and disposition.status == "noise")
             ):
                 return None
             validated_dispositions.append(replace(disposition, high_risk=high_risk))

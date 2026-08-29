@@ -1380,10 +1380,10 @@ class CheckpointContextEngine(ContextEngine):
                     "this shard exactly. Each fact needs a unique fact_id, kind "
                     f"({', '.join(sorted(_MAP_KINDS))}), exact text, and source_event_ids from "
                     "this shard. Give every source event exactly one disposition with source_event_id and "
-                    f"status ({', '.join(sorted(_MAP_DISPOSITIONS))}). represented names existing fact_ids; "
+                    f"status ({', '.join(sorted(_MAP_DISPOSITIONS - {'externalized'}))}). represented names existing fact_ids; "
                     "example: {\"schema_version\":2,\"source_event_ids\":[1],\"facts\":[{\"fact_id\":\"fact:1\",\"kind\":\"observation\",\"text\":\"noted\",\"source_event_ids\":[1]}],\"dispositions\":[{\"source_event_id\":1,\"status\":\"represented\",\"fact_ids\":[\"fact:1\"]}]}. "
-                    "duplicate names an existing duplicate_of event; reconstructible and "
-                    "externalized use a session-event:<id> recovery_ref. Do not call tools."
+                    "duplicate names an existing duplicate_of event; reconstructible uses a "
+                    "session-event:<id> recovery_ref. Do not call tools."
                 ),
             },
             {
@@ -1819,8 +1819,14 @@ class CheckpointContextEngine(ContextEngine):
                 if fact_refs or duplicate_of is not None or cls._recovery_event_id(recovery_ref, source_event_ids) is None:
                     return None
             elif status == "externalized":
+                if (
+                    fact_refs
+                    or duplicate_of is not None
+                    or cls._recovery_event_id(recovery_ref, source_event_ids) is None
+                ):
+                    return None
                 # Only the planner may externalize, after SessionDB commits the body.
-                return None
+                status = "reconstructible"
             elif fact_refs or duplicate_of is not None or recovery_ref is not None:
                 return None
             parsed_dispositions.append(
@@ -1829,6 +1835,31 @@ class CheckpointContextEngine(ContextEngine):
         if {disposition.source_event_id for disposition in parsed_dispositions} != set(expected_source_ids):
             return None
         return MapShard(expected_source_ids, tuple(parsed_facts), tuple(parsed_dispositions))
+
+    @staticmethod
+    def _map_source_blob(row: Dict[str, Any]) -> str:
+        parts = []
+        for key in ("content", "tool_name", "tool_calls"):
+            value = row.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+            elif value is not None:
+                parts.append(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        tool_calls = row.get("tool_calls")
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (TypeError, ValueError):
+                tool_calls = None
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                function = call.get("function") if isinstance(call, dict) else None
+                arguments = function.get("arguments") if isinstance(function, dict) else None
+                if isinstance(arguments, str):
+                    parts.append(arguments)
+                elif arguments is not None:
+                    parts.append(json.dumps(arguments, ensure_ascii=False, separators=(",", ":")))
+        return " ".join(parts)
 
     @classmethod
     def _validate_map_shard_sources(
@@ -1849,19 +1880,34 @@ class CheckpointContextEngine(ContextEngine):
                 validated.append(fact)
                 continue
             probe = " ".join(fact.text.split()).casefold()
+            source_rows = [
+                rows[event_id]
+                for event_id in fact.source_event_ids
+                if event_id in rows
+            ]
+            if len(source_rows) != len(fact.source_event_ids):
+                continue
             supporting = [
                 row
-                for event_id in fact.source_event_ids
-                if (row := rows.get(event_id)) is not None
-                and isinstance(row.get("content"), str)
-                and probe in " ".join(row["content"].split()).casefold()
+                for row in source_rows
+                if probe in " ".join(cls._map_source_blob(row).split()).casefold()
             ]
-            if not supporting:
-                continue
             executable = (
                 fact.kind.casefold() in _AUTHORITATIVE_MAP_KINDS
                 or fact.action_state is not None
             )
+            if not executable:
+                if fact.kind.casefold() == "verification":
+                    continue
+                if fact.kind.casefold() == "observation" and any(
+                    marker in probe
+                    for marker in ("i wrote", "was written", "test passed", "tests passed")
+                ):
+                    continue
+                validated.append(fact)
+                continue
+            if not supporting:
+                continue
             if executable:
                 for row in supporting:
                     if row.get("role") != "user":
@@ -1886,7 +1932,7 @@ class CheckpointContextEngine(ContextEngine):
                     continue
             if executable and not any(
                 row.get("role") in _AUTHORITATIVE_ROLES
-                and probe in " ".join(row["content"].split()).casefold()
+                and probe in " ".join(cls._map_source_blob(row).split()).casefold()
                 for row in supporting
             ):
                 continue
@@ -1901,13 +1947,13 @@ class CheckpointContextEngine(ContextEngine):
         validated_by_id = {fact.fact_id: fact for fact in validated}
         validated_dispositions = []
         for disposition in shard.dispositions:
-            if disposition.status == "represented" and (
-                not set(disposition.fact_ids) <= set(validated_by_id)
-                or any(
-                    disposition.source_event_id not in validated_by_id[fact_id].source_event_ids
-                    for fact_id in disposition.fact_ids
-                )
-            ):
+            fact_ids = tuple(
+                fact_id
+                for fact_id in disposition.fact_ids
+                if fact_id in validated_by_id
+                and disposition.source_event_id in validated_by_id[fact_id].source_event_ids
+            )
+            if disposition.status == "represented" and not fact_ids:
                 return None
             row = rows[disposition.source_event_id]
             content = row.get("content")
@@ -1927,7 +1973,13 @@ class CheckpointContextEngine(ContextEngine):
                 or (binding_identity and disposition.status == "noise")
             ):
                 return None
-            validated_dispositions.append(replace(disposition, high_risk=high_risk))
+            validated_dispositions.append(
+                replace(
+                    disposition,
+                    fact_ids=fact_ids if disposition.status == "represented" else disposition.fact_ids,
+                    high_risk=high_risk,
+                )
+            )
         return MapShard(
             shard.source_event_ids, tuple(validated), tuple(validated_dispositions)
         )

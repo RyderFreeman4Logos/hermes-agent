@@ -934,6 +934,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from agent import relay_llm
+
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -964,6 +966,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
+            relay_llm.capture_transport_request(api_kwargs)
             raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
@@ -989,8 +992,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
+        relay_llm.capture_transport_request(api_kwargs)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    relay_llm.capture_transport_request(api_kwargs)
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -3536,9 +3541,16 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
+
+                def _create_summary(request):
+                    from agent import relay_llm
+
+                    relay_llm.capture_transport_request(request)
+                    return summary_client.chat.completions.create(**request)
+
                 summary_response = _managed_summary_call(
                     summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
+                    _create_summary,
                     retry_count=0,
                 )
                 _summary_result = agent._get_transport().normalize_response(summary_response)
@@ -3601,9 +3613,16 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
                 )
+
+                def _create_summary_retry(request):
+                    from agent import relay_llm
+
+                    relay_llm.capture_transport_request(request)
+                    return summary_client.chat.completions.create(**request)
+
                 summary_response = _managed_summary_call(
                     summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
+                    _create_summary_retry,
                     retry_count=1,
                 )
                 _retry_result = agent._get_transport().normalize_response(summary_response)
@@ -3854,6 +3873,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
+                        relay_llm.capture_transport_request(final_kwargs)
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
@@ -3872,6 +3892,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
+                            relay_llm.capture_transport_request(final_kwargs)
                             return normalize_converse_response(
                                 client.converse(**final_kwargs)
                             )
@@ -4373,6 +4394,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
+            relay_llm.capture_transport_request(stream_kwargs)
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
@@ -4955,6 +4977,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            relay_llm.capture_transport_request(final_kwargs)
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()

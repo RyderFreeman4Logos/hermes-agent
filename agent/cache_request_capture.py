@@ -19,6 +19,7 @@ __all__ = ["capture_provider_request", "enabled", "strict_write_enabled"]
 _SCHEMA = "hermes.cache_request.v1"
 _REDACTED = "[REDACTED]"
 _SECRET_KEY = re.compile(r"[^a-z0-9]+")
+_URI_USERINFO = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@]*@", re.IGNORECASE)
 _SECRET_KEYS = {
     "authorization",
     "apikey",
@@ -152,10 +153,17 @@ def _redact(value: Any, *, preserve: bool = False) -> Any:
     if isinstance(value, (list, tuple)):
         return [_redact(child, preserve=preserve) for child in value]
     if isinstance(value, str):
-        return _redact_url_userinfo(redact_sensitive_text(value))
+        return _redact_scalar(value)
     if isinstance(value, (int, float, bool)) or value is None:
         return value
-    return str(value)
+    return _redact_scalar(str(value))
+
+
+def _redact_scalar(value: str) -> str:
+    redacted = _redact_url_userinfo(
+        redact_sensitive_text(value, force=True, redact_url_credentials=True)
+    )
+    return _REDACTED if _URI_USERINFO.search(redacted) else redacted
 
 
 def _is_secret_key(key: Any) -> bool:

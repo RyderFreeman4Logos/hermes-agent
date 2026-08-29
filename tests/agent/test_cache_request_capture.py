@@ -149,6 +149,48 @@ def test_persist_redacts_hostile_identity_and_neutral_scalar(monkeypatch, tmp_pa
     assert captures[1]["route"]["route"] == safe_route
 
 
+def test_primary_route_identity_and_persisted_scalars_are_strictly_sanitized(
+    monkeypatch, tmp_path
+):
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    markers = (
+        "query-credential-marker",
+        "redis-password-marker",
+        "fallback-secret-marker",
+    )
+
+    class HostileValue:
+        def __str__(self) -> str:
+            return "token=fallback-secret-marker"
+
+    def _primary_attempt(route: str | None) -> None:
+        relay_llm._execute_attempt(
+            {
+                "model": "m",
+                "callback": "https://provider.example.test/cb?code=query-credential-marker",
+                "cache": "redis://:redis-password-marker@host/0",
+                "fallback": HostileValue(),
+            },
+            lambda request: relay_llm.capture_transport_request(request),
+            name="openai",
+            model_name="m",
+            metadata={"api_mode": "chat_completions", "route": route},
+        )
+
+    _primary_attempt("https://provider.example.test/v1")
+    captures = _captures(tmp_path)
+    serialized = json.dumps(captures)
+    assert not any(marker in serialized for marker in markers)
+    assert captures[0]["route"]["route"] == "https://provider.example.test/v1"
+
+    for route in (None, "", " ", "unknown"):
+        _primary_attempt(route)
+    assert len(_captures(tmp_path)) == 1
+
+
 def test_transport_and_ordinary_secrets_are_redacted(monkeypatch, tmp_path):
     monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
     _enable(monkeypatch)

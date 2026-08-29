@@ -1862,23 +1862,28 @@ class CheckpointContextEngine(ContextEngine):
                 fact.kind.casefold() in _AUTHORITATIVE_MAP_KINDS
                 or fact.action_state is not None
             )
-            if executable and any(
-                (
-                    any(marker in content for marker in _NEGATION_MARKERS)
-                    and not any(marker in probe for marker in _NEGATION_MARKERS)
-                )
-                or (
-                    "must " in content
-                    and not any(marker in content for marker in _NEGATION_MARKERS)
-                    and "must " not in probe
-                )
-                for content in (
-                    " ".join(row["content"].split()).casefold()
-                    for row in supporting
-                    if row.get("role") == "user"
-                )
-            ):
-                continue
+            if executable:
+                for row in supporting:
+                    if row.get("role") != "user":
+                        continue
+                    content = " ".join(row["content"].split()).casefold()
+                    clause = next(
+                        (part for part in re.split(r"(?<=[.;!?])\s+", content) if probe in part),
+                        content,
+                    )
+                    if (
+                        any(marker in clause for marker in _NEGATION_MARKERS)
+                        and not any(marker in probe for marker in _NEGATION_MARKERS)
+                    ) or (
+                        "must " in clause
+                        and not any(marker in clause for marker in _NEGATION_MARKERS)
+                        and "must " not in probe
+                    ):
+                        break
+                else:
+                    row = None
+                if row is not None and row.get("role") == "user":
+                    continue
             if executable and not any(
                 row.get("role") in _AUTHORITATIVE_ROLES
                 and probe in " ".join(row["content"].split()).casefold()

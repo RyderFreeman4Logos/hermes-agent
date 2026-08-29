@@ -1353,6 +1353,31 @@ def test_executable_map_facts_reject_hard_constraint_substrings(source, fact):
     assert engine._map_group(messages, CausalGroup((0,)), (101,)) is None
 
 
+def test_executable_map_facts_keep_actions_in_a_separate_request_clause():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    source = (
+        "Never delete configuration files. Prepare the release plan, then delete stale "
+        "cache files before the staging rollout."
+    )
+    fact = {
+        "kind": "action",
+        "text": "delete stale cache files",
+        "source_event_ids": [101],
+        "identity": "cache:delete-stale",
+        "action_state": "planned",
+    }
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response({"source_event_ids": [101], "facts": [fact]})
+        )
+    )
+
+    assert engine._map_group(
+        [{"role": "user", "content": source}], CausalGroup((0,)), (101,)
+    ) is not None
+
+
 def test_executable_map_facts_accept_ordinary_request_substrings():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 

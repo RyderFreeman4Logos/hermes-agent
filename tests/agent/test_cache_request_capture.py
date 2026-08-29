@@ -24,6 +24,17 @@ def _captures(tmp_path: Path) -> list[dict]:
     return [json.loads(path.read_text()) for path in files]
 
 
+def _capture(request: dict[str, Any], **identity: Any) -> None:
+    details = {
+        "route": "https://provider.example.test/v1",
+        "provider": "test-provider",
+        "model": str(request.get("model") or "test-model"),
+        "api_mode": "chat_completions",
+    }
+    details.update(identity)
+    capture.capture_provider_request(request, **details)
+
+
 def _first_difference(left, right, path=()):
     if type(left) is not type(right) or not isinstance(left, (dict, list)):
         return path if left != right else None
@@ -50,7 +61,7 @@ def test_capture_is_disabled_by_default(monkeypatch, tmp_path):
     monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(capture, "_settings", lambda: {})
 
-    capture.capture_provider_request({"model": "m"})
+    _capture({"model": "m"})
 
     assert cast(dict[str, Any], DEFAULT_CONFIG)["debug"]["cache_requests"] == {
         "enabled": False,
@@ -65,8 +76,8 @@ def test_exact_capture_preserves_one_character_system_prompt_diff(monkeypatch, t
     base = {"model": "m", "messages": [{"role": "system", "content": "A"}]}
     changed = {"model": "m", "messages": [{"role": "system", "content": "B"}]}
 
-    capture.capture_provider_request(base, provider="p", model="m")
-    capture.capture_provider_request(changed, provider="p", model="m")
+    _capture(base, provider="p", model="m")
+    _capture(changed, provider="p", model="m")
 
     requests = [item["request"] for item in _captures(tmp_path)]
     assert requests[0]["messages"][0]["content"] == "A"
@@ -80,8 +91,8 @@ def test_exact_capture_preserves_tool_reorder(monkeypatch, tmp_path):
     first = {"tools": [{"name": "one"}, {"name": "two"}], "body": "body"}
     second = {"tools": [{"name": "two"}, {"name": "one"}], "body": "body"}
 
-    capture.capture_provider_request(first)
-    capture.capture_provider_request(second)
+    _capture(first)
+    _capture(second)
 
     requests = [item["request"] for item in _captures(tmp_path)]
     assert [tool["name"] for tool in requests[0]["tools"]] == ["one", "two"]
@@ -107,8 +118,8 @@ def test_exact_capture_preserves_input_and_prompt_cache_key(monkeypatch, tmp_pat
         "prompt_cache_key": "PCK-B",
     }
 
-    capture.capture_provider_request(first)
-    capture.capture_provider_request(second)
+    _capture(first)
+    _capture(second)
 
     requests = [item["request"] for item in _captures(tmp_path)]
     assert requests[0]["input"] == "INPUT-A"
@@ -119,37 +130,66 @@ def test_exact_capture_preserves_input_and_prompt_cache_key(monkeypatch, tmp_pat
     assert requests[1]["tools"][0]["name"] == "TOOL-B"
 
 
-def test_only_transport_secrets_are_redacted(monkeypatch, tmp_path):
+def test_transport_and_ordinary_secrets_are_redacted(monkeypatch, tmp_path):
     monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
     _enable(monkeypatch)
     request = {
         "headers": {
-            "Authorization": "Bearer auth-secret",
-            "X-API-Key": "api-secret",
-            "Cookie": "cookie-secret",
+            "Authorization": "fake-auth-value",
+            "X-API-Key": "fake-api-value",
+            "Cookie": "fake-cookie-value",
         },
-        "refresh_token": "refresh-secret",
-        "messages": [{"role": "user", "content": "prompt-secret"}],
-        "body": "body-secret",
+        "refresh_token": "fake-refresh-value",
+        "password": "fake-password-value",
+        "token": "fake-token-value",
+        "access_token": "fake-access-token-value",
+        "client_secret": "fake-client-secret-value",
+        "private_key": "fake-private-key-value",
+        "credentials": "fake-credentials-value",
+        "key": "fake-key-value",
+        "secret": "fake-secret-value",
+        "messages": [{"role": "user", "content": "prompt-body", "password": "fake-nested-password"}],
+        "body": "body-value",
         "cache_control": {"type": "ephemeral"},
         "tools": [{"function": {"parameters": {"properties": {"api_key": {"type": "string"}}}}}],
     }
 
-    capture.capture_provider_request(request)
+    _capture(request)
 
     path = next((tmp_path / "debug" / "cache-requests").glob("*.json"))
     serialized = path.read_text()
     saved = json.loads(serialized)["request"]
-    assert "auth-secret" not in serialized
-    assert "api-secret" not in serialized
-    assert "cookie-secret" not in serialized
-    assert "refresh-secret" not in serialized
+    for value in (
+        "fake-auth-value",
+        "fake-api-value",
+        "fake-cookie-value",
+        "fake-refresh-value",
+        "fake-password-value",
+        "fake-token-value",
+        "fake-access-token-value",
+        "fake-client-secret-value",
+        "fake-private-key-value",
+        "fake-credentials-value",
+        "fake-key-value",
+        "fake-secret-value",
+        "fake-nested-password",
+    ):
+        assert value not in serialized
     assert saved["headers"]["Authorization"] == "[REDACTED]"
     assert saved["headers"]["X-API-Key"] == "[REDACTED]"
     assert saved["headers"]["Cookie"] == "[REDACTED]"
     assert saved["refresh_token"] == "[REDACTED]"
-    assert saved["messages"][0]["content"] == "prompt-secret"
-    assert saved["body"] == "body-secret"
+    assert saved["password"] == "[REDACTED]"
+    assert saved["token"] == "[REDACTED]"
+    assert saved["access_token"] == "[REDACTED]"
+    assert saved["client_secret"] == "[REDACTED]"
+    assert saved["private_key"] == "[REDACTED]"
+    assert saved["credentials"] == "[REDACTED]"
+    assert saved["key"] == "[REDACTED]"
+    assert saved["secret"] == "[REDACTED]"
+    assert saved["messages"][0]["content"] == "prompt-body"
+    assert saved["messages"][0]["password"] == "[REDACTED]"
+    assert saved["body"] == "body-value"
     assert saved["cache_control"] == {"type": "ephemeral"}
     assert saved["tools"][0]["function"]["parameters"]["properties"]["api_key"] == {
         "type": "string"
@@ -180,14 +220,27 @@ def test_strict_write_propagates_capture_failure(monkeypatch):
     monkeypatch.setattr(capture, "_persist", lambda payload: (_ for _ in ()).throw(OSError("disk")))
 
     with pytest.raises(OSError, match="disk"):
-        capture.capture_provider_request({"messages": []})
+        _capture({"messages": []})
+
+
+def test_capture_rejects_incomplete_or_conflicting_identity(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+
+    capture.capture_provider_request({"model": "m"})
+    _capture({"model": "m"}, route=" ")
+    _capture({"model": "m"}, provider="unknown")
+    _capture({"model": "m"}, api_mode=" ")
+    _capture({"model": "m"}, model="other-model")
+
+    assert not (tmp_path / "debug").exists()
 
 
 def test_atomic_private_capture_files(monkeypatch, tmp_path):
     monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
     _enable(monkeypatch)
 
-    capture.capture_provider_request({"model": "m"})
+    _capture({"model": "m"})
 
     root = tmp_path / "debug" / "cache-requests"
     path = next(root.glob("*.json"))
@@ -209,7 +262,12 @@ def test_capture_records_each_physical_attempt(monkeypatch, tmp_path):
             lambda final_request: relay_llm.capture_transport_request(final_request),
             name="provider",
             model_name="m",
-            metadata={"api_request_id": "turn:api:0", "retry_count": retry_count},
+            metadata={
+                "api_mode": "chat_completions",
+                "api_request_id": "turn:api:0",
+                "retry_count": retry_count,
+                "route": "https://provider.example.test/v1",
+            },
         )
 
     captures = _captures(tmp_path)
@@ -367,6 +425,42 @@ def test_codex_direct_auxiliary_stream_captures_once(monkeypatch, tmp_path):
         "retry": 0,
     }
     assert saved["request"] == opened[0]
+
+
+@pytest.mark.asyncio
+async def test_async_codex_fallback_captures_once(monkeypatch, tmp_path):
+    from agent import auxiliary_client as auxiliary
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    opened = []
+
+    class Responses:
+        def create(self, **kwargs):
+            opened.append(dict(kwargs))
+            return SimpleNamespace(output=[], usage=None)
+
+    real_client = SimpleNamespace(
+        api_key="[REDACTED]",
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=Responses(),
+        close=lambda: None,
+    )
+    client = auxiliary.AsyncCodexAuxiliaryClient(
+        auxiliary.CodexAuxiliaryClient(real_client, "gpt-5.4")
+    )
+
+    @auxiliary._relay_auxiliary_call_async
+    async def run(task):
+        auxiliary._set_relay_auxiliary_route("openai-codex", "gpt-5.4", "codex_responses")
+        return await auxiliary._relay_async_completion(
+            client, {"model": "gpt-5.4", "messages": []}
+        )
+
+    await run("title_generation")
+
+    assert len(opened) == 1
+    assert len(_captures(tmp_path)) == 1
 
 
 def test_bedrock_stream_fallback_captures_each_final_opener(monkeypatch, tmp_path):

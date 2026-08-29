@@ -1914,6 +1914,9 @@ class _CodexCompletionsAdapter:
                 _notify_aux_provider_response()
                 _check_cancelled()
 
+            from agent import relay_llm
+
+            relay_llm.capture_transport_request(stream_kwargs)
             event_stream = self._client.responses.create(**stream_kwargs)
             with attempt_stream_lock:
                 attempt_stream.append(event_stream)
@@ -3457,6 +3460,8 @@ def _relay_auxiliary_metadata(
     *,
     provider: str | None = None,
     api_mode: str | None = None,
+    model: Any = None,
+    route: str | None = None,
 ) -> tuple[str, str, dict[str, Any]] | None:
     context = _RELAY_AUX_CALL_CONTEXT.get()
     if context is None:
@@ -3464,9 +3469,10 @@ def _relay_auxiliary_metadata(
     attempt_count = int(context.get("attempt_count") or 0)
     context["attempt_count"] = attempt_count + 1
     provider_name = str(provider or context.get("provider") or "auxiliary")
-    model_name = str(context.get("model") or "unknown")
+    model_name = str(model or context.get("model") or "unknown")
     return provider_name, model_name, {
         "api_mode": str(api_mode or context.get("api_mode") or "chat_completions"),
+        "route": str(route or ""),
         "api_request_id": str(context["request_id"]),
         "call_role": f"auxiliary:{context['task']}",
         "retry_count": attempt_count,
@@ -3482,7 +3488,18 @@ def _relay_sync_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    callback = create or (lambda request: client.chat.completions.create(**request))
+    callback: Callable[[dict[str, Any]], Any]
+    if create is None:
+        def _default_callback(request: dict[str, Any]) -> Any:
+            from agent import relay_llm
+
+            if not _client_streams_internally(client):
+                relay_llm.capture_transport_request(request)
+            return client.chat.completions.create(**request)
+
+        callback = _default_callback
+    else:
+        callback = create
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
@@ -3510,7 +3527,17 @@ async def _relay_async_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    callback = create or (lambda request: client.chat.completions.create(**request))
+    callback: Callable[[dict[str, Any]], Any]
+    if create is None:
+        async def _default_callback(request: dict[str, Any]) -> Any:
+            from agent import relay_llm
+
+            relay_llm.capture_transport_request(request)
+            return await client.chat.completions.create(**request)
+
+        callback = _default_callback
+    else:
+        callback = create
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return await callback(kwargs)
@@ -3534,15 +3561,22 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
+    def _stream_callback(request: dict[str, Any]) -> Any:
+        from agent import relay_llm
+
+        if not _client_streams_internally(client):
+            relay_llm.capture_transport_request(request)
+        return client.chat.completions.create(**request)
+
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return _stream_callback(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.stream_current(
         kwargs,
-        lambda request: client.chat.completions.create(**request),
+        _stream_callback,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         finalizer=dict,
@@ -10107,6 +10141,10 @@ def _create_with_progress(
     _notify_aux_dispatch()
     _notify_aux_progress()  # Preserve the watchdog's historical dispatch tick.
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
+        if not _client_streams_internally(client):
+            from agent import relay_llm
+
+            relay_llm.capture_transport_request(kwargs)
         response = client.chat.completions.create(**kwargs)
         if not _client_streams_internally(client):
             _notify_aux_provider_response()
@@ -10116,7 +10154,10 @@ def _create_with_progress(
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
+    from agent import relay_llm
+
     try:
+        relay_llm.capture_transport_request(stream_kwargs)
         chunks = client.chat.completions.create(**stream_kwargs)
     except Exception as exc:
         # Genuine provider failures (auth, credit, rate limit, network) are
@@ -10140,6 +10181,7 @@ def _create_with_progress(
             "non-streaming", task or "call", exc,
         )
         _notify_aux_dispatch()
+        relay_llm.capture_transport_request(kwargs)
         response = client.chat.completions.create(**kwargs)
         _notify_aux_provider_response()
         return response
@@ -10325,6 +10367,9 @@ async def _acreate_with_stream(
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
+    from agent import relay_llm
+
+    relay_llm.capture_transport_request(stream_kwargs)
     chunks = await client.chat.completions.create(**stream_kwargs)
     # Defensive: shims may hand back a complete response despite stream=True.
     if hasattr(chunks, "choices"):
@@ -10735,8 +10780,27 @@ def _call_llm_impl(
             # manager iterate the completed SimpleNamespace itself (#55933).
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its
-            # boundary.
-            return client.chat.completions.create(**kwargs)
+            # boundary. Keep the physical opener inside Relay's request-local
+            # capture context without routing the completed response through
+            # generic stream management.
+            direct_route = _relay_auxiliary_metadata(
+                provider=request_provider,
+                api_mode=resolved_api_mode,
+                model=kwargs.get("model"),
+                route=str(getattr(client, "base_url", "") or ""),
+            )
+            if direct_route is None:
+                return client.chat.completions.create(**kwargs)
+            provider_name, fallback_model, metadata = direct_route
+            from agent import relay_llm
+
+            return relay_llm._execute_attempt(
+                kwargs,
+                lambda request: client.chat.completions.create(**request),
+                name=provider_name,
+                model_name=str(kwargs.get("model") or fallback_model),
+                metadata=metadata,
+            )
         return _relay_sync_stream(
             client,
             kwargs,
@@ -11671,6 +11735,14 @@ async def _async_call_llm_impl(
         async def _acreate(_kwargs: Dict[str, Any]) -> Any:
             if _force_stream_async:
                 return await _acreate_with_stream(client, _kwargs, task)
+            if not isinstance(client, (
+                AsyncCodexAuxiliaryClient,
+                AsyncAnthropicAuxiliaryClient,
+                AsyncBedrockAuxiliaryClient,
+            )):
+                from agent import relay_llm
+
+                relay_llm.capture_transport_request(_kwargs)
             return await client.chat.completions.create(**_kwargs)
 
         try:

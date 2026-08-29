@@ -1704,6 +1704,8 @@ class CheckpointContextEngine(ContextEngine):
         parsed_facts = []
         total_fact_text_bytes = 0
         for fact in facts:
+            if isinstance(fact, dict) and "event_ids" in fact and "source_event_ids" not in fact:
+                fact["source_event_ids"] = fact.pop("event_ids")
             if not isinstance(fact, dict) or not {"kind", "text"} <= set(fact):
                 return None
             if set(fact) - {

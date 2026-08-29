@@ -6342,10 +6342,19 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         for i in range(len(messages) - 1, head_end - 1, -1):
             msg = messages[i]
+            content = _content_text_for_contains(msg.get("content"))
             if (
                 self._is_actionable_user_turn(msg)
                 and not self._is_synthetic_compression_user_turn(msg)
-                and not _synthetic_user_row(_content_text_for_contains(msg.get("content")))
+                and not (
+                    _synthetic_user_row(content)
+                    and (
+                        len(content) > _ACTIVE_TASK_MAX_CHARS
+                        or not content.lstrip().startswith(
+                            "[ASYNC DELEGATION BATCH COMPLETE"
+                        )
+                    )
+                )
             ):
                 return i
         return -1

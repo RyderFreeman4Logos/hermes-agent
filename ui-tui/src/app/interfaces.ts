@@ -15,6 +15,7 @@ import type {
 import type { QueueItem } from '../hooks/useQueue.js'
 import type { ParsedVoiceRecordKey } from '../lib/platform.js'
 import type { RpcResult } from '../lib/rpc.js'
+import type { StatusBarSegment } from '../lib/statusBar.js'
 import type { ActiveWidget } from '../sdk/types.js'
 import type { Theme } from '../theme.js'
 import type {
@@ -343,6 +344,7 @@ export interface UiState {
   sid: null | string
   status: string
   statusBar: StatusBarMode
+  statusBarSegments: StatusBarSegment[]
   streaming: boolean
   theme: Theme
   // `display.timestamps` — dim [HH:MM] labels on user/assistant transcript

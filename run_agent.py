@@ -802,6 +802,7 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self._awaiting_cache_usage_after_compression = False
 
         # Session boundary: the usage anchor describes the OLD session's
         # transcript — a fresh/branched/resumed session must fall back to

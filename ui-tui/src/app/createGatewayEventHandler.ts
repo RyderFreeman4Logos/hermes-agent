@@ -428,6 +428,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
+  let cacheStatusActive = false
   let startupPromptSubmitted = false
 
   // Request IDs of clarify prompts we've already flushed to the transcript as
@@ -585,6 +586,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       thinkingStatusTimer = null
     }
 
+    if (cacheStatusActive && getUiState().status.startsWith('cache ') && !status.startsWith('cache ')) {
+      return
+    }
+
     patchUiState({ status })
   }
 
@@ -597,7 +602,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     thinkingStatusTimer = setTimeout(() => {
       thinkingStatusTimer = null
-      patchUiState({ status: pendingThinkingStatus || statusFromBusy() })
+      setStatus(pendingThinkingStatus || statusFromBusy())
     }, STREAM_BATCH_MS)
   }
 
@@ -605,7 +610,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     turnController.clearStatusTimer()
     turnController.statusTimer = setTimeout(() => {
       turnController.statusTimer = null
-      patchUiState({ status: statusFromBusy() })
+      setStatus(statusFromBusy())
     }, ms)
   }
 
@@ -822,6 +827,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.start':
+        cacheStatusActive = false
         resetAgentsNudgeTurnState()
         turnController.startMessage()
 
@@ -847,6 +853,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           setStatus(brief)
           restoreStatusAfter(6000)
 
+          return
+        }
+
+        if (p.kind === 'cache_hit') {
+          cacheStatusActive = true
+          setStatus(p.text)
           return
         }
 
@@ -1439,7 +1451,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           }
         }
 
-        setStatus('ready')
+        if (!cacheStatusActive) {
+          setStatus('ready')
+        }
 
         if (ev.payload?.usage) {
           patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, ev.payload!.usage) }))

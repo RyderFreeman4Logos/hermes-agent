@@ -130,6 +130,25 @@ def test_exact_capture_preserves_input_and_prompt_cache_key(monkeypatch, tmp_pat
     assert requests[1]["tools"][0]["name"] == "TOOL-B"
 
 
+def test_persist_redacts_hostile_identity_and_neutral_scalar(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    route_secret = "opaque-" + "route-secret"
+    scalar_secret = "opaque-" + "scalar-secret"
+    _capture(
+        {"context": f"postgres://user:{scalar_secret}@example.test/db"},
+        route=f"https://user:{route_secret}@example.test/v1",
+    )
+    safe_route = "openai-responses"
+    _capture({"context": "benign"}, route=safe_route)
+    captures = _captures(tmp_path)
+    serialized = json.dumps(captures)
+
+    assert not any(marker in serialized for marker in (route_secret, scalar_secret))
+    assert captures[0]["route"]["model"] == "test-model"
+    assert captures[1]["route"]["route"] == safe_route
+
+
 def test_transport_and_ordinary_secrets_are_redacted(monkeypatch, tmp_path):
     monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
     _enable(monkeypatch)

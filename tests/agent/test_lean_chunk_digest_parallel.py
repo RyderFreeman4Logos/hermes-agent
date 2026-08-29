@@ -8,6 +8,13 @@ import pytest
 from agent.auxiliary_client import async_call_llm, call_llm
 
 
+def _client(create, endpoint: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        base_url=endpoint,
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+
+
 def _response(content: str) -> MagicMock:
     response = MagicMock()
     response.choices = [MagicMock()]
@@ -70,3 +77,93 @@ async def test_stale_configured_fallback_continues_to_next_candidate(async_mode)
     assert attempted == labels
     assert configured_chain.call_count == 2
     assert configured_chain.call_args_list[1].kwargs["start_index"] == 1
+
+
+def test_stale_selected_fallback_continues_without_reopening_primary():
+    first = _client(
+        MagicMock(side_effect=RuntimeError("connection refused")),
+        "https://first.invalid/v1",
+    )
+    response = _response("second")
+    labels = ["fallback_chain[0](first)", "fallback_chain[1](second)"]
+    route_info = {"fallback_label": labels[0]}
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("primary", "primary-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._selected_configured_fallback",
+            return_value=(first, "first-model", labels[0]),
+        ) as selected,
+        patch("agent.auxiliary_client._get_cached_client") as cached,
+        patch("agent.auxiliary_client._transient_retry_count", return_value=0),
+        patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(MagicMock(), "second-model", labels[1]),
+        ) as configured,
+        patch(
+            "agent.auxiliary_client._call_fallback_candidate_sync",
+            return_value=response,
+        ) as fallback,
+    ):
+        result = call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "digest"}],
+            route_info=route_info,
+        )
+
+    assert result is response
+    selected.assert_called_once_with("compression", labels[0])
+    cached.assert_not_called()
+    assert configured.call_args.args[:2] == ("compression", labels[0])
+    assert fallback.call_args.args[2] == labels[1]
+
+
+@pytest.mark.asyncio
+async def test_async_stale_selected_fallback_continues_without_reopening_primary():
+    first = _client(
+        AsyncMock(side_effect=RuntimeError("connection refused")),
+        "https://first.invalid/v1",
+    )
+    second = MagicMock()
+    response = _response("second")
+    labels = ["fallback_chain[0](first)", "fallback_chain[1](second)"]
+    route_info = {"fallback_label": labels[0]}
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("primary", "primary-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._selected_configured_fallback",
+            return_value=(first, "first-model", labels[0]),
+        ) as selected,
+        patch("agent.auxiliary_client._get_cached_client") as cached,
+        patch("agent.auxiliary_client._transient_retry_count", return_value=0),
+        patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(second, "second-model", labels[1]),
+        ) as configured,
+        patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(second, "second-model"),
+        ),
+        patch(
+            "agent.auxiliary_client._call_fallback_candidate_async",
+            new=AsyncMock(return_value=response),
+        ) as fallback,
+    ):
+        result = await async_call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "digest"}],
+            route_info=route_info,
+        )
+
+    assert result is response
+    selected.assert_called_once_with("compression", labels[0])
+    cached.assert_not_called()
+    assert configured.call_args.args[:2] == ("compression", labels[0])
+    assert fallback.call_args.args[2] == labels[1]

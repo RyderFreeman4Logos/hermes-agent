@@ -889,11 +889,7 @@ export function StatusRule({
         : null
     ].filter((item): item is NonNullable<typeof item> => item !== null)
 
-    const visibleItems = customSegments
-      ? (packStatusRows(items, cols, stringWidth(' │ '), stringWidth('─ '))[0] ?? [])
-      : items
-
-    return <StatusRows cols={cols} items={visibleItems} multiline={cols < 72} showSpawnHud={shows('spawn_hud')} t={t} />
+    return <StatusRows cols={cols} items={items} multiline={cols < 72 || customSegments} showSpawnHud={shows('spawn_hud')} t={t} />
   }
 
   return (

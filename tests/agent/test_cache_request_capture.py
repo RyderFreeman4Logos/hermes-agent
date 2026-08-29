@@ -255,6 +255,38 @@ def test_transport_and_ordinary_secrets_are_redacted(monkeypatch, tmp_path):
     assert saved["tools"][0]["function"]["parameters"]["properties"]["api_key"] == "[REDACTED]"
 
 
+def test_capture_redacts_secret_key_tokens_without_redacting_labels(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    markers = {
+        "AWS_SECRET_ACCESS_KEY": "redaction-class-aws-marker",
+        "database_secret": "redaction-class-suffix-marker",
+        "x-api-key": "redaction-class-conventional-marker",
+    }
+    nested_markers = {
+        "provider_secret_access_key": "redaction-class-nested-marker",
+    }
+
+    _capture(
+        {
+            **markers,
+            "nested": nested_markers,
+            "api_mode": "chat_completions",
+            "model": "test-model",
+            "route": "primary-route",
+        }
+    )
+
+    serialized = next((tmp_path / "debug" / "cache-requests").glob("*.json")).read_text()
+    saved = json.loads(serialized)["request"]
+    assert not any(marker in serialized for marker in (*markers.values(), *nested_markers.values()))
+    assert all(saved[key] == "[REDACTED]" for key in markers)
+    assert saved["nested"]["provider_secret_access_key"] == "[REDACTED]"
+    assert saved["api_mode"] == "chat_completions"
+    assert saved["model"] == "test-model"
+    assert saved["route"] == "primary-route"
+
+
 def test_preserved_payload_redacts_structured_secret_values(monkeypatch, tmp_path):
     monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
     _enable(monkeypatch)

@@ -1784,6 +1784,30 @@ def test_map_unwraps_pretty_printed_json_fence_without_closing_fence():
     assert len(shard.facts) == 2
 
 
+def test_map_unwraps_json_fence_after_leading_prose_without_bare_json_extraction():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    payload = {"source_event_ids": [1], "facts": [{
+        "kind": "request",
+        "text": "Continue.",
+        "source_event_ids": [1],
+    }]}
+    engine = CheckpointContextEngine()
+    group = CausalGroup((0,))
+    unfenced = engine._parse_map_shard(_map_response(payload), group, (1,))
+    fenced = _map_response(payload)
+    pretty = json.dumps(json.loads(fenced.choices[0].message.content), indent=2)
+    fenced.choices[0].message.content = f"Here is the JSON output.\n\n```json\n{pretty}\n```"
+
+    shard = engine._parse_map_shard(fenced, group, (1,))
+
+    assert unfenced is not None
+    assert shard == unfenced
+    bare_json = _map_response(payload)
+    bare_json.choices[0].message.content = f"Here is the JSON output.\n\n{pretty}"
+    assert engine._parse_map_shard(bare_json, group, (1,)) is None
+
+
 @pytest.mark.parametrize(
     "aliases",
     (

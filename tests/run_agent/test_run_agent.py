@@ -1395,6 +1395,93 @@ class TestInvalidateSystemPrompt:
 
 
 class TestBuildApiKwargs:
+    def test_named_custom_profile_request_reuses_stable_prefix_key(
+        self, agent, monkeypatch
+    ):
+        """The resolved named-custom route emits a stable cache key on the wire."""
+        from hermes_cli import runtime_provider
+        from providers import get_provider_profile
+
+        custom_provider = {
+            "name": "localrouter",
+            "base_url": "https://localrouter.invalid/v1",
+            "api_key": "[REDACTED]",
+        }
+        monkeypatch.setattr(
+            runtime_provider,
+            "_get_named_custom_provider",
+            lambda requested: (
+                custom_provider if requested == "custom:localrouter" else None
+            ),
+        )
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+
+        runtime = runtime_provider.resolve_runtime_provider(
+            requested="custom:localrouter", target_model="local-model"
+        )
+        assert runtime["provider"] == "custom"
+        assert runtime["requested_provider"] == "custom:localrouter"
+        assert get_provider_profile(runtime["provider"]) is not None
+
+        agent.provider = runtime["provider"]
+        agent.requested_provider = runtime["requested_provider"]
+        agent.base_url = runtime["base_url"]
+        agent.api_mode = runtime["api_mode"]
+        agent.model = "local-model"
+        agent.session_id = "same-route-session"
+        agent._cached_system_prompt_static = "stable prefix"
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+        def emitted_request(volatile, stable_text="stable prefix"):
+            agent._cached_system_prompt_static = stable_text
+            request = agent._build_api_kwargs(
+                [
+                    {
+                        "role": "system",
+                        "content": f"{stable_text}\n\n{volatile}",
+                    },
+                    {"role": "user", "content": "next request"},
+                ]
+            )
+            agent.client.chat.completions.create(**request)
+            return agent.client.chat.completions.create.call_args_list[-1].kwargs
+
+        first = emitted_request("first volatile suffix")
+        second = emitted_request("second volatile suffix")
+        changed_prefix = emitted_request(
+            "second volatile suffix", stable_text="changed prefix"
+        )
+
+        assert second["prompt_cache_key"].startswith("pck_")
+        assert len(second["prompt_cache_key"]) == len("pck_") + 24
+        assert second["prompt_cache_key"] == first["prompt_cache_key"]
+        assert changed_prefix["prompt_cache_key"] != second["prompt_cache_key"]
+
+    def test_codex_request_uses_stable_authority_under_false_marker_policy(self, agent):
+        agent.provider = "openai"
+        agent.api_mode = "codex_responses"
+        agent.base_url = "https://api.openai.com/v1"
+        agent.model = "gpt-5.6-sol"
+        agent.session_id = "codex-stable-session"
+        agent._cached_system_prompt_static = "stable prefix"
+
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+
+        def request(volatile):
+            return agent._build_api_kwargs(
+                [
+                    {"role": "system", "content": f"stable prefix\n\n{volatile}"},
+                    {"role": "user", "content": "next request"},
+                ]
+            )
+
+        first = request("first volatile suffix")
+        second = request("second volatile suffix")
+
+        assert second["prompt_cache_key"] == first["prompt_cache_key"]
+        assert second["instructions"] == "stable prefix\n\nsecond volatile suffix"
+        assert "cache_control" not in second["instructions"]
+
     def test_basic_kwargs(self, agent):
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
@@ -3072,6 +3159,109 @@ class TestRunConversation:
                 "cache_control": {"type": "ephemeral"},
             },
         ]
+
+    def test_first_main_route_after_in_place_compression_keeps_cache_key(
+        self, agent, tmp_path, monkeypatch
+    ):
+        """The first real request after compression must use the stable prefix."""
+        from agent.transports.codex import _cache_scope_from_session_id, _content_cache_key
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "production-boundary-session"
+        db.create_session(session_id, source="cli", model=agent.model)
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = session_id
+        agent._last_flushed_db_idx = 0
+        agent._flushed_db_message_ids = set()
+        agent._flushed_db_message_session_id = session_id
+        agent.compression_in_place = True
+        agent.compression_enabled = False
+        agent._use_prompt_caching, agent._use_native_cache_layout = (
+            agent._anthropic_prompt_cache_policy(
+                provider="openai",
+                base_url="https://api.openai.com/v1",
+                api_mode="chat_completions",
+                model="gpt-5.6",
+            )
+        )
+        assert (agent._use_prompt_caching, agent._use_native_cache_layout) == (
+            False,
+            False,
+        )
+        agent._cache_ttl = "5m"
+        agent.provider = "boundary-test"
+        agent.base_url = "https://api.openai.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.openai.com"
+
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = "old volatile suffix"
+        agent._memory_manager.prefetch_all.return_value = ""
+        agent._memory_manager.describe_recall.return_value = ""
+        initial_prompt = agent._build_system_prompt()
+        stable_prefix = agent._cached_system_prompt_static
+        agent._cached_system_prompt = initial_prompt
+        agent._memory_manager.build_system_prompt.return_value = "rebuilt volatile suffix"
+
+        def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
+            return [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "assistant", "content": "recent reply"},
+            ]
+
+        agent.context_compressor.compress = _fake_compress
+        agent.context_compressor._last_compress_aborted = False
+        agent.context_compressor._last_summary_error = None
+        agent.context_compressor.compression_count = 1
+        source_messages = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": f"m{index}"}
+            for index in range(8)
+        ]
+        monkeypatch.setattr(
+            "agent.conversation_compression._refresh_agent_tool_definitions",
+            lambda _agent: False,
+        )
+        compressed, _rebuilt_prompt = agent._compress_context(
+            source_messages, None, approx_tokens=100_000
+        )
+
+        assert agent._last_compaction_in_place is True
+        assert agent.context_compressor.awaiting_real_usage_after_compression is True
+        assert agent.session_id == session_id
+        assert agent._memory_manager.build_system_prompt.call_count >= 2
+
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="done",
+            finish_reason="stop",
+            usage={"prompt_tokens": 512, "completion_tokens": 1, "total_tokens": 513},
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "next request", conversation_history=compressed, task_id="post-compress"
+            )
+
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 1
+        request = agent.client.chat.completions.create.call_args_list[0].kwargs
+        scope = _cache_scope_from_session_id(session_id)
+        assert request["prompt_cache_key"] == _content_cache_key(
+            stable_prefix, request["tools"], scope
+        )
+        assert request["prompt_cache_key"] != _content_cache_key(
+            "", request["tools"], scope
+        )
+        system = request["messages"][0]
+        assert system["role"] == "system"
+        assert isinstance(system["content"], str)
+        assert "rebuilt volatile suffix" in system["content"]
+        assert "cache_control" not in system["content"]
+        db.close()
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)

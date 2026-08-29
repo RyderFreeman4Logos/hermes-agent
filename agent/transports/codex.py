@@ -34,6 +34,7 @@ from agent.reasoning_effort import (
     clamp_effort,
     codex_supported_efforts,
 )
+from agent.message_content import flatten_message_text
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
@@ -441,7 +442,9 @@ class ResponsesApiTransport(ProviderTransport):
         payload_messages = messages
         if not instructions:
             if messages and messages[0].get("role") == "system":
-                instructions = str(messages[0].get("content") or "").strip()
+                instructions = flatten_message_text(
+                    messages[0].get("content"), sep=""
+                ).strip()
                 payload_messages = messages[1:]
         if not instructions:
             instructions = DEFAULT_AGENT_IDENTITY
@@ -618,8 +621,13 @@ class ResponsesApiTransport(ProviderTransport):
         _cache_scope = _cache_scope_from_session_id(
             params.get("cache_scope_id") or session_id
         )
+        cache_key_instructions = params.get("cache_key_instructions")
         cache_key = _content_cache_key(
-            instructions, response_tools, _cache_scope
+            cache_key_instructions
+            if isinstance(cache_key_instructions, str)
+            else instructions,
+            response_tools,
+            _cache_scope,
         ) or _cache_scope
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.

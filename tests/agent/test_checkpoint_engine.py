@@ -1230,6 +1230,81 @@ def test_map_source_membership_cannot_forge_authority_or_effects():
     assert shard is None
 
 
+def test_empty_represented_assistant_does_not_poison_covered_tool_shard():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine, MapDisposition
+
+    tool_result = json.dumps(
+        {"todos": [{"id": "todo-1", "content": "run tests"}]},
+        separators=(",", ":"),
+    )
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response(
+                {
+                    "schema_version": 2,
+                    "source_event_ids": [101, 102],
+                    "facts": [
+                        {
+                            "fact_id": "fact:plan",
+                            "kind": "plan",
+                            "text": "Created todos for the requested work.",
+                            "source_event_ids": [101],
+                        },
+                        {
+                            "fact_id": "fact:tool-result",
+                            "kind": "tool_result",
+                            "text": "todo list created",
+                            "source_event_ids": [102],
+                        },
+                    ],
+                    "dispositions": [
+                        {
+                            "source_event_id": 101,
+                            "status": "represented",
+                            "fact_ids": ["fact:plan"],
+                        },
+                        {
+                            "source_event_id": 102,
+                            "status": "represented",
+                            "fact_ids": ["fact:tool-result"],
+                        },
+                    ],
+                }
+            )
+        )
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path":"todos.json"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": tool_result},
+    ]
+
+    shard = engine._map_group(messages, CausalGroup((0, 1)), (101, 102))
+
+    assert shard is not None
+    assert [fact.fact_id for fact in shard.facts] == ["fact:tool-result"]
+    assert shard.dispositions == (
+        MapDisposition(source_event_id=101, status="noise"),
+        MapDisposition(
+            source_event_id=102,
+            status="represented",
+            fact_ids=("fact:tool-result",),
+        ),
+    )
+
+
 @pytest.mark.parametrize("kind", ("task", "instruction", "command", "goal"))
 def test_map_rejects_unknown_imperative_sibling_kinds_at_parse_time(kind):
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine

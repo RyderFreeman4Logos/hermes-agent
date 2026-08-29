@@ -1953,8 +1953,6 @@ class CheckpointContextEngine(ContextEngine):
                 if fact_id in validated_by_id
                 and disposition.source_event_id in validated_by_id[fact_id].source_event_ids
             )
-            if disposition.status == "represented" and not fact_ids:
-                return None
             row = rows[disposition.source_event_id]
             content = row.get("content")
             text = content.casefold() if isinstance(content, str) else ""
@@ -1966,6 +1964,10 @@ class CheckpointContextEngine(ContextEngine):
                 "subagent final", "next action", "acceptance",
             ))
             binding_identity = text.startswith(("decision:", "repository identity:"))
+            if disposition.status == "represented" and not fact_ids:
+                if row.get("role") == "user" or high_risk or binding_identity or not validated:
+                    return None
+                disposition = replace(disposition, status="noise", fact_ids=())
             if (
                 (row.get("role") == "user" and disposition.status == "noise")
                 or (high_risk and not validated and disposition.status != "externalized")

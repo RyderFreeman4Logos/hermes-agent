@@ -9,8 +9,16 @@ import {
   normalizeIndicatorStyle,
   normalizeMouseTracking,
   normalizeStatusBar,
+  normalizeStatusBarSegments,
   syncMcpReload
 } from '../app/useConfigSync.js'
+
+describe('normalizeStatusBarSegments', () => {
+  it('keeps missing config backward-compatible and preserves hide-all', () => {
+    expect(normalizeStatusBarSegments(undefined)).toEqual(expect.arrayContaining(['indicator', 'model', 'cwd']))
+    expect(normalizeStatusBarSegments([])).toEqual([])
+  })
+})
 
 describe('applyDisplay', () => {
   beforeEach(() => {

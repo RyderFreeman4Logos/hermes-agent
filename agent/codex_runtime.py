@@ -23,6 +23,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
@@ -646,6 +647,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         try:
             fn(text)
+        except StreamPayloadBoundExceeded:
+            raise
         except Exception:
             logger.debug("_fire_stream_delta raised", exc_info=True)
 
@@ -658,6 +661,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         try:
             fn(text)
+        except StreamPayloadBoundExceeded:
+            raise
         except Exception:
             logger.debug("_fire_reasoning_delta raised", exc_info=True)
 

@@ -6480,6 +6480,22 @@ def _next_configured_fallback_index(label: str) -> Optional[int]:
         return None
 
 
+def _selected_configured_fallback(
+    task: Optional[str], label: str,
+) -> Tuple[Optional[Any], Optional[str], str]:
+    """Re-resolve a recorded configured route before retrying a sibling call."""
+    next_index = _next_configured_fallback_index(label)
+    if not task or next_index is None:
+        return None, None, ""
+    selected_index = next_index - 1
+    return _try_configured_fallback_chain(
+        task,
+        "",
+        start_index=selected_index,
+        attempted_indices=set(range(selected_index)),
+    )
+
+
 def _try_configured_fallback_for_unavailable_client(
     task: Optional[str],
     failed_provider: str,
@@ -10526,15 +10542,26 @@ def _call_llm_impl(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
-        client, final_model = _get_cached_client(
-            resolved_provider,
-            resolved_model,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            api_mode=resolved_api_mode,
-            main_runtime=main_runtime,
-            task=task,
-        )
+        client = None
+        final_model = resolved_model
+        if fallback_label:
+            client, selected_model, selected_label = _selected_configured_fallback(
+                task, fallback_label,
+            )
+            if client is not None:
+                final_model = selected_model or resolved_model or ""
+                fallback_label = selected_label
+                resolved_provider = selected_label
+        if client is None:
+            client, final_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
+                task=task,
+            )
         effective_provider = _effective_provider_for_client(
             client, resolved_provider,
         )
@@ -11495,16 +11522,27 @@ async def _async_call_llm_impl(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
-        client, final_model = _get_cached_client(
-            resolved_provider,
-            resolved_model,
-            async_mode=True,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            api_mode=resolved_api_mode,
-            main_runtime=main_runtime,
-            task=task,
-        )
+        client = None
+        final_model = resolved_model
+        if fallback_label:
+            client, selected_model, selected_label = _selected_configured_fallback(
+                task, fallback_label,
+            )
+            if client is not None:
+                final_model = selected_model or resolved_model or ""
+                fallback_label = selected_label
+                resolved_provider = selected_label
+        if client is None:
+            client, final_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                async_mode=True,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
+                task=task,
+            )
         effective_provider = _effective_provider_for_client(
             client, resolved_provider,
         )

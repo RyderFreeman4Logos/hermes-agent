@@ -113,3 +113,18 @@ def test_long_internal_completion_does_not_hoard_the_whole_transcript(
 
     assert len(compressed) < len(messages)
     _assert_tool_pairs_are_complete(compressed)
+
+
+def test_short_internal_completion_anchors_following_blank_echo(
+    compressor: ContextCompressor,
+) -> None:
+    completion = "[ASYNC DELEGATION BATCH COMPLETE — deleg_9dc8cde8]"
+    messages = [
+        {"role": "user", "content": completion},
+        {"role": "user", "content": " \n"},
+        {"role": "assistant", "content": "working from the completion"},
+    ]
+
+    assert len(completion) <= _ACTIVE_TASK_MAX_CHARS
+    assert compressor._find_last_user_message_idx(messages, 0) == 0
+    assert compressor._blank_echo_indices_after(messages, 0) == {1}

@@ -1706,11 +1706,15 @@ class CheckpointContextEngine(ContextEngine):
         for fact in facts:
             if isinstance(fact, dict) and "event_ids" in fact and "source_event_ids" not in fact:
                 fact["source_event_ids"] = fact.pop("event_ids")
+            if isinstance(fact, dict) and "fact_id" in fact:
+                if "id" in fact:
+                    return None
+                fact["id"] = fact.pop("fact_id")
             if not isinstance(fact, dict) or not {"kind", "text"} <= set(fact):
                 return None
             if set(fact) - {
                 "kind",
-                "fact_id",
+                "id",
                 "text",
                 "source_event_ids",
                 "uncertain",
@@ -1720,7 +1724,7 @@ class CheckpointContextEngine(ContextEngine):
             }:
                 return None
             kind = fact["kind"]
-            fact_id = fact.get("fact_id")
+            fact_id = fact.get("id")
             text = fact["text"]
             uncertain = fact.get("uncertain", False)
             if not isinstance(kind, str):

@@ -1915,6 +1915,43 @@ def test_map_accepts_fact_event_ids_alias_but_rejects_conflicts_and_unknown_keys
     assert engine._parse_map_shard(_map_response(unknown), group, (1,)) is None
 
 
+def test_map_accepts_fact_id_alias_but_rejects_conflicts_and_unknown_keys():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    payload = {
+        "schema_version": 2,
+        "source_event_ids": [1],
+        "facts": [{
+            "id": "fact:request",
+            "kind": "request",
+            "text": "Continue.",
+            "source_event_ids": [1],
+        }],
+        "dispositions": [{
+            "source_event_id": 1,
+            "status": "represented",
+            "fact_ids": ["fact:request"],
+        }],
+    }
+    engine = CheckpointContextEngine()
+    group = CausalGroup((0,))
+
+    canonical = engine._parse_map_shard(_map_response(payload), group, (1,))
+    alias_payload = deepcopy(payload)
+    alias_payload["facts"][0]["fact_id"] = alias_payload["facts"][0].pop("id")
+    alias = engine._parse_map_shard(_map_response(alias_payload), group, (1,))
+
+    assert canonical is not None
+    assert alias == canonical
+    conflicting = deepcopy(payload)
+    conflicting["facts"][0]["fact_id"] = conflicting["facts"][0]["id"]
+    assert engine._parse_map_shard(_map_response(conflicting), group, (1,)) is None
+    for key in ("_fact_id", "unknown"):
+        unknown = deepcopy(payload)
+        unknown["facts"][0][key] = True
+        assert engine._parse_map_shard(_map_response(unknown), group, (1,)) is None
+
+
 def test_map_prompt_requires_unfenced_json_and_canonical_disposition_keys():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 

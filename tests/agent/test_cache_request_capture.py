@@ -191,9 +191,31 @@ def test_transport_and_ordinary_secrets_are_redacted(monkeypatch, tmp_path):
     assert saved["messages"][0]["password"] == "[REDACTED]"
     assert saved["body"] == "body-value"
     assert saved["cache_control"] == {"type": "ephemeral"}
-    assert saved["tools"][0]["function"]["parameters"]["properties"]["api_key"] == {
-        "type": "string"
+    assert saved["tools"][0]["function"]["parameters"]["properties"]["api_key"] == "[REDACTED]"
+
+
+def test_preserved_payload_redacts_structured_secret_values(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    request = {
+        "messages": [
+            {
+                "content": {
+                    "password": {"value": "dict-secret-marker"},
+                    "token": ["list-secret-marker"],
+                }
+            }
+        ]
     }
+
+    _capture(request)
+
+    serialized = next((tmp_path / "debug" / "cache-requests").glob("*.json")).read_text()
+    saved = json.loads(serialized)["request"]
+    assert "dict-secret-marker" not in serialized
+    assert "list-secret-marker" not in serialized
+    assert saved["messages"][0]["content"]["password"] == "[REDACTED]"
+    assert saved["messages"][0]["content"]["token"] == "[REDACTED]"
 
 
 def test_capture_is_non_fatal_by_default(monkeypatch):

@@ -19,6 +19,8 @@ from tools.process_registry import (
     ProcessSession,
 )
 
+_MISSING_EXIT_CODE = object()
+
 
 @pytest.fixture()
 def registry():
@@ -34,6 +36,9 @@ def _make_session(
     exit_code=None,
     output="",
     notify_on_complete=False,
+    delegated_child=False,
+    completion_reason="exited",
+    termination_source="",
 ) -> ProcessSession:
     s = ProcessSession(
         id=sid,
@@ -44,6 +49,9 @@ def _make_session(
         exit_code=exit_code,
         output_buffer=output,
         notify_on_complete=notify_on_complete,
+        delegated_child=delegated_child,
+        completion_reason=completion_reason,
+        termination_source=termination_source,
     )
     return s
 
@@ -130,6 +138,67 @@ class TestCompletionQueue:
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
+    @pytest.mark.parametrize(
+        ("exit_code", "completion_reason", "termination_source", "visible"),
+        (
+            (0, "exited", "", False),
+            (1, "exited", "", True),
+            (-1, "lost", "backend_lost", True),
+            (-15, "killed", "process.kill", True),
+            (None, "exited", "", True),
+            (True, "exited", "", True),
+            ("0", "exited", "", True),
+            (_MISSING_EXIT_CODE, "exited", "", True),
+        ),
+        ids=(
+            "success",
+            "nonzero",
+            "lost",
+            "killed",
+            "none",
+            "bool",
+            "string",
+            "missing",
+        ),
+    )
+    def test_delegated_child_suppresses_only_routine_success(
+        self, registry, exit_code, completion_reason, termination_source, visible
+    ):
+        session = _make_session(
+            task_id="sa-9-child",
+            notify_on_complete=True,
+            delegated_child=True,
+            output="child output",
+            exit_code=None if exit_code is _MISSING_EXIT_CODE else exit_code,
+            completion_reason=completion_reason,
+            termination_source=termination_source,
+        )
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        assert not registry.completion_queue.empty()
+        if exit_code is _MISSING_EXIT_CODE:
+            event = registry.completion_queue.get_nowait()
+            del event["exit_code"]
+            registry.completion_queue.put(event)
+
+        notifications = registry.drain_notifications()
+        assert (len(notifications) == 1) is visible
+        assert registry.completion_queue.empty()
+        assert registry._finished[session.id].output_buffer == "child output"
+
+    def test_parent_owned_success_still_notifies(self, registry):
+        session = _make_session(notify_on_complete=True, output="done", exit_code=0)
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        event = registry.completion_queue.get_nowait()
+        assert event["delegated_child"] is False
+        registry.completion_queue.put(event)
+        assert len(registry.drain_notifications()) == 1
+
 
 # =========================================================================
 # Checkpoint persistence
@@ -138,13 +207,14 @@ class TestCompletionQueue:
 class TestCheckpointNotify:
     def test_checkpoint_includes_notify(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
-            s = _make_session(notify_on_complete=True)
+            s = _make_session(notify_on_complete=True, delegated_child=True)
             registry._running[s.id] = s
             registry._write_checkpoint()
 
             data = json.loads((tmp_path / "procs.json").read_text())
             assert len(data) == 1
             assert data[0]["notify_on_complete"] is True
+            assert data[0]["delegated_child"] is True
 
 
     def test_recover_defaults_false(self, registry, tmp_path):
@@ -161,6 +231,7 @@ class TestCheckpointNotify:
             assert recovered == 1
             s = registry.get("proc_live")
             assert s.notify_on_complete is False
+            assert s.delegated_child is False
 
 
 # =========================================================================

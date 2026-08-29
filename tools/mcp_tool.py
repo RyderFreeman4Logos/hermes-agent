@@ -8179,7 +8179,9 @@ def refresh_agent_mcp_tools(
     explicit user consent; the late-binding and between-turns paths only rebuild
     at a turn boundary, before that turn's ``tools=`` prefix is assembled).
     """
+    from agent.memory_provider import normalize_memory_provider_mode
     from model_tools import get_tool_definitions
+    from tools.memory_tool import frozen_memory_surface
     from tools.registry import registry
 
     # Explicit reloads (/reload-mcp) pass freshly-resolved toolsets so a server
@@ -8195,6 +8197,10 @@ def refresh_agent_mcp_tools(
         enabled = getattr(agent, "enabled_toolsets", None)
         disabled = getattr(agent, "disabled_toolsets", None)
 
+    with _agent_tools_lock:
+        snapshot_epoch = getattr(agent, "_tool_snapshot_generation", 0)
+        snapshot_epoch = snapshot_epoch if isinstance(snapshot_epoch, int) else 0
+
     # Capture the registry generation this rebuild is derived from BEFORE the
     # (potentially slow) get_tool_definitions call. Used at publish time to
     # reject a stale write: if two callers race (e.g. the late-refresh daemon
@@ -8207,14 +8213,22 @@ def refresh_agent_mcp_tools(
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
-    new_defs = list(
-        get_tool_definitions(
-            enabled_toolsets=enabled,
-            disabled_toolsets=disabled,
-            quiet_mode=quiet_mode,
-        )
-        or []
+    memory_mode = normalize_memory_provider_mode(
+        getattr(agent, "_memory_provider_mode", None)
+    ) or "hybrid"
+    memory_flags = (
+        bool(getattr(agent, "_memory_enabled", False)),
+        bool(getattr(agent, "_user_profile_enabled", False)),
     )
+    with frozen_memory_surface(memory_mode, memory_flags):
+        new_defs = list(
+            get_tool_definitions(
+                enabled_toolsets=enabled,
+                disabled_toolsets=disabled,
+                quiet_mode=quiet_mode,
+            )
+            or []
+        )
     new_names = {t["function"]["name"] for t in new_defs}
 
     # Re-append the post-build injected families that get_tool_definitions does
@@ -8237,6 +8251,9 @@ def refresh_agent_mcp_tools(
         # whole refresh.
         published_gen_raw = getattr(agent, "_tool_snapshot_generation", -1)
         published_gen = published_gen_raw if isinstance(published_gen_raw, int) else -1
+        if published_gen != snapshot_epoch:
+            agent._tool_snapshot_generation = published_gen + 1
+            return set()
         if snapshot_generation < published_gen:
             # A newer snapshot already won; our set is stale — drop it.
             return set()

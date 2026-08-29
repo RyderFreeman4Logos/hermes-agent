@@ -1783,6 +1783,37 @@ def test_map_accepts_legacy_represented_fact_id_aliases(aliases):
     ) is None
 
 
+def test_map_accepts_getting_status_alias_but_rejects_conflict():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    payload = {
+        "schema_version": 2,
+        "source_event_ids": [1],
+        "facts": [{
+            "fact_id": "fact:request",
+            "kind": "request",
+            "text": "Continue.",
+            "source_event_ids": [1],
+        }],
+        "dispositions": [{
+            "source_event_id": 1,
+            "getting_status": "represented",
+            "fact_ids": ["fact:request"],
+        }],
+    }
+    engine = CheckpointContextEngine()
+
+    shard = engine._parse_map_shard(_map_response(payload), CausalGroup((0,)), (1,))
+
+    assert shard is not None
+    assert shard.dispositions[0].status == "represented"
+    conflicting = deepcopy(payload)
+    conflicting["dispositions"][0]["status"] = "represented"
+    assert engine._parse_map_shard(
+        _map_response(conflicting), CausalGroup((0,)), (1,)
+    ) is None
+
+
 def test_map_prompt_requires_unfenced_json_and_canonical_disposition_keys():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 

@@ -1677,6 +1677,8 @@ class CheckpointContextEngine(ContextEngine):
                         disposition["source_event_id"] = disposition.pop("event_id")
                     if "disposition" in disposition and "status" not in disposition:
                         disposition["status"] = disposition.pop("disposition")
+                    if "getting_status" in disposition and "status" not in disposition:
+                        disposition["status"] = disposition.pop("getting_status")
                     aliases = [
                         disposition.pop(key)
                         for key in ("represented_by", "represented_fact_ids", "ref")

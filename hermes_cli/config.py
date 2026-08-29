@@ -2201,6 +2201,20 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                         "Add the API endpoint URL, e.g.: base_url: https://api.example.com/v1",
                     ))
 
+    # ── delegation.model_pool: non-empty pool requires explicit standard ──
+    delegation_cfg = config.get("delegation")
+    if isinstance(delegation_cfg, dict):
+        pool = delegation_cfg.get("model_pool")
+        if isinstance(pool, dict) and pool:
+            names = [str(name) for name in pool if str(name).strip()]
+            if "standard" not in names:
+                issues.append(ConfigIssue(
+                    "error",
+                    "delegation.model_pool is non-empty but has no 'standard' profile",
+                    "Add an explicit standard profile, or remove model_pool. "
+                    "YAML key order is not a routing default.",
+                ))
+
     # ── fallback_model: single dict OR list of dicts (chain) ─────────────
     fb = config.get("fallback_model")
     if fb is not None:

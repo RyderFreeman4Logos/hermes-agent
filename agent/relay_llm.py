@@ -57,7 +57,7 @@ def capture_transport_request(request: dict[str, Any]) -> None:
         api_mode=str(metadata.get("api_mode") or "unknown"),
         route=str(metadata.get("route") or "unknown"),
         provider=name,
-        model=str(request.get("model") or model_name),
+        model=model_name,
         correlation=request_id or None,
         attempt_id=f"{request_id}:attempt:{retry}" if request_id else None,
         retry=retry,

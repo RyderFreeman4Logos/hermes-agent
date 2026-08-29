@@ -23,6 +23,7 @@ from agent.secret_scope import (
     reset_secret_scope,
     set_secret_scope,
 )
+from agent.memory_provider import normalize_memory_provider_mode
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
     INDICATOR_STYLES,
@@ -2623,6 +2624,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
+    memory_provider_mode = _session_memory_provider_mode(session)
     return {
         "type": "turn.start",
         "sid": sid,
@@ -2638,6 +2640,7 @@ def _compute_host_turn_frame(
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
+        "memory_provider_mode_override": memory_provider_mode,
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
@@ -3220,7 +3223,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {"session_db": session_db}
+                kw: dict[str, Any] = {"session_db": session_db}
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -3248,6 +3251,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                    kw["memory_provider_mode_override"] = _session_memory_provider_mode(current)
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -3263,6 +3267,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _persist_live_session_runtime(current)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -3787,6 +3792,28 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
+def _session_memory_provider_mode(session: dict) -> str:
+    agent = session.get("agent") or {}
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict) and "memory_provider_mode" in init_config:
+        return normalize_memory_provider_mode(init_config["memory_provider_mode"]) or "hybrid"
+    mode = getattr(agent, "_memory_provider_mode", None)
+    if hasattr(agent, "_memory_provider_mode"):
+        return normalize_memory_provider_mode(mode) or "hybrid"
+    overrides = session.get("resume_runtime_overrides")
+    if isinstance(overrides, dict) and "memory_provider_mode_override" in overrides:
+        return normalize_memory_provider_mode(
+            overrides["memory_provider_mode_override"]
+        ) or "hybrid"
+    try:
+        from tools.memory_tool import get_memory_provider_mode
+
+        memory_config = _load_cfg().get("memory", {})
+        return get_memory_provider_mode(memory_config if isinstance(memory_config, dict) else {})
+    except Exception:
+        return "hybrid"
+
+
 def _ensure_session_db_row(session: dict) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
@@ -3887,6 +3914,7 @@ def _ensure_session_db_row(session: dict) -> None:
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
     parent_session_id = session.get("parent_session_id") or None
+    model_config["memory_provider_mode"] = _session_memory_provider_mode(session)
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
     # Bot-Mode room plumbing sessions are per-member scratch conversations
@@ -5423,6 +5451,11 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["service_tier_override"] = ""
     elif service_tier:
         overrides["service_tier_override"] = service_tier
+    if "memory_provider_mode" in model_config:
+        overrides["memory_provider_mode_override"] = (
+            normalize_memory_provider_mode(model_config["memory_provider_mode"])
+            or "hybrid"
+        )
 
     return overrides
 
@@ -5442,13 +5475,22 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     route the resumed chat to the wrong endpoint while the model column claimed
     the new one.
     """
-    config = dict(existing or {})
+    config = copy.deepcopy(existing) if isinstance(existing, dict) else {}
     model = str(getattr(agent, "model", "") or "").strip()
     provider = str(getattr(agent, "provider", "") or "").strip()
     base_url = str(getattr(agent, "base_url", "") or "").strip()
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict) and "memory_provider_mode" in init_config:
+        memory_provider_mode = normalize_memory_provider_mode(
+            init_config["memory_provider_mode"]
+        ) or "hybrid"
+    else:
+        memory_provider_mode = normalize_memory_provider_mode(
+            getattr(agent, "_memory_provider_mode", None)
+        ) or "hybrid"
 
     if model:
         config["model"] = model
@@ -5495,13 +5537,14 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     else:
         config.pop("api_mode", None)
     if isinstance(reasoning_config, dict):
-        config["reasoning_config"] = reasoning_config
+        config["reasoning_config"] = copy.deepcopy(reasoning_config)
     else:
         config.pop("reasoning_config", None)
     if service_tier:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+    config["memory_provider_mode"] = memory_provider_mode
 
     return config
 
@@ -8483,6 +8526,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
+    _persist_live_session_runtime(session)
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
     session["queued_prompt"] = None
@@ -8648,6 +8692,7 @@ def _make_agent(
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
+    memory_provider_mode_override: str | None = None,
     platform_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
@@ -8804,6 +8849,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
+        memory_provider_mode_override=memory_provider_mode_override,
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same

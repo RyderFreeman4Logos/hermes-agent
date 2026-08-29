@@ -1743,6 +1743,47 @@ def test_map_unwraps_complete_json_fence_and_aliases_disposition_keys():
     assert engine._parse_map_shard(_map_response(unknown), group, (1,)) is None
 
 
+def test_map_unwraps_pretty_printed_json_fence_without_closing_fence():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    payload = {
+        "schema_version": 2,
+        "source_event_ids": [79, 80],
+        "facts": [
+            {
+                "fact_id": "fact:1",
+                "kind": "request",
+                "text": "Continue the checkpoint work.",
+                "source_event_ids": [79],
+            },
+            {
+                "fact_id": "fact:2",
+                "kind": "decision",
+                "text": "Keep the parser fail-closed.",
+                "source_event_ids": [80],
+            },
+        ],
+        "dispositions": [
+            {"source_event_id": 79, "status": "represented", "fact_ids": ["fact:1"]},
+            {"source_event_id": 80, "status": "represented", "fact_ids": ["fact:2"]},
+        ],
+    }
+    engine = CheckpointContextEngine()
+    group = CausalGroup((0, 1))
+    unfenced = engine._parse_map_shard(
+        _map_response(payload), group, (79, 80)
+    )
+    fenced = _map_response(payload)
+    fenced.choices[0].message.content = f"```json\n{json.dumps(payload, indent=2)}"
+
+    shard = engine._parse_map_shard(fenced, group, (79, 80))
+
+    assert unfenced is not None
+    assert shard == unfenced
+    assert shard is not None
+    assert len(shard.facts) == 2
+
+
 @pytest.mark.parametrize(
     "aliases",
     (

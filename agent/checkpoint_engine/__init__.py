@@ -1658,8 +1658,10 @@ class CheckpointContextEngine(ContextEngine):
             or len(content.encode("utf-8")) > _MAP_RESPONSE_MAX_BYTES
         ):
             return None
-        if content.startswith("```json\n") and content.endswith("\n```"):
-            content = content[len("```json\n"):-len("\n```")]
+        if content.startswith("```json\n"):
+            content = content[len("```json\n") :]
+            if content.endswith("\n```"):
+                content = content[: -len("\n```")]
         try:
             payload = json.loads(content)
         except (TypeError, ValueError):

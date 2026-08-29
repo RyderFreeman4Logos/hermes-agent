@@ -179,6 +179,51 @@ def test_cache_info_omits_tokens_when_counts_missing():
     assert "prompt_tokens" not in info
 
 
+def test_message_complete_preserves_compression_bound_reason(frames, turn_env):
+    class _Agent:
+        context_compressor = types.SimpleNamespace(awaiting_real_usage_after_compression=True)
+        session_id = "session-key"
+
+        def run_conversation(self, _prompt, **_kwargs):
+            self._first_turn_usage = {
+                "cache_read_tokens": 3,
+                "cache_telemetry": "reported",
+                "cache_write_tokens": 0,
+                "prompt_tokens": 4_000,
+            }
+            callback = getattr(self, "_tui_cache_callback")
+            callback(
+                "hit",
+                0,
+                3,
+                4_000,
+                {
+                    "request_index": 1,
+                    "pct": 0,
+                    "state": "hit",
+                    "timestamp": 1.0,
+                    "turn_origin": "user",
+                },
+            )
+            return {"final_response": "reply", "messages": []}
+
+        def clear_interrupt(self):
+            return None
+
+    agent = _Agent()
+    session = _session(agent=agent, running=True)
+    sid = "loop-stamp-compression-bound"
+    server._sessions[sid] = session
+    try:
+        server._attach_tui_cache_callback(agent, sid)
+        server._run_prompt_submit("rid", sid, session, "wake")
+    finally:
+        server._sessions.pop(sid, None)
+
+    payload = _complete_payloads(frames)[0]
+    assert payload["cache_info"]["compression_bound"] is True
+
+
 def test_usage_without_cache_telemetry_does_not_fake_token_counts():
     info = server._cache_info_from_usage({"prompt_tokens": 4_000})
     assert info == {"state": "unavailable", "pct": 0}

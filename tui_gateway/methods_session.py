@@ -4,7 +4,15 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
+from typing import TYPE_CHECKING
+
 from .method_ctx import HandlerRegistry
+
+if TYPE_CHECKING:
+    from .server import (
+        _begin_manual_compression_fence,
+        _finish_manual_compression_fence,
+    )
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -2905,13 +2913,19 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    busy_response = _err(
+        rid, 4009, "session busy — /interrupt the current turn before /compress"
+    )
     if session.get("running"):
-        return _err(
-            rid, 4009, "session busy — /interrupt the current turn before /compress"
-        )
+        return busy_response
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
     )
+
+    try:
+        manual_compression_fence = _begin_manual_compression_fence(session)
+    except RuntimeError:
+        return busy_response
 
     sid = params.get("session_id", "")
     focus_topic = str(params.get("focus_topic", "") or "").strip()
@@ -3024,6 +3038,8 @@ def _(rid, params: dict) -> dict:
             committed=False,
         )
         return _err(rid, 5005, str(e))
+    finally:
+        _finish_manual_compression_fence(session, manual_compression_fence)
 
 
 @method("session.save")

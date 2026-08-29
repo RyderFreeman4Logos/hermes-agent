@@ -1,5 +1,6 @@
 """Shared utility functions for hermes-agent."""
 
+import ipaddress
 import errno
 import json
 import logging
@@ -10,7 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import yaml
 
@@ -18,6 +19,67 @@ logger = logging.getLogger(__name__)
 
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+
+def normalize_route_base_url(base_url: Any) -> str:
+    """Return a fail-closed identity for an endpoint URL.
+
+    Only scheme/host casing, IDNA spelling, IPv6 compression, default HTTP(S)
+    ports, and the existing no-query trailing-slash rule are normalized.
+    Path/query bytes and case remain untouched.
+    """
+    if base_url is None:
+        return ""
+    raw = base_url if isinstance(base_url, str) else str(base_url)
+    raw = raw.strip()
+    if not raw or any(ord(char) <= 0x20 for char in raw):
+        return ""
+    had_query_delimiter = "?" in raw.split("#", 1)[0]
+    try:
+        parsed = urlsplit(raw)
+        if not parsed.scheme or not parsed.netloc or not parsed.hostname:
+            return ""
+        scheme = parsed.scheme.lower()
+        if not scheme[0].isalpha() or not all(
+            char.isalnum() or char in "+-." for char in scheme
+        ):
+            return ""
+        port = parsed.port
+        hostname = parsed.hostname
+    except (TypeError, ValueError, IndexError):
+        return ""
+
+    if "%" in hostname:
+        address, zone = hostname.split("%", 1)
+        try:
+            host = f"{ipaddress.ip_address(address).compressed}%{zone}"
+        except ValueError:
+            return ""
+    elif ":" in hostname:
+        try:
+            host = ipaddress.ip_address(hostname).compressed
+        except ValueError:
+            return ""
+    else:
+        try:
+            host = hostname.encode("idna").decode("ascii").lower()
+        except (UnicodeError, AttributeError):
+            return ""
+
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None and (scheme, port) not in {("http", 80), ("https", 443)}:
+        host = f"{host}:{port}"
+    userinfo = parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else ""
+    authority = f"{userinfo}@{host}" if userinfo else host
+
+    path = parsed.path
+    if path.endswith("/") and not had_query_delimiter:
+        path = path[:-1]
+    normalized = urlunsplit((scheme, authority, path, parsed.query, ""))
+    if had_query_delimiter and not parsed.query:
+        normalized += "?"
+    return normalized
 
 
 def is_truthy_value(value: Any, default: bool = False) -> bool:

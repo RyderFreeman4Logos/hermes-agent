@@ -946,7 +946,7 @@ class MemoryManager:
                         error_class="invalid_operations",
                     )
                 action = operation.get("action")
-                if action not in {"add", "replace", "remove"}:
+                if not isinstance(action, str) or action not in {"add", "replace", "remove"}:
                     return tool_error(
                         "Each operation must use add, replace, or remove.",
                         success=False,
@@ -968,7 +968,7 @@ class MemoryManager:
                     )
         else:
             action = request.get("action")
-            if action not in {"add", "replace", "remove"}:
+            if not isinstance(action, str) or action not in {"add", "replace", "remove"}:
                 return tool_error(
                     "Use add, replace, or remove.",
                     success=False,

@@ -856,6 +856,39 @@ class TestCodexToolProgressBridge:
         on_event({})
         assert events == []
 
+    @pytest.mark.parametrize(
+        ("method", "callback_attr"),
+        [
+            ("item/agentMessage/delta", "_fire_stream_delta"),
+            ("item/reasoning/delta", "_fire_reasoning_delta"),
+        ],
+    )
+    def test_bridge_propagates_stream_payload_bound_exceeded(
+        self, method, callback_attr
+    ):
+        from agent.codex_runtime import make_codex_app_server_event_bridge
+        from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+        overflow = StreamPayloadBoundExceeded(256 * 1024 + 1)
+
+        def raise_overflow(_text):
+            raise overflow
+
+        agent = SimpleNamespace(
+            tool_progress_callback=None,
+            _fire_stream_delta=None,
+            _fire_reasoning_delta=None,
+            _emit_interim_assistant_message=None,
+        )
+        setattr(agent, callback_attr, raise_overflow)
+
+        with pytest.raises(StreamPayloadBoundExceeded) as caught:
+            make_codex_app_server_event_bridge(agent)(
+                {"method": method, "params": {"delta": "overflow"}}
+            )
+
+        assert caught.value is overflow
+
     def test_session_wired_with_on_event_that_fires_tool_progress(self, monkeypatch):
         """The session is constructed with an on_event hook that, when fed an
         item/started note, calls the agent's tool_progress_callback."""

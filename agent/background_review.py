@@ -341,12 +341,21 @@ def _resolve_review_runtime(
         "base_url": parent_runtime.get("base_url") or None,
         "api_mode": parent_api_mode,
         "credential_pool": getattr(agent, "_credential_pool", None),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "request_overrides": {},
         "max_tokens": getattr(agent, "max_tokens", None),
         "command": getattr(agent, "acp_command", None),
         "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
     }
+    if getattr(agent, "service_tier", None):
+        try:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            parent["request_overrides"] = resolve_fast_mode_overrides(
+                agent.model
+            ) or {}
+        except Exception:
+            pass
     task = _background_review_task_config(task_cfg)
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
@@ -1296,6 +1305,12 @@ def _run_review_in_thread(
                     _pref_val = getattr(agent, _pref_attr, None)
                     if _pref_val:
                         _fork_kwargs[_pref_attr] = _pref_val
+            from agent.agent_init import _request_override_projections
+
+            caller_overrides, derived_overrides = _request_override_projections(
+                agent, _rt.get("request_overrides") or {}
+            )
+            _fork_kwargs["fast_mode_overrides"] = derived_overrides
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
                 max_iterations=_REVIEW_MAX_ITERATIONS,
@@ -1306,7 +1321,7 @@ def _run_review_in_thread(
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
                 credential_pool=_rt.get("credential_pool"),
-                request_overrides=_rt.get("request_overrides") or {},
+                request_overrides=caller_overrides,
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),

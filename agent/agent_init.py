@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import copy as _copy
 import logging
 import os
 import re
@@ -49,10 +50,9 @@ from agent.tool_guardrails import (
     ToolGuardrailDecision,
 )
 from hermes_cli.config import cfg_get
-from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
-from utils import base_url_host_matches, is_truthy_value
+from utils import base_url_host_matches, is_truthy_value, normalize_route_base_url
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
 # capture our warnings.  (run_agent.py also does
@@ -398,9 +398,67 @@ def _record_codex_gpt55_autoraise_notice(autoraise: Dict[str, Any]) -> None:
 
 
 def _normalized_custom_base_url(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return value.strip().rstrip("/")
+    return normalize_route_base_url(value)
+
+
+_REQUEST_OVERRIDE_REJECTION = "request override projection rejected"
+_REQUEST_OVERRIDE_UNSET = object()
+
+
+class _RequestOverrideProjectionError(TypeError):
+    """A target request mapping could not be safely projected."""
+
+
+def _validate_request_override_graph(value: Any) -> None:
+    seen: set[int] = set()
+
+    def _validate(item: Any) -> None:
+        item_type = type(item)
+        if item_type in {type(None), str, bytes, int, float, bool}:
+            return
+        if item_type not in {dict, list, tuple}:
+            raise _RequestOverrideProjectionError(
+                _REQUEST_OVERRIDE_REJECTION
+            ) from None
+        item_id = id(item)
+        if item_id in seen:
+            return
+        seen.add(item_id)
+        values = item.items() if item_type is dict else enumerate(item)
+        for key, nested in values:
+            _validate(key)
+            _validate(nested)
+
+    _validate(value)
+
+
+def _copy_validated_request_override_graph(value: Any) -> Any:
+    try:
+        return _copy.deepcopy(value)
+    except Exception:
+        raise _RequestOverrideProjectionError(_REQUEST_OVERRIDE_REJECTION) from None
+
+
+def _copy_request_override_graph(value: Any) -> Any:
+    """Validate and detach one exact-plain request/runtime graph."""
+    _validate_request_override_graph(value)
+    return _copy_validated_request_override_graph(value)
+
+
+def _request_override_projections(
+    agent, derived_overrides: Optional[Dict[str, Any]] = None
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return independent caller-owned and derived runtime projections."""
+    try:
+        owned = object.__getattribute__(agent, "__dict__")
+    except (AttributeError, TypeError):
+        owned = {}
+    except Exception:
+        raise _RequestOverrideProjectionError(_REQUEST_OVERRIDE_REJECTION) from None
+    caller = owned.get("_caller_request_overrides", {}) if type(owned) is dict else {}
+    return _copy_request_override_graph(caller or {}), _copy_request_override_graph(
+        derived_overrides or {}
+    )
 
 
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
@@ -433,6 +491,27 @@ def _custom_provider_extra_body_for_agent(
     base_url: str,
     custom_providers: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
+    selected = _select_custom_provider_extra_body(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        custom_providers=custom_providers,
+    )
+    if selected is None:
+        return None
+    _validate_request_override_graph({"extra_body": selected})
+    return _copy_validated_request_override_graph({"extra_body": selected})[
+        "extra_body"
+    ]
+
+
+def _select_custom_provider_extra_body(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    custom_providers: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
     provider_norm = (provider or "").strip().lower()
     if provider_norm == "custom":
         provider_key_filter = ""
@@ -447,7 +526,7 @@ def _custom_provider_extra_body_for_agent(
 
     fallback: Optional[Dict[str, Any]] = None
     for entry in custom_providers or []:
-        if not isinstance(entry, dict):
+        if type(entry) is not dict:
             continue
         if provider_key_filter:
             entry_keys = {
@@ -459,35 +538,105 @@ def _custom_provider_extra_body_for_agent(
         if _normalized_custom_base_url(entry.get("base_url")) != target_url:
             continue
         extra_body = entry.get("extra_body")
-        if not isinstance(extra_body, dict) or not extra_body:
+        if type(extra_body) is not dict or not extra_body:
             continue
         provider_model = str(entry.get("model", "") or "").strip()
         if provider_model:
             if _custom_provider_model_matches(model, entry):
-                return dict(extra_body)
+                return extra_body
         elif fallback is None:
-            fallback = dict(extra_body)
+            fallback = extra_body
 
     return fallback
 
 
-def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
-    extra_body = _custom_provider_extra_body_for_agent(
-        provider=agent.provider,
-        model=agent.model,
-        base_url=agent.base_url,
+def _project_request_overrides(
+    agent,
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    service_tier: Optional[str],
+    derived_overrides: Optional[Dict[str, Any]] = None,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    caller_overrides: Any = _REQUEST_OVERRIDE_UNSET,
+) -> Dict[str, Any]:
+    """Return one detached target-runtime mapping without publishing it."""
+    del service_tier  # The caller supplies the tier-derived target layer explicitly.
+    if caller_overrides is _REQUEST_OVERRIDE_UNSET:
+        if hasattr(agent, "_caller_request_overrides"):
+            caller_source = getattr(agent, "_caller_request_overrides")
+        else:
+            current = getattr(agent, "request_overrides", {})
+            caller_source = (
+                {
+                    key: value
+                    for key, value in current.items()
+                    if key not in {"service_tier", "speed"}
+                }
+                if type(current) is dict
+                else current
+            )
+    else:
+        caller_source = caller_overrides
+    caller_source = {} if caller_source is None else caller_source
+    derived_source = {} if derived_overrides is None else derived_overrides
+    custom_source = _select_custom_provider_extra_body(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        custom_providers=custom_providers or [],
+    )
+
+    if type(caller_source) is not dict or type(derived_source) is not dict:
+        raise _RequestOverrideProjectionError(_REQUEST_OVERRIDE_REJECTION) from None
+    _validate_request_override_graph(caller_source)
+    _validate_request_override_graph(derived_source)
+    if custom_source is not None:
+        _validate_request_override_graph({"extra_body": custom_source})
+
+    caller = _copy_validated_request_override_graph(caller_source)
+    derived = _copy_validated_request_override_graph(derived_source)
+    custom = (
+        _copy_validated_request_override_graph({"extra_body": custom_source})[
+            "extra_body"
+        ]
+        if custom_source is not None
+        else None
+    )
+
+    composed: Dict[str, Any] = {}
+    if custom is not None:
+        composed["extra_body"] = custom
+    derived_extra = derived.get("extra_body")
+    if type(derived_extra) is dict and type(composed.get("extra_body")) is dict:
+        composed["extra_body"].update(derived_extra)
+        derived = {key: value for key, value in derived.items() if key != "extra_body"}
+    composed.update(derived)
+    caller_extra = caller.get("extra_body")
+    if type(caller_extra) is dict and type(composed.get("extra_body")) is dict:
+        composed["extra_body"].update(caller_extra)
+        caller = {key: value for key, value in caller.items() if key != "extra_body"}
+    composed.update(caller)
+    return composed
+
+
+def _compose_request_overrides(
+    agent,
+    derived_overrides: Optional[Dict[str, Any]] = None,
+    *,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Project and publish one constructor/cached-turn request mapping."""
+    agent.request_overrides = _project_request_overrides(
+        agent,
+        provider=getattr(agent, "provider", ""),
+        model=getattr(agent, "model", ""),
+        base_url=getattr(agent, "base_url", ""),
+        service_tier=getattr(agent, "service_tier", None),
+        derived_overrides=derived_overrides,
         custom_providers=custom_providers,
     )
-    if not extra_body:
-        return
-
-    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
-    existing_extra_body = overrides.get("extra_body")
-    if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
-    agent.request_overrides = overrides
 
 
 def _normalize_run_budget_seconds(value) -> Optional[float]:
@@ -587,6 +736,7 @@ def init_agent(
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
+    fast_mode_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
     user_id: str = None,
@@ -963,7 +1113,9 @@ def init_agent(
     # keep it in sync with the active provider.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
     agent.service_tier = service_tier
-    agent.request_overrides = dict(request_overrides or {})
+    agent._caller_request_overrides = _copy_request_override_graph(
+        request_overrides or {}
+    )
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     
@@ -2603,7 +2755,9 @@ def init_agent(
     # Store for reuse by _check_compression_model_feasibility (auxiliary
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
-    _merge_custom_provider_extra_body(agent, _custom_providers)
+    _compose_request_overrides(
+        agent, fast_mode_overrides, custom_providers=_custom_providers
+    )
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:
@@ -3100,6 +3254,7 @@ def init_agent(
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": _copy_request_override_graph(agent.request_overrides),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),

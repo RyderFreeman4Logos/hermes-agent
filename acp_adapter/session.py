@@ -646,18 +646,24 @@ class SessionManager:
 
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+        except Exception:
+            logger.debug("ACP session using default provider resolution")
+        else:
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
+                    "requested_provider": runtime.get("requested_provider"),
                     "api_mode": api_mode or runtime.get("api_mode"),
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
+                    "credential_pool": runtime.get("credential_pool"),
+                    "max_tokens": runtime.get("max_output_tokens"),
+                    "request_overrides": {},
+                    "fast_mode_overrides": runtime.get("request_overrides") or {},
                 }
             )
-        except Exception:
-            logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)
 

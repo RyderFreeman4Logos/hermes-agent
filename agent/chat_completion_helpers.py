@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+import copy
 import json
 import logging
 import math
@@ -2446,6 +2447,364 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
+_FALLBACK_RUNTIME_MISSING = object()
+_SNAPSHOT_UNSUPPORTED_VALUE = "unsupported fallback snapshot value"
+_SNAPSHOT_PLAIN_SCALARS = {type(None), str, bytes, int, float, bool, complex}
+_SNAPSHOT_CONTAINERS = {dict, list, tuple, set, frozenset}
+_CLIENT_KWARG_CAPABILITY_KEYS = frozenset({"http_client", "api_key"})
+_SNAPSHOT_CAPABILITY_MEMO = "_capability_memo"
+
+
+def _snapshot_capability_memo(agent) -> dict[int, Any]:
+    """Capture exact identities from agent-owned runtime handle positions."""
+    memo: dict[int, Any] = {}
+
+    def _retain(value: Any) -> None:
+        if (
+            value is not _FALLBACK_RUNTIME_MISSING
+            and value is not None
+            and type(value) not in _SNAPSHOT_PLAIN_SCALARS
+            and type(value) not in _SNAPSHOT_CONTAINERS
+        ):
+            memo[id(value)] = value
+
+    for name in (
+        "client",
+        "_anthropic_client",
+        "_credential_pool",
+        "context_compressor",
+        "api_key",
+        "_anthropic_api_key",
+    ):
+        _retain(getattr(agent, name, _FALLBACK_RUNTIME_MISSING))
+
+    client_kwargs = getattr(agent, "_client_kwargs", _FALLBACK_RUNTIME_MISSING)
+    if type(client_kwargs) is dict:
+        for name in _CLIENT_KWARG_CAPABILITY_KEYS:
+            if name in client_kwargs:
+                _retain(client_kwargs[name])
+
+    transport_cache = getattr(agent, "_transport_cache", _FALLBACK_RUNTIME_MISSING)
+    if type(transport_cache) is dict:
+        for value in transport_cache.values():
+            _retain(value)
+
+    compressor = getattr(agent, "context_compressor", _FALLBACK_RUNTIME_MISSING)
+    if compressor is not _FALLBACK_RUNTIME_MISSING and compressor is not None:
+        _retain(getattr(compressor, "api_key", _FALLBACK_RUNTIME_MISSING))
+    return memo
+
+
+def _is_snapshot_capability(value: Any, memo: dict[int, Any]) -> bool:
+    value_id = id(value)
+    return value_id in memo and memo[value_id] is value
+
+
+def _validate_snapshot_graph(
+    value: Any,
+    seen: set[int],
+    capability_memo: dict[int, Any],
+    capability_keys: frozenset[str] = frozenset(),
+) -> None:
+    """Validate plain snapshot data without invoking user-defined copying."""
+    if type(value) in _SNAPSHOT_PLAIN_SCALARS:
+        return
+    value_type = type(value)
+    if value_type not in _SNAPSHOT_CONTAINERS:
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+    value_id = id(value)
+    if value_id in seen:
+        return
+    seen.add(value_id)
+    if value_type is dict:
+        for key, item in value.items():
+            _validate_snapshot_graph(key, seen, capability_memo)
+            if key in capability_keys and _is_snapshot_capability(
+                item, capability_memo
+            ):
+                continue
+            _validate_snapshot_graph(item, seen, capability_memo)
+    elif value_type in {list, tuple, set, frozenset}:
+        for item in value:
+            _validate_snapshot_graph(item, seen, capability_memo)
+
+
+def _snapshot_copy(
+    value: Any,
+    capability_memo: dict[int, Any],
+    *,
+    capability_keys: frozenset[str] = frozenset(),
+) -> Any:
+    """Copy validated config while retaining snapshot-owned capabilities."""
+    _validate_snapshot_graph(value, set(), capability_memo, capability_keys)
+    try:
+        return copy.deepcopy(value, dict(capability_memo))
+    except Exception:
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE) from None
+
+
+def _prepare_snapshot_direct(value: Any, capability_memo: dict[int, Any]) -> Any:
+    if value is _FALLBACK_RUNTIME_MISSING or _is_snapshot_capability(
+        value, capability_memo
+    ):
+        return value
+    _validate_snapshot_graph(value, set(), capability_memo)
+    return value
+
+
+def _prepare_snapshot_transport_cache(
+    value: Any, capability_memo: dict[int, Any]
+) -> Any:
+    if value is _FALLBACK_RUNTIME_MISSING:
+        return value
+    if type(value) is not dict:
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+    for key, transport in value.items():
+        _validate_snapshot_graph(key, set(), capability_memo)
+        if not _is_snapshot_capability(transport, capability_memo):
+            _validate_snapshot_graph(transport, set(), capability_memo)
+    return dict(value)
+
+
+def _snapshot_fallback_candidate_runtime(agent) -> dict[str, Any]:
+    """Capture mutable runtime state before attempting a fallback candidate."""
+    capability_memo = _snapshot_capability_memo(agent)
+
+    def _value(
+        name: str,
+        *,
+        deep: bool = False,
+        capability_keys: frozenset[str] = frozenset(),
+    ):
+        value = getattr(agent, name, _FALLBACK_RUNTIME_MISSING)
+        if value is _FALLBACK_RUNTIME_MISSING:
+            return value
+        return (
+            _snapshot_copy(
+                value, capability_memo, capability_keys=capability_keys
+            )
+            if deep
+            else value
+        )
+
+    snapshot = {
+        name: _value(name)
+        for name in (
+            "model",
+            "provider",
+            "requested_provider",
+            "base_url",
+            "api_mode",
+            "api_key",
+            "client",
+            "_anthropic_client",
+            "_anthropic_api_key",
+            "_anthropic_base_url",
+            "_is_anthropic_oauth",
+            "_reasoning_echo_flag",
+            "_credential_pool",
+            "_credential_pool_entry_id",
+            "_fallback_activated",
+            "_config_context_length",
+            "_use_prompt_caching",
+            "_use_native_cache_layout",
+            "_cached_system_prompt",
+            "_pending_fallback_notice",
+        )
+    }
+    snapshot["_client_kwargs"] = _value(
+        "_client_kwargs", deep=True, capability_keys=_CLIENT_KWARG_CAPABILITY_KEYS
+    )
+    for name in ("request_overrides", "reasoning_config"):
+        snapshot[name] = _value(name, deep=True)
+
+    snapshot["_transport_cache"] = _prepare_snapshot_transport_cache(
+        _value("_transport_cache"), capability_memo
+    )
+
+    compressor = getattr(agent, "context_compressor", _FALLBACK_RUNTIME_MISSING)
+    snapshot["context_compressor"] = compressor
+    snapshot["compressor_fields"] = (
+        {
+            name: getattr(compressor, name, _FALLBACK_RUNTIME_MISSING)
+            for name in (
+                "model",
+                "context_length",
+                "base_url",
+                "api_key",
+                "provider",
+                "api_mode",
+                "threshold_tokens",
+            )
+        }
+        if compressor is not _FALLBACK_RUNTIME_MISSING and compressor is not None
+        else {}
+    )
+    snapshot[_SNAPSHOT_CAPABILITY_MEMO] = capability_memo
+    return snapshot
+
+
+def _restore_fallback_candidate_runtime(agent, snapshot: dict[str, Any]) -> None:
+    """Restore a rejected candidate without rewinding fallback-chain progress."""
+    if type(snapshot) is not dict:
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+    capability_memo = snapshot.get(_SNAPSHOT_CAPABILITY_MEMO)
+    if type(capability_memo) is not dict or any(
+        type(key) is not int or id(value) != key
+        for key, value in capability_memo.items()
+    ):
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+
+    direct_names = (
+        "model",
+        "provider",
+        "requested_provider",
+        "base_url",
+        "api_mode",
+        "api_key",
+        "client",
+        "_anthropic_client",
+        "_anthropic_api_key",
+        "_anthropic_base_url",
+        "_is_anthropic_oauth",
+        "_reasoning_echo_flag",
+        "_credential_pool",
+        "_credential_pool_entry_id",
+        "_fallback_activated",
+        "_config_context_length",
+        "_use_prompt_caching",
+        "_use_native_cache_layout",
+        "_cached_system_prompt",
+        "_pending_fallback_notice",
+    )
+    try:
+        prepared = {
+            name: _prepare_snapshot_direct(snapshot[name], capability_memo)
+            for name in direct_names
+        }
+        prepared["_client_kwargs"] = _snapshot_copy(
+            snapshot["_client_kwargs"],
+            capability_memo,
+            capability_keys=_CLIENT_KWARG_CAPABILITY_KEYS,
+        )
+        for name in ("request_overrides", "reasoning_config"):
+            prepared[name] = _snapshot_copy(snapshot[name], capability_memo)
+        prepared["_transport_cache"] = _prepare_snapshot_transport_cache(
+            snapshot["_transport_cache"], capability_memo
+        )
+        compressor = _prepare_snapshot_direct(
+            snapshot["context_compressor"], capability_memo
+        )
+        fields = snapshot["compressor_fields"]
+        if type(fields) is not dict:
+            raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+        prepared_fields = {
+            name: _prepare_snapshot_direct(value, capability_memo)
+            for name, value in fields.items()
+        }
+    except (KeyError, TypeError):
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE) from None
+
+    def _restore_attr(name: str) -> None:
+        value = prepared[name]
+        if value is _FALLBACK_RUNTIME_MISSING:
+            try:
+                delattr(agent, name)
+            except AttributeError:
+                pass
+            return
+        setattr(agent, name, value)
+
+    for name in direct_names:
+        _restore_attr(name)
+    for name in ("_client_kwargs", "request_overrides", "reasoning_config"):
+        _restore_attr(name)
+    _restore_attr("_transport_cache")
+
+    if compressor is _FALLBACK_RUNTIME_MISSING:
+        try:
+            delattr(agent, "context_compressor")
+        except AttributeError:
+            pass
+        return
+    agent.context_compressor = compressor
+    if compressor is None:
+        return
+
+    fields = prepared_fields
+    update_model = getattr(compressor, "update_model", None)
+    required = ("model", "context_length", "base_url", "api_key", "provider")
+    if callable(update_model) and all(
+        fields.get(name, _FALLBACK_RUNTIME_MISSING) is not _FALLBACK_RUNTIME_MISSING
+        for name in required
+    ):
+        try:
+            update_model(
+                model=fields["model"],
+                context_length=fields["context_length"],
+                base_url=fields["base_url"],
+                api_key=fields["api_key"],
+                provider=fields["provider"],
+                api_mode=fields.get("api_mode", ""),
+            )
+        except Exception:
+            logger.debug(
+                "Fallback rollback could not rebind context compressor",
+                exc_info=True,
+            )
+    for name, value in fields.items():
+        try:
+            if value is _FALLBACK_RUNTIME_MISSING:
+                delattr(compressor, name)
+            else:
+                setattr(compressor, name, value)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _close_rejected_fallback_clients(
+    agent,
+    snapshot: dict[str, Any],
+    *,
+    resolved_client: Any,
+    active_client: Any,
+    active_anthropic_client: Any,
+) -> None:
+    """Best-effort close clients created by a rejected candidate."""
+    retained = {
+        id(value)
+        for value in (snapshot["client"], snapshot["_anthropic_client"])
+        if value is not _FALLBACK_RUNTIME_MISSING and value is not None
+    }
+    seen: set[int] = set()
+    for client, is_anthropic in (
+        (resolved_client, False),
+        (active_client, False),
+        (active_anthropic_client, True),
+    ):
+        if client is None or id(client) in retained or id(client) in seen:
+            continue
+        seen.add(id(client))
+        try:
+            if not is_anthropic and callable(
+                getattr(agent, "_close_openai_client", None)
+            ):
+                agent._close_openai_client(
+                    client,
+                    reason="fallback_activation_rollback",
+                    shared=True,
+                )
+            else:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+        except Exception:
+            logger.debug(
+                "Fallback rollback could not close rejected candidate client",
+                exc_info=True,
+            )
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -2551,7 +2910,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
+    _entry_runtime = None
+    fb_client = None
     try:
+        _entry_runtime = _snapshot_fallback_candidate_runtime(agent)
         from agent.auxiliary_client import resolve_provider_client
         # Pass base_url and api_key from fallback config so custom
         # endpoints (e.g. Ollama Cloud) resolve correctly instead of
@@ -2664,6 +3026,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         old_model = agent.model
         old_provider = agent.provider
+        old_base_url = agent.base_url
+
+        from agent.agent_runtime_helpers import (
+            _project_request_overrides_for_runtime,
+        )
+
+        projected_overrides = _project_request_overrides_for_runtime(
+            agent,
+            provider=fb_provider,
+            model=fb_model,
+            base_url=fb_base_url,
+            service_tier=getattr(agent, "service_tier", None),
+        )
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
@@ -2674,6 +3049,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        agent.request_overrides = projected_overrides
         # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
         # Read from the fallback entry so the flag travels with the active
         # provider; restore_primary_runtime will revert it from the snapshot.
@@ -2867,9 +3243,38 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _reset_stale_streak(agent)
         return True
     except Exception as e:
+        _rejected_client = getattr(agent, "client", None)
+        _rejected_anthropic_client = getattr(agent, "_anthropic_client", None)
+        if _entry_runtime is not None:
+            try:
+                _restore_fallback_candidate_runtime(agent, _entry_runtime)
+            except Exception:
+                logger.error(
+                    "Fallback rollback stopped: snapshot_validation_rejected"
+                )
+                _close_rejected_fallback_clients(
+                    agent,
+                    _entry_runtime,
+                    resolved_client=fb_client,
+                    active_client=_rejected_client,
+                    active_anthropic_client=_rejected_anthropic_client,
+                )
+                return False
+            _close_rejected_fallback_clients(
+                agent,
+                _entry_runtime,
+                resolved_client=fb_client,
+                active_client=_rejected_client,
+                active_anthropic_client=_rejected_anthropic_client,
+            )
         if fb_provider == "nous":
             unavailable.add(fb_key)
-        logger.error("Failed to activate fallback %s: %s", fb_model, e)
+        from agent.agent_init import _RequestOverrideProjectionError
+
+        if isinstance(e, _RequestOverrideProjectionError):
+            logger.error("Failed to activate fallback: request_override_rejected")
+        else:
+            logger.error("Failed to activate fallback %s: %s", fb_model, e)
         return agent._try_activate_fallback(reason)  # try next in chain
 
 

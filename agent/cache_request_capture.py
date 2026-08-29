@@ -27,6 +27,22 @@ _SECRET_KEYS = {
     "refreshtoken",
     "refreshtokens",
     "setcookie",
+    "password",
+    "passwords",
+    "token",
+    "tokens",
+    "accesstoken",
+    "clientsecret",
+    "secret",
+    "secrets",
+    "privatekey",
+    "privatekeys",
+    "secretkey",
+    "secretkeys",
+    "credential",
+    "credentials",
+    "key",
+    "keys",
 }
 _PRESERVE_KEYS = {
     "body",
@@ -77,11 +93,15 @@ def capture_provider_request(
 ) -> None:
     """Persist one exact physical provider request immediately before transport.
 
-    The input is copied while redacting transport credentials only; the
+    The input is copied while redacting secrets; the
     provider's request is untouched. Capture is best-effort unless strict write
     mode is enabled.
     """
     if not enabled():
+        return
+    identity = tuple(_identity_value(value) for value in (route, provider, model, api_mode))
+    request_model = _identity_value(request.get("model"))
+    if not all(identity) or (request_model is not None and request_model != identity[2]):
         return
     try:
         retry_value = max(0, int(retry))
@@ -93,10 +113,10 @@ def capture_provider_request(
                 "schema": _SCHEMA,
                 "timestamp_ns": time.time_ns(),
                 "route": {
-                    "route": route,
-                    "provider": provider,
-                    "model": model,
-                    "api_mode": api_mode,
+                    "route": identity[0],
+                    "provider": identity[1],
+                    "model": identity[2],
+                    "api_mode": identity[3],
                 },
                 "physical_attempt": {
                     "correlation": correlation,
@@ -111,30 +131,25 @@ def capture_provider_request(
             raise
 
 
+def _identity_value(value: Any) -> str | None:
+    identity = str(value or "").strip()
+    return identity if identity and identity.lower() != "unknown" else None
+
+
 def _redact(value: Any, *, preserve: bool = False) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, child in value.items():
             normalized = _SECRET_KEY.sub("", str(key).lower())
-            if preserve or normalized in _PRESERVE_KEYS:
-                result[str(key)] = _copy_exact(child)
-            elif _is_secret_key(key):
+            if _is_secret_key(key) and not (preserve and isinstance(child, dict)):
                 result[str(key)] = _REDACTED
+            elif preserve or normalized in _PRESERVE_KEYS:
+                result[str(key)] = _redact(child, preserve=True)
             else:
                 result[str(key)] = _redact(child)
         return result
     if isinstance(value, (list, tuple)):
         return [_redact(child, preserve=preserve) for child in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
-
-
-def _copy_exact(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _copy_exact(child) for key, child in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_copy_exact(child) for child in value]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)

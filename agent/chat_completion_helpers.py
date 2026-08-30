@@ -3302,7 +3302,8 @@ def _build_partial_stream_stub(
     the conversation loop enters its continuation/retry path instead of
     silently accepting truncated output as a complete turn (#32086).
     """
-    full_content = bounded_stream_text(full_content or "") or None
+    bounded_stream_text((full_content or "") + (full_reasoning or ""))
+    full_content = full_content or None
     mock_message = SimpleNamespace(
         role=role,
         content=full_content,
@@ -5184,7 +5185,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Return a partial response stub with finish_reason="length"
             # so the conversation loop's continuation machinery fires.
             # tool_calls=None prevents auto-execution of incomplete calls.
-            _partial_text = (
+            _partial_text = bounded_stream_text(
                 getattr(agent, "_current_streamed_assistant_text", "") or ""
             ).strip() or None
 

@@ -25,14 +25,14 @@ class TestResolveContextCompressionTimeouts:
     def test_defaults_when_empty_cfg(self):
         idle, ceiling = resolve_context_compression_timeouts({})
         assert idle == 120.0
-        assert ceiling == 600.0
+        assert ceiling >= idle
 
     def test_zero_idle_disables_wrapper(self):
         idle, ceiling = resolve_context_compression_timeouts(
             {"context_timeout_seconds": 0}
         )
         assert idle == 0.0
-        assert ceiling == 600.0
+        assert ceiling >= 0.0
 
     def test_ceiling_clamped_to_idle(self):
         idle, ceiling = resolve_context_compression_timeouts(
@@ -43,6 +43,55 @@ class TestResolveContextCompressionTimeouts:
         )
         assert idle == 90.0
         assert ceiling == 90.0
+
+    def test_auxiliary_timeout_extends_default_host_ceiling(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "compression": {
+                    "context_timeout_seconds": 120,
+                    "context_total_ceiling_seconds": 600,
+                },
+                "auxiliary": {"compression": {"timeout": 1700}},
+            },
+        )
+        idle, ceiling = resolve_context_compression_timeouts()
+        assert idle == 120.0
+        assert ceiling == 1700.0
+
+    def test_gateway_style_configured_auxiliary_timeout_reaches_host_fence(self):
+        config = {
+            "compression": {
+                "context_timeout_seconds": 30,
+                "context_total_ceiling_seconds": 600,
+            },
+            "auxiliary": {"compression": {"timeout": 1700}},
+        }
+        idle, ceiling = resolve_context_compression_timeouts(config)
+        assert idle == 30.0
+        assert ceiling == 1700.0
+
+        seen = {}
+
+        def worker(fence: CompressionCommitFence):
+            seen["ceiling"] = fence._host_ceiling
+            fence.touch_progress()
+            assert fence.begin_commit()
+            try:
+                return ([{"role": "assistant", "content": "ok"}], "prompt")
+            finally:
+                fence.finish_commit()
+
+        messages, prompt = run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=[{"role": "user", "content": "summarize"}],
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=idle,
+            total_ceiling_seconds=ceiling,
+        )
+        assert seen["ceiling"] == 1700.0
+        assert messages[0]["content"] == "ok"
+        assert prompt == "prompt"
 
 
 class TestRunCompressContextWithProgressTimeout:

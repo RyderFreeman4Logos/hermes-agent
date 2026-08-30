@@ -434,21 +434,40 @@ def test_codex_no_delivery_retry_discards_attempt_payload_state():
     assert agent._current_streamed_assistant_text == ""
 
 
-@pytest.mark.parametrize("live_delta", [True, False], ids=["live", "completed-only"])
-def test_app_server_completed_partial_uses_scrubbed_delivery(monkeypatch, live_delta):
+@pytest.mark.parametrize(
+    ("sink", "live_delta", "has_stream", "has_interim", "physically_delivered"),
+    [
+        ("interim-only", False, False, True, True),
+        ("stream-only", False, True, False, True),
+        ("both", False, True, True, True),
+        ("plugin-only", False, False, False, False),
+        ("no-consumer", False, False, False, False),
+        ("live-and-completed", True, True, True, True),
+    ],
+)
+def test_app_server_completed_partial_sink_matrix(
+    monkeypatch, sink, live_delta, has_stream, has_interim, physically_delivered
+):
     from agent.codex_runtime import make_codex_app_server_event_bridge
 
     hidden = "HOSTILE-COMPLETED-SECRET"
     raw = f"<memory-context>\n{hidden * 128}\n</memory-context>\n\nVisible"
     streamed, interim, plugin, persisted = [], [], [], []
     agent = _make_codex_agent(
-        stream_delta_callback=streamed.append,
-        interim_assistant_callback=lambda text, **_kwargs: interim.append(text),
+        stream_delta_callback=streamed.append if has_stream else None,
+        interim_assistant_callback=(
+            (lambda text, **_kwargs: interim.append(text)) if has_interim else None
+        ),
     )
     monkeypatch.setattr(
         "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
-        lambda hook, **payload: plugin.append((hook, str(payload))),
+        lambda hook, **payload: (
+            plugin.append((hook, str(payload))) if sink == "plugin-only" else None
+        ),
     )
+    session_db = MagicMock()
+    session_db.get_session.return_value = None
+    setattr(agent, "_session_db", session_db)
     agent._flush_messages_to_session_db = (
         lambda messages, *_args, **_kwargs: persisted.append(str(messages)) or True
     )
@@ -484,10 +503,15 @@ def test_app_server_completed_partial_uses_scrubbed_delivery(monkeypatch, live_d
 
     result = agent.run_conversation("hi")
 
-    assert streamed == ["Visible"]
-    assert interim == ["Visible"]
-    assert result["final_response"] == "Visible"
+    assert streamed == (["Visible"] if has_stream else [])
+    assert interim == (["Visible"] if has_interim and physically_delivered else [])
+    assert result["final_response"] == ("Visible" if physically_delivered else "")
     assert result["partial"] is True
+    assert bool(plugin) is (sink == "plugin-only")
+    assert any("Visible" in payload for _hook, payload in plugin) is (
+        sink == "plugin-only"
+    )
+    assert any("Visible" in payload for payload in persisted) is physically_delivered
     surfaces = [
         *streamed,
         *interim,

@@ -279,6 +279,46 @@ def test_chat_partial_warning_bound_is_terminal(monkeypatch):
     assert displayed == [text]
 
 
+def test_chat_delivered_error_partial_bounds_authoritative_text(monkeypatch):
+    import httpx
+
+    agents = []
+
+    def stream(*_args, **_kwargs):
+        yield _make_stream_chunk(content="ok")
+        agents[0]._current_streamed_assistant_text = "é" * (
+            DEFAULT_STREAM_PAYLOAD_BOUND_BYTES // 2 + 1
+        )
+        raise httpx.RemoteProtocolError("peer closed connection")
+
+    agent, _client = _chat_agent(monkeypatch, stream, display=lambda _text: None)
+    agents.append(agent)
+
+    with pytest.raises(StreamPayloadBoundExceeded):
+        agent._interruptible_streaming_api_call({})
+
+
+@pytest.mark.parametrize(
+    ("content", "reasoning"),
+    [
+        ("é" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES // 2 + 1), None),
+        (None, "é" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES // 2 + 1)),
+        (
+            "é" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES // 4),
+            "é" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES // 4 + 1),
+        ),
+    ],
+    ids=["assistant-only", "reasoning-only", "combined"],
+)
+def test_partial_stream_stub_bounds_each_utf8_payload(content, reasoning):
+    from agent.chat_completion_helpers import _build_partial_stream_stub
+
+    with pytest.raises(StreamPayloadBoundExceeded):
+        _build_partial_stream_stub(
+            "assistant", content, reasoning, "test/model", None
+        )
+
+
 def test_chat_no_delivery_retry_discards_attempt_payload_state(monkeypatch):
     import httpx
 

@@ -6988,6 +6988,8 @@ class AIAgent:
                 delivered = True
             except Exception:
                 pass
+        if delivered:
+            self._record_streamed_assistant_text(text)
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 

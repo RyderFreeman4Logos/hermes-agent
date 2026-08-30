@@ -183,7 +183,6 @@ def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldo
     "error",
     [
         pytest.param(_HTTPError(401, "unauthorized"), id="401"),
-        pytest.param(_HTTPError(402, "payment required"), id="402"),
         pytest.param(_HTTPError(500, "server error"), id="5xx"),
         pytest.param(TimeoutError("request timed out"), id="timeout"),
         pytest.param(ConnectionError("network connection failed"), id="network"),

@@ -3043,6 +3043,25 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
+        _result_billing = result.get("billing_block")
+        _child_model = getattr(child, "model", "")
+        if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and (
+                "grok" not in str(_child_model).lower()
+                or (
+                    getattr(child, "_delegate_model_profile", None) == "standard"
+                    and result.get("billing_unverified", False)
+                )
+            )
+        ):
+            # Do not attach a parent xAI terminal to a child routed elsewhere (#209).
+            summary = (
+                "Subagent failed after an unverified provider billing error."
+                if result.get("billing_unverified", False)
+                else "Subagent failed with a provider error unrelated to its effective model."
+            )
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
@@ -3114,6 +3133,13 @@ def _run_single_child(
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
+        if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and result.get("billing_unverified", False)
+            and getattr(child, "_delegate_model_profile", None) == "standard"
+        ):
+            _model = None
         _provider = getattr(child, "provider", None)
 
         entry: Dict[str, Any] = {
@@ -3164,6 +3190,13 @@ def _run_single_child(
                 entry["model"] = _model
             if isinstance(_provider, str) and _provider:
                 entry["provider"] = _provider
+        if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and result.get("billing_unverified", False)
+            and getattr(child, "_delegate_model_profile", None) == "standard"
+        ):
+            entry["model"] = None
         # Per-delegation spend, serialized back to the model alongside
         # tokens/api_calls so the parent can see what each delegation cost.
         # Mirrors _child_cost_usd (which is stripped pre-serialization and

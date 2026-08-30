@@ -435,24 +435,38 @@ def test_codex_no_delivery_retry_discards_attempt_payload_state():
 
 
 @pytest.mark.parametrize(
-    ("sink", "live_delta", "has_stream", "has_interim", "physically_delivered"),
+    (
+        "sink",
+        "live_delta",
+        "has_stream",
+        "has_tts",
+        "has_interim",
+        "physically_delivered",
+    ),
     [
-        ("interim-only", False, False, True, True),
-        ("stream-only", False, True, False, True),
-        ("both", False, True, True, True),
-        ("plugin-only", False, False, False, False),
-        ("no-consumer", False, False, False, False),
-        ("live-and-completed", True, True, True, True),
+        ("interim-only", False, False, False, True, True),
+        ("stream-only", False, True, False, False, True),
+        ("tts-only", False, False, True, False, True),
+        ("both", False, True, False, True, True),
+        ("plugin-only", False, False, False, False, False),
+        ("no-consumer", False, False, False, False, False),
+        ("live-and-completed", True, True, False, True, True),
     ],
 )
 def test_app_server_completed_partial_sink_matrix(
-    monkeypatch, sink, live_delta, has_stream, has_interim, physically_delivered
+    monkeypatch,
+    sink,
+    live_delta,
+    has_stream,
+    has_tts,
+    has_interim,
+    physically_delivered,
 ):
     from agent.codex_runtime import make_codex_app_server_event_bridge
 
     hidden = "HOSTILE-COMPLETED-SECRET"
     raw = f"<memory-context>\n{hidden * 128}\n</memory-context>\n\nVisible"
-    streamed, interim, plugin, persisted = [], [], [], []
+    streamed, tts, interim, plugin, persisted = [], [], [], [], []
     agent = _make_codex_agent(
         stream_delta_callback=streamed.append if has_stream else None,
         interim_assistant_callback=(
@@ -462,7 +476,7 @@ def test_app_server_completed_partial_sink_matrix(
     monkeypatch.setattr(
         "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
         lambda hook, **payload: (
-            plugin.append((hook, str(payload))) if sink == "plugin-only" else None
+            plugin.append((hook, str(payload))) if sink != "no-consumer" else None
         ),
     )
     session_db = MagicMock()
@@ -501,16 +515,22 @@ def test_app_server_completed_partial_sink_matrix(
         make_session(client, on_event=make_codex_app_server_event_bridge(agent)),
     )
 
-    result = agent.run_conversation("hi")
+    result = agent.run_conversation(
+        "hi", stream_callback=tts.append if has_tts else None
+    )
 
     assert streamed == (["Visible"] if has_stream else [])
+    assert tts == (["Visible"] if has_tts else [])
     assert interim == (["Visible"] if has_interim and physically_delivered else [])
     assert result["final_response"] == ("Visible" if physically_delivered else "")
     assert result["partial"] is True
-    assert bool(plugin) is (sink == "plugin-only")
-    assert any("Visible" in payload for _hook, payload in plugin) is (
-        sink == "plugin-only"
+    assert [hook for hook, _payload in plugin].count("on_stream_delta") == (
+        0 if sink == "no-consumer" else 1
     )
+    assert [hook for hook, _payload in plugin].count("on_interim_message") == (
+        0 if sink == "no-consumer" else 1
+    )
+    assert all("Visible" in payload for _hook, payload in plugin)
     assert any("Visible" in payload for payload in persisted) is physically_delivered
     surfaces = [
         *streamed,
@@ -522,6 +542,96 @@ def test_app_server_completed_partial_sink_matrix(
     ]
     assert all(hidden not in surface for surface in surfaces)
     assert streamed_payload_bytes(result["final_response"]) <= DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+
+
+def test_interim_exact_stream_duplicate_does_not_consume_payload_twice(monkeypatch):
+    interim, plugin = [], []
+    agent = _agent()
+    agent.interim_assistant_callback = (
+        lambda text, **kwargs: interim.append((text, kwargs["already_streamed"]))
+    )
+    agent._current_streamed_assistant_text = "x"
+    agent._current_streamed_payload_bytes = 1
+    monkeypatch.setattr(
+        "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+        lambda hook, **payload: plugin.append((hook, payload["text"])),
+    )
+
+    assert agent._emit_interim_assistant_message({"content": "x"}) is True
+
+    assert agent._current_streamed_payload_bytes == 1
+    assert interim == [("x", True)]
+    assert plugin == [("on_interim_message", "x")]
+
+
+@pytest.mark.parametrize("suffix", ["y", "é"], ids=["ascii", "utf8"])
+def test_interim_prefix_extension_overflow_precedes_plugin_and_callback(
+    monkeypatch, suffix
+):
+    interim, plugin = [], []
+    agent = _agent()
+    agent.interim_assistant_callback = lambda text, **kwargs: interim.append(text)
+    agent._current_streamed_assistant_text = "x"
+    agent._current_streamed_payload_bytes = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+    monkeypatch.setattr(
+        "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+        lambda hook, **payload: plugin.append((hook, payload["text"])),
+    )
+
+    with pytest.raises(StreamPayloadBoundExceeded) as caught:
+        agent._emit_interim_assistant_message({"content": "x" + suffix})
+
+    assert caught.value.size == (
+        DEFAULT_STREAM_PAYLOAD_BOUND_BYTES + streamed_payload_bytes(suffix)
+    )
+    assert plugin == []
+    assert interim == []
+
+
+class _CodexCommentaryStream:
+    def __iter__(self):
+        item = SimpleNamespace(
+            id="commentary-1",
+            type="message",
+            phase="commentary",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="é")],
+        )
+        yield SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                id="commentary-1", type="message", phase="commentary"
+            ),
+        )
+        yield SimpleNamespace(type="response.output_text.delta", delta="é")
+        yield SimpleNamespace(type="response.output_item.done", item=item)
+        yield SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed", id="response-1", usage=None),
+        )
+
+    def close(self):
+        return None
+
+
+def test_codex_commentary_owner_admits_before_interim_egress(monkeypatch):
+    interim, plugin = [], []
+    agent = _agent()
+    agent.api_mode = "codex_responses"
+    agent.interim_assistant_callback = lambda text, **kwargs: interim.append(text)
+    agent._current_streamed_payload_bytes = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+    monkeypatch.setattr(
+        "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+        lambda hook, **payload: plugin.append((hook, payload["text"])),
+    )
+    client = MagicMock()
+    client.responses.create.return_value = _CodexCommentaryStream()
+
+    with pytest.raises(StreamPayloadBoundExceeded):
+        agent._run_codex_stream({}, client=client)
+
+    assert plugin == []
+    assert interim == []
 
 
 def test_app_server_resets_stream_state_before_every_turn(monkeypatch):

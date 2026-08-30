@@ -24,6 +24,7 @@ import re
 import ssl
 import sys
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -115,9 +116,49 @@ from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
-from utils import base_url_host_matches, env_var_enabled
+from utils import base_url_host_matches, env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+def _loop_timing_context(
+    agent: Any,
+    *,
+    now: Optional[datetime] = None,
+    stop: bool = False,
+) -> Optional[str]:
+    """Record a loop boundary or return its API-only timing context."""
+    current = now or datetime.now().astimezone()
+    if stop:
+        agent._loop_timing_last_stop = current
+        return None
+
+    previous_start = getattr(agent, "_loop_timing_last_start", None)
+    previous_stop = getattr(agent, "_loop_timing_last_stop", None)
+    agent._loop_timing_last_start = current
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
+        enabled = is_truthy_value(
+            agent_config.get("loop_timing_context")
+            if isinstance(agent_config, dict)
+            else None,
+            default=True,
+        )
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+
+    lines = ["[Agent loop timing]"]
+    if previous_start is not None:
+        lines.append(f"Previous loop start: {previous_start.isoformat(timespec='seconds')}")
+    if previous_stop is not None:
+        lines.append(f"Previous loop stop: {previous_stop.isoformat(timespec='seconds')}")
+    lines.append(f"Current loop start: {current.isoformat(timespec='seconds')}")
+    return "\n".join(lines)
 
 
 def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -> bool:
@@ -2682,6 +2723,12 @@ def run_conversation(
             )
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools
+
+        # Timing is API-only context. Append it after cache planning so it never
+        # receives a breakpoint or changes the stable cached prefix.
+        _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
+        if _loop_timing_text:
+            api_messages.append({"role": "system", "content": _loop_timing_text})
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it

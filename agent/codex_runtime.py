@@ -1217,12 +1217,16 @@ def _consume_codex_event_stream(
                 if on_commentary_message is None and on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
+                    except StreamPayloadBoundExceeded:
+                        raise
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text and active_message_phase == "analysis":
                 if on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
+                    except StreamPayloadBoundExceeded:
+                        raise
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text:
@@ -1238,6 +1242,8 @@ def _consume_codex_event_stream(
                     if on_text_delta is not None:
                         try:
                             on_text_delta(delta_text)
+                        except StreamPayloadBoundExceeded:
+                            raise
                         except Exception:
                             logger.debug("Codex stream on_text_delta raised", exc_info=True)
             continue
@@ -1282,6 +1288,8 @@ def _consume_codex_event_stream(
                     active_summary_index = summary_index
                 try:
                     on_reasoning_delta(reasoning_text)
+                except StreamPayloadBoundExceeded:
+                    raise
                 except Exception:
                     logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             continue
@@ -1605,10 +1613,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
+    deltas_were_sent = {"yes": False}
 
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
-        agent._fire_stream_delta(text)
+        deltas_were_sent["yes"] = (
+            agent._fire_stream_delta(text) or deltas_were_sent["yes"]
+        )
 
     def _on_reasoning_delta(text: str) -> None:
         agent._fire_reasoning_delta(text)
@@ -1742,6 +1753,23 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if deltas_were_sent["yes"]:
+                    partial_text = "".join(agent._codex_streamed_text_parts)
+                    return SimpleNamespace(
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=partial_text)],
+                        )],
+                        output_text=partial_text,
+                        usage=None,
+                        status="completed",
+                        id=None,
+                        model=api_kwargs.get("model"),
+                        incomplete_details=None,
+                        error=None,
+                    )
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -1749,6 +1777,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         attempt + 1, max_stream_retries + 1,
                         agent._client_log_context(), exc,
                     )
+                    agent._codex_streamed_text_parts.clear()
                     continue
                 _log_codex_request_failure(
                     agent,

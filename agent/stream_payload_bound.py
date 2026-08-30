@@ -48,6 +48,44 @@ def accumulate_stream_text(
     return combined
 
 
+def admit_stream_payload(
+    agent: Any,
+    text: str,
+    *,
+    bound: int = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+) -> int:
+    """Admit UTF-8 bytes before any stream payload reaches a consumer."""
+    current = int(getattr(agent, "_current_streamed_payload_bytes", 0) or 0)
+    if not isinstance(text, str) or not text:
+        return current
+    size = current + streamed_payload_bytes(text)
+    if size > bound:
+        raise StreamPayloadBoundExceeded(size, bound)
+    agent._current_streamed_payload_bytes = size
+    return size
+
+
+def bounded_stream_text(
+    text: str,
+    *,
+    bound: int = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+) -> str:
+    """Return ``text`` only when its serialized UTF-8 form is within bound."""
+    return accumulate_stream_text("", text or "", bound=bound)
+
+
+def authoritative_stream_text(
+    agent: Any,
+    *,
+    bound: int = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+) -> str:
+    """Return the independently bounded, physically delivered projection."""
+    return bounded_stream_text(
+        getattr(agent, "_current_streamed_assistant_text", "") or "",
+        bound=bound,
+    )
+
+
 def stream_payload_error_text(
     size: int,
     bound: int = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,

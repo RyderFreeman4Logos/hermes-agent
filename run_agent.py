@@ -6586,80 +6586,45 @@ class AIAgent:
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
-    def _reset_stream_delivery_tracking(self) -> None:
-        """Reset tracking for text delivered during the current model response."""
-        # Flush any benign partial-tag tail held by the think scrubber
-        # first (#17924): an innocent '<' at the end of the stream that
-        # turned out not to be a tag prefix should reach the UI.  Then
-        # flush the context scrubber.  Order matters — the think
-        # scrubber's output feeds into the context scrubber's state.
+    def _reset_stream_delivery_tracking(self, *, flush: bool = True) -> None:
+        """Finish or discard one attempt, then clear its delivery state."""
         think_scrubber = getattr(self, "_stream_think_scrubber", None)
-        if think_scrubber is not None:
-            think_tail = think_scrubber.flush()
+        context_scrubber = getattr(self, "_stream_context_scrubber", None)
+        if flush:
+            think_tail = think_scrubber.flush() if think_scrubber is not None else ""
+            if think_tail and context_scrubber is not None:
+                think_tail = context_scrubber.feed(think_tail)
             if think_tail:
-                # Route the tail through the context scrubber too so a
-                # memory-context span straddling the final boundary is
-                # still caught.
-                ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
-                if ctx_scrubber is not None:
-                    think_tail = ctx_scrubber.feed(think_tail)
-                if think_tail:
-                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                    delivered = False
-                    for cb in callbacks:
-                        try:
-                            cb(think_tail)
-                            delivered = True
-                        except Exception:
-                            pass
-                    if delivered:
-                        self._record_streamed_assistant_text(think_tail)
-        # Flush any benign partial-tag tail held by the context scrubber so it
-        # reaches the UI before we clear state for the next model call.  If
-        # the scrubber is mid-span, flush() drops the orphaned content.
-        scrubber = getattr(self, "_stream_context_scrubber", None)
-        if scrubber is not None:
-            tail = scrubber.flush()
-            if tail:
-                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                delivered = False
-                for cb in callbacks:
-                    try:
-                        cb(tail)
-                        delivered = True
-                    except Exception:
-                        pass
-                if delivered:
-                    self._record_streamed_assistant_text(tail)
+                self._emit_admitted_stream_text(think_tail)
+            context_tail = (
+                context_scrubber.flush() if context_scrubber is not None else ""
+            )
+            if context_tail:
+                self._emit_admitted_stream_text(context_tail)
+        else:
+            if think_scrubber is not None:
+                think_scrubber.reset()
+            if context_scrubber is not None:
+                context_scrubber.reset()
         self._current_streamed_assistant_text = ""
         self._current_streamed_payload_bytes = 0
 
-    def _record_streamed_assistant_text(self, text: str) -> None:
-        """Accumulate visible assistant text emitted through stream callbacks."""
-        # Single-writer guard (#65991): a superseded stream must not pollute the
-        # turn's accumulated text (which also feeds the interim-visible-text
-        # de-dup comparison), even when a caller reaches this directly (the
-        # tool-suppressed content path) rather than through _fire_stream_delta.
+    def _record_streamed_assistant_text(
+        self, text: str, *, admitted: bool = False
+    ) -> None:
+        """Accumulate assistant text only after display or TTS accepted it."""
         if self._stream_writer_superseded():
             return
         if isinstance(text, str) and text:
             from agent.stream_payload_bound import (
-                DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
                 accumulate_stream_text,
-                streamed_payload_bytes,
+                admit_stream_payload,
             )
 
+            if not admitted:
+                admit_stream_payload(self, text)
             existing = getattr(self, "_current_streamed_assistant_text", "") or ""
-            next_bytes = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0)
-            if not next_bytes and existing:
-                next_bytes = streamed_payload_bytes(existing)
-            next_bytes += streamed_payload_bytes(text)
-            if next_bytes > DEFAULT_STREAM_PAYLOAD_BOUND_BYTES:
-                from agent.stream_payload_bound import StreamPayloadBoundExceeded
-
-                raise StreamPayloadBoundExceeded(next_bytes)
             self._current_streamed_assistant_text = accumulate_stream_text(existing, text)
-            self._current_streamed_payload_bytes = next_bytes
 
     @staticmethod
     def _normalize_interim_visible_text(text: str) -> str:
@@ -6966,6 +6931,38 @@ class AIAgent:
         except Exception:
             logger.debug("on_stream_end plugin hook enqueue failed", exc_info=True)
 
+    def _emit_admitted_stream_text(self, text: str) -> bool:
+        """Admit once, then fan visible text out to every stream consumer."""
+        from agent.stream_payload_bound import admit_stream_payload
+
+        admit_stream_payload(self, text)
+        callbacks = [
+            cb
+            for cb in (self.stream_delta_callback, self._stream_callback)
+            if cb is not None
+        ]
+        delivered = False
+        for cb in callbacks:
+            try:
+                cb(text)
+                delivered = True
+            except Exception:
+                pass
+        if delivered:
+            self._record_streamed_assistant_text(text, admitted=True)
+        try:
+            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+            enqueue_plugin_stream_hook(
+                "on_stream_delta",
+                **self._stream_hook_base_payload(),
+                delta=text,
+                kind="text",
+            )
+        except Exception:
+            logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
+        return delivered
+
     def _fire_stream_delta(self, text: str) -> bool:
         """Fire display/TTS callbacks and report physical delivery."""
         # Single-writer guard (#65991): a superseded stream must not interleave
@@ -7013,28 +7010,7 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return False
-        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
-        if delivered:
-            self._record_streamed_assistant_text(text)
-        try:
-            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
-
-            enqueue_plugin_stream_hook(
-                "on_stream_delta",
-                **self._stream_hook_base_payload(),
-                delta=text,
-                kind="text",
-            )
-        except Exception:
-            logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
-        return delivered
+        return self._emit_admitted_stream_text(text)
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
@@ -7044,17 +7020,9 @@ class AIAgent:
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
         if isinstance(text, str) and text:
-            from agent.stream_payload_bound import (
-                DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
-                StreamPayloadBoundExceeded,
-                streamed_payload_bytes,
-            )
+            from agent.stream_payload_bound import admit_stream_payload
 
-            nxt = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0)
-            nxt += streamed_payload_bytes(text)
-            if nxt > DEFAULT_STREAM_PAYLOAD_BOUND_BYTES:
-                raise StreamPayloadBoundExceeded(nxt)
-            self._current_streamed_payload_bytes = nxt
+            admit_stream_payload(self, text)
         cb = self.reasoning_callback
         if cb is not None:
             try:

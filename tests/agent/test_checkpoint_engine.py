@@ -2289,6 +2289,82 @@ def test_map_rejects_one_million_character_response_before_parsing(monkeypatch):
     assert not engine._map_shard_cache
 
 
+def test_map_call_receives_strict_dynamic_json_schema():
+    from agent.checkpoint_engine import (
+        CausalGroup,
+        CheckpointContextEngine,
+        _MAP_DISPOSITIONS,
+        _MAP_KINDS,
+    )
+
+    auxiliary = _FakeAuxiliaryClient(
+        _map_response(
+            {
+                "source_event_ids": [41, 42],
+                "facts": [
+                    {
+                        "kind": "request",
+                        "text": "Keep the checkpoint deterministic.",
+                        "source_event_ids": [41],
+                    }
+                ],
+            }
+        )
+    )
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+
+    shard = engine._map_group(
+        [
+            {"role": "user", "content": "Keep the checkpoint deterministic."},
+            {"role": "assistant", "content": "Understood."},
+        ],
+        CausalGroup((0, 1)),
+        (41, 42),
+    )
+
+    assert shard is not None
+    response_format = auxiliary.calls[0]["extra_body"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    json_schema = response_format["json_schema"]
+    assert json_schema["strict"] is True
+    schema = json_schema["schema"]
+    assert schema["required"] == [
+        "schema_version",
+        "source_event_ids",
+        "facts",
+        "dispositions",
+    ]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["schema_version"] == {"type": "integer", "enum": [2]}
+    assert schema["properties"]["source_event_ids"] == {
+        "type": "array",
+        "items": {"type": "integer", "enum": [41, 42]},
+    }
+    fact_schema = schema["properties"]["facts"]["items"]
+    assert set(fact_schema["required"]) == {
+        "fact_id",
+        "kind",
+        "text",
+        "source_event_ids",
+        "uncertain",
+        "identity",
+        "supersedes",
+        "action_state",
+    }
+    assert fact_schema["additionalProperties"] is False
+    assert fact_schema["properties"]["kind"]["enum"] == sorted(_MAP_KINDS)
+    disposition_schema = schema["properties"]["dispositions"]["items"]
+    assert set(disposition_schema["required"]) == {
+        "source_event_id",
+        "status",
+        "fact_ids",
+        "duplicate_of",
+        "recovery_ref",
+    }
+    assert disposition_schema["additionalProperties"] is False
+    assert disposition_schema["properties"]["status"]["enum"] == sorted(_MAP_DISPOSITIONS)
+
+
 def test_map_accepts_a_boundary_normal_valid_shard():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 
@@ -3089,6 +3165,8 @@ def test_checkpoint_map_and_reduce_use_the_public_auxiliary_chain(monkeypatch):
 
     assert _compress(engine, [{"role": "user", "content": "finish the migration"}])
     assert [call["max_tokens"] for call in calls] == [1101, 2048]
+    assert "response_format" in calls[0]["extra_body"]
+    assert "extra_body" not in calls[1]
     assert all(call["task"] == "compression" and call["tools"] == [] for call in calls)
 
 

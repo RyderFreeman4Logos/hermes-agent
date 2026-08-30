@@ -180,6 +180,80 @@ def test_configured_chain_keeps_entry_settings_without_main_fallback(monkeypatch
     assert calls[1][1]["reasoning_config"]["effort"] == "high"
 
 
+def test_configured_chain_merges_per_call_extra_body(monkeypatch):
+    import agent.auxiliary_client as auxiliary_client
+
+    response = MagicMock()
+    config = {"provider": "primary", "model": "primary-model", "extra_body": {"marker": "task"}}
+    calls = []
+
+    monkeypatch.setattr(auxiliary_client, "_get_auxiliary_task_config", lambda _task: config)
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_resolve_fallback_entry",
+        lambda entry: (object(), entry["model"]),
+    )
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_call_fallback_candidate_sync",
+        lambda _client, _model, _label, **kwargs: calls.append(kwargs) or response,
+    )
+
+    assert auxiliary_client.call_configured_auxiliary_chain(
+        task="compression",
+        messages=[{"role": "user", "content": "compress"}],
+        extra_body={"response_format": {"type": "json_schema"}},
+    ) is response
+    assert calls[0]["effective_extra_body"] == {
+        "marker": "task",
+        "response_format": {"type": "json_schema"},
+    }
+
+
+def test_configured_chain_retries_without_rejected_response_format(monkeypatch):
+    import agent.auxiliary_client as auxiliary_client
+
+    response = MagicMock()
+    calls = []
+    destination = auxiliary_client._FallbackDestination(
+        "openai", "https://example.test/v1", "openai", "model"
+    )
+
+    def relay(_client, kwargs, **_route):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("response_format is unavailable now")
+        return response
+
+    monkeypatch.setattr(auxiliary_client, "_fallback_destination", lambda *_args: destination)
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_replan_synchronous_cache_sections",
+        lambda messages, tools, **_kwargs: (messages, tools),
+    )
+    monkeypatch.setattr(auxiliary_client, "_relay_sync_completion", relay)
+    monkeypatch.setattr(
+        auxiliary_client, "_validate_llm_response",
+        lambda value, _task, **_kwargs: value,
+    )
+
+    assert auxiliary_client._call_fallback_candidate_sync(
+        object(),
+        "model",
+        "fallback_chain[0](openai)",
+        task="checkpoint_map",
+        messages=[{"role": "user", "content": "map"}],
+        temperature=0,
+        max_tokens=128,
+        tools=[],
+        effective_timeout=30,
+        effective_extra_body={"response_format": {"type": "json_schema"}},
+        reasoning_config=None,
+    ) is response
+    assert calls[0]["extra_body"]["response_format"]["type"] == "json_schema"
+    assert "extra_body" not in calls[1]
+
+
 class TestSyncCallEnforcesLimit:
     def test_call_llm_caps_concurrent_inflight(self):
         limit = 2

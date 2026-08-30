@@ -5289,8 +5289,26 @@ def _call_fallback_candidate_sync(
             task,
         )
     except Exception as fb_err:
+        retry_kwargs = (
+            _without_structured_output_format(fb_kwargs)
+            if _is_structured_output_rejection(fb_err)
+            else None
+        )
+        if retry_kwargs is not None:
+            try:
+                return _validate_llm_response(
+                    _relay_sync_completion(
+                        fb_client,
+                        retry_kwargs,
+                        provider=destination.provider,
+                        api_mode=destination.api_mode,
+                    ),
+                    task,
+                )
+            except Exception as retry_err:
+                fb_err = retry_err
         if not _is_auth_error(fb_err):
-            raise
+            raise fb_err
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
         )
@@ -8513,6 +8531,7 @@ def call_configured_auxiliary_chain(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     tools: Optional[list] = None,
+    extra_body: Optional[dict] = None,
 ) -> Optional[Any]:
     """Call only a task's configured primary and fallback candidates.
 
@@ -8546,9 +8565,11 @@ def call_configured_auxiliary_chain(
                 client, resolved_model = _resolve_fallback_entry(entry)
                 if client is None:
                     continue
-                extra_body, reasoning_config = _configured_chain_request_settings(
+                configured_extra_body, reasoning_config = _configured_chain_request_settings(
                     task, entry, primary=primary,
                 )
+                if extra_body:
+                    configured_extra_body = {**configured_extra_body, **extra_body}
                 timeout = _fallback_entry_timeout(task, label) or task_timeout
                 response = _call_fallback_candidate_sync(
                     client,
@@ -8560,7 +8581,7 @@ def call_configured_auxiliary_chain(
                     max_tokens=max_tokens,
                     tools=tools,
                     effective_timeout=timeout,
-                    effective_extra_body=extra_body,
+                    effective_extra_body=configured_extra_body,
                     reasoning_config=reasoning_config,
                 )
             except Exception as exc:

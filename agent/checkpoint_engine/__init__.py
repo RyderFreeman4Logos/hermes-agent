@@ -88,6 +88,94 @@ _MAP_DISPOSITIONS = frozenset(
 )
 
 
+def _map_response_format(source_event_ids: tuple[int, ...]) -> dict:
+    """Build the strict wire contract for one Map shard."""
+    event_ids = list(source_event_ids)
+    event_id = {"type": "integer", "enum": event_ids}
+    nullable_event_id = {
+        "anyOf": [event_id, {"type": "null"}],
+    }
+    nullable_recovery_ref = {
+        "anyOf": [
+            {
+                "type": "string",
+                "enum": [f"session-event:{value}" for value in event_ids],
+            },
+            {"type": "null"},
+        ],
+    }
+    fact_schema = {
+        "type": "object",
+        "properties": {
+            "fact_id": {"type": "string"},
+            "kind": {"type": "string", "enum": sorted(_MAP_KINDS)},
+            "text": {"type": "string"},
+            "source_event_ids": {"type": "array", "items": event_id},
+            "uncertain": {"type": "boolean"},
+            "identity": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "supersedes": {"type": "array", "items": {"type": "string"}},
+            "action_state": {
+                "anyOf": [
+                    {"type": "string", "enum": sorted(_ACTION_STATES)},
+                    {"type": "null"},
+                ],
+            },
+        },
+        "required": [
+            "fact_id",
+            "kind",
+            "text",
+            "source_event_ids",
+            "uncertain",
+            "identity",
+            "supersedes",
+            "action_state",
+        ],
+        "additionalProperties": False,
+    }
+    disposition_schema = {
+        "type": "object",
+        "properties": {
+            "source_event_id": event_id,
+            "status": {"type": "string", "enum": sorted(_MAP_DISPOSITIONS)},
+            "fact_ids": {"type": "array", "items": {"type": "string"}},
+            "duplicate_of": nullable_event_id,
+            "recovery_ref": nullable_recovery_ref,
+        },
+        "required": [
+            "source_event_id",
+            "status",
+            "fact_ids",
+            "duplicate_of",
+            "recovery_ref",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "checkpoint_map",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "schema_version": {"type": "integer", "enum": [2]},
+                    "source_event_ids": {"type": "array", "items": event_id},
+                    "facts": {"type": "array", "items": fact_schema},
+                    "dispositions": {"type": "array", "items": disposition_schema},
+                },
+                "required": [
+                    "schema_version",
+                    "source_event_ids",
+                    "facts",
+                    "dispositions",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 _ACK_ONLY = frozenset(
     {
         "ok",
@@ -1565,27 +1653,40 @@ class CheckpointContextEngine(ContextEngine):
 
     @staticmethod
     def _configured_auxiliary_response(
-        messages: List[Dict[str, str]], max_tokens: int,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+        source_event_ids: Optional[tuple[int, ...]] = None,
     ) -> Any:
         """Call the public configured-only compression chain."""
         from agent.auxiliary_client import call_configured_auxiliary_chain
 
-        return call_configured_auxiliary_chain(
-            task=_MAP_TASK,
-            messages=messages,
-            temperature=0,
-            max_tokens=max_tokens,
-            tools=[],
-        )
+        request = {
+            "task": _MAP_TASK,
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "tools": [],
+        }
+        if source_event_ids is not None:
+            request["extra_body"] = {
+                "response_format": _map_response_format(source_event_ids),
+            }
+        return call_configured_auxiliary_chain(**request)
 
-    def _call_map(self, messages: List[Dict[str, str]]) -> Any:
+    def _call_map(
+        self, messages: List[Dict[str, str]], source_event_ids: tuple[int, ...],
+    ) -> Any:
+        extra_body = {"response_format": _map_response_format(source_event_ids)}
         if self._auxiliary_client is not None:
             return self._auxiliary_client.complete(
                 messages=messages,
                 max_tokens=self._map_max_output_tokens,
                 tools=[],
+                extra_body=extra_body,
             )
-        return self._configured_auxiliary_response(messages, self._map_max_output_tokens)
+        return self._configured_auxiliary_response(
+            messages, self._map_max_output_tokens, source_event_ids
+        )
 
     def _call_semantic_reduce(self, messages: List[Dict[str, str]]) -> Any:
         if self._auxiliary_client is not None:
@@ -2177,7 +2278,8 @@ class CheckpointContextEngine(ContextEngine):
                         self._map_shard_cache.pop(cache_key, None)
             shard = self._parse_map_shard(
                 self._call_map(
-                    self._map_prompt(messages, group, source_event_ids)
+                    self._map_prompt(messages, group, source_event_ids),
+                    tuple(source_event_ids[index] for index in group.event_indices),
                 ),
                 group,
                 source_event_ids,

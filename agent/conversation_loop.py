@@ -2895,7 +2895,10 @@ def run_conversation(
         if (
             agent.compression_enabled
             and not _review_fork_first_request_pending(agent)
-            and len(messages) > 1
+            # A freshly appended timing row is metadata, not enough history to
+            # justify compaction before the first provider request. It remains
+            # in this outer-run guard, so tool continuations still compact.
+            and len(messages) > 1 + int(loop_timing_persisted)
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)

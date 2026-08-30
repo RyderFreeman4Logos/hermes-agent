@@ -644,11 +644,28 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         # codex_responses commentary channel).
         if not getattr(agent, "show_commentary", True):
             return
+        completed_text = authoritative_stream_text(agent)
+        if not completed_text:
+            fire = getattr(agent, "_fire_stream_delta", None)
+            if fire is None:
+                return
+            try:
+                fire(text)
+            except StreamPayloadBoundExceeded:
+                raise
+            except Exception:
+                logger.debug("_fire_stream_delta raised", exc_info=True)
+                return
+            completed_text = authoritative_stream_text(agent)
+        if not completed_text.strip():
+            return
         emit = getattr(agent, "_emit_interim_assistant_message", None)
         if emit is None:
             return
         try:
-            emit({"role": "assistant", "content": text})
+            emit({"role": "assistant", "content": completed_text})
+        except StreamPayloadBoundExceeded:
+            raise
         except Exception:
             logger.debug(
                 "_emit_interim_assistant_message raised", exc_info=True,

@@ -1379,6 +1379,8 @@ def _consume_codex_event_stream(
                     if commentary_text:
                         try:
                             on_commentary_message(commentary_text)
+                        except StreamPayloadBoundExceeded:
+                            raise
                         except Exception:
                             logger.debug(
                                 "Codex stream on_commentary_message raised",

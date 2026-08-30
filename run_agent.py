@@ -6771,19 +6771,11 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
-        cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(text, str):
+        if not isinstance(text, str):
             return
-        visible = self._strip_think_blocks(text).strip()
-        if visible:
-            visible = redact_sensitive_text(visible)
-        if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
-            return
-        try:
-            cb(visible, already_streamed=False)
-            self._record_delivered_interim_text(visible)
-        except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+        visible = redact_sensitive_text(self._strip_think_blocks(text).strip())
+        if visible and visible != "(empty)":
+            self._emit_interim_assistant_message({"role": "assistant", "content": visible})
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any], *, admitted: bool = False
@@ -6817,26 +6809,33 @@ class AIAgent:
         ):
             return False
         already_streamed = self._interim_content_was_streamed(visible)
-        if not already_streamed and not admitted:
-            from agent.stream_payload_bound import admit_stream_payload
+        if not admitted:
+            from agent.stream_payload_bound import admit_stream_payload, authoritative_stream_text
 
-            admit_stream_payload(self, visible)
-        try:
-            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+            streamed = authoritative_stream_text(self)
+            unseen = visible[len(streamed) :] if visible.startswith(streamed) else visible
+            admit_stream_payload(self, unseen)
+        hook_key = self._normalize_interim_visible_text(visible)
+        queued = getattr(self, "_queued_interim_texts", set())
+        if hook_key not in queued:
+            try:
+                from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
-            enqueue_plugin_stream_hook(
-                "on_interim_message",
-                turn_id=getattr(self, "_current_turn_id", "") or "",
-                iteration=int(getattr(self, "_api_call_count", 0) or 0),
-                session_id=self.session_id or "",
-                model=self.model or "",
-                provider=self.provider or "",
-                surface=self.platform or "cli",
-                text=visible,
-                already_streamed=already_streamed,
-            )
-        except Exception:
-            logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
+                enqueue_plugin_stream_hook(
+                    "on_interim_message",
+                    turn_id=getattr(self, "_current_turn_id", "") or "",
+                    iteration=int(getattr(self, "_api_call_count", 0) or 0),
+                    session_id=self.session_id or "",
+                    model=self.model or "",
+                    provider=self.provider or "",
+                    surface=self.platform or "cli",
+                    text=visible,
+                    already_streamed=already_streamed,
+                )
+                queued.add(hook_key)
+                self._queued_interim_texts = queued
+            except Exception:
+                logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
             return False

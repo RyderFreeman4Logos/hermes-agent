@@ -7403,6 +7403,111 @@ def test_notification_poller_requeues_failed_async_delivery(
         server._sessions.pop("sid-a", None)
 
 
+def test_notification_poller_survives_live_claim_exception(monkeypatch):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-live-claim-error",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid-a",
+        "status": "completed",
+        "summary": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    session = _session(session_key="session-a")
+    server._sessions["sid-a"] = session
+    first_claim_failed = threading.Event()
+    allow_retry_claim = threading.Event()
+    claims = []
+    delivered = []
+
+    def _claim(_event, _consumer):
+        claims.append(_event)
+        if len(claims) == 1:
+            first_claim_failed.set()
+            raise RuntimeError("injected claim failure")
+        assert allow_retry_claim.wait(timeout=2)
+        return "claim"
+
+    def _submit(*_args, **_kwargs):
+        delivered.append(event)
+        with session["history_lock"]:
+            session["running"] = False
+        return True
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", lambda *_args: True)
+    monkeypatch.setattr(server, "_run_prompt_submit", _submit)
+    stop = threading.Event()
+    poller = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, "sid-a", session),
+        daemon=True,
+    )
+    poller.start()
+    try:
+        assert first_claim_failed.wait(timeout=1)
+        assert poller.is_alive()
+        allow_retry_claim.set()
+        deadline = time.monotonic() + 2
+        while not delivered and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert delivered == [event]
+        assert claims == [event, event]
+        assert isolated_queue.empty()
+        assert session["running"] is False
+    finally:
+        allow_retry_claim.set()
+        stop.set()
+        poller.join(timeout=2)
+        server._sessions.pop("sid-a", None)
+
+
+def test_notification_poller_shutdown_requeues_claim_exception(monkeypatch):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-shutdown-claim-error",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid-a",
+        "status": "completed",
+        "summary": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("injected claim failure")),
+    )
+    session = _session(session_key="session-a")
+    server._sessions["sid-a"] = session
+    stop = threading.Event()
+    stop.set()
+    try:
+        server._notification_poller_loop(stop, "sid-a", session)
+
+        assert list(isolated_queue.queue) == [event]
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("sid-a", None)
+
+
 def test_run_prompt_submit_requeues_post_turn_event_when_admission_fails(
     monkeypatch, tmp_path
 ):
@@ -7467,6 +7572,74 @@ def test_run_prompt_submit_requeues_post_turn_event_when_admission_fails(
         assert releases == [event["delegation_id"]]
         assert isolated_queue.get_nowait() == event
         assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-a", None)
+
+
+@pytest.mark.parametrize("raise_index", [0, 1], ids=["first", "middle"])
+def test_run_prompt_submit_unwinds_post_turn_claim_exception(
+    monkeypatch, tmp_path, raise_index
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    events = [
+        {
+            "type": "async_delegation",
+            "delegation_id": f"deleg-claim-error-{index}",
+            "session_key": "session-a",
+            "origin_ui_session_id": "sid-a",
+            "status": "completed",
+            "summary": f"done-{index}",
+        }
+        for index in range(3)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    claims = []
+    releases = []
+
+    def _claim(event, _consumer):
+        claims.append(event["delegation_id"])
+        if len(claims) - 1 == raise_index:
+            raise RuntimeError("injected claim failure")
+        return f"claim-{event['delegation_id']}"
+
+    def _release(event, _claim):
+        releases.append(event["delegation_id"])
+        if raise_index == 1:
+            raise RuntimeError("injected release failure")
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        _release,
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "get_durable_delegation",
+        lambda _delegation_id: {"delivery_state": "pending"},
+    )
+    turns = []
+    session = _session(
+        session_key="session-a",
+        agent=_RecordingAgent(turns),
+        running=True,
+    )
+    server._sessions["sid-a"] = session
+    try:
+        assert server._run_prompt_submit("rid-a", "sid-a", session, "parent") is True
+
+        assert turns == ["parent"]
+        assert list(isolated_queue.queue) == events
+        assert releases == [event["delegation_id"] for event in events[:raise_index]]
+        assert session["running"] is False
     finally:
         server._sessions.pop("sid-a", None)
 

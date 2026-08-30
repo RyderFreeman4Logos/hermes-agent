@@ -102,6 +102,7 @@ def test_poller_holds_dequeued_event_until_fence_release(monkeypatch):
     )
     monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: object())
     monkeypatch.setattr(async_delegation, "complete_event_delivery", lambda *_args: None)
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", lambda *_args: True)
     monkeypatch.setattr(async_delegation, "release_event_delivery", lambda *_args: None)
 
     delivered = []

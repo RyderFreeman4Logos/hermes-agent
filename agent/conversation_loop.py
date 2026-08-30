@@ -2011,6 +2011,7 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        agent._reset_stream_delivery_tracking(flush=False)
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,

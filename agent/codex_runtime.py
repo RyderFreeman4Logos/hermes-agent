@@ -684,7 +684,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             if fire is None:
                 return
             try:
-                fire(text)
+                fire(text, interim=True)
             except StreamPayloadBoundExceeded:
                 raise
             except Exception:

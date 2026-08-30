@@ -3902,8 +3902,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 def _on_text(text):
                     _bedrock_response_started["yes"] = True
                     _fire_first()
-                    agent._fire_stream_delta(text)
-                    deltas_were_sent["yes"] = True
+                    deltas_were_sent["yes"] = agent._fire_stream_delta(text) or deltas_were_sent["yes"]
 
                 def _on_tool(name):
                     _bedrock_response_started["yes"] = True
@@ -4496,8 +4495,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if not tool_calls_acc:
                 for text in pending_parts:
                     _fire_first_delta()
-                    agent._fire_stream_delta(text)
-                    deltas_were_sent["yes"] = True
+                    deltas_were_sent["yes"] = agent._fire_stream_delta(text) or deltas_were_sent["yes"]
                 return
             if agent.stream_delta_callback:
                 for text in pending_parts:
@@ -4620,8 +4618,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
-                    agent._fire_stream_delta(delta_content)
-                    deltas_were_sent["yes"] = True
+                    deltas_were_sent["yes"] = (
+                        agent._fire_stream_delta(delta_content) or deltas_were_sent["yes"]
+                    )
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
                 # tool calls).  But reasoning tags embedded in suppressed
@@ -5059,8 +5058,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             text = getattr(delta, "text", "")
                             if text and not has_tool_use:
                                 _fire_first_delta()
-                                agent._fire_stream_delta(text)
-                                deltas_were_sent["yes"] = True
+                                deltas_were_sent["yes"] = agent._fire_stream_delta(text) or deltas_were_sent["yes"]
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:

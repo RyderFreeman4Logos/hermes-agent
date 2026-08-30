@@ -412,6 +412,74 @@ class TestStreamingCallbacks:
         assert tts == ([text] if with_tts else [])
         assert agent._current_streamed_assistant_text == (text if with_tts else "")
 
+    @pytest.mark.parametrize(
+        ("delivery", "expected_attempts"),
+        [
+            pytest.param("all-fail", 2, id="callback-failures-retry"),
+            pytest.param("plugin-only", 2, id="plugin-only-retries"),
+            pytest.param("tts", 1, id="tts-delivery-does-not-retry"),
+        ],
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_transient_text_drop_retries_only_without_physical_delivery(
+        self, mock_close, mock_create, delivery, expected_attempts, monkeypatch,
+    ):
+        """Retry authority comes only from successful display/TTS delivery."""
+        from run_agent import AIAgent
+        import httpx
+
+        attempts = 0
+
+        def _stream(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            yield _make_stream_chunk(content="first" if attempts == 1 else "retry")
+            if attempts == 1:
+                raise httpx.RemoteProtocolError("peer closed connection")
+            yield _make_stream_chunk(finish_reason="stop")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = _stream
+        mock_create.return_value = mock_client
+
+        def _fail(_text):
+            raise RuntimeError("delivery failed")
+
+        plugin_deltas = []
+        monkeypatch.setattr(
+            "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+            lambda hook, **payload: (
+                plugin_deltas.append(payload["delta"])
+                if hook == "on_stream_delta"
+                else None
+            ),
+        )
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=None if delivery == "plugin-only" else _fail,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        tts = []
+        agent._stream_callback = tts.append if delivery == "tts" else (
+            None if delivery == "plugin-only" else _fail
+        )
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert attempts == expected_attempts
+        assert response.choices[0].message.content == (
+            "retry" if expected_attempts == 2 else "first"
+        )
+        assert plugin_deltas == (["first", "retry"] if expected_attempts == 2 else ["first"])
+        assert tts == (["first"] if delivery == "tts" else [])
 
 
 
@@ -1075,7 +1143,7 @@ class TestPartialToolCallWarning:
         agent._interrupt_requested = False
 
         fired_deltas: list = []
-        agent._fire_stream_delta = lambda text: fired_deltas.append(text)
+        agent._fire_stream_delta = lambda text: fired_deltas.append(text) or True
         agent._current_streamed_assistant_text = "Let me write the audit: "
 
         import os as _os
@@ -1151,9 +1219,9 @@ class TestPartialToolCallWarning:
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
-        agent._fire_stream_delta = lambda text: None
-        # Empty recovered text — the exact "0 chars recovered, no tool call"
-        # production condition.
+        agent._fire_stream_delta = lambda text: True
+        # A physical sink accepted the delta while recovered text is empty —
+        # the exact partial-stub condition.
         agent._current_streamed_assistant_text = ""
 
         import os as _os
@@ -1245,7 +1313,7 @@ class TestSilentRetryMidToolCall:
         agent._interrupt_requested = False
 
         fired_deltas: list = []
-        agent._fire_stream_delta = lambda text: fired_deltas.append(text)
+        agent._fire_stream_delta = lambda text: fired_deltas.append(text) or True
 
         import os as _os
         _prev = _os.environ.get("HERMES_STREAM_RETRIES")
@@ -1319,7 +1387,7 @@ class TestSilentRetryMidToolCall:
         agent._interrupt_requested = False
 
         fired_deltas: list = []
-        agent._fire_stream_delta = lambda text: fired_deltas.append(text)
+        agent._fire_stream_delta = lambda text: fired_deltas.append(text) or True
 
         import os as _os
         _prev = _os.environ.get("HERMES_STREAM_RETRIES")
@@ -1372,10 +1440,10 @@ class TestSilentRetryMidToolCall:
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
+            stream_delta_callback=lambda _text: None,
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
-        agent._current_streamed_assistant_text = "Here's my answer so far"
 
         import os as _os
         _prev = _os.environ.get("HERMES_STREAM_RETRIES")

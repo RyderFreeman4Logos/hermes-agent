@@ -6943,13 +6943,13 @@ class AIAgent:
         except Exception:
             logger.debug("on_stream_end plugin hook enqueue failed", exc_info=True)
 
-    def _fire_stream_delta(self, text: str) -> None:
-        """Fire all registered stream delta callbacks (display + TTS)."""
+    def _fire_stream_delta(self, text: str) -> bool:
+        """Fire display/TTS callbacks and report physical delivery."""
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_stream_delta")
-            return
+            return False
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -6989,7 +6989,7 @@ class AIAgent:
             ):
                 text = text.lstrip("\n")
         if not text:
-            return
+            return False
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -7011,6 +7011,7 @@ class AIAgent:
             )
         except Exception:
             logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
+        return delivered
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""

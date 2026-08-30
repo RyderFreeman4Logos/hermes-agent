@@ -5082,9 +5082,12 @@ class TestRunConversation:
         ok_resp = _mock_response(content="done", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [exc, ok_resp]
 
-        # Compress drops the huge history (15 msgs -> 1), freeing tokens.
+        # Compress enough to fit, but leaves normal history for the retry.
         mock_compress = MagicMock(return_value=(
-            [{"role": "user", "content": "hello"}],
+            [
+                {"role": "assistant", "content": "previous"},
+                {"role": "user", "content": "hello"},
+            ],
             "You are helpful.",
         ))
         with (
@@ -5110,9 +5113,11 @@ class TestRunConversation:
         # output-cap retry would call the compressor but re-transmit the same
         # oversized request forever.
         second_messages = second_call.get("messages", [])
-        assert second_messages[-1].get("content") == "hello"
-        assert len(second_messages) == 2
+        assert second_messages[-2].get("content") == "hello"
+        assert "[Agent loop timing]" in second_messages[-1].get("content", "")
+        assert len(second_messages) == 4
         assert second_messages[0]["role"] == "system"
+        assert "cache_control" not in second_messages[-1]
         # context_length was NOT mutated by an output-cap error.
         assert agent.context_compressor.context_length == 200_000
 

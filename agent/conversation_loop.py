@@ -2133,6 +2133,7 @@ def run_conversation(
     # objects without the attribute (older pickles / minimal stubs).
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
+    _skip_preflight_after_output_cap_compression = False
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
@@ -2859,12 +2860,17 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        # The output-cap handler's restart rebuilds API-only timing. Skip this
+        # one re-entry because that handler already owns its compression pass.
+        _skip_preflight = _skip_preflight_after_output_cap_compression
+        _skip_preflight_after_output_cap_compression = False
         if (
             agent.compression_enabled
             and not _review_fork_first_request_pending(agent)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
+            and not _skip_preflight
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
@@ -6169,7 +6175,9 @@ def run_conversation(
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
                             )
+                            _skip_preflight_after_output_cap_compression = True
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
+                                _skip_preflight_after_output_cap_compression = False
                                 compression_attempts -= 1
                                 agent._persist_session(messages, conversation_history)
                                 return _compression_deferred_result(

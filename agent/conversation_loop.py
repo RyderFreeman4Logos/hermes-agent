@@ -2172,7 +2172,7 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
-    loop_timing_persisted = False
+    loop_timing_persisted_text = ""
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -2751,29 +2751,29 @@ def run_conversation(
 
         # Timing is hidden system metadata. Append after cache planning so the
         # new block never receives a breakpoint, then persist it for the next
-        # cycle's stable historical prefix. The local guard spans inner tool /
-        # retry continuations but resets for each outer run_conversation call.
+        # cycle's stable historical prefix. The exact normalized-text sentinel
+        # spans inner continuations but resets for each outer run_conversation.
         _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
-        if _loop_timing_text and (
-            not loop_timing_persisted
-            or not any(
+        if _loop_timing_text:
+            if not loop_timing_persisted_text:
+                loop_timing_persisted_text = _drop_redundant_previous_loop_start(
+                    _loop_timing_text, messages
+                )
+            if not any(
                 message.get("role") == "system"
-                and message.get("content") == _loop_timing_text
+                and message.get("content") == loop_timing_persisted_text
                 for message in messages
-            )
-        ):
-            _loop_timing_text = _drop_redundant_previous_loop_start(
-                _loop_timing_text, messages
-            )
-            api_messages.append({"role": "system", "content": _loop_timing_text})
-            messages.append(
-                {
-                    "role": "system",
-                    "content": _loop_timing_text,
-                    "display_kind": "hidden",
-                }
-            )
-            loop_timing_persisted = True
+            ):
+                api_messages.append(
+                    {"role": "system", "content": loop_timing_persisted_text}
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": loop_timing_persisted_text,
+                        "display_kind": "hidden",
+                    }
+                )
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -2912,7 +2912,7 @@ def run_conversation(
             # A freshly appended timing row is metadata, not enough history to
             # justify compaction before the first provider request. It remains
             # in this outer-run guard, so tool continuations still compact.
-            and len(messages) > 1 + int(loop_timing_persisted)
+            and len(messages) > 1 + int(bool(loop_timing_persisted_text))
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
             and not _skip_preflight

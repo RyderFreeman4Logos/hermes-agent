@@ -8128,30 +8128,19 @@ class AIAgent:
                     # caller's live transcript. Plugin/legacy context engines are
                     # allowed to mutate their input list in place; after a host
                     # timeout the worker stays alive, so a shared list would let
-                    # a late engine rewrite the live conversation (roles,
-                    # ordering, persisted content) behind the caller's back.
-                    # Deep-snapshot here, on the worker thread, so the caller's
-                    # list object is never touched by pooled code. Results are
-                    # published to caller-visible state only via the returned
-                    # value of an ADMITTED commit (the host discards results on
-                    # timeout/cancel); durable SessionDB mutation is already
-                    # gated behind the commit fence inside compress_context.
+                    # a late engine rewrite the live conversation behind the
+                    # caller's back.
                     snapshot = copy.deepcopy(messages)
                     result_msgs, result_prompt = _run(
                         fence, target_messages=snapshot
                     )
                     if result_msgs is snapshot:
-                        # No-op/abort path returned the snapshot unchanged: hand
-                        # back the caller's ORIGINAL list so identity-based
-                        # semantics (len/identity no-op detection, flush dedup
-                        # by id()) keep working.
+                        # Preserve identity-based no-op semantics for callers.
                         return messages, result_prompt
                     return result_msgs, result_prompt
 
-                # Resolve the fallback prompt lazily on timeout only. Eager
-                # rebuild here would raise before compress_context runs whenever
-                # _cached_system_prompt is unset and _build_system_prompt fails
-                # (lock-refresher / noop-exception tests rely on that path).
+                # Resolve only on timeout; eager rebuild would turn a normal
+                # compression call into a system-prompt failure path.
                 def _fallback_prompt():
                     cached = getattr(self, "_cached_system_prompt", None)
                     if cached:
@@ -8167,14 +8156,69 @@ class AIAgent:
                         return system_message or ""
 
                 def _on_timeout(idle, waited, since_progress):
-                    logger.warning(
-                        "Context compression made no progress for %.1fs "
-                        "(total wait %.1fs, ceiling %.1fs); continuing without "
-                        "compression",
-                        since_progress,
+                    from agent.auxiliary_client import classify_compression_watchdog
+
+                    reason = classify_compression_watchdog(
+                        idle,
                         waited,
                         total_ceiling,
+                        since_progress,
+                        getattr(active_fence, "had_meaningful_progress", False),
                     )
+                    if reason == "total_ceiling":
+                        logger.warning(
+                            "Context compression hit the total ceiling after %.1fs "
+                            "(last meaningful progress %.1fs ago, ceiling %.1fs); "
+                            "continuing without compression",
+                            waited,
+                            since_progress,
+                            total_ceiling,
+                        )
+                        timeout_label = "host compress_context timeout (total ceiling)"
+                        emit_msg = (
+                            "⚠ Context compression hit the total time ceiling "
+                            f"after {waited:.1f}s. No messages were dropped — "
+                            "continuing without compression. Run /compress to "
+                            "retry, /new for a clean session, or check "
+                            "auxiliary.compression."
+                        )
+                    elif reason == "candidate_fallback":
+                        logger.warning(
+                            "Context compression cancelled after fallback "
+                            "progression (waited %.1fs, last meaningful progress "
+                            "%.1fs ago); continuing without compression",
+                            waited,
+                            since_progress,
+                        )
+                        timeout_label = (
+                            "host compress_context timeout (cancelled/fallback)"
+                        )
+                        emit_msg = (
+                            "⚠ Context compression stopped after trying "
+                            "configured fallbacks. No messages were dropped — "
+                            "continuing without compression. Run /compress to "
+                            "retry, /new for a clean session, or check "
+                            "auxiliary.compression."
+                        )
+                    else:
+                        logger.warning(
+                            "Context compression made no progress for %.1fs "
+                            "(total wait %.1fs, ceiling %.1fs); continuing without "
+                            "compression",
+                            since_progress,
+                            waited,
+                            total_ceiling,
+                        )
+                        timeout_label = (
+                            "host compress_context timeout (no summary progress)"
+                        )
+                        emit_msg = (
+                            "⚠ Context compression timed out "
+                            f"after {idle:.1f}s with no output from the summary "
+                            "model. No messages were dropped — continuing without "
+                            "compression. Run /compress to retry, /new for a clean "
+                            "session, or check auxiliary.compression."
+                        )
                     touch = getattr(self, "_touch_activity", None)
                     if callable(touch):
                         try:
@@ -8187,38 +8231,24 @@ class AIAgent:
                                 "compress_context timeout activity touch failed",
                                 exc_info=True,
                             )
-                    # Same timeout cooldown ladder as summary-LLM timeouts
-                    # (#62452): avoid re-burning the full idle budget every turn.
                     compressor = getattr(self, "context_compressor", None)
                     if compressor is not None:
                         record = getattr(compressor, "record_timeout_failure", None)
                         if callable(record):
                             try:
-                                record(
-                                    "host compress_context timeout "
-                                    "(no summary progress)"
-                                )
+                                record(timeout_label)
                             except Exception:
                                 logger.debug(
-                                    "failed to record compress_context timeout "
-                                    "cooldown",
+                                    "failed to record compress_context timeout cooldown",
                                     exc_info=True,
                                 )
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
-                        emit(
-                            "⚠ Context compression timed out "
-                            f"after {idle:.1f}s with no output from the summary "
-                            "model. No messages were dropped — continuing without "
-                            "compression. Run /compress to retry, /new for a clean "
-                            "session, or check auxiliary.compression."
-                        )
+                        emit(emit_msg)
 
                 def _on_commit_overrun(waited, ceiling):
-                    # Commit-phase ceiling breach: the SessionDB mutation is in
-                    # flight and must complete (abandoning it mid-commit would
-                    # diverge live messages from durable session state), so this
-                    # only surfaces the overrun — it never cancels the commit.
+                    # Never cancel an in-flight SessionDB mutation: doing so can
+                    # diverge the live transcript from durable session state.
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
                         emit(
@@ -8229,11 +8259,8 @@ class AIAgent:
                         )
 
                 def _publish_new_fence():
-                    # The stall-fallback retry (#78981) needs a fence the aborted
-                    # attempt cannot veto. Publish it on the same serialized slot
-                    # hard_interrupt() reads, so a /stop during the retry admits
-                    # against the attempt that is actually running. The finally
-                    # below restores whatever the caller had either way.
+                    # hard_interrupt() must target the retry, not the aborted
+                    # attempt. Publication is serialized with begin_commit().
                     retry_fence = CompressionCommitFence()
                     with fence_registration_lock:
                         self._active_compression_commit_fence = retry_fence

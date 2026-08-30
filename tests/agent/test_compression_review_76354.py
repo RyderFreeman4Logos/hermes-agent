@@ -540,8 +540,18 @@ class TestRound2MidCommitLeaseRelease:
         worker.start()
         assert commit_entered.wait(timeout=5)
 
-        # Host revokes WHILE the commit is in flight.
-        fence.revoke_commit_admission()
+        # Host revokes WHILE the commit is in flight. The condition lock is
+        # intentionally held for the whole commit, so an external revoke waits
+        # until that state transition can close admission under the lock.
+        revoke_finished = threading.Event()
+
+        def _revoke():
+            fence.revoke_commit_admission()
+            revoke_finished.set()
+
+        revoker = threading.Thread(target=_revoke, daemon=True)
+        revoker.start()
+        assert not revoke_finished.wait(timeout=0.05)
 
         # ── Assert the hung state BEFORE releasing the commit ────────────
         assert not commit_finished.is_set()
@@ -556,9 +566,12 @@ class TestRound2MidCommitLeaseRelease:
             "admitted commit"
         )
 
-        # ── Release the commit; deferred release must fire promptly ──────
+        # ── Release the commit; revoke must complete promptly ────────────
         release_commit.set()
         assert commit_finished.wait(timeout=5)
+        assert revoke_finished.wait(timeout=5)
+        revoker.join(timeout=1)
+        assert not revoker.is_alive()
         deadline = time.time() + 5
         while time.time() < deadline:
             if db.get_compression_lock_holder(session_id) is None:

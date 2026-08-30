@@ -6757,6 +6757,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     def _deliver(_rid, sid, session, text):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
+        return True
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
     server._sessions.update(

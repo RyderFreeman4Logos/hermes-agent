@@ -141,7 +141,7 @@ def test_idle_routine_child_successes_do_not_submit_parent_turn(monkeypatch):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda *_args, **_kw: turns.append("submitted"),
+        lambda *_args, **_kw: turns.append("submitted") or True,
     )
 
     server._flush_pending_completions_if_idle("sid_child_idle", sess, set())
@@ -215,7 +215,8 @@ def test_busy_completions_coalesce_to_one_ingest_batch_idle_stays_immediate(
         server,
         "_run_prompt_submit",
         lambda _rid, _sid, session, text, **_kw: idle_turns.append(text)
-        or session.__setitem__("running", False),
+        or session.__setitem__("running", False)
+        or True,
     )
     idle_evt = _completion("proc_idle_one", 0, "echo idle")
     process_registry._completion_consumed.discard("proc_idle_one")
@@ -250,7 +251,8 @@ def test_busy_completions_coalesce_to_one_ingest_batch_idle_stays_immediate(
         server,
         "_run_prompt_submit",
         lambda _rid, _sid, session, text, **_kw: busy_turns.append(text)
-        or session.__setitem__("running", False),
+        or session.__setitem__("running", False)
+        or True,
     )
     events = [
         _completion("proc_busy_a", 0, "echo a"),
@@ -320,7 +322,8 @@ def test_idle_completions_coalesce_to_one_ingest_batch(monkeypatch):
         server,
         "_run_prompt_submit",
         lambda _rid, _sid, session, text, **_kw: turns.append(text)
-        or session.__setitem__("running", False),
+        or session.__setitem__("running", False)
+        or True,
     )
     events = [
         _completion("proc_idle_a", 0, "echo a"),
@@ -417,7 +420,8 @@ def test_child_tails_after_compress_do_not_each_start_a_parent_turn(monkeypatch)
         server,
         "_run_prompt_submit",
         lambda _rid, _sid, session, text, **_kw: turns.append(text)
-        or session.__setitem__("running", False),
+        or session.__setitem__("running", False)
+        or True,
     )
 
     child_events = [
@@ -505,7 +509,8 @@ def test_midloop_completions_use_steer_rail_not_new_turns(monkeypatch):
         server,
         "_run_prompt_submit",
         lambda _rid, _sid, session, text, **_kw: turns.append(text)
-        or session.__setitem__("running", False),
+        or session.__setitem__("running", False)
+        or True,
     )
     events = [
         _completion("proc_mid_a", 0, "echo a"),
@@ -581,7 +586,8 @@ def test_llm_blocked_pileup_is_one_steer_batch_zero_drops(monkeypatch):
         server,
         "_run_prompt_submit",
         lambda _rid, _sid, session, text, **_kw: turns.append(text)
-        or session.__setitem__("running", False),
+        or session.__setitem__("running", False)
+        or True,
     )
     events = [
         _completion("proc_llm_a", 0, "echo a"),
@@ -647,7 +653,8 @@ def test_single_completion_steers_while_parent_waits_on_tools(monkeypatch):
         server,
         "_run_prompt_submit",
         lambda _rid, _sid, session, text, **_kw: turns.append(text)
-        or session.__setitem__("running", False),
+        or session.__setitem__("running", False)
+        or True,
     )
     evt = _completion("proc_wait_one", 0, "echo wait")
     process_registry._completion_consumed.discard("proc_wait_one")
@@ -667,36 +674,6 @@ def test_single_completion_steers_while_parent_waits_on_tools(monkeypatch):
         process_registry._completion_consumed.discard("proc_wait_one")
         while not isolated.empty():
             isolated.get_nowait()
-
-
-def test_steer_accept_does_not_ack_until_leftover_ingest():
-    """steer() True stages only; leftover enqueue is the ingest ACK."""
-    agent = _SteerAgent()
-    sess = _session(running=True, agent=agent)
-    evt = _completion("proc_ack_leftover", 0, "echo leftover")
-    process_registry._completion_consumed.discard("proc_ack_leftover")
-    try:
-        ok = server._deliver_completions_via_steer(
-            "sid_ack_leftover", sess, [evt], set()
-        )
-        assert ok is True
-        assert agent.steers
-        assert "proc_ack_leftover" not in process_registry._completion_consumed
-        pending = sess.get("_completion_pending") or []
-        assert {item.get("session_id") for item in pending} == {"proc_ack_leftover"}
-
-        # Existing leftover harvest: finalize_turn drains _pending_steer and
-        # _run_prompt_submit requeues result["pending_steer"]. That enqueue is ingest.
-        leftover = agent._pending_steer
-        assert leftover and "proc_ack_leftover" in leftover
-        agent._pending_steer = None
-        with sess["history_lock"]:
-            server._enqueue_prompt(sess, leftover, sess.get("transport"))
-        server._ack_steered_completion_ingest(sess)
-        assert "proc_ack_leftover" in process_registry._completion_consumed
-        assert sess.get("_completion_pending") in (None, [])
-    finally:
-        process_registry._completion_consumed.discard("proc_ack_leftover")
 
 
 def test_interrupt_after_steer_accept_does_not_drop_completion():

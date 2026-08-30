@@ -7013,13 +7013,16 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
-        self._record_streamed_assistant_text(text)
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+        delivered = False
         for cb in callbacks:
             try:
                 cb(text)
+                delivered = True
             except Exception:
                 pass
+        if delivered:
+            self._record_streamed_assistant_text(text)
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 

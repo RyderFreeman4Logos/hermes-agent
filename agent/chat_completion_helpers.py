@@ -4087,6 +4087,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 raise InterruptedError("Agent interrupted during Bedrock API call (post-worker)")
             if result["error"] is not None:
+                if isinstance(result["error"], StreamPayloadBoundExceeded):
+                    raise result["error"]
+                if deltas_were_sent["yes"]:
+                    partial_text = (
+                        getattr(agent, "_current_streamed_assistant_text", "") or ""
+                    ).strip() or None
+                    partial = _build_partial_stream_stub(
+                        "assistant",
+                        partial_text,
+                        None,
+                        getattr(agent, "model", "unknown"),
+                        None,
+                    )
+                    _emit_stream_end(
+                        final_text=partial_text or "",
+                        finished=False,
+                        error=str(result["error"]),
+                    )
+                    _reset_stale_streak(agent)
+                    return partial
                 raise result["error"]
             # Success — clear the cross-turn breaker (#58962): Bedrock proved
             # responsive.  Mirrors the OpenAI/Anthropic success reset below so a
@@ -4516,9 +4536,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _fire_first_delta()
                     deltas_were_sent["yes"] = agent._fire_stream_delta(text) or deltas_were_sent["yes"]
                 return
-            if agent.stream_delta_callback:
+            if agent._has_stream_consumers():
                 for text in pending_parts:
-                    agent._fire_stream_delta(text)
+                    deltas_were_sent["yes"] = (
+                        agent._fire_stream_delta(text) or deltas_were_sent["yes"]
+                    )
 
         for chunk in _iter_provider_stream_chunks(
             stream,
@@ -4651,8 +4673,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
-                    agent._fire_stream_delta(delta_content)
+                elif agent._has_stream_consumers():
+                    deltas_were_sent["yes"] = (
+                        agent._fire_stream_delta(delta_content)
+                        or deltas_were_sent["yes"]
+                    )
 
             # Accumulate tool call deltas — notify display on first name
             delta_tool_calls = getattr(delta, "tool_calls", None)

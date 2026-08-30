@@ -11707,6 +11707,7 @@ def _take_steered_completion_snapshot(session: dict, text: str) -> list:
                 and f" {event_sid} " in f" {text} "
             ):
                 evt.pop("_steer_accepted", None)
+                evt.pop("_steer_publication", None)
                 selected.append(evt)
     return selected
 
@@ -11756,6 +11757,7 @@ def _bind_completion_steer_guards(session: dict, agent) -> None:
                 with session["history_lock"]:
                     for evt in session.get("_completion_pending") or []:
                         evt.pop("_steer_accepted", None)
+                        evt.pop("_steer_publication", None)
             return result
 
         agent.clear_interrupt = _clear
@@ -11875,16 +11877,58 @@ def _deliver_claimed_notification_turn(
     return retry
 
 
-def _submit_process_notification_turn(sid: str, session: dict, evt: dict, text: str) -> bool:
-    """Claim + one agent turn for a process notification (single or batch text)."""
-    from tools.async_delegation import claim_event_delivery
+def _claim_notification_events(
+    session: dict, events: list[dict], consumer: str
+) -> tuple[list[tuple[dict, str]], list[dict]]:
+    """Claim a selected batch, unwinding the whole reservation on claim error."""
+    from tools.async_delegation import claim_event_delivery, release_event_delivery
 
-    claim = claim_event_delivery(evt, "tui-poller")
-    if claim is None:
+    claimed: list[tuple[dict, str]] = []
+    retry: list[dict] = []
+    try:
+        for evt in events:
+            claim = claim_event_delivery(evt, consumer)
+            if claim is None:
+                if _notification_delivery_is_pending(evt):
+                    retry.append(evt)
+                continue
+            claimed.append((evt, claim))
+    except Exception as exc:
+        claims = {id(evt): claim for evt, claim in claimed}
+        retry = []
+        for evt in events:
+            claim = claims.get(id(evt))
+            if claim is not None and _notification_delivery_is_pending(evt):
+                try:
+                    release_event_delivery(evt, claim)
+                except Exception as release_exc:
+                    print(
+                        f"[tui_gateway] completion delivery release failed: "
+                        f"{type(release_exc).__name__}: {release_exc}",
+                        file=sys.stderr,
+                    )
+            if _notification_delivery_is_pending(evt):
+                retry.append(evt)
+        claimed = []
+        print(
+            f"[tui_gateway] completion delivery claim failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+    if not claimed:
         with session["history_lock"]:
             session["running"] = False
-        return False
-    return not _deliver_claimed_notification_turn(sid, session, [(evt, claim)], text)
+    return claimed, retry
+
+
+def _submit_process_notification_turn(
+    sid: str, session: dict, evt: dict, text: str
+) -> list[dict]:
+    """Claim + deliver one notification turn; return retryable events."""
+    claimed, retry = _claim_notification_events(session, [evt], "tui-poller")
+    if claimed:
+        retry.extend(_deliver_claimed_notification_turn(sid, session, claimed, text))
+    return retry
 
 
 def _session_can_steer_completions(session: dict) -> bool:
@@ -11926,26 +11970,50 @@ def _deliver_completions_via_steer(
     if batch_key not in emitted:
         _emit("status.update", sid, {"kind": "process", "text": text})
         emitted.add(batch_key)
+    publication = object()
+    replaced: dict[int, dict] = {}
+    with session["history_lock"]:
+        _bind_completion_steer_guards(session, session.get("agent"))
+        pending = session.setdefault("_completion_pending", [])
+        for evt in events:
+            key = _notification_event_dedup_key(evt)
+            match = next(
+                (
+                    (index, item)
+                    for index, item in enumerate(pending)
+                    if _notification_event_dedup_key(item) == key
+                ),
+                None,
+            )
+            staged = dict(match[1] if match is not None else evt)
+            staged["_steer_accepted"] = True
+            staged["_steer_publication"] = publication
+            if match is None:
+                pending.append(staged)
+            else:
+                pending[match[0]] = staged
+                replaced[id(staged)] = match[1]
     try:
-        if not steer(text):
-            return False
+        accepted = bool(steer(text))
     except Exception:
+        accepted = False
+    if not accepted:
+        with session["history_lock"]:
+            pending = session.get("_completion_pending") or []
+            session["_completion_pending"] = [
+                replaced[id(item)]
+                if item.get("_steer_publication") is publication and id(item) in replaced
+                else item
+                for item in pending
+                if item.get("_steer_publication") is not publication
+                or id(item) in replaced
+            ]
         return False
     # steer() True is staging only — ACK at leftover/tool-result ingest.
-    _bind_completion_steer_guards(session, session.get("agent"))
     with session["history_lock"]:
-        pending = session.setdefault("_completion_pending", [])
-        have = {evt.get("session_id") for evt in pending}
-        for evt in events:
-            sid = evt.get("session_id")
-            if sid in have:
-                for item in pending:
-                    if item.get("session_id") == sid:
-                        item["_steer_accepted"] = True
-            else:
-                staged = dict(evt)
-                staged["_steer_accepted"] = True
-                pending.append(staged)
+        for item in session.get("_completion_pending") or []:
+            if item.get("_steer_publication") is publication:
+                item.pop("_steer_publication", None)
     return True
 
 
@@ -11971,7 +12039,7 @@ def _deliver_completion_notifications(
         if dedup_key not in emitted:
             _emit("status.update", sid, {"kind": "process", "text": text})
             emitted.add(dedup_key)
-        if _submit_process_notification_turn(sid, session, evt, text):
+        if not _submit_process_notification_turn(sid, session, evt, text):
             _mark_completion_events_consumed([evt])
         else:
             with session["history_lock"]:
@@ -11991,7 +12059,7 @@ def _deliver_completion_notifications(
     if batch_key not in emitted:
         _emit("status.update", sid, {"kind": "process", "text": text})
         emitted.add(batch_key)
-    if _submit_process_notification_turn(sid, session, events[0], text):
+    if not _submit_process_notification_turn(sid, session, events[0], text):
         _mark_completion_events_consumed(events)
     else:
         with session["history_lock"]:
@@ -12508,8 +12576,10 @@ def _notification_poller_loop(
             time.sleep(0.25)
             continue
 
-        if not _submit_process_notification_turn(sid, session, evt, text):
-            process_registry.requeue_completion_front(evt)
+        retry = _submit_process_notification_turn(sid, session, evt, text)
+        for retry_evt in reversed(retry):
+            process_registry.completion_queue.put(retry_evt)
+        if retry:
             time.sleep(0.25)
 
     # Drain any remaining events after stop signal (process all pending
@@ -12563,8 +12633,7 @@ def _notification_poller_loop(
                 break
             session["running"] = True
 
-        if not _submit_process_notification_turn(sid, session, evt, text):
-            deferred.append(evt)
+        deferred.extend(_submit_process_notification_turn(sid, session, evt, text))
 
     # One batch for any completions that arrived while busy / on drain.
     # If the session is still running, leave them on the session so a later
@@ -13869,28 +13938,30 @@ def _run_prompt_submit(
                     else:
                         session["running"] = True
                 if drained:
-                    from tools.async_delegation import claim_event_delivery
-
-                    claimed: list[tuple[dict, str, str]] = []
-                    for pending_evt, pending_synth in drained:
-                        claim = claim_event_delivery(pending_evt, "tui-post-turn")
-                        if claim is None:
-                            if _notification_delivery_is_pending(pending_evt):
-                                process_registry.completion_queue.put(pending_evt)
-                            continue
-                        claimed.append((pending_evt, claim, pending_synth))
-                    if not claimed:
-                        with session["history_lock"]:
-                            session["running"] = False
-                    else:
-                        retry = _deliver_claimed_notification_turn(
-                            sid,
-                            session,
-                            [(evt, claim) for evt, claim, _synth in claimed],
-                            "\n\n".join(synth for _evt, _claim, synth in claimed),
-                            rid=rid,
+                    claimed, retry = _claim_notification_events(
+                        session,
+                        [pending_evt for pending_evt, _pending_synth in drained],
+                        "tui-post-turn",
+                    )
+                    if claimed:
+                        synth_by_event = {
+                            id(pending_evt): pending_synth
+                            for pending_evt, pending_synth in drained
+                        }
+                        retry.extend(
+                            _deliver_claimed_notification_turn(
+                                sid,
+                                session,
+                                claimed,
+                                "\n\n".join(
+                                    synth_by_event[id(evt)] for evt, _claim in claimed
+                                ),
+                                rid=rid,
+                            )
                         )
-                        for pending_evt in retry:
+                    retry_ids = {id(pending_evt) for pending_evt in retry}
+                    for pending_evt, _pending_synth in drained:
+                        if id(pending_evt) in retry_ids:
                             process_registry.completion_queue.put(pending_evt)
         except Exception as _drain_exc:
             print(

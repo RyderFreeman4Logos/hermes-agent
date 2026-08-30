@@ -1,11 +1,11 @@
 from types import SimpleNamespace
 
-from agent.agent_init import _merge_custom_provider_extra_body
+from agent.agent_init import _project_request_overrides
 
 
 
 
-def test_custom_provider_extra_body_preserves_caller_override():
+def test_projected_custom_provider_extra_body_preserves_caller_override():
     agent = SimpleNamespace(
         provider="custom",
         model="google/gemma-4-31b-it",
@@ -18,9 +18,14 @@ def test_custom_provider_extra_body_preserves_caller_override():
         },
     )
 
-    _merge_custom_provider_extra_body(
+    projected = _project_request_overrides(
         agent,
-        [
+        provider=agent.provider,
+        model=agent.model,
+        base_url=agent.base_url,
+        service_tier=None,
+        caller_overrides=agent.request_overrides,
+        custom_providers=[
             {
                 "name": "gemma",
                 "base_url": "https://example.test/v1",
@@ -33,7 +38,7 @@ def test_custom_provider_extra_body_preserves_caller_override():
         ],
     )
 
-    assert agent.request_overrides["extra_body"] == {
+    assert projected["extra_body"] == {
         "enable_thinking": True,
         "reasoning_effort": "low",
         "caller_only": True,
@@ -42,7 +47,7 @@ def test_custom_provider_extra_body_preserves_caller_override():
 
 
 
-def test_named_custom_provider_extra_body_matches_provider_key():
+def test_projected_named_custom_provider_extra_body_matches_provider_key():
     agent = SimpleNamespace(
         provider="custom:zai-coding-plan",
         model="glm-5.2",
@@ -50,9 +55,14 @@ def test_named_custom_provider_extra_body_matches_provider_key():
         request_overrides={},
     )
 
-    _merge_custom_provider_extra_body(
+    projected = _project_request_overrides(
         agent,
-        [
+        provider=agent.provider,
+        model=agent.model,
+        base_url=agent.base_url,
+        service_tier=None,
+        caller_overrides=agent.request_overrides,
+        custom_providers=[
             {
                 "provider_key": "other-provider",
                 "name": "Other Provider",
@@ -70,4 +80,4 @@ def test_named_custom_provider_extra_body_matches_provider_key():
         ],
     )
 
-    assert agent.request_overrides == {"extra_body": {"enable_thinking": False}}
+    assert projected == {"extra_body": {"enable_thinking": False}}

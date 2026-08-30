@@ -7322,6 +7322,299 @@ def test_run_prompt_submit_batches_post_turn_completions_with_real_threading(
             process_registry._poll_observed.discard(event["session_id"])
 
 
+@pytest.mark.parametrize("route", ["live", "shutdown"])
+@pytest.mark.parametrize("failure", ["admission", "settlement"])
+def test_notification_poller_requeues_failed_async_delivery(
+    monkeypatch, route, failure
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": f"deleg-{route}-{failure}",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid-a",
+        "status": "completed",
+        "summary": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    session = _session(session_key="session-a", running=False)
+    server._sessions["sid-a"] = session
+    stop = threading.Event()
+    delivery_state = {"value": "pending"}
+    settlements = []
+    releases = []
+
+    if route == "shutdown":
+        isolated_queue.put(event)
+        stop.set()
+    else:
+        def _get_once(*_args, **_kwargs):
+            stop.set()
+            return event
+
+        monkeypatch.setattr(process_registry, "get_completion_for_owner", _get_once)
+
+    def _submit(*_args, **_kwargs):
+        with session["history_lock"]:
+            session["running"] = False
+        return failure != "admission"
+
+    def _complete(delegation_id, _claim):
+        settlements.append(delegation_id)
+        if failure == "settlement":
+            return False
+        delivery_state["value"] = "delivered"
+        return True
+
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", _submit)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: "claim")
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", _complete)
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda evt, _claim: releases.append(evt["delegation_id"]),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "get_durable_delegation",
+        lambda _delegation_id: {"delivery_state": delivery_state["value"]},
+    )
+
+    try:
+        server._notification_poller_loop(stop, "sid-a", session)
+
+        remaining = []
+        while not isolated_queue.empty():
+            remaining.append(isolated_queue.get_nowait())
+        assert delivery_state["value"] == "pending"
+        if failure == "admission":
+            assert settlements == []
+        else:
+            assert settlements
+        assert releases
+        assert remaining == [event]
+    finally:
+        server._sessions.pop("sid-a", None)
+
+
+def test_run_prompt_submit_requeues_post_turn_event_when_admission_fails(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    delivery_state = {"value": "pending"}
+    releases = []
+    session_ref = {}
+
+    class _ClosingAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            turns.append(prompt)
+            session_ref["session"]["_closing"] = True
+            return {"final_response": "", "messages": []}
+
+    session = _session(
+        session_key="session-a",
+        agent=_ClosingAgent(turns),
+        running=True,
+    )
+    session_ref["session"] = session
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-post-turn-admission",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid-a",
+        "status": "completed",
+        "summary": "done",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: "claim")
+
+    def _complete(_delegation_id, _claim):
+        delivery_state["value"] = "delivered"
+        return True
+
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", _complete)
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda evt, _claim: releases.append(evt["delegation_id"]),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "get_durable_delegation",
+        lambda _delegation_id: {"delivery_state": delivery_state["value"]},
+    )
+    server._sessions["sid-a"] = session
+
+    try:
+        assert server._run_prompt_submit("rid-a", "sid-a", session, "parent") is True
+        assert delivery_state["value"] == "pending"
+        assert releases == [event["delegation_id"]]
+        assert isolated_queue.get_nowait() == event
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-a", None)
+
+
+def test_run_prompt_submit_suppresses_routine_child_in_post_turn_projection(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    session = _session(
+        session_key="session-a",
+        agent=_RecordingAgent(turns),
+        running=True,
+    )
+    child = {
+        "type": "completion",
+        "session_id": "proc-routine-child",
+        "session_key": "session-a",
+        "command": "child",
+        "exit_code": 0,
+        "output": "done",
+        "started_at": 1.0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "delegated_child": True,
+    }
+    consolidated = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-consolidated",
+        "session_key": "session-a",
+        "origin_ui_session_id": "sid-a",
+        "status": "completed",
+        "summary": "consolidated parent result",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    drain_calls = 0
+
+    def _drain_once(*_args, **_kwargs):
+        nonlocal drain_calls
+        drain_calls += 1
+        if drain_calls > 1:
+            return []
+        return [
+            (child, "routine child proc-routine-child completed"),
+            (consolidated, "consolidated parent result"),
+        ]
+
+    monkeypatch.setattr(process_registry, "drain_notifications", _drain_once)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: "claim")
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", lambda *_args: True)
+    monkeypatch.setattr(
+        async_delegation,
+        "get_durable_delegation",
+        lambda _delegation_id: {"delivery_state": "delivered"},
+    )
+    process_registry._completion_consumed.discard(child["session_id"])
+    server._sessions["sid-a"] = session
+
+    try:
+        assert server._run_prompt_submit("rid-a", "sid-a", session, "parent") is True
+        assert len(turns) == 2
+        assert "consolidated parent result" in turns[1]
+        assert child["session_id"] not in turns[1]
+        assert child["session_id"] in process_registry._completion_consumed
+    finally:
+        server._sessions.pop("sid-a", None)
+        process_registry._completion_consumed.discard(child["session_id"])
+
+
+@pytest.mark.parametrize("admitted", [True, False])
+def test_run_prompt_submit_leftover_completion_ack_tracks_prompt_admission(
+    monkeypatch, tmp_path, admitted
+):
+    from tools.process_registry import process_registry
+
+    real_drain_queued_prompt = server._drain_queued_prompt
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_drain_queued_prompt", real_drain_queued_prompt)
+    turns = []
+    acked = []
+    event = {
+        "type": "completion",
+        "session_id": "proc-leftover",
+        "command": "child",
+        "exit_code": 0,
+        "output": "done",
+        "_steer_accepted": True,
+    }
+    leftover = "[IMPORTANT: Background process proc-leftover completed normally]"
+    session_ref = {}
+
+    class _LeftoverAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            turns.append(prompt)
+            if len(turns) == 1:
+                if not admitted:
+                    session_ref["session"]["_closing"] = True
+                return {
+                    "final_response": "",
+                    "messages": [],
+                    "pending_steer": leftover,
+                }
+            return {"final_response": "", "messages": []}
+
+    session = _session(
+        session_key="session-a",
+        agent=_LeftoverAgent(turns),
+        running=True,
+        _completion_pending=[event],
+    )
+    session_ref["session"] = session
+    original_mark = server._mark_completion_events_consumed
+
+    def _mark(events):
+        acked.extend(evt["session_id"] for evt in events)
+        original_mark(events)
+
+    monkeypatch.setattr(server, "_mark_completion_events_consumed", _mark)
+    process_registry._completion_consumed.discard(event["session_id"])
+    server._sessions["sid-a"] = session
+
+    try:
+        assert server._run_prompt_submit("rid-a", "sid-a", session, "parent") is True
+        pending = session.get("_completion_pending") or []
+        if admitted:
+            assert turns == ["parent", leftover]
+            assert acked == [event["session_id"]]
+            assert pending == []
+            assert event["session_id"] in process_registry._completion_consumed
+        else:
+            assert turns == ["parent"]
+            assert acked == []
+            assert [evt["session_id"] for evt in pending] == [event["session_id"]]
+            assert "_steer_accepted" not in pending[0]
+            assert event["session_id"] not in process_registry._completion_consumed
+    finally:
+        server._sessions.pop("sid-a", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+
+
 def test_run_prompt_submit_reconciles_durable_batch_settlement_failure(
     monkeypatch, tmp_path
 ):

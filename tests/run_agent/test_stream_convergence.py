@@ -434,37 +434,69 @@ def test_codex_no_delivery_retry_discards_attempt_payload_state():
     assert agent._current_streamed_assistant_text == ""
 
 
-def test_app_server_partial_uses_scrubbed_delivery(monkeypatch):
-    raw = "<memory-context>\n" + "secret" * 50_000 + "\n</memory-context>\n\nVisible"
-    agent = _make_codex_agent()
+@pytest.mark.parametrize("live_delta", [True, False], ids=["live", "completed-only"])
+def test_app_server_completed_partial_uses_scrubbed_delivery(monkeypatch, live_delta):
+    from agent.codex_runtime import make_codex_app_server_event_bridge
 
-    def partial_turn(self, user_input, **kwargs):
-        agent._current_streamed_assistant_text = "Visible"
-        agent._current_streamed_payload_bytes = streamed_payload_bytes("Visible")
-        return TurnResult(
-            final_text=raw,
-            projected_messages=[{"role": "assistant", "content": raw}],
-            interrupted=True,
-            error="transport dropped",
-            turn_id="turn-1",
-            thread_id="thread-1",
-        )
-
+    hidden = "HOSTILE-COMPLETED-SECRET"
+    raw = f"<memory-context>\n{hidden * 128}\n</memory-context>\n\nVisible"
+    streamed, interim, plugin, persisted = [], [], [], []
+    agent = _make_codex_agent(
+        stream_delta_callback=streamed.append,
+        interim_assistant_callback=lambda text, **_kwargs: interim.append(text),
+    )
     monkeypatch.setattr(
-        "agent.transports.codex_app_server_session.CodexAppServerSession.run_turn",
-        partial_turn,
+        "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+        lambda hook, **payload: plugin.append((hook, str(payload))),
+    )
+    agent._flush_messages_to_session_db = (
+        lambda messages, *_args, **_kwargs: persisted.append(str(messages)) or True
+    )
+
+    client = FakeClient()
+    if live_delta:
+        client.queue_notification(
+            "item/agentMessage/delta",
+            threadId="t",
+            turnId="tu1",
+            delta=raw,
+        )
+    client.queue_notification(
+        "item/completed",
+        threadId="t",
+        turnId="tu1",
+        item={"type": "agentMessage", "id": "m1", "text": raw},
+    )
+    client.queue_notification(
+        "turn/completed",
+        threadId="t",
+        turn={
+            "id": "tu1",
+            "status": "failed",
+            "error": {"message": "transport dropped"},
+        },
+    )
+    setattr(
+        agent,
+        "_codex_session",
+        make_session(client, on_event=make_codex_app_server_event_bridge(agent)),
     )
 
     result = agent.run_conversation("hi")
 
+    assert streamed == ["Visible"]
+    assert interim == ["Visible"]
     assert result["final_response"] == "Visible"
-    assistant_text = "".join(
-        str(message.get("content") or "")
-        for message in result["messages"]
-        if message.get("role") == "assistant"
-    )
-    assert "Visible" in assistant_text
-    assert "secret" not in assistant_text
+    assert result["partial"] is True
+    surfaces = [
+        *streamed,
+        *interim,
+        *(payload for _hook, payload in plugin),
+        result["final_response"],
+        str(result["messages"]),
+        *persisted,
+    ]
+    assert all(hidden not in surface for surface in surfaces)
     assert streamed_payload_bytes(result["final_response"]) <= DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
 
 

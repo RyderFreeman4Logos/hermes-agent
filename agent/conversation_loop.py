@@ -161,6 +161,27 @@ def _loop_timing_context(
     return "\n".join(lines)
 
 
+def _drop_redundant_previous_loop_start(text: str, history) -> str:
+    """Drop Previous loop start when history already has that Current stamp."""
+    if not text or not history:
+        return text
+    lines = text.splitlines()
+    previous = next(
+        (line for line in lines if line.startswith("Previous loop start: ")), None
+    )
+    if previous is None:
+        return text
+    needle = f"Current loop start: {previous[len('Previous loop start: '):]}"
+    if any(
+        isinstance(message, dict)
+        and "[Agent loop timing]" in str(message.get("content", ""))
+        and needle in str(message.get("content", ""))
+        for message in history
+    ):
+        return "\n".join(line for line in lines if line != previous)
+    return text
+
+
 def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -> bool:
     """Store one real usage reading and consume pending cache attribution."""
     agent._last_turn_usage = dict(usage)
@@ -2727,11 +2748,22 @@ def run_conversation(
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools
 
-        # Timing is API-only context. Append it after cache planning so it never
-        # receives a breakpoint or changes the stable cached prefix.
+        # Timing is hidden system metadata. Append after cache planning so the
+        # new block never receives a breakpoint, then persist it for the next
+        # cycle's stable historical prefix.
         _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
         if _loop_timing_text:
+            _loop_timing_text = _drop_redundant_previous_loop_start(
+                _loop_timing_text, messages
+            )
             api_messages.append({"role": "system", "content": _loop_timing_text})
+            messages.append(
+                {
+                    "role": "system",
+                    "content": _loop_timing_text,
+                    "display_kind": "hidden",
+                }
+            )
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it

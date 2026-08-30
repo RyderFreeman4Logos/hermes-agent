@@ -173,7 +173,7 @@ class TestResolveAutoMainFirst:
         assert client is task_client
         assert model == "task-free-model"
         mock_task_chain.assert_called_once_with(
-            "title_generation", "nvidia", reason="main provider unavailable")
+            "title_generation", "nvidia", reason="main provider unavailable", codex_only=True)
         mock_main_chain.assert_not_called()
         mock_openrouter.assert_not_called()
 

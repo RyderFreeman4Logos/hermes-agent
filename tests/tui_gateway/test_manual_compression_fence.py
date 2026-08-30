@@ -105,11 +105,12 @@ def test_poller_holds_dequeued_event_until_fence_release(monkeypatch):
     monkeypatch.setattr(async_delegation, "release_event_delivery", lambda *_args: None)
 
     delivered = []
-    monkeypatch.setattr(
-        server,
-        "_run_prompt_submit",
-        lambda _rid, _sid, _session, _text, **_kwargs: delivered.append(_text),
-    )
+
+    def accepted_submit(_rid, _sid, _session, _text, **_kwargs):
+        delivered.append(_text)
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", accepted_submit)
 
     session = _session()
     event = _delegation_event()

@@ -10,6 +10,8 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from tools.process_registry import process_registry
 from tui_gateway import server
 
@@ -107,10 +109,9 @@ def test_notification_turn_releases_claim_when_prompt_admission_fails(monkeypatc
         lambda *_args, **_kwargs: False,
     )
 
-    assert (
-        server._submit_process_notification_turn("sid", sess, evt, "completion")
-        is False
-    )
+    assert server._submit_process_notification_turn(
+        "sid", sess, evt, "completion"
+    ) == [evt]
     assert calls == [("release", (evt, "claim-token"))]
 
 
@@ -705,6 +706,118 @@ def test_interrupt_after_steer_accept_does_not_drop_completion():
         assert process_registry.is_completion_consumed("proc_int_drop") is False
     finally:
         process_registry._completion_consumed.discard("proc_int_drop")
+
+
+def test_shared_apply_can_ack_before_steer_returns(monkeypatch):
+    inserted: list[str] = []
+    marked: list[str] = []
+
+    class _ApplyBarrierAgent(_SteerAgent):
+        def __init__(self):
+            super().__init__()
+
+            def _apply(messages, _num_tool_msgs):
+                text = self._pending_steer
+                self._pending_steer = None
+                messages[-1]["content"] += text
+
+            self._apply_pending_steer_to_tool_results = _apply
+
+        def steer(self, text: str) -> bool:
+            assert super().steer(text)
+            messages = [{"role": "tool", "content": "result:"}]
+            self._apply_pending_steer_to_tool_results(messages, 1)
+            inserted.append(messages[0]["content"])
+            return True
+
+    agent = _ApplyBarrierAgent()
+    sess = _session(running=True, agent=agent)
+    event = _completion("proc-publish-apply", 0, "echo apply")
+    monkeypatch.setattr(
+        server,
+        "_mark_completion_events_consumed",
+        lambda events: marked.extend(evt["session_id"] for evt in events),
+    )
+
+    assert server._deliver_completions_via_steer("sid-apply", sess, [event], set())
+    assert "proc-publish-apply" in inserted[0]
+    assert marked == [event["session_id"]]
+    assert sess.get("_completion_pending") == []
+
+
+def test_final_leftover_can_ack_before_steer_returns(monkeypatch):
+    marked: list[str] = []
+    session_ref = {}
+
+    class _LeftoverBarrierAgent(_SteerAgent):
+        def steer(self, text: str) -> bool:
+            assert super().steer(text)
+            leftover = self._pending_steer
+            self._pending_steer = None
+            assert leftover is not None
+            sess = session_ref["session"]
+            snapshot = server._take_steered_completion_snapshot(sess, leftover)
+            with sess["history_lock"]:
+                server._enqueue_prompt(
+                    sess,
+                    leftover,
+                    None,
+                    on_admitted=lambda: server._ack_steered_completion_ingest(
+                        sess, snapshot
+                    ),
+                )
+                sess["running"] = False
+            assert server._drain_queued_prompt("rid", "sid-leftover", sess)
+            return True
+
+    agent = _LeftoverBarrierAgent()
+    sess = _session(running=True, agent=agent)
+    session_ref["session"] = sess
+    event = _completion("proc-publish-leftover", 0, "echo leftover")
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        server,
+        "_mark_completion_events_consumed",
+        lambda events: marked.extend(evt["session_id"] for evt in events),
+    )
+
+    assert server._deliver_completions_via_steer("sid-leftover", sess, [event], set())
+    assert marked == [event["session_id"]]
+    assert sess.get("_completion_pending") == []
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["false", "raises"])
+def test_failed_steer_rolls_back_only_its_publication(monkeypatch, raises):
+    prior = _completion("proc-prior", 0, "echo prior")
+    later = _completion("proc-later", 0, "echo later")
+    event = _completion("proc-failed-publication", 0, "echo failed")
+    session_ref = {}
+
+    class _FailingAgent(_SteerAgent):
+        def steer(self, text: str) -> bool:
+            assert getattr(self, "_completion_steer_guards", False)
+            sess = session_ref["session"]
+            with sess["history_lock"]:
+                sess["_completion_pending"].append(later)
+            if raises:
+                raise RuntimeError("injected steer failure")
+            return False
+
+    sess = _session(running=True, agent=_FailingAgent(), _completion_pending=[prior])
+    session_ref["session"] = sess
+    marked: list[str] = []
+    monkeypatch.setattr(
+        server,
+        "_mark_completion_events_consumed",
+        lambda events: marked.extend(evt["session_id"] for evt in events),
+    )
+
+    assert not server._deliver_completions_via_steer("sid-failed", sess, [event], set())
+    assert [item["session_id"] for item in sess["_completion_pending"]] == [
+        prior["session_id"],
+        later["session_id"],
+    ]
+    assert marked == []
 
 
 def test_leftover_ack_does_not_consume_later_steer():

@@ -7,6 +7,8 @@ import threading
 import time
 import types
 from collections.abc import Callable
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools.process_registry import process_registry
 from tui_gateway import server
@@ -802,3 +804,126 @@ def test_leftover_ack_toctou_does_not_consume_later_steer():
     finally:
         process_registry._completion_consumed.discard("proc_race_a")
         process_registry._completion_consumed.discard("proc_race_b")
+
+
+def test_pre_api_completion_ingest_acks_only_inserted_snapshot(tmp_path, monkeypatch):
+    """The real conversation loop ACKs only the completion inserted before API."""
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            session_id="pre-api-ack-test",
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            provider="openai-compat",
+            model="test/model",
+            max_iterations=2,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent._cached_system_prompt = "stable test prompt"
+    agent._session_db = None
+    agent._session_json_enabled = False
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    agent._cleanup_task_resources = lambda *_a, **_kw: None
+    agent._save_trajectory = lambda *_a, **_kw: None
+
+    sess = _session(running=True, agent=agent)
+    first = _completion("proc_pre_api_a", 0, "echo a")
+    later = _completion("proc_pre_api_b", 0, "echo b")
+    no_tool = _completion("proc_pre_api_no_tool", 0, "echo no-tool")
+    ids = {evt["session_id"] for evt in (first, later, no_tool)}
+    process_registry._completion_consumed.difference_update(ids)
+    marked: list[str] = []
+    original_mark = server._mark_completion_events_consumed
+
+    def record_mark(events):
+        marked.extend(evt["session_id"] for evt in events)
+        original_mark(events)
+
+    monkeypatch.setattr(server, "_mark_completion_events_consumed", record_mark)
+    original_ack = server._ack_steered_completion_ingest
+    ack_calls = 0
+
+    def ack_with_concurrent_later(session, snapshot=None):
+        nonlocal ack_calls
+        ack_calls += 1
+        if ack_calls == 1:
+            assert server._deliver_completions_via_steer(
+                "sid_pre_api", sess, [later], set()
+            )
+        original_ack(session, snapshot)
+
+    monkeypatch.setattr(server, "_ack_steered_completion_ingest", ack_with_concurrent_later)
+    seen_requests: list[list[dict]] = []
+
+    def response(content: str, finish_reason: str):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content, tool_calls=None),
+                    finish_reason=finish_reason,
+                )
+            ],
+            model="test/model",
+            usage=None,
+        )
+
+    def model_call(kwargs):
+        seen_requests.append(kwargs["messages"])
+        if len(seen_requests) == 1:
+            assert server._deliver_completions_via_steer(
+                "sid_pre_api", sess, [first], set()
+            )
+            return response("partial", "length")
+        return response("done", "stop")
+
+    agent._interruptible_api_call = model_call
+    history = [
+        {"role": "user", "content": "run a tool"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "content": "prior output", "tool_call_id": "tc1"},
+    ]
+
+    try:
+        result = agent.run_conversation("continue", conversation_history=history)
+
+        assert len(seen_requests) == 2
+        provider_text = str(seen_requests[1])
+        assert "proc_pre_api_a" in provider_text
+        assert "proc_pre_api_b" not in provider_text
+        assert marked.count("proc_pre_api_a") == 1
+        assert "proc_pre_api_a" in process_registry._completion_consumed
+        assert "proc_pre_api_b" not in process_registry._completion_consumed
+        assert [
+            evt["session_id"] for evt in sess.get("_completion_pending") or []
+        ] == ["proc_pre_api_b"]
+        assert "proc_pre_api_b" in result.get("pending_steer", "")
+
+        assert server._deliver_completions_via_steer(
+            "sid_pre_api", sess, [no_tool], set()
+        )
+        agent._apply_pending_steer_to_tool_results(
+            [{"role": "user", "content": "no tool result"}], 1
+        )
+        assert "proc_pre_api_no_tool" in agent._pending_steer
+        assert "proc_pre_api_no_tool" not in process_registry._completion_consumed
+    finally:
+        process_registry._completion_consumed.difference_update(ids)

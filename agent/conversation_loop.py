@@ -2172,6 +2172,7 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    loop_timing_persisted = False
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -2750,9 +2751,10 @@ def run_conversation(
 
         # Timing is hidden system metadata. Append after cache planning so the
         # new block never receives a breakpoint, then persist it for the next
-        # cycle's stable historical prefix.
+        # cycle's stable historical prefix. The local guard spans inner tool /
+        # retry continuations but resets for each outer run_conversation call.
         _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
-        if _loop_timing_text:
+        if _loop_timing_text and not loop_timing_persisted:
             _loop_timing_text = _drop_redundant_previous_loop_start(
                 _loop_timing_text, messages
             )
@@ -2764,6 +2766,7 @@ def run_conversation(
                     "display_kind": "hidden",
                 }
             )
+            loop_timing_persisted = True
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it

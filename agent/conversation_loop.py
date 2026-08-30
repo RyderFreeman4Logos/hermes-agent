@@ -2754,7 +2754,14 @@ def run_conversation(
         # cycle's stable historical prefix. The local guard spans inner tool /
         # retry continuations but resets for each outer run_conversation call.
         _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
-        if _loop_timing_text and not loop_timing_persisted:
+        if _loop_timing_text and (
+            not loop_timing_persisted
+            or not any(
+                message.get("role") == "system"
+                and message.get("content") == _loop_timing_text
+                for message in messages
+            )
+        ):
             _loop_timing_text = _drop_redundant_previous_loop_start(
                 _loop_timing_text, messages
             )

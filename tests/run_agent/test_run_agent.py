@@ -4144,6 +4144,9 @@ class TestRunConversation:
             )
             result = agent.run_conversation("search something")
         mock_compress.assert_called_once()
+        assert any(
+            message["role"] == "tool" for message in mock_compress.call_args.args[0]
+        )
         assert result["final_response"] == "All done"
         assert result["completed"] is True
 

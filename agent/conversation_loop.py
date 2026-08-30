@@ -250,20 +250,22 @@ def _standard_child_has_successful_llm_request(agent) -> bool:
 
 
 def _standard_child_can_fallback(
-    agent, *, rate_limited: bool = False, terminal_quota: bool = False
+    agent, *, rate_limited: bool = False, terminal_quota: bool = False, billing: bool = False
 ) -> bool:
-    """Permit only pre-success 429 fallback for standard-profile children."""
+    """Permit pre-success 429 or billing fallback for standard children."""
     if not _is_standard_profile_child(agent):
         return True
     return (
-        (rate_limited or terminal_quota)
+        (rate_limited or terminal_quota or billing)
         and not _standard_child_has_successful_llm_request(agent)
     )
 
 
 def _standard_child_fallback_reason(agent, reason, *, terminal_quota: bool = False):
-    """Map the terminal quota case onto the shared standard-child guard."""
-    if _is_standard_profile_child(agent) and terminal_quota:
+    """Map standard-child billing/quota failures to the shared rate-limit gate."""
+    if _is_standard_profile_child(agent) and (
+        terminal_quota or reason == FailoverReason.billing
+    ):
         return FailoverReason.rate_limit
     return reason
 
@@ -5817,6 +5819,7 @@ def run_conversation(
                             FailoverReason.upstream_rate_limit,
                         },
                         terminal_quota=_terminal_quota_429,
+                        billing=classified.reason == FailoverReason.billing,
                     )
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):
@@ -5889,6 +5892,7 @@ def run_conversation(
                             FailoverReason.upstream_rate_limit,
                         },
                         terminal_quota=_terminal_quota_429,
+                        billing=classified.reason == FailoverReason.billing,
                     )
                 ):
                     retry_count = max_retries
@@ -6517,7 +6521,13 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
-                if is_client_error and not _is_standard_profile_child(agent):
+                if is_client_error and (
+                    not _is_standard_profile_child(agent)
+                    or (
+                        classified.reason == FailoverReason.billing
+                        and _standard_child_can_fallback(agent, billing=True)
+                    )
+                ):
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /
@@ -6558,8 +6568,17 @@ def run_conversation(
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if (
-                        _standard_child_can_fallback(agent)
-                        and agent._try_activate_fallback()
+                        _standard_child_can_fallback(
+                            agent,
+                            billing=classified.reason == FailoverReason.billing,
+                        )
+                        and agent._try_activate_fallback(
+                            reason=_standard_child_fallback_reason(
+                                agent,
+                                classified.reason,
+                                terminal_quota=_terminal_quota_429,
+                            )
+                        )
                     ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -6787,6 +6806,7 @@ def run_conversation(
                                 FailoverReason.upstream_rate_limit,
                             },
                             terminal_quota=_terminal_quota_429,
+                            billing=classified.reason == FailoverReason.billing,
                         )
                         and agent._try_activate_fallback(
                             reason=_standard_child_fallback_reason(

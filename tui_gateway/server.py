@@ -9712,6 +9712,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    on_admitted: Callable[[], None] | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -9740,6 +9741,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if on_admitted is not None:
+        queued["_on_admitted"] = [on_admitted]
     existing = session.get("queued_prompt")
     if (
         existing
@@ -9751,6 +9754,7 @@ def _enqueue_prompt(
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        existing.setdefault("_on_admitted", []).extend(queued.get("_on_admitted", []))
         return
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
@@ -10008,6 +10012,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session.pop("queued_prompts", None)
             session["running"] = False
             return True
+    admitted = False
     dispatch_failed = False
     try:
         if use_compute_host:
@@ -10031,24 +10036,27 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
+            else:
+                admitted = True
         else:
             if queued.get("image_paths"):
-                _run_prompt_submit(
+                admitted = _run_prompt_submit(
                     rid,
                     sid,
                     session,
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
-                )
+                ) is True
             else:
-                _run_prompt_submit(
+                admitted = _run_prompt_submit(
                     rid,
                     sid,
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
-                )
+                ) is True
+            dispatch_failed = not admitted
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -10058,6 +10066,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         with session["history_lock"]:
             session["running"] = False
         dispatch_failed = True
+    if admitted:
+        for callback in queued.get("_on_admitted", []):
+            callback()
     if dispatch_failed:
         with session["history_lock"]:
             drain_next = bool(session.get("queued_prompt")) and not session.get(
@@ -11684,17 +11695,43 @@ def _filter_routine_delegated_child_completions(events: list) -> list:
     return visible
 
 
-def _ack_steered_completion_ingest(session: dict) -> None:
-    """ACK staged completions only after leftover enqueue or equivalent ingest."""
+def _take_steered_completion_snapshot(session: dict, text: str) -> list:
+    """Make the staged completions carried by ``text`` fresh until admission."""
+    selected = []
+    with session["history_lock"]:
+        for evt in session.get("_completion_pending") or []:
+            event_sid = str(evt.get("session_id") or "")
+            if (
+                evt.get("_steer_accepted")
+                and event_sid
+                and f" {event_sid} " in f" {text} "
+            ):
+                evt.pop("_steer_accepted", None)
+                selected.append(evt)
+    return selected
+
+
+def _ack_steered_completion_ingest(session: dict, snapshot: list | None = None) -> None:
+    """ACK staged completions only after leftover or tool-result admission."""
     with session["history_lock"]:
         live = str(getattr(session.get("agent"), "_pending_steer", None) or "")
         pending = list(session.get("_completion_pending") or [])
         accepted = []
         keep = []
+        snapshot_keys = (
+            {_notification_event_dedup_key(evt) for evt in snapshot}
+            if snapshot is not None
+            else None
+        )
         for evt in pending:
             sid = evt.get("session_id")
+            if snapshot_keys is not None:
+                if _notification_event_dedup_key(evt) in snapshot_keys:
+                    accepted.append(evt)
+                else:
+                    keep.append(evt)
             # Still only on the live steer rail — not in this ingest snapshot.
-            if evt.get("_steer_accepted") and sid and live and f" {sid} " in f" {live} ":
+            elif evt.get("_steer_accepted") and sid and live and f" {sid} " in f" {live} ":
                 keep.append(evt)
             elif evt.get("_steer_accepted"):
                 accepted.append(evt)
@@ -11744,50 +11781,110 @@ def _format_completion_batch(events: list) -> str:
     return "[IMPORTANT: " + "\n".join(lines) + "]"
 
 
-def _submit_process_notification_turn(sid: str, session: dict, evt: dict, text: str) -> bool:
-    """Claim + one agent turn for a process notification (single or batch text)."""
-    rid = f"__notif__{int(time.time() * 1000)}"
+def _notification_delivery_is_pending(evt: dict) -> bool:
+    if evt.get("type") != "async_delegation":
+        return True
+    try:
+        from tools.async_delegation import get_durable_delegation
+
+        durable = get_durable_delegation(str(evt.get("delegation_id") or ""))
+    except Exception as exc:
+        print(
+            f"[tui_gateway] completion delivery state lookup failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return True
+    return durable is None or durable.get("delivery_state") == "pending"
+
+
+def _deliver_claimed_notification_turn(
+    sid: str,
+    session: dict,
+    claimed: list[tuple[dict, str]],
+    text: str,
+    *,
+    rid: str | None = None,
+) -> list:
+    """Admit then settle a claimed batch; return only retryable members."""
+    rid = rid or f"__notif__{int(time.time() * 1000)}"
     from tools.async_delegation import (
-        claim_event_delivery,
+        complete_completion_delivery,
         complete_event_delivery,
         release_event_delivery,
     )
 
-    _claim = claim_event_delivery(evt, "tui-poller")
-    if _claim is None:
-        with session["history_lock"]:
-            session["running"] = False
-        return False
+    failed = False
+    error = None
     try:
         _emit("message.start", sid)
-        if evt.get("type") == "async_delegation":
+        display_evt = claimed[0][0] if len(claimed) == 1 else None
+        if display_evt is not None and display_evt.get("type") == "async_delegation":
             accepted = _run_prompt_submit(
                 rid,
                 sid,
                 session,
                 text,
                 display_kind="async_delegation_complete",
-                display_metadata=_async_delegation_display_metadata(evt),
+                display_metadata=_async_delegation_display_metadata(display_evt),
             )
         else:
-            accepted = _run_prompt_submit(
-                rid, sid, session, text
-            )
-        if accepted is False:
-            release_event_delivery(evt, _claim)
-            return False
-        complete_event_delivery(evt, _claim)
-        return True
+            accepted = _run_prompt_submit(rid, sid, session, text)
+        if accepted is not True:
+            failed = True
+        else:
+            for evt, claim in claimed:
+                if evt.get("type") == "async_delegation":
+                    settled = complete_completion_delivery(
+                        str(evt.get("delegation_id") or ""), claim
+                    )
+                else:
+                    complete_event_delivery(evt, claim)
+                    settled = True
+                if not settled:
+                    failed = True
     except Exception as exc:
-        release_event_delivery(evt, _claim)
+        failed = True
+        error = exc
+
+    if not failed:
+        return []
+
+    retry = []
+    for evt, claim in claimed:
+        if not _notification_delivery_is_pending(evt):
+            continue
+        try:
+            release_event_delivery(evt, claim)
+        except Exception as exc:
+            print(
+                f"[tui_gateway] completion delivery release failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        if _notification_delivery_is_pending(evt):
+            retry.append(evt)
+    if error is not None:
         print(
-            f"[tui_gateway] notification poller dispatch failed: "
-            f"{type(exc).__name__}: {exc}",
+            f"[tui_gateway] completion notification dispatch failed: "
+            f"{type(error).__name__}: {error}",
             file=sys.stderr,
         )
+    with session["history_lock"]:
+        session["running"] = False
+    return retry
+
+
+def _submit_process_notification_turn(sid: str, session: dict, evt: dict, text: str) -> bool:
+    """Claim + one agent turn for a process notification (single or batch text)."""
+    from tools.async_delegation import claim_event_delivery
+
+    claim = claim_event_delivery(evt, "tui-poller")
+    if claim is None:
         with session["history_lock"]:
             session["running"] = False
         return False
+    return not _deliver_claimed_notification_turn(sid, session, [(evt, claim)], text)
 
 
 def _session_can_steer_completions(session: dict) -> bool:
@@ -12411,36 +12508,9 @@ def _notification_poller_loop(
             time.sleep(0.25)
             continue
 
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        if not _submit_process_notification_turn(sid, session, evt, text):
+            process_registry.requeue_completion_front(evt)
+            time.sleep(0.25)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -12493,36 +12563,8 @@ def _notification_poller_loop(
                 break
             session["running"] = True
 
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        if not _submit_process_notification_turn(sid, session, evt, text):
+            deferred.append(evt)
 
     # One batch for any completions that arrived while busy / on drain.
     # If the session is still running, leave them on the session so a later
@@ -13746,8 +13788,22 @@ def _run_prompt_submit(
         # both texts.
         _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
         if isinstance(_leftover_steer, str) and _leftover_steer.strip():
+            _leftover_completion_snapshot = _take_steered_completion_snapshot(
+                session, _leftover_steer
+            )
             with session["history_lock"]:
-                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+                _enqueue_prompt(
+                    session,
+                    _leftover_steer,
+                    session.get("transport"),
+                    on_admitted=(
+                        lambda: _ack_steered_completion_ingest(
+                            session, _leftover_completion_snapshot
+                        )
+                    ) if _leftover_completion_snapshot else None,
+                )
+        else:
+            _leftover_completion_snapshot = []
         if _drain_queued_prompt(rid, sid, session):
             return
 
@@ -13797,6 +13853,13 @@ def _run_prompt_submit(
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
+            visible_ids = {
+                id(evt)
+                for evt in _filter_routine_delegated_child_completions(
+                    [evt for evt, _synth in drained]
+                )
+            }
+            drained = [pair for pair in drained if id(pair[0]) in visible_ids]
             if drained:
                 with session["history_lock"]:
                     if session.get("running"):
@@ -13806,93 +13869,29 @@ def _run_prompt_submit(
                     else:
                         session["running"] = True
                 if drained:
-                    from tools.async_delegation import (
-                        claim_event_delivery,
-                        complete_completion_delivery,
-                        complete_event_delivery,
-                        get_durable_delegation,
-                        release_event_delivery,
-                    )
-
-                    def _delivery_is_pending(pending_evt):
-                        if pending_evt.get("type") != "async_delegation":
-                            return True
-                        try:
-                            durable = get_durable_delegation(
-                                str(pending_evt.get("delegation_id") or "")
-                            )
-                        except Exception as _state_exc:
-                            print(
-                                f"[tui_gateway] completion delivery state lookup failed: "
-                                f"{type(_state_exc).__name__}: {_state_exc}",
-                                file=sys.stderr,
-                            )
-                            return True
-                        return durable is None or durable.get("delivery_state") == "pending"
-
-                    def _requeue_if_pending(pending_evt):
-                        if _delivery_is_pending(pending_evt):
-                            process_registry.completion_queue.put(pending_evt)
+                    from tools.async_delegation import claim_event_delivery
 
                     claimed: list[tuple[dict, str, str]] = []
                     for pending_evt, pending_synth in drained:
                         claim = claim_event_delivery(pending_evt, "tui-post-turn")
                         if claim is None:
-                            if pending_evt.get("type") == "async_delegation":
-                                _requeue_if_pending(pending_evt)
+                            if _notification_delivery_is_pending(pending_evt):
+                                process_registry.completion_queue.put(pending_evt)
                             continue
                         claimed.append((pending_evt, claim, pending_synth))
                     if not claimed:
                         with session["history_lock"]:
                             session["running"] = False
                     else:
-                        _settlement_failed = False
-                        _settlement_error = None
-                        try:
-                            _emit("message.start", sid)
-                            _run_prompt_submit(
-                                rid,
-                                sid,
-                                session,
-                                "\n\n".join(
-                                    pending_synth
-                                    for _pending_evt, _claim, pending_synth in claimed
-                                ),
-                            )
-                            for pending_evt, claim, _pending_synth in claimed:
-                                if pending_evt.get("type") == "async_delegation":
-                                    settled = complete_completion_delivery(
-                                        str(pending_evt.get("delegation_id") or ""),
-                                        claim,
-                                    )
-                                else:
-                                    complete_event_delivery(pending_evt, claim)
-                                    settled = True
-                                if not settled:
-                                    _settlement_failed = True
-                        except Exception as _n_exc:
-                            _settlement_failed = True
-                            _settlement_error = _n_exc
-                        if _settlement_failed:
-                            for pending_evt, claim, _pending_synth in claimed:
-                                if _delivery_is_pending(pending_evt):
-                                    try:
-                                        release_event_delivery(pending_evt, claim)
-                                    except Exception as _release_exc:
-                                        print(
-                                            f"[tui_gateway] completion delivery release failed: "
-                                            f"{type(_release_exc).__name__}: {_release_exc}",
-                                            file=sys.stderr,
-                                        )
-                                _requeue_if_pending(pending_evt)
-                            if _settlement_error is not None:
-                                print(
-                                    f"[tui_gateway] completion notification dispatch failed: "
-                                    f"{type(_settlement_error).__name__}: {_settlement_error}",
-                                    file=sys.stderr,
-                                )
-                            with session["history_lock"]:
-                                session["running"] = False
+                        retry = _deliver_claimed_notification_turn(
+                            sid,
+                            session,
+                            [(evt, claim) for evt, claim, _synth in claimed],
+                            "\n\n".join(synth for _evt, _claim, synth in claimed),
+                            rid=rid,
+                        )
+                        for pending_evt in retry:
+                            process_registry.completion_queue.put(pending_evt)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

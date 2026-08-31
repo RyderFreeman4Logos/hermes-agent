@@ -138,6 +138,9 @@ def _record_codex_app_server_usage(
             # Consume the marker so a later unrelated reading is not charged to
             # it and preflight deferral cannot stay latched indefinitely.
             compressor.update_from_response({})
+        # This terminal turn has no accepted usage record. Do not let its
+        # compaction boundary label a later unrelated provider response.
+        agent._awaiting_cache_usage_after_compression = False
         if agent._session_db and agent.session_id:
             try:
                 if not agent._session_db_created:

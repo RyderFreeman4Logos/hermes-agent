@@ -288,6 +288,22 @@ class TestRunConversationCodexPath:
             agent.run_conversation("following turn")
         assert "cache_attribution" not in agent._first_turn_usage
 
+    def test_explicit_compact_without_usage_clears_cache_attribution(self):
+        class FakeSession:
+            def compact_thread(self):
+                return TurnResult(
+                    thread_id="thread-compact-1",
+                    turn_id="turn-compact-no-usage",
+                )
+
+        agent = _make_codex_agent()
+        agent._codex_session = FakeSession()
+
+        agent._compress_context([], "system", force=True)
+
+        assert agent.context_compressor.awaiting_real_usage_after_compression is False
+        assert agent._awaiting_cache_usage_after_compression is False
+
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()
         with patch.object(agent, "_spawn_background_review", return_value=None):

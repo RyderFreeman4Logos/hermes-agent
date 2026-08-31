@@ -195,25 +195,16 @@ class CheckpointContextEngine(ContextEngine):
 
     def _plan_map_shards(self, messages: Sequence[Mapping[str, Any]]) -> tuple[tuple[int, ...], ...]:
         groups = tuple((i,) for i, message in enumerate(messages) if self._is_map_source(message))
+        if len(groups) > self.max_map_shards:
+            raise CheckpointRejected("Map plan exceeds configured shard limit")
         if self.policy is StructuredOutputPolicy.REQUIRED:
-            shards: list[tuple[int, ...]] = []
             for group in groups:
                 if self._estimate_map_output_tokens(messages, group) > self.effective_map_output_tokens:
                     raise CheckpointRejected(
                         "causal Map group exceeds effective Map output cap "
                         f"({self.effective_map_output_tokens})"
                     )
-                shards.append(group)
-            if len(shards) > self.max_map_shards:
-                raise CheckpointRejected("Map plan exceeds configured shard limit")
-            return tuple(shards)
-        size = max(1, (len(groups) + self.max_map_shards - 1) // self.max_map_shards)
-        shards: list[tuple[int, ...]] = []
-        for n in range(0, len(groups), size):
-            indices = tuple(i for group in groups[n:n + size] for i in group)
-            if indices:
-                shards.append(indices)
-        return tuple(shards[:self.max_map_shards])
+        return groups
 
     def _map_payload(
         self, messages: Sequence[Mapping[str, Any]], event_ids: Sequence[int],

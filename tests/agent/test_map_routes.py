@@ -111,6 +111,49 @@ def test_map_parser_rejects_model_owned_identity_fields():
         )
 
 
+@pytest.mark.parametrize("policy", ("preferred", "disabled"))
+def test_nonrequired_map_rejects_shard_limit_before_building_multi_source_request(policy):
+    calls = []
+    messages = [
+        {"role": "user", "content": "first source", "_row_id": 1},
+        {"role": "assistant", "content": "second source", "_row_id": 2},
+    ]
+    engine = CheckpointContextEngine(
+        {"mode": "live", "structured_output": policy, "max_map_shards": 1},
+        map_caller=calls.append,
+    )
+
+    assert engine.compress(messages) is messages
+    assert engine.last_rejection == "Map plan exceeds configured shard limit"
+    assert calls == []
+
+
+@pytest.mark.parametrize("policy", ("preferred", "disabled"))
+def test_nonrequired_map_uses_singleton_requests_when_shard_limit_allows(policy):
+    requests = []
+
+    def caller(request):
+        requests.append(request)
+        payload = json.loads(request["messages"][0]["content"])
+        assert len(payload["messages"]) == 1
+        assert "event_index" not in json.dumps(request)
+        return {"facts": []}
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "structured_output": policy, "max_map_shards": 2}, map_caller=caller,
+    )
+
+    messages = [
+        {"role": "user", "content": "first source", "_row_id": 1},
+        {"role": "assistant", "content": "second source", "_row_id": 2},
+    ]
+    result = engine.compress(messages)
+
+    assert result is not messages
+    assert engine.last_rejection is None
+    assert len(requests) == 2
+
+
 def test_required_map_hides_externalized_artifact_identity_from_model():
     requests = []
 

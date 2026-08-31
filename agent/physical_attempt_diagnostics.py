@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -298,6 +299,8 @@ def _append(record: dict[str, Any]) -> None:
     with _LOCK:
         fd = _private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
         try:
+            # ponytail: one sink lock; shard diagnostics only if write throughput matters.
+            fcntl.flock(fd, fcntl.LOCK_EX)
             if os.fstat(fd).st_size + len(payload) > _MAX_RECORDS_BYTES:
                 os.ftruncate(fd, 0)
             os.write(fd, payload)

@@ -2021,6 +2021,14 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        "checkpoint": {
+            "mode": "shadow",
+            "trace": False,
+            "target_wire_tokens": 48000,
+            "hard_max_wire_tokens": 60000,
+            "map_concurrency": 2,
+            "max_map_shards": 32,
+        },
         # Return freed glibc allocator pages after long-running agent/TUI
         # cleanup boundaries. Unsupported platforms are safe no-ops.
         "memory_trim": {

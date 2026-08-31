@@ -3,7 +3,37 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import threading
+from multiprocessing.synchronize import Barrier, Event
+from pathlib import Path
 from types import SimpleNamespace
+
+
+def _concurrent_capped_append(
+    root: str, start: Event, size_barrier: Barrier,
+) -> None:
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    diagnostics.get_hermes_home = lambda: Path(root)
+    diagnostics._MAX_RECORDS_BYTES = 1024
+    original_fstat = diagnostics.os.fstat
+    calls = 0
+
+    def synchronize_pre_write_size(fd: int):
+        nonlocal calls
+        calls += 1
+        info = original_fstat(fd)
+        if calls == 2:
+            try:
+                size_barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return info
+
+    diagnostics.os.fstat = synchronize_pre_write_size
+    start.wait(5)
+    diagnostics._append({"value": "x" * 900})
 
 
 def _config(enabled: bool) -> dict[str, object]:
@@ -329,6 +359,29 @@ def test_enabled_diagnostics_work_without_posix_uid_apis(monkeypatch, tmp_path):
         ).read_text(encoding="utf-8").splitlines()
     ]
     assert [record["phase"] for record in records] == ["attempt", "attempt", "pair"]
+
+
+def test_retention_stays_bounded_across_processes(tmp_path):
+    (tmp_path / "observability").mkdir(mode=0o700)
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    size_barrier = context.Barrier(8, timeout=2)
+    processes = [
+        context.Process(
+            target=_concurrent_capped_append,
+            args=(str(tmp_path), start, size_barrier),
+        )
+        for _ in range(8)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+
+    records_path = tmp_path / "observability" / "physical_attempt_digests.jsonl"
+    assert records_path.stat().st_size <= 1024
 
 
 def test_retention_stays_bounded_for_unique_correlations_and_records(

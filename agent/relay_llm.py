@@ -10,7 +10,7 @@ import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 from agent import relay_runtime
 
@@ -24,25 +24,6 @@ def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -
         remember_sent_request(request, api_mode=api_mode)
     except Exception:
         logger.debug("cache low-hit remember failed", exc_info=True)
-
-
-_cache_capture_module = globals().get("cache_request_capture")
-_capture_provider_request = getattr(
-    _cache_capture_module, "capture_provider_request", None
-)
-if callable(_capture_provider_request):
-    capture_provider_request = cast(Callable[..., None], _capture_provider_request)
-    _cache_capture_module = cast(Any, _cache_capture_module)
-
-    def _capture_provider_request_with_lowhit(
-        request: dict[str, Any], **kwargs: Any
-    ) -> None:
-        _remember_lowhit_transport_request(
-            request, str(kwargs.get("api_mode") or "unknown")
-        )
-        capture_provider_request(request, **kwargs)
-
-    _cache_capture_module.capture_provider_request = _capture_provider_request_with_lowhit
 
 
 _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
@@ -111,6 +92,9 @@ def execute(
     """Run one non-streaming physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
+        _remember_lowhit_transport_request(
+            request, str((metadata or {}).get("api_mode") or "unknown")
+        )
         return callback(request)
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
@@ -143,6 +127,9 @@ def execute(
                 relay_request_body=relay_request_body,
                 codec_baseline_body=codec_baseline_body,
                 metadata=metadata,
+            )
+            _remember_lowhit_transport_request(
+                final_request, str((metadata or {}).get("api_mode") or "unknown")
             )
             raw = callback_context.copy().run(guarded, final_request)
         except BaseException as exc:
@@ -203,6 +190,9 @@ async def execute_async(
     """Run one asynchronous physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
+        _remember_lowhit_transport_request(
+            request, str((metadata or {}).get("api_mode") or "unknown")
+        )
         return await callback(request)
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
@@ -228,6 +218,9 @@ async def execute_async(
                 relay_request_body=relay_request_body,
                 codec_baseline_body=codec_baseline_body,
                 metadata=metadata,
+            )
+            _remember_lowhit_transport_request(
+                final_request, str((metadata or {}).get("api_mode") or "unknown")
             )
             async def call_provider() -> Any:
                 # Nested relay calls inside a managed provider callback must
@@ -295,6 +288,9 @@ def execute_current(
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
+        _remember_lowhit_transport_request(
+            request, str((metadata or {}).get("api_mode") or "unknown")
+        )
         return callback(request)
     return execute(
         request,
@@ -319,6 +315,9 @@ async def execute_current_async(
     """Run an async provider attempt under the inherited turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
+        _remember_lowhit_transport_request(
+            request, str((metadata or {}).get("api_mode") or "unknown")
+        )
         return await callback(request)
     return await execute_async(
         request,
@@ -369,6 +368,9 @@ def stream_current(
     """
     turn = relay_runtime.active_turn()
     if turn is None:
+        _remember_lowhit_transport_request(
+            request, str((metadata or {}).get("api_mode") or "unknown")
+        )
         return stream_factory(request)
     if _has_running_event_loop():
         # Managed provider callbacks execute on the Relay session's event
@@ -380,6 +382,9 @@ def stream_current(
         # own completed_response_predicate traps a completed response (e.g.
         # the MoA facade's auxiliary ``call_llm(stream=True)`` returning a
         # full response when an adapter ignores ``stream=True``).
+        _remember_lowhit_transport_request(
+            request, str((metadata or {}).get("api_mode") or "unknown")
+        )
         return stream_factory(request)
     managed = stream(
         request,
@@ -503,6 +508,9 @@ class ManagedLlmStream(Iterator[Any]):
             or session is None
             or not runtime.managed_execution_enabled()
         ):
+            _remember_lowhit_transport_request(
+                request, str((metadata or {}).get("api_mode") or "unknown")
+            )
             raw_stream = stream_factory(request)
             if completed_response_predicate is not None and completed_response_predicate(
                 raw_stream
@@ -531,15 +539,19 @@ class ManagedLlmStream(Iterator[Any]):
         async def provider_stream(next_request: Any):
             raw_stream = None
             try:
+                final_request = _provider_request(
+                    request,
+                    next_request,
+                    relay_request_body=relay_request_body,
+                    codec_baseline_body=codec_baseline_body,
+                    metadata=metadata,
+                )
+                _remember_lowhit_transport_request(
+                    final_request, str((metadata or {}).get("api_mode") or "unknown")
+                )
                 raw_stream = run_callback(
                     stream_factory,
-                    _provider_request(
-                        request,
-                        next_request,
-                        relay_request_body=relay_request_body,
-                        codec_baseline_body=codec_baseline_body,
-                        metadata=metadata,
-                    )
+                    final_request,
                 )
                 if (
                     completed_response_predicate is not None

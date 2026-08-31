@@ -1563,3 +1563,28 @@ def format_token_count_compact(value: int) -> str:
             return f"{sign}{text}{suffix}"
 
     return f"{value:,}"
+
+
+_normalize_usage_without_lowhit_dump = normalize_usage
+
+
+def _normalize_usage_with_lowhit_dump(
+    response_usage: Any,
+    *,
+    provider: Optional[str] = None,
+    api_mode: Optional[str] = None,
+) -> CanonicalUsage:
+    """Normalize usage and record economically near-zero cache misses."""
+    usage = _normalize_usage_without_lowhit_dump(
+        response_usage, provider=provider, api_mode=api_mode
+    )
+    try:
+        from agent.cache_lowhit_request_dump import maybe_dump_on_usage
+
+        maybe_dump_on_usage(usage)
+    except Exception:
+        logger.debug("cache low-hit dump failed", exc_info=True)
+    return usage
+
+
+normalize_usage = _normalize_usage_with_lowhit_dump

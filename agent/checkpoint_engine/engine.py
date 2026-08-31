@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 from collections.abc import Iterable
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
 from agent.context_engine import ContextEngine
 from .core import (
-    ActiveIntent, CausalGroup, CheckpointGeneration, CheckpointRejected,
+    ActiveIntent, CausalGroup, CheckpointGeneration, CheckpointMapCallRejected, CheckpointRejected,
     ArtifactReference, ContentAddressedArtifacts, DeterministicLanes,
     DurableCheckpointStore, Effect, HostLifecycleEvent, MapDisposition,
-    MapFact, MapResponse, MapShard, ReducedState, StructuredOutputPolicy,
+    MapAttemptRecord, MapFact, MapResponse, MapShard, ReducedState, StructuredOutputPolicy,
     TaskEpoch, ToolExecutionReceipt, ToolReceipt,
     TraceRecord, count_request_tokens, parse_map_response, prepare_provider_request,
 )
@@ -50,6 +51,7 @@ class CheckpointContextEngine(ContextEngine):
         self.last_rejection: str | None = None
         self.last_trace: TraceRecord | None = None
         self._store = store or DurableCheckpointStore()
+        self._store_explicit = store is not None
         self.session_id = session_id
         previous = self._store.generation(session_id)
         self.generation = previous.generation if previous else 0
@@ -60,7 +62,8 @@ class CheckpointContextEngine(ContextEngine):
         self._tool_receipts: tuple[ToolExecutionReceipt, ...] = ()
         self._tool_receipt_lock = Lock()
         self._last_route_attempts: list[str] = []
-        self._last_map_identity: dict[str, Any] = {}
+        self._map_route_attempts: list[str] = []
+        self._map_attempt_records: list[MapAttemptRecord] = []
         self._artifacts = ContentAddressedArtifacts(artifact_root) if artifact_root else None
 
     @property
@@ -78,6 +81,15 @@ class CheckpointContextEngine(ContextEngine):
         self.last_prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
         self.last_total_tokens = int(usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens) or 0)
+
+    def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
+        """Bind the default artifact store beside the durable session DB."""
+        self.session_id = session_id or self.session_id
+        db_path = getattr(session_db, "db_path", None)
+        if not self._store_explicit and db_path:
+            self._store = DurableCheckpointStore(Path(db_path).parent / "checkpoint-artifacts")
+            previous = self._store.generation(self.session_id)
+            self.generation = previous.generation if previous else 0
 
     def should_compress(self, prompt_tokens: int | None = None) -> bool:
         return bool(prompt_tokens is not None and self.threshold_tokens and prompt_tokens >= self.threshold_tokens)
@@ -200,18 +212,22 @@ class CheckpointContextEngine(ContextEngine):
         for route in routes:
             route = dict(route)
             self._last_route_attempts.append(str(route.get("model", route.get("name", "configured"))))
+            self._map_route_attempts.append(self._last_route_attempts[-1])
             if self.policy is StructuredOutputPolicy.REQUIRED and route.get("structured_output") is False:
                 continue
             try:
                 request = prepare_provider_request(prompt, model=route.get("model"), policy=self.policy, schema=MapResponse.schema(), route_capabilities=route)
                 raw = self._map_caller(request)
                 if isinstance(raw, Mapping) and "_checkpoint_identity" in raw:
-                    self._last_map_identity = dict(raw["_checkpoint_identity"] or {})
+                    self._record_map_attempt(raw["_checkpoint_identity"])
                 if isinstance(raw, Mapping) and "content" in raw:
                     raw = raw["content"]
                 elif isinstance(raw, Mapping) and "choices" in raw:
                     raw = raw["choices"][0]["message"]["content"]
                 return parse_map_response(raw, expected_source_event_ids=source_ids, source_events=source_events)
+            except CheckpointMapCallRejected as exc:
+                self._record_map_attempt(exc.identity)
+                last_error = exc
             except (RuntimeError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
                 last_error = exc
         if last_error:
@@ -242,6 +258,26 @@ class CheckpointContextEngine(ContextEngine):
         if self._artifacts is not None:
             self._artifacts.put(content)
         return ArtifactReference(artifact_id, media_type)
+
+    def _record_map_attempt(self, identity: Mapping[str, Any]) -> None:
+        snapshot = identity.get("code_snapshot") if isinstance(identity.get("code_snapshot"), Mapping) else {}
+        def optional_int(value: Any) -> int | None:
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+        self._map_attempt_records.append(MapAttemptRecord(
+            configured_route=identity.get("configured_route") or None,
+            physical_model=identity.get("physical_model") or None,
+            actual_wire_mode=identity.get("actual_wire_mode") or None,
+            fallback_rejection=identity.get("fallback_rejection") or None,
+            input_tokens=optional_int(identity.get("input_tokens")),
+            output_tokens=optional_int(identity.get("output_tokens")),
+            latency_ms=optional_int(identity.get("latency_ms")),
+            finish_reason=identity.get("finish_reason") or None,
+            response_hash=identity.get("response_hash") or None,
+            code_head=snapshot.get("head") or None,
+            code_tree=snapshot.get("tree") or None,
+            dirty=snapshot.get("dirty") if isinstance(snapshot.get("dirty"), bool) else None,
+            dirty_diff_hash=snapshot.get("dirty_diff_hash") or None,
+        ))
 
     def checkpoint_artifact_read(self, artifact_id: str) -> str:
         return self._store.read_artifact(artifact_id)
@@ -316,9 +352,13 @@ class CheckpointContextEngine(ContextEngine):
             self._host_events = tuple(kwargs.get("host_events", self._host_events))
             self._tool_receipts = tuple(kwargs.get("tool_receipts", self._tool_receipts))
             lanes = self._extract_deterministic_lanes(source_messages, tool_receipts=self._tool_receipts)
+            self._map_attempt_records = []
+            self._map_route_attempts = []
             shards = tuple(self._call_map(source_messages, ids) for ids in self._plan_map_shards(source_messages))
             reduced = self._reduce(lanes, shards, source_messages, host_events=self._host_events)
             checkpoint = self._render_checkpoint(reduced)
+            artifact = self.externalize_artifact(checkpoint)
+            reduced = replace(reduced, artifacts=(artifact.artifact_id,))
             candidate = self._projection(source_messages, checkpoint)
             if self._estimate_wire_tokens(candidate) > self.hard_max_wire_tokens:
                 raise CheckpointRejected("projected request exceeds hard wire budget")
@@ -340,29 +380,33 @@ class CheckpointContextEngine(ContextEngine):
                 reduced_hash = hashlib.sha256(json.dumps(asdict(reduced), default=str, sort_keys=True).encode()).hexdigest()
                 prompt_hash = hashlib.sha256(json.dumps(candidate, default=str, sort_keys=True).encode()).hexdigest()
                 schema_hash = hashlib.sha256(json.dumps(MapResponse.schema(), sort_keys=True).encode()).hexdigest()
-                identity = dict(self._last_map_identity)
-                code_snapshot = dict(identity.get("code_snapshot") or {})
-                code_head = str(code_snapshot.get("head", ""))
-                code_tree = str(code_snapshot.get("tree", ""))
-                dirty = bool(code_snapshot.get("dirty", False))
-                dirty_diff_hash = str(code_snapshot.get("dirty_diff_hash", ""))
-                configured_route = str(identity.get("configured_route", ""))
-                physical_model = str(identity.get("physical_model", ""))
+                records = tuple(self._map_attempt_records)
+                identity = records[-1] if records else MapAttemptRecord()
+                code_head, code_tree = identity.code_head or "", identity.code_tree or ""
+                dirty = bool(identity.dirty)
+                dirty_diff_hash = identity.dirty_diff_hash or ""
+                configured_route = identity.configured_route or ""
+                physical_model = identity.physical_model or ""
                 final_request = prepare_provider_request(
                     candidate, model=physical_model or None, policy=StructuredOutputPolicy.DISABLED
                 )
                 identity_complete = bool(
-                    code_head and code_tree and "dirty" in code_snapshot
-                    and "dirty_diff_hash" in code_snapshot and physical_model
-                    and configured_route and identity.get("actual_wire_mode")
-                    and identity.get("response_hash") and identity.get("finish_reason")
+                    code_head and code_tree and dirty_diff_hash and physical_model
+                    and configured_route and records and all(
+                        item.actual_wire_mode == "structured" and not item.fallback_rejection
+                        and item.input_tokens is not None and item.output_tokens is not None
+                        and item.latency_ms is not None and item.finish_reason and item.response_hash
+                        and item.code_head and item.code_tree and item.dirty is not None and item.dirty_diff_hash
+                        for item in records
+                    )
                 )
                 self.last_trace = TraceRecord(
                     self.generation, revision.revision, "auxiliary",
-                    tuple(self._last_route_attempts), self.policy.value, schema_hash,
-                    prompt_hash, reduced_hash, int(identity.get("input_tokens", count_request_tokens(candidate))),
-                    int(identity.get("output_tokens", 0)), int(identity.get("latency_ms", 0)),
-                    str(identity.get("finish_reason", "")), str(identity.get("response_hash", "")),
+                    tuple(self._map_route_attempts), self.policy.value, schema_hash,
+                    prompt_hash, reduced_hash, identity.input_tokens if identity.input_tokens is not None else 0,
+                    identity.output_tokens if identity.output_tokens is not None else 0,
+                    identity.latency_ms if identity.latency_ms is not None else 0,
+                    identity.finish_reason or "", identity.response_hash or "",
                     code_tree, dirty, source="raw_transcript",
                     projection_hash=prompt_hash,
                     artifact_graph_hash=hashlib.sha256(json.dumps(reduced.artifacts, sort_keys=True).encode()).hexdigest(),
@@ -372,12 +416,13 @@ class CheckpointContextEngine(ContextEngine):
                     extractor_hash=hashlib.sha256(b"checkpoint-extractor-v1").hexdigest(),
                     tokens_counting_mode="conservative_4_chars",
                     configured_route=configured_route,
-                    actual_wire_mode=str(identity.get("actual_wire_mode", "")),
-                    fallback_rejection=str(identity.get("fallback_rejection", "")),
+                    actual_wire_mode=identity.actual_wire_mode or "",
+                    fallback_rejection=identity.fallback_rejection or "",
                     final_request_hash=hashlib.sha256(json.dumps(final_request, sort_keys=True, default=str).encode()).hexdigest(),
                     code_head=code_head,
                     dirty_diff_hash=dirty_diff_hash,
                     map_shard_provenance=tuple(shard.source_event_ids for shard in shards),
+                    map_attempt_records=records,
                     execution_identity_complete=identity_complete,
                     benchmark_admissible=identity_complete,
                 )

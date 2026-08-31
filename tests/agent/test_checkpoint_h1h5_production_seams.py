@@ -1,9 +1,11 @@
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.checkpoint_engine import CheckpointContextEngine, DurableCheckpointStore
+from agent.checkpoint_engine import CheckpointContextEngine, CheckpointMapCallRejected, DurableCheckpointStore
+from hermes_state import SessionDB
 
 
 def test_returned_tool_error_emits_failed_checkpoint_receipt(monkeypatch):
@@ -53,6 +55,42 @@ def test_production_auxiliary_map_adapter_reaches_required_structured_route(monk
     assert engine._last_route_attempts == ["map-model"]
 
 
+def test_production_map_does_not_replay_structured_rejection_prompt_only():
+    from agent.agent_init import _build_checkpoint_map_caller
+
+    client = MagicMock()
+    client.base_url = "https://api.openai.com/v1"
+    client.chat.completions.create.side_effect = [
+        RuntimeError("HTTP 400: This response_format type is unavailable now"),
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "schema_version": 1, "source_event_ids": [1], "facts": [],
+            })))],
+            usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
+        ),
+    ]
+    agent = SimpleNamespace(
+        provider="configured-provider", model="configured-model",
+        base_url="https://configured.example/v1", api_key="key", api_mode="chat_completions",
+    )
+    engine = CheckpointContextEngine(
+        {"mode": "live", "map_routes": [{"model": "map-model", "structured_output": True}]},
+        map_caller=_build_checkpoint_map_caller(agent),
+    )
+
+    with (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("openai-codex", "map-model", None, None, None)),
+        patch("agent.auxiliary_client._get_cached_client", return_value=(client, "map-model")),
+        patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda response, *_a, **_k: response),
+    ):
+        result = engine.compress([{"role": "user", "content": "source", "_row_id": 1}])
+
+    assert client.chat.completions.create.call_count == 1, client.chat.completions.create.call_args_list
+    assert result == [{"role": "user", "content": "source", "_row_id": 1}]
+    assert "response_format" in client.chat.completions.create.call_args.kwargs["extra_body"]
+
+
 def test_parser_rejects_model_text_without_evidence_and_uses_host_span_text():
     from agent.checkpoint_engine import parse_map_response
 
@@ -84,6 +122,74 @@ def test_compress_kwargs_cannot_make_trace_benchmark_admissible():
     assert engine.last_trace.benchmark_admissible is False
 
 
+def test_trace_requires_every_map_attempt_to_be_complete_and_structured():
+    attempts = iter([
+        {
+            "content": {"schema_version": 1, "source_event_ids": [1], "facts": []},
+            "_checkpoint_identity": {
+                "configured_route": "first", "physical_model": "m1",
+                "actual_wire_mode": "prompt_only", "fallback_rejection": "response_format rejected",
+                "input_tokens": 3, "output_tokens": 2, "latency_ms": 4,
+                "finish_reason": "stop", "response_hash": "first",
+                "code_snapshot": {"head": "h", "tree": "t", "dirty": False, "dirty_diff_hash": "d"},
+            },
+        },
+        {
+            "content": {"schema_version": 1, "source_event_ids": [2], "facts": []},
+            "_checkpoint_identity": {
+                "configured_route": "last", "physical_model": "m2",
+                "actual_wire_mode": "structured", "fallback_rejection": "",
+                "input_tokens": None, "output_tokens": 2, "latency_ms": None,
+                "finish_reason": "stop", "response_hash": "last",
+                "code_snapshot": {"head": "h", "tree": "t", "dirty": False, "dirty_diff_hash": "d"},
+            },
+        },
+    ])
+    engine = CheckpointContextEngine(
+        {"mode": "live", "trace": True, "max_map_shards": 2}, map_caller=lambda _request: next(attempts),
+    )
+    engine.compress([
+        {"role": "user", "content": "first", "_row_id": 1},
+        {"role": "assistant", "content": "second", "_row_id": 2},
+    ])
+
+    assert engine.last_trace is not None
+    assert len(engine.last_trace.map_attempt_records) == 2
+    assert engine.last_trace.execution_identity_complete is False
+    assert engine.last_trace.benchmark_admissible is False
+
+
+def test_rejected_physical_route_is_retained_when_next_structured_route_succeeds():
+    identity = {
+        "configured_route": "rejected", "physical_model": "m1", "actual_wire_mode": "structured",
+        "fallback_rejection": "response_format rejected", "input_tokens": None, "output_tokens": None,
+        "latency_ms": 1, "finish_reason": None, "response_hash": None,
+        "code_snapshot": {"head": "h", "tree": "t", "dirty": False, "dirty_diff_hash": "d"},
+    }
+    calls = 0
+
+    def caller(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise CheckpointMapCallRejected(identity, RuntimeError("response_format rejected"))
+        return {"content": {"schema_version": 1, "source_event_ids": [1], "facts": []}, "_checkpoint_identity": {
+            **identity, "configured_route": "second", "physical_model": "m2",
+            "fallback_rejection": None, "input_tokens": 3, "output_tokens": 2,
+            "finish_reason": "stop", "response_hash": "ok",
+        }}
+
+    engine = CheckpointContextEngine({"mode": "live", "trace": True, "map_routes": [
+        {"model": "m1", "structured_output": True}, {"model": "m2", "structured_output": True},
+    ]}, map_caller=caller)
+    engine.compress([{"role": "user", "content": "source", "_row_id": 1}])
+
+    assert engine.last_trace is not None
+    assert engine.last_trace.route_attempts == ("m1", "m2")
+    assert len(engine.last_trace.map_attempt_records) == 2
+    assert engine.last_trace.benchmark_admissible is False
+
+
 def test_artifact_recovery_is_advertised_dispatched_and_reloaded(tmp_path):
     store = DurableCheckpointStore(tmp_path)
     engine = CheckpointContextEngine({"mode": "live"}, store=store, session_id="s")
@@ -96,3 +202,22 @@ def test_artifact_recovery_is_advertised_dispatched_and_reloaded(tmp_path):
 
     reloaded = CheckpointContextEngine({"mode": "live"}, store=DurableCheckpointStore(tmp_path), session_id="s")
     assert reloaded.checkpoint_artifact_read(artifact.artifact_id) == "durable artifact"
+
+
+def test_production_bound_store_persists_compaction_artifact_across_restore(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    map_caller = lambda request: {
+        "schema_version": 1,
+        "source_event_ids": json.loads(request["messages"][0]["content"])["source_event_ids"],
+        "facts": [],
+    }
+    first = CheckpointContextEngine({"mode": "live"}, session_id="s", map_caller=map_caller)
+    first.bind_session_state(db, "s")
+    first.compress([{"role": "user", "content": "durable source", "_row_id": 1}])
+    generation = first._store.generation("s")
+
+    assert generation is not None and generation.artifact_dependencies
+    artifact_id = generation.artifact_dependencies[0]
+    restored = CheckpointContextEngine({"mode": "live"}, session_id="s")
+    restored.bind_session_state(SessionDB(db_path=tmp_path / "state.db"), "s")
+    assert json.loads(restored.handle_tool_call("checkpoint_artifact_read", {"artifact_id": artifact_id}))["content"].startswith("CHECKPOINT")

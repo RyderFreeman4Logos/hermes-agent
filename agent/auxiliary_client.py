@@ -9709,6 +9709,7 @@ def call_llm(
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
+    structured_output_required: bool = False,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()
@@ -9763,6 +9764,7 @@ def call_llm(
                 stream=stream,
                 stream_options=stream_options,
                 route_info=route_info,
+                structured_output_required=structured_output_required,
             )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -9813,6 +9815,7 @@ def _call_llm_impl(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    structured_output_required: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -10155,7 +10158,9 @@ def _call_llm_impl(
                 first_err = retry_err
                 kwargs = retry_kwargs
 
-        if _is_structured_output_rejection(first_err):
+        if structured_output_required and _is_structured_output_rejection(first_err):
+            raise first_err
+        if not structured_output_required and _is_structured_output_rejection(first_err):
             retry_kwargs = _without_structured_output_format(kwargs)
             if retry_kwargs is not None:
                 logger.info(

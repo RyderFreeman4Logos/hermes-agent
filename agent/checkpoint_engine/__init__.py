@@ -1,7 +1,7 @@
 from .core import (
-    ActiveIntent, ArtifactReference, CausalGroup, CheckpointGeneration, CheckpointRejected,
+    ActiveIntent, ArtifactReference, CausalGroup, CheckpointGeneration, CheckpointMapCallRejected, CheckpointRejected,
     ContentAddressedArtifacts, DeterministicLanes, DurableCheckpointStore,
-    Effect, EvidenceSpan, HostLifecycleEvent, MapDisposition, MapFact, MapResponse, MapShard,
+    Effect, EvidenceSpan, HostLifecycleEvent, MapAttemptRecord, MapDisposition, MapFact, MapResponse, MapShard,
     ReducedState, StructuredOutputPolicy, StructuredOutputUnavailable,
     TaskEpoch, ToolExecutionReceipt, ToolReceipt, TraceRecord, TranscriptRevision,
     count_request_tokens, extract_canonical_evidence, parse_map_response,

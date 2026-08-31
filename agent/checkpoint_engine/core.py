@@ -28,6 +28,14 @@ class CheckpointRejected(RuntimeError):
     pass
 
 
+class CheckpointMapCallRejected(CheckpointRejected):
+    """A failed physical Map attempt with its transport-boundary record."""
+
+    def __init__(self, identity: Mapping[str, Any], cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.identity = dict(identity)
+
+
 @dataclass(frozen=True)
 class HostLifecycleEvent:
     """A host-authored lifecycle boundary; models cannot create one."""
@@ -266,8 +274,26 @@ class TraceRecord:
     code_head: str = ""
     dirty_diff_hash: str = ""
     map_shard_provenance: tuple[tuple[int, ...], ...] = ()
+    map_attempt_records: tuple["MapAttemptRecord", ...] = ()
     execution_identity_complete: bool = False
     benchmark_admissible: bool = False
+
+
+@dataclass(frozen=True)
+class MapAttemptRecord:
+    configured_route: str | None = None
+    physical_model: str | None = None
+    actual_wire_mode: str | None = None
+    fallback_rejection: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    latency_ms: int | None = None
+    finish_reason: str | None = None
+    response_hash: str | None = None
+    code_head: str | None = None
+    code_tree: str | None = None
+    dirty: bool | None = None
+    dirty_diff_hash: str | None = None
 
 
 class MapResponse:
@@ -381,6 +407,11 @@ class DurableCheckpointStore:
                 item["artifact_dependencies"] = tuple(item.get("artifact_dependencies", ()))
                 self._generations[session_id] = CheckpointGeneration(**item)
             for session_id, items in payload.get("traces", {}).items():
+                for item in items:
+                    item["map_attempt_records"] = tuple(
+                        MapAttemptRecord(**record)
+                        for record in item.get("map_attempt_records", ())
+                    )
                 self._traces[session_id] = [TraceRecord(**item) for item in items]
             self._raw_events = {
                 session_id: [dict(event) for event in events]

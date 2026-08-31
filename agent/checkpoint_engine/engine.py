@@ -218,15 +218,27 @@ class CheckpointContextEngine(ContextEngine):
             try:
                 request = prepare_provider_request(prompt, model=route.get("model"), policy=self.policy, schema=MapResponse.schema(), route_capabilities=route)
                 raw = self._map_caller(request)
-                if isinstance(raw, Mapping) and "_checkpoint_identity" in raw:
-                    self._record_map_attempt(raw["_checkpoint_identity"])
+                if isinstance(raw, Mapping):
+                    identities = raw.get("_checkpoint_attempt_identities")
+                    if isinstance(identities, (list, tuple)):
+                        for identity in identities:
+                            if isinstance(identity, Mapping):
+                                self._record_map_attempt(identity)
+                    elif "_checkpoint_identity" in raw:
+                        self._record_map_attempt(raw["_checkpoint_identity"])
                 if isinstance(raw, Mapping) and "content" in raw:
                     raw = raw["content"]
                 elif isinstance(raw, Mapping) and "choices" in raw:
                     raw = raw["choices"][0]["message"]["content"]
                 return parse_map_response(raw, expected_source_event_ids=source_ids, source_events=source_events)
             except CheckpointMapCallRejected as exc:
-                self._record_map_attempt(exc.identity)
+                identities = exc.identity.get("_checkpoint_attempt_identities")
+                if isinstance(identities, (list, tuple)):
+                    for identity in identities:
+                        if isinstance(identity, Mapping):
+                            self._record_map_attempt(identity)
+                else:
+                    self._record_map_attempt(exc.identity)
                 last_error = exc
             except (RuntimeError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
                 last_error = exc

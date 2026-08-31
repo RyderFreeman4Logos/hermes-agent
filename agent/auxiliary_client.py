@@ -58,8 +58,8 @@ import threading
 import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
-from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -3463,6 +3463,7 @@ def _relay_auxiliary_call(callback):
             "model": "",
             "response_model": None,
             "api_mode": "chat_completions",
+            "checkpoint_attempts": kwargs.get("checkpoint_attempts"),
         })
         try:
             return callback(*args, **kwargs)
@@ -3557,22 +3558,75 @@ def _relay_sync_completion(
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    started_at = time.monotonic()
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
-    if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
+    try:
+        if route is None:
+            response = _run_protected_sync_provider_call(callback, kwargs)
+        else:
+            provider_name, fallback_model, metadata = route
+            from agent import relay_llm
 
-    return relay_llm.execute_current(
-        kwargs,
-        lambda request: _run_protected_sync_provider_call(callback, request),
-        name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model),
-        metadata=metadata,
-        defer_logical_completion=True,
+            response = relay_llm.execute_current(
+                kwargs,
+                lambda request: _run_protected_sync_provider_call(callback, request),
+                name=provider_name,
+                model_name=str(kwargs.get("model") or fallback_model),
+                metadata=metadata,
+                defer_logical_completion=True,
+            )
+    except Exception as exc:
+        _record_checkpoint_attempt(kwargs, provider, started_at, error=exc)
+        raise
+    _record_checkpoint_attempt(kwargs, provider, started_at, response=response)
+    return response
+
+
+def _record_checkpoint_attempt(
+    kwargs: Mapping[str, Any],
+    provider: str | None,
+    started_at: float,
+    *,
+    response: Any = None,
+    error: Exception | None = None,
+) -> None:
+    """Capture one checkpoint request at the dispatch boundary, if requested."""
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    attempts = context.get("checkpoint_attempts") if context else None
+    if not isinstance(attempts, list):
+        return
+    extra_body = kwargs.get("extra_body")
+    wire_mode = (
+        "structured"
+        if isinstance(extra_body, Mapping) and extra_body.get("response_format")
+        else "prompt_only"
     )
+    content = ""
+    usage = choice = None
+    if response is not None:
+        try:
+            content = extract_content_or_reasoning(response)
+            usage = getattr(response, "usage", None)
+            choice = (getattr(response, "choices", None) or [None])[0]
+        except (AttributeError, IndexError, TypeError):
+            pass
+    rejection = None
+    if error is not None:
+        retry_class = "transient" if _is_transient_transport_error(error) else "rejected"
+        rejection = f"{retry_class}: {type(error).__name__}: {error}"
+    attempts.append(MappingProxyType({
+        "configured_route": provider or None,
+        "physical_model": kwargs.get("model") or None,
+        "actual_wire_mode": wire_mode,
+        "fallback_rejection": rejection,
+        "input_tokens": getattr(usage, "prompt_tokens", None),
+        "output_tokens": getattr(usage, "completion_tokens", None),
+        "latency_ms": int((time.monotonic() - started_at) * 1000),
+        "finish_reason": getattr(choice, "finish_reason", None),
+        "response_hash": hashlib.sha256(content.encode()).hexdigest() if response is not None else None,
+    }))
 
 
 async def _relay_async_completion(
@@ -9710,6 +9764,7 @@ def call_llm(
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
     structured_output_required: bool = False,
+    checkpoint_attempts: Optional[list[Any]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()

@@ -91,6 +91,111 @@ def test_production_map_does_not_replay_structured_rejection_prompt_only():
     assert "response_format" in client.chat.completions.create.call_args.kwargs["extra_body"]
 
 
+def test_production_map_records_each_transient_physical_send(monkeypatch):
+    from agent.agent_init import _build_checkpoint_map_caller
+
+    client = MagicMock()
+    client.base_url = "https://api.openai.com/v1"
+    client.chat.completions.create.side_effect = [
+        RuntimeError("connection reset"),
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "schema_version": 1, "source_event_ids": [1], "facts": [],
+            })), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
+        ),
+    ]
+    agent = SimpleNamespace(
+        provider="configured-provider", model="configured-model",
+        base_url="https://configured.example/v1", api_key="key", api_mode="chat_completions",
+    )
+    engine = CheckpointContextEngine(
+        {"mode": "live", "trace": True, "map_routes": [{"model": "map-model", "structured_output": True}]},
+        map_caller=_build_checkpoint_map_caller(agent),
+    )
+
+    with (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("openai-codex", "map-model", None, None, None)),
+        patch("agent.auxiliary_client._get_cached_client", return_value=(client, "map-model")),
+        patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda response, *_a, **_k: response),
+        patch("agent.auxiliary_client._is_transient_transport_error", return_value=True),
+        patch("agent.auxiliary_client._transient_retry_count", return_value=1),
+        patch("agent.auxiliary_client.time.sleep"),
+    ):
+        engine.compress([{"role": "user", "content": "source", "_row_id": 1}])
+
+    records = engine.last_trace.map_attempt_records
+    assert client.chat.completions.create.call_count == 2
+    assert [(record.configured_route, record.physical_model, record.actual_wire_mode)
+            for record in records] == [
+        ("openai-codex", "map-model", "structured"),
+        ("openai-codex", "map-model", "structured"),
+    ]
+    assert records[0].fallback_rejection and "transient" in records[0].fallback_rejection
+    assert records[1].input_tokens == 3
+    assert records[1].output_tokens == 2
+    assert records[1].finish_reason == "stop"
+    assert records[1].response_hash
+    assert engine.last_trace.benchmark_admissible is False
+
+
+def test_production_map_records_primary_and_fallback_physical_sends(monkeypatch):
+    from agent.agent_init import _build_checkpoint_map_caller
+    from agent.auxiliary_client import _FallbackDestination
+
+    primary = MagicMock()
+    primary.base_url = "https://primary.example/v1"
+    primary.chat.completions.create.side_effect = RuntimeError("connection down")
+    fallback = MagicMock()
+    fallback.base_url = "https://fallback.example/v1"
+    fallback.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "schema_version": 1, "source_event_ids": [1], "facts": [],
+        })), finish_reason="stop")],
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=4),
+    )
+    agent = SimpleNamespace(
+        provider="configured-provider", model="configured-model",
+        base_url="https://configured.example/v1", api_key="key", api_mode="chat_completions",
+    )
+    engine = CheckpointContextEngine(
+        {"mode": "live", "trace": True, "map_routes": [{"model": "primary-model", "structured_output": True}]},
+        map_caller=_build_checkpoint_map_caller(agent),
+    )
+
+    with (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("auto", "primary-model", None, None, None)),
+        patch("agent.auxiliary_client._get_cached_client", return_value=(primary, "primary-model")),
+        patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda response, *_a, **_k: response),
+        patch("agent.auxiliary_client._is_transient_transport_error", return_value=False),
+        patch("agent.auxiliary_client._is_connection_error", return_value=True),
+        patch("agent.auxiliary_client._try_configured_fallback_chain",
+              return_value=(fallback, "fallback-model", "fallback_chain[0](fallback-provider)")),
+        patch("agent.auxiliary_client._fallback_destination", return_value=_FallbackDestination(
+            "fallback-provider", "https://fallback.example/v1", None, "fallback-model",
+        )),
+        patch("agent.auxiliary_client._replan_synchronous_cache_sections", side_effect=lambda messages, tools, **_k: (messages, tools)),
+    ):
+        engine.compress([{"role": "user", "content": "source", "_row_id": 1}])
+
+    records = engine.last_trace.map_attempt_records
+    assert primary.chat.completions.create.call_count == 1
+    assert fallback.chat.completions.create.call_count == 1
+    assert [(record.configured_route, record.physical_model, record.actual_wire_mode)
+            for record in records] == [
+        ("auto", "primary-model", "structured"),
+        ("fallback-provider", "fallback-model", "structured"),
+    ]
+    assert records[0].fallback_rejection and "rejected" in records[0].fallback_rejection
+    assert records[1].input_tokens == 5
+    assert records[1].output_tokens == 4
+    assert records[1].finish_reason == "stop"
+    assert records[1].response_hash
+    assert engine.last_trace.benchmark_admissible is False
+
+
 def test_parser_rejects_model_text_without_evidence_and_uses_host_span_text():
     from agent.checkpoint_engine import parse_map_response
 

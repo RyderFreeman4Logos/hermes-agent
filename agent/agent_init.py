@@ -133,15 +133,11 @@ def _build_checkpoint_map_caller(agent: Any) -> Callable[[dict[str, Any]], dict[
         from agent.auxiliary_client import call_llm, extract_content_or_reasoning
         from agent.checkpoint_engine import CheckpointMapCallRejected
 
-        route_info: dict[str, str] = {}
-        started_at = time.monotonic()
-        identity = {
-            "configured_route": None, "physical_model": request.get("model") or None,
-            "actual_wire_mode": "structured" if request.get("response_format") else "prompt_only",
-            "fallback_rejection": None, "input_tokens": None, "output_tokens": None,
-            "latency_ms": None, "finish_reason": None, "response_hash": None,
-            "code_snapshot": code_snapshot,
-        }
+        attempts: list[dict[str, Any]] = []
+
+        def identities() -> tuple[dict[str, Any], ...]:
+            return tuple({**attempt, "code_snapshot": code_snapshot} for attempt in attempts)
+
         try:
             response = call_llm(
                 task="checkpoint", model=request.get("model"), messages=request["messages"],
@@ -150,29 +146,13 @@ def _build_checkpoint_map_caller(agent: Any) -> Callable[[dict[str, Any]], dict[
                     "provider": getattr(agent, "provider", ""), "model": getattr(agent, "model", ""),
                     "base_url": getattr(agent, "base_url", ""), "api_key": getattr(agent, "api_key", ""),
                     "api_mode": getattr(agent, "api_mode", ""),
-                }, route_info=route_info, structured_output_required=True,
+                }, checkpoint_attempts=attempts, structured_output_required=True,
             )
         except Exception as exc:
-            identity["configured_route"] = route_info.get("provider") or None
-            identity["physical_model"] = route_info.get("model") or identity["physical_model"]
-            identity["latency_ms"] = int((time.monotonic() - started_at) * 1000)
-            identity["fallback_rejection"] = str(exc)
-            raise CheckpointMapCallRejected(identity, exc) from exc
-        content = extract_content_or_reasoning(response)
-        usage = getattr(response, "usage", None)
-        choice = (getattr(response, "choices", None) or [None])[0]
+            raise CheckpointMapCallRejected({"_checkpoint_attempt_identities": identities()}, exc) from exc
         return {
-            "content": content,
-            "_checkpoint_identity": {
-                **identity,
-                "configured_route": route_info.get("provider") or None,
-                "physical_model": route_info.get("model") or identity["physical_model"],
-                "input_tokens": getattr(usage, "prompt_tokens", None),
-                "output_tokens": getattr(usage, "completion_tokens", None),
-                "latency_ms": int((time.monotonic() - started_at) * 1000),
-                "finish_reason": getattr(choice, "finish_reason", None),
-                "response_hash": hashlib.sha256(content.encode()).hexdigest(),
-            },
+            "content": extract_content_or_reasoning(response),
+            "_checkpoint_attempt_identities": identities(),
         }
     return call
 

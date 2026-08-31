@@ -398,7 +398,10 @@ class CheckpointContextEngine(ContextEngine):
             lines.append(f"Observed effect {effect.tool_call_id}: {effect.status}")
         for fact in reduced.facts:
             state = "uncertain" if fact.uncertain else "observed"
-            lines.append(f"{state} {fact.kind}: {fact.text}")
+            line = f"{state} {fact.kind}"
+            if fact.summary:
+                line += f": {fact.summary}"
+            lines.append(line)
         for artifact_id in reduced.artifacts:
             lines.append(f"Artifact available via checkpoint_artifact_read: {artifact_id}")
         for epoch in reduced.epochs:

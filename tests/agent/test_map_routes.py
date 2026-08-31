@@ -2,7 +2,63 @@ import json
 
 import pytest
 
-from agent.checkpoint_engine import CheckpointContextEngine, MapResponse, parse_map_response
+from agent.checkpoint_engine import (
+    CheckpointContextEngine,
+    MapFact,
+    MapResponse,
+    ReducedState,
+    parse_map_response,
+)
+
+
+def test_checkpoint_render_uses_bounded_summaries_not_full_evidence():
+    quote = "full evidence " + "x" * 16_000
+    state = ReducedState(
+        None,
+        (),
+        (
+            MapFact("observation", quote, (1,), summary="bounded summary"),
+            MapFact("tool_result", quote, (2,), uncertain=True),
+        ),
+        (),
+    )
+
+    checkpoint = CheckpointContextEngine()._render_checkpoint(state)
+
+    assert "observed observation: bounded summary" in checkpoint
+    assert "uncertain tool_result" in checkpoint
+    assert quote not in checkpoint
+    assert len(checkpoint) < 200
+
+
+def test_required_map_full_span_facts_fit_checkpoint_wire_budget():
+    quote = "full evidence " + "x" * 16_000
+
+    def caller(request):
+        payload = json.loads(request["messages"][0]["content"])
+        text = payload["messages"][0]["content"]["evidence"][0]["text"]
+        return {"facts": [{
+            "kind": "observation",
+            "summary": "bounded summary",
+            "evidence": [{"start_char": 0, "end_char": len(text)}],
+        }]}
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "protect_first_n": 0, "protect_last_n": 0},
+        map_caller=caller,
+    )
+    messages = [
+        {"role": "tool", "tool_call_id": f"call-{index}", "content": quote, "_row_id": index}
+        for index in range(40)
+    ]
+
+    result = engine.compress(messages)
+
+    assert result is not messages
+    assert engine.last_rejection is None
+    checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
+    assert checkpoint.count("observed observation: bounded summary") == 40
+    assert quote not in checkpoint
 
 
 def test_required_map_schema_keeps_identity_host_owned_and_binds_single_evidence():
@@ -34,7 +90,8 @@ def test_required_map_schema_keeps_identity_host_owned_and_binds_single_evidence
 
     assert requests
     checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
-    assert "observed observation: source" in checkpoint
+    assert "observed observation" in checkpoint
+    assert "observed observation: source" not in checkpoint
 
 
 def test_map_schema_and_parser_reject_model_owned_fact_text():
@@ -119,7 +176,8 @@ def test_map_requests_one_textual_host_source_and_host_disposes_empty_assistant(
     assert len(requests) == 4
     assert engine.last_rejection is None
     checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
-    assert all(f"observed tool_result: tool {n}" in checkpoint for n in range(1, 5))
+    assert checkpoint.count("observed tool_result") == 4
+    assert all(f"tool {n} text" not in checkpoint for n in range(1, 5))
 
 
 def test_required_map_default_shard_cap_allows_40_singleton_sources():
@@ -245,7 +303,8 @@ def test_required_map_hides_externalized_artifact_identity_from_model():
 
     assert requests
     checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
-    assert "observed tool_result: host excerpt" in checkpoint
+    assert "observed tool_result" in checkpoint
+    assert "host excerpt plus hidden artifact" not in checkpoint
 
 
 def test_required_map_uses_only_configured_structured_fallback():
@@ -360,7 +419,8 @@ def test_required_map_binds_evidence_bounds_and_parser_to_wire_excerpt():
     }])
 
     checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
-    assert "observed tool_result: " + excerpt[:168] in checkpoint
+    assert "observed tool_result" in checkpoint
+    assert excerpt[:168] not in checkpoint
 
 
 def test_required_map_rejects_externalized_evidence_past_host_excerpt():
@@ -408,7 +468,8 @@ def test_required_map_extracts_only_host_excerpt_from_externalized_evidence():
     ])
 
     checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
-    assert "observed tool_result: host-visible evidence" in checkpoint
+    assert "observed tool_result" in checkpoint
+    assert "host-visible evidence" not in checkpoint
     assert tool_body not in checkpoint
 
 

@@ -11,11 +11,39 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from agent import cache_request_capture, relay_runtime
 
 logger = logging.getLogger(__name__)
+
+
+def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -> None:
+    try:
+        from agent.cache_lowhit_request_dump import remember_sent_request
+
+        remember_sent_request(request, api_mode=api_mode)
+    except Exception:
+        logger.debug("cache low-hit remember failed", exc_info=True)
+
+
+_cache_capture_module = globals().get("cache_request_capture")
+_capture_provider_request = getattr(
+    _cache_capture_module, "capture_provider_request", None
+)
+if callable(_capture_provider_request):
+    capture_provider_request = cast(Callable[..., None], _capture_provider_request)
+    _cache_capture_module = cast(Any, _cache_capture_module)
+
+    def _capture_provider_request_with_lowhit(
+        request: dict[str, Any], **kwargs: Any
+    ) -> None:
+        _remember_lowhit_transport_request(
+            request, str(kwargs.get("api_mode") or "unknown")
+        )
+        capture_provider_request(request, **kwargs)
+
+    _cache_capture_module.capture_provider_request = _capture_provider_request_with_lowhit
 
 
 _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(

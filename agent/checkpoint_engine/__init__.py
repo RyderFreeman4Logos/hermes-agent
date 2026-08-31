@@ -1,9 +1,9 @@
 from .core import (
-    ActiveIntent, CausalGroup, CheckpointGeneration, CheckpointRejected,
+    ActiveIntent, ArtifactReference, CausalGroup, CheckpointGeneration, CheckpointRejected,
     ContentAddressedArtifacts, DeterministicLanes, DurableCheckpointStore,
-    Effect, EvidenceSpan, MapDisposition, MapFact, MapResponse, MapShard,
+    Effect, EvidenceSpan, HostLifecycleEvent, MapDisposition, MapFact, MapResponse, MapShard,
     ReducedState, StructuredOutputPolicy, StructuredOutputUnavailable,
-    TaskEpoch, ToolReceipt, TraceRecord, TranscriptRevision,
+    TaskEpoch, ToolExecutionReceipt, ToolReceipt, TraceRecord, TranscriptRevision,
     count_request_tokens, parse_map_response, prepare_provider_request,
 )
 from .engine import CheckpointContextEngine

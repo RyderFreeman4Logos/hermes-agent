@@ -10,8 +10,10 @@ from typing import Any
 from agent.context_engine import ContextEngine
 from .core import (
     ActiveIntent, CausalGroup, CheckpointGeneration, CheckpointRejected,
-    DeterministicLanes, DurableCheckpointStore, Effect, MapDisposition,
-    MapFact, MapResponse, MapShard, ReducedState, StructuredOutputPolicy, TaskEpoch,
+    ArtifactReference, ContentAddressedArtifacts, DeterministicLanes,
+    DurableCheckpointStore, Effect, HostLifecycleEvent, MapDisposition,
+    MapFact, MapResponse, MapShard, ReducedState, StructuredOutputPolicy,
+    TaskEpoch, ToolExecutionReceipt, ToolReceipt,
     TraceRecord, count_request_tokens, parse_map_response, prepare_provider_request,
 )
 
@@ -19,7 +21,7 @@ from .core import (
 class CheckpointContextEngine(ContextEngine):
     """Host-owned checkpoint projection with an optional auxiliary Map step."""
 
-    def __init__(self, config: Mapping[str, Any] | None = None, *, store: DurableCheckpointStore | None = None, session_id: str = "default", map_caller: Callable[..., Any] | None = None) -> None:
+    def __init__(self, config: Mapping[str, Any] | None = None, *, store: DurableCheckpointStore | None = None, session_id: str = "default", map_caller: Callable[..., Any] | None = None, artifact_root: str | None = None) -> None:
         cfg = config or {}
         self.mode = str(cfg.get("mode", "shadow"))
         if self.mode not in {"shadow", "live"}:
@@ -51,6 +53,10 @@ class CheckpointContextEngine(ContextEngine):
         self._map_caller = map_caller
         self._map_routes = tuple(cfg.get("map_routes", ()))
         self._before_commit: Callable[[], Any] | None = None
+        self._host_events: tuple[HostLifecycleEvent, ...] = ()
+        self._tool_receipts: tuple[ToolExecutionReceipt, ...] = ()
+        self._last_route_attempts: list[str] = []
+        self._artifacts = ContentAddressedArtifacts(artifact_root) if artifact_root else None
 
     @property
     def name(self) -> str:
@@ -81,7 +87,22 @@ class CheckpointContextEngine(ContextEngine):
     def _capture_revision(self, messages: Sequence[Mapping[str, Any]]):
         return self._store.revision(self.session_id, messages)
 
-    def _extract_deterministic_lanes(self, messages: Sequence[Mapping[str, Any]]) -> DeterministicLanes:
+    def task_epochs(self, events: Sequence[HostLifecycleEvent]) -> tuple[TaskEpoch, ...]:
+        """Derive epochs only from host lifecycle events, never model prose."""
+        opened: dict[tuple[str, int], int] = {}
+        closed: dict[tuple[str, int], int] = {}
+        for event in sorted(events, key=lambda item: item.event_id):
+            key = (event.task_id, event.epoch)
+            if event.kind in {"task_started", "epoch_opened"}:
+                opened.setdefault(key, event.event_id)
+            elif event.kind in {"task_finished", "epoch_closed"}:
+                closed[key] = event.event_id
+        return tuple(
+            TaskEpoch(f"{task_id}:{epoch}", event_id, closed.get((task_id, epoch)))
+            for (task_id, epoch), event_id in opened.items()
+        )
+
+    def _extract_deterministic_lanes(self, messages: Sequence[Mapping[str, Any]], *, tool_receipts: Sequence[ToolExecutionReceipt] = ()) -> DeterministicLanes:
         users = [(i, m) for i, m in enumerate(messages) if self._role(m) == "user"]
         active = None
         if users:
@@ -90,13 +111,24 @@ class CheckpointContextEngine(ContextEngine):
             if isinstance(content, list):
                 content = " ".join(str(x.get("text", "")) for x in content if isinstance(x, Mapping))
             active = ActiveIntent(str(content), (i,), (self._row_id(m, i),))
+        receipt_by_call = {receipt.tool_call_id: receipt for receipt in tool_receipts}
         effects: list[Effect] = []
         for i, m in enumerate(messages):
             if self._role(m) != "tool":
                 continue
             rid = str(m.get("tool_call_id", f"tool:{i}"))
-            status = "failed" if str(m.get("status", "")).lower() in {"error", "failed"} else ("succeeded" if str(m.get("status", "")).lower() in {"success", "succeeded"} else "observed")
-            effects.append(Effect(rid, m.get("name"), status, (i,), (self._row_id(m, i),)))
+            receipt = receipt_by_call.get(rid)
+            message_status = str(m.get("status", "")).lower()
+            status = receipt.status if receipt else (
+                "failed" if message_status in {"error", "failed"} else
+                ("succeeded" if message_status in {"success", "succeeded"} else "observed")
+            )
+            source_ids = receipt.source_event_ids if receipt else (self._row_id(m, i),)
+            typed_receipt = ToolReceipt(
+                receipt.tool_call_id, receipt.tool_name, receipt.status,
+                receipt.source_event_ids,
+            ) if receipt else None
+            effects.append(Effect(rid, receipt.tool_name if receipt else m.get("name"), status, (i,), source_ids, typed_receipt))
         recent = tuple(range(max(0, len(messages) - self.protect_last_n), len(messages)))
         return DeterministicLanes(active, tuple(effects), (), recent)
 
@@ -142,13 +174,16 @@ class CheckpointContextEngine(ContextEngine):
         return MapShard(tuple(self._row_id(messages[i], i) for i in event_ids), tuple(facts), dispositions)
 
     def _call_map(self, messages: Sequence[Mapping[str, Any]], event_ids: tuple[int, ...]) -> MapShard:
+        self._last_route_attempts = []
         if self._map_caller is None:
+            self._last_route_attempts.append("local")
             return self._local_map(messages, event_ids)
         prompt = [{"role": "user", "content": json.dumps({"source_event_ids": event_ids, "messages": [messages[i] for i in event_ids]}, default=str)}]
         routes = self._map_routes or ({},)
         last_error: Exception | None = None
         for route in routes:
             route = dict(route)
+            self._last_route_attempts.append(str(route.get("model", route.get("name", "configured"))))
             if self.policy is StructuredOutputPolicy.REQUIRED and route.get("structured_output") is False:
                 continue
             try:
@@ -163,14 +198,34 @@ class CheckpointContextEngine(ContextEngine):
             raise last_error
         raise CheckpointRejected("no configured structured-capable map route")
 
-    def _reduce(self, lanes: DeterministicLanes, shards: Iterable[MapShard], messages: Sequence[Mapping[str, Any]]) -> ReducedState:
+    def _reduce(self, lanes: DeterministicLanes, shards: Iterable[MapShard], messages: Sequence[Mapping[str, Any]], *, host_events: Sequence[HostLifecycleEvent] = ()) -> ReducedState:
         all_facts: list[MapFact] = []
         dispositions: list[MapDisposition] = []
         for shard in shards:
             all_facts.extend(shard.facts)
             dispositions.extend(shard.dispositions)
-        epochs = tuple(TaskEpoch(f"epoch:{i}", d.source_event_id) for i, d in enumerate(dispositions) if d.status in {"in_progress", "unresolved"})
+        epochs = self.task_epochs(host_events)
         return ReducedState(lanes.active_intent, lanes.effects, tuple(all_facts), tuple(dispositions), epochs)
+
+    def reduce_host_state(
+        self,
+        messages: Sequence[Mapping[str, Any]], *,
+        host_events: Sequence[HostLifecycleEvent] = (),
+        tool_receipts: Sequence[ToolExecutionReceipt] = (),
+    ) -> ReducedState:
+        lanes = self._extract_deterministic_lanes(messages, tool_receipts=tool_receipts)
+        shards = (self._local_map(messages, tuple(range(len(messages)))),) if messages else ()
+        return self._reduce(lanes, shards, messages, host_events=host_events)
+
+    def externalize_artifact(self, content: str, *, media_type: str = "text/plain") -> ArtifactReference:
+        if self._artifacts is None:
+            raise CheckpointRejected("artifact store is not configured")
+        return ArtifactReference(self._artifacts.put(content), media_type)
+
+    def checkpoint_artifact_read(self, artifact_id: str) -> str:
+        if self._artifacts is None:
+            raise CheckpointRejected("artifact store is not configured")
+        return self._artifacts.read(artifact_id)
 
     def _render_checkpoint(self, reduced: ReducedState) -> str:
         lines = ["CHECKPOINT (host-authored; raw transcript remains authoritative)"]
@@ -197,7 +252,8 @@ class CheckpointContextEngine(ContextEngine):
         recent = [dict(messages[i]) for i in sorted(recent_indices)]
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for m in system + [{"role": "assistant", "content": checkpoint}] + latest + recent:
+        checkpoint_message = {"role": "assistant", "content": checkpoint, "checkpoint_projection": True}
+        for m in system + [checkpoint_message] + latest + recent:
             key = json.dumps(m, sort_keys=True, default=str)
             if key not in seen:
                 out.append(m)
@@ -213,13 +269,18 @@ class CheckpointContextEngine(ContextEngine):
     def compress(self, messages: list[dict[str, Any]], current_tokens: int | None = None, focus_topic: str | None = None, force: bool = False, memory_context: str = "", **kwargs: Any) -> list[dict[str, Any]]:
         if not isinstance(messages, list) or self._has_inflight_tools(messages):
             return messages
+        self._store.record_raw(self.session_id, messages)
+        raw_messages = self._store.raw_messages(self.session_id)
+        source_messages = raw_messages or tuple(messages)
         revision = self._capture_revision(messages)
         try:
-            lanes = self._extract_deterministic_lanes(messages)
-            shards = tuple(self._call_map(messages, ids) for ids in self._plan_map_shards(messages))
-            reduced = self._reduce(lanes, shards, messages)
+            self._host_events = tuple(kwargs.get("host_events", self._host_events))
+            self._tool_receipts = tuple(kwargs.get("tool_receipts", self._tool_receipts))
+            lanes = self._extract_deterministic_lanes(source_messages, tool_receipts=self._tool_receipts)
+            shards = tuple(self._call_map(source_messages, ids) for ids in self._plan_map_shards(source_messages))
+            reduced = self._reduce(lanes, shards, source_messages, host_events=self._host_events)
             checkpoint = self._render_checkpoint(reduced)
-            candidate = self._projection(messages, checkpoint)
+            candidate = self._projection(source_messages, checkpoint)
             if self._estimate_wire_tokens(candidate) > self.hard_max_wire_tokens:
                 raise CheckpointRejected("projected request exceeds hard wire budget")
             generation = CheckpointGeneration(self.generation + 1, revision.revision, revision.source_event_ids, DurableCheckpointStore.signature(candidate), self.mode)
@@ -234,7 +295,20 @@ class CheckpointContextEngine(ContextEngine):
                 reduced_hash = hashlib.sha256(json.dumps(asdict(reduced), default=str, sort_keys=True).encode()).hexdigest()
                 prompt_hash = hashlib.sha256(json.dumps(candidate, default=str, sort_keys=True).encode()).hexdigest()
                 schema_hash = hashlib.sha256(json.dumps(MapResponse.schema(), sort_keys=True).encode()).hexdigest()
-                self.last_trace = TraceRecord(self.generation, revision.revision, "auxiliary", ("configured",), self.policy.value, schema_hash, prompt_hash, reduced_hash, count_request_tokens(candidate), 0, 0, "stop", hashlib.sha256(checkpoint.encode()).hexdigest(), "unknown", False)
+                self.last_trace = TraceRecord(
+                    self.generation, revision.revision, "auxiliary",
+                    tuple(self._last_route_attempts), self.policy.value, schema_hash,
+                    prompt_hash, reduced_hash, count_request_tokens(candidate), 0,
+                    0, "stop", hashlib.sha256(checkpoint.encode()).hexdigest(),
+                    "unknown", False, source="raw_transcript",
+                    projection_hash=prompt_hash,
+                    artifact_graph_hash=hashlib.sha256(json.dumps(reduced.artifacts, sort_keys=True).encode()).hexdigest(),
+                    execution_provenance_hash=hashlib.sha256(json.dumps([asdict(effect) for effect in reduced.effects], default=str, sort_keys=True).encode()).hexdigest(),
+                    continuation_window_hash=hashlib.sha256(json.dumps(candidate[-self.protect_last_n:], default=str, sort_keys=True).encode()).hexdigest(),
+                    physical_model=str(kwargs.get("physical_model", "unknown")),
+                    extractor_hash=hashlib.sha256(b"checkpoint-extractor-v1").hexdigest(),
+                    tokens_counting_mode="conservative_4_chars",
+                )
                 self._store.append_trace(self.session_id, self.last_trace)
             return messages if self.mode == "shadow" else candidate
         except (CheckpointRejected, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:

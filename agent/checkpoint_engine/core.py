@@ -28,6 +28,36 @@ class CheckpointRejected(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class HostLifecycleEvent:
+    """A host-authored lifecycle boundary; models cannot create one."""
+
+    event_id: int
+    kind: str
+    task_id: str
+    epoch: int
+
+
+@dataclass(frozen=True)
+class ArtifactReference:
+    artifact_id: str
+    media_type: str = "text/plain"
+
+
+@dataclass(frozen=True)
+class ToolExecutionReceipt:
+    """The only authority for whether a side effect completed."""
+
+    tool_call_id: str
+    tool_name: str
+    effect_class: str
+    status: str
+    exit_code: int | None
+    error_type: str | None
+    artifact_refs: tuple[ArtifactReference | str, ...]
+    source_event_ids: tuple[int, ...]
+
+
 def prepare_provider_request(
     messages: Sequence[Mapping[str, Any]],
     *,
@@ -202,6 +232,15 @@ class TraceRecord:
     response_hash: str
     code_tree: str
     dirty: bool
+    source: str = "raw_transcript"
+    projection_hash: str = ""
+    artifact_graph_hash: str = ""
+    execution_provenance_hash: str = ""
+    continuation_window_hash: str = ""
+    physical_model: str = ""
+    prompt_hash_version: str = "v1"
+    extractor_hash: str = ""
+    tokens_counting_mode: str = "conservative"
 
 
 class MapResponse:
@@ -215,7 +254,26 @@ class MapResponse:
             "properties": {
                 "schema_version": {"type": "integer", "enum": [cls.VERSION]},
                 "source_event_ids": {"type": "array", "items": {"type": "integer"}},
-                "facts": {"type": "array", "items": {"type": "object"}},
+                "facts": {"type": "array", "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "text": {"type": "string"},
+                        "source_event_ids": {"type": "array", "items": {"type": "integer"}},
+                        "uncertain": {"type": "boolean"},
+                        "evidence": {"type": "array", "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "event_id": {"type": "string"},
+                                "start_char": {"type": "integer", "minimum": 0},
+                                "end_char": {"type": "integer", "minimum": 0},
+                            },
+                            "required": ["event_id", "start_char", "end_char"],
+                        }},
+                    },
+                    "required": ["kind", "text", "source_event_ids"],
+                }},
             },
             "required": ["schema_version", "source_event_ids", "facts"],
         }
@@ -230,14 +288,20 @@ def parse_map_response(raw: str | Mapping[str, Any], *, expected_source_event_id
     if source_ids != tuple(expected_source_event_ids):
         raise ValueError("map source range mismatch")
     facts: list[MapFact] = []
-    for n, item in enumerate(payload.get("facts", ())):
+    for item in payload.get("facts", ()):
         if not isinstance(item, Mapping) or set(item) - {"kind", "text", "source_event_ids", "uncertain", "evidence"}:
             raise ValueError("invalid map fact")
         ids = tuple(item.get("source_event_ids", ()))
         if not ids or not set(ids) <= set(source_ids):
             raise ValueError("fact has invalid source ids")
         evidence = tuple(EvidenceSpan(str(s["event_id"]), int(s["start_char"]), int(s["end_char"])) for s in item.get("evidence", ()))
-        facts.append(MapFact(str(item.get("kind", "observation")), str(item.get("text", "")), ids, evidence, bool(item.get("uncertain", False)), f"fact:{n}"))
+        identity = json.dumps(
+            [str(item.get("kind", "observation")), str(item.get("text", "")), ids,
+             [(e.event_id, e.start_char, e.end_char) for e in evidence]],
+            sort_keys=True, separators=(",", ":"),
+        )
+        fact_id = "fact:" + sha256(identity.encode()).hexdigest()[:16]
+        facts.append(MapFact(str(item.get("kind", "observation")), str(item.get("text", "")), ids, evidence, bool(item.get("uncertain", False)), fact_id))
     dispositions = tuple(
         MapDisposition(event_id, "unresolved", recovery_ref=f"session-event:{event_id}")
         for event_id in source_ids
@@ -253,6 +317,7 @@ class DurableCheckpointStore:
         self._revisions: dict[str, TranscriptRevision] = {}
         self._generations: dict[str, CheckpointGeneration] = {}
         self._traces: dict[str, list[TraceRecord]] = {}
+        self._raw_events: dict[str, list[dict[str, Any]]] = {}
 
     @staticmethod
     def signature(messages: Sequence[Mapping[str, Any]]) -> str:
@@ -285,6 +350,26 @@ class DurableCheckpointStore:
 
     def traces(self, session_id: str) -> tuple[TraceRecord, ...]:
         return tuple(self._traces.get(session_id, ()))
+
+    def record_raw(self, session_id: str, messages: Sequence[Mapping[str, Any]]) -> None:
+        """Retain immutable input events; rendered projections are excluded."""
+        with self._lock:
+            events = self._raw_events.setdefault(session_id, [])
+            seen = {event.get("_row_id") for event in events}
+            for message in messages:
+                if message.get("checkpoint_projection") or message.get("_checkpoint"):
+                    continue
+                row_id = message.get("_row_id")
+                if row_id is not None and row_id in seen:
+                    continue
+                event = dict(message)
+                if row_id is None:
+                    event["_row_id"] = len(events)
+                events.append(event)
+
+    def raw_messages(self, session_id: str) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            return tuple(dict(event) for event in self._raw_events.get(session_id, ()))
 
 
 class ContentAddressedArtifacts:

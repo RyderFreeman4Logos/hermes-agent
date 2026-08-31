@@ -80,6 +80,26 @@ def test_map_requests_one_textual_host_source_and_host_disposes_empty_assistant(
     assert all(f"observed tool_result: tool {n}" in checkpoint for n in range(1, 5))
 
 
+def test_required_map_default_shard_cap_allows_40_singleton_sources():
+    requests = []
+
+    def caller(request):
+        requests.append(request)
+        payload = json.loads(request["messages"][0]["content"])
+        assert len(payload["messages"]) == 1
+        return {"facts": []}
+
+    engine = CheckpointContextEngine({"mode": "live"}, map_caller=caller)
+    messages = [
+        {"role": "user", "content": f"source {index}", "_row_id": index}
+        for index in range(40)
+    ]
+
+    assert engine.compress(messages) is not messages
+    assert engine.last_rejection is None
+    assert len(requests) == 40
+
+
 @pytest.mark.parametrize(("span", "error"), [
     ({"end_char": 1}, "missing evidence start_char"),
     ({"start_char": 0}, "missing evidence end_char"),

@@ -38,7 +38,8 @@ class CheckpointContextEngine(ContextEngine):
         self.target_wire_tokens = int(cfg.get("target_wire_tokens", 48_000))
         self.hard_max_wire_tokens = int(cfg.get("hard_max_wire_tokens", 60_000))
         self.map_concurrency = int(cfg.get("map_concurrency", 2))
-        self.max_map_shards = int(cfg.get("max_map_shards", 32))
+        configured_max_map_shards = cfg.get("max_map_shards")
+        self.max_map_shards = int(configured_max_map_shards) if configured_max_map_shards is not None else None
         map_cfg = cfg.get("map", {})
         configured_map_output = (
             map_cfg.get("max_output_tokens", self._EFFECTIVE_MAP_OUTPUT_CAP)
@@ -52,7 +53,7 @@ class CheckpointContextEngine(ContextEngine):
         )
         if self.target_wire_tokens <= 0 or self.hard_max_wire_tokens < self.target_wire_tokens:
             raise ValueError("checkpoint wire budgets are invalid")
-        if self.map_concurrency < 1 or self.max_map_shards < 1:
+        if self.map_concurrency < 1 or (self.max_map_shards is not None and self.max_map_shards < 1):
             raise ValueError("checkpoint scheduler limits are invalid")
         self.policy = StructuredOutputPolicy(str(cfg.get("structured_output", cfg.get("policy", "required"))).lower())
         self.context_length = int(cfg.get("context_length", self.hard_max_wire_tokens))
@@ -195,7 +196,7 @@ class CheckpointContextEngine(ContextEngine):
 
     def _plan_map_shards(self, messages: Sequence[Mapping[str, Any]]) -> tuple[tuple[int, ...], ...]:
         groups = tuple((i,) for i, message in enumerate(messages) if self._is_map_source(message))
-        if len(groups) > self.max_map_shards:
+        if self.max_map_shards is not None and len(groups) > self.max_map_shards:
             raise CheckpointRejected("Map plan exceeds configured shard limit")
         if self.policy is StructuredOutputPolicy.REQUIRED:
             for group in groups:

@@ -7071,6 +7071,17 @@ def _compress_session_history(
             before_messages = list(session.get("history", []))
             history_version = int(session.get("history_version", 0))
     history = before_messages
+    _replay_cache_pending_before = bool(
+        getattr(agent, "_awaiting_cache_usage_after_compression", False)
+    )
+    _replay_compressor = getattr(agent, "context_compressor", None)
+    _replay_real_usage_pending_before = bool(
+        getattr(
+            _replay_compressor,
+            "awaiting_real_usage_after_compression",
+            False,
+        )
+    )
     if len(history) < 4:
         usage = _get_usage(agent)
         return 0, usage

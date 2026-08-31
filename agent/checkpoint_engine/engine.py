@@ -24,6 +24,7 @@ class CheckpointContextEngine(ContextEngine):
     """Host-owned checkpoint projection with an optional auxiliary Map step."""
 
     _EFFECTIVE_MAP_OUTPUT_CAP = 16_384
+    _MAP_ARTIFACT_EVIDENCE_CHARS = 16_000
 
     def __init__(self, config: Mapping[str, Any] | None = None, *, store: DurableCheckpointStore | None = None, session_id: str = "default", map_caller: Callable[..., Any] | None = None, artifact_root: str | None = None) -> None:
         cfg = config or {}
@@ -224,6 +225,11 @@ class CheckpointContextEngine(ContextEngine):
                     "artifact_id": artifact.artifact_id,
                     "media_type": artifact.media_type,
                     "source_event_id": self._row_id(messages[i], i),
+                    "evidence": [{
+                        "start_char": 0,
+                        "end_char": min(len(content), self._MAP_ARTIFACT_EVIDENCE_CHARS),
+                        "text": content[:self._MAP_ARTIFACT_EVIDENCE_CHARS],
+                    }],
                 }
             map_messages.append(message)
         return {"source_event_ids": source_ids, "messages": map_messages}
@@ -382,6 +388,8 @@ class CheckpointContextEngine(ContextEngine):
         for fact in reduced.facts:
             state = "uncertain" if fact.uncertain else "observed"
             lines.append(f"{state} {fact.kind}: {fact.text}")
+        for artifact_id in reduced.artifacts:
+            lines.append(f"Artifact available via checkpoint_artifact_read: {artifact_id}")
         for epoch in reduced.epochs:
             lines.append(f"Open epoch {epoch.epoch_id} from event {epoch.opened_by_event_id}")
         return "\n".join(lines)
@@ -428,9 +436,10 @@ class CheckpointContextEngine(ContextEngine):
             self._map_artifact_ids = set()
             shards = tuple(self._call_map(source_messages, ids) for ids in self._plan_map_shards(source_messages))
             reduced = self._reduce(lanes, shards, source_messages, host_events=self._host_events)
+            reduced = replace(reduced, artifacts=tuple(sorted(self._map_artifact_ids)))
             checkpoint = self._render_checkpoint(reduced)
             artifact = self.externalize_artifact(checkpoint)
-            reduced = replace(reduced, artifacts=(*sorted(self._map_artifact_ids), artifact.artifact_id))
+            reduced = replace(reduced, artifacts=(*reduced.artifacts, artifact.artifact_id))
             candidate = self._projection(source_messages, checkpoint)
             if self._estimate_wire_tokens(candidate) > self.hard_max_wire_tokens:
                 raise CheckpointRejected("projected request exceeds hard wire budget")

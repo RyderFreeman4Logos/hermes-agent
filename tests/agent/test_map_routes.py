@@ -86,6 +86,34 @@ def test_required_map_externalizes_an_oversized_tool_result_before_planning():
     assert engine.checkpoint_artifact_read(tool_pointer["artifact_id"]) == tool_body
 
 
+def test_checkpoint_keeps_externalized_tool_artifact_after_tail_eviction():
+    def caller(request):
+        payload = json.loads(request["messages"][0]["content"])
+        return {"schema_version": 1, "source_event_ids": payload["source_event_ids"], "facts": []}
+
+    tool_body = "durable artifact result\n" + "x" * 70_000
+    engine = CheckpointContextEngine(
+        {"mode": "live", "protect_last_n": 2}, map_caller=caller,
+    )
+    result = engine.compress([
+        {"role": "assistant", "content": None, "_row_id": 1,
+         "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": tool_body, "_row_id": 2},
+        {"role": "user", "content": "later one", "_row_id": 3},
+        {"role": "assistant", "content": "later two", "_row_id": 4},
+        {"role": "user", "content": "later three", "_row_id": 5},
+    ])
+
+    checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
+    artifact_id = next(
+        line.removeprefix("Artifact available via checkpoint_artifact_read: ")
+        for line in checkpoint.splitlines()
+        if line.startswith("Artifact available via checkpoint_artifact_read: ")
+    )
+    assert all(message.get("tool_call_id") != "call-1" for message in result)
+    assert engine.checkpoint_artifact_read(artifact_id) == tool_body
+
+
 def test_required_map_rejects_a_causal_group_over_effective_output_cap_before_send():
     calls = []
     engine = CheckpointContextEngine(

@@ -55,6 +55,46 @@ def test_production_auxiliary_map_adapter_reaches_required_structured_route(monk
     assert engine._last_route_attempts == ["map-model"]
 
 
+def test_production_map_externalization_sends_bounded_host_evidence(monkeypatch):
+    from agent.agent_init import _build_checkpoint_map_caller
+
+    calls = []
+
+    def call_llm(**kwargs):
+        calls.append(kwargs)
+        payload = json.loads(kwargs["messages"][0]["content"])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "schema_version": 1, "source_event_ids": payload["source_event_ids"], "facts": [],
+            })))],
+            usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", call_llm)
+    agent = SimpleNamespace(
+        provider="configured-provider", model="configured-model",
+        base_url="https://configured.example/v1", api_key="key", api_mode="chat_completions",
+    )
+    tool_body = "host evidence: keep this exact result\n" + "x" * 70_000
+    engine = CheckpointContextEngine(
+        {"mode": "live", "map_routes": [{"model": "map-model", "structured_output": True}]},
+        map_caller=_build_checkpoint_map_caller(agent),
+    )
+
+    assert engine.compress([
+        {"role": "assistant", "content": None, "_row_id": 1,
+         "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": tool_body, "_row_id": 2},
+    ])
+
+    outbound = calls[0]["messages"][0]["content"]
+    tool_payload = json.loads(outbound)["messages"][1]["content"]
+    assert tool_body not in outbound
+    assert tool_payload["artifact_id"]
+    assert tool_payload["evidence"][0]["text"] == tool_body[:tool_payload["evidence"][0]["end_char"]]
+    assert len(tool_payload["evidence"][0]["text"]) < len(tool_body)
+
+
 def test_production_map_forwards_the_effective_output_cap(monkeypatch):
     from agent.agent_init import _build_checkpoint_map_caller
 

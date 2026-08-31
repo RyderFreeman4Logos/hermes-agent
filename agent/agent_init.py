@@ -2697,7 +2697,10 @@ def init_agent(
         # Try loading from plugins/context_engine/<name>/
         try:
             from plugins.context_engine import load_context_engine
-            _selected_engine = load_context_engine(_engine_name)
+            _selected_engine = load_context_engine(
+                _engine_name,
+                _ctx_cfg.get("checkpoint", {}) if isinstance(_ctx_cfg, dict) else None,
+            )
         except Exception as _ce_load_err:
             _ra().logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
 

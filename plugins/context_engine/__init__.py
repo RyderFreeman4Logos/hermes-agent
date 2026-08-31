@@ -23,7 +23,7 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, cast
 
 logger = logging.getLogger(__name__)
 
@@ -76,18 +76,18 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
     return results
 
 
-def load_context_engine(name: str) -> Optional["ContextEngine"]:
+def load_context_engine(name: str, config: Optional[dict] = None) -> Optional["ContextEngine"]:
     """Load and return a ContextEngine instance by name.
 
     Returns None if the engine is not found or fails to load.
     """
     engine_dir = _CONTEXT_ENGINE_PLUGINS_DIR / name
     if not engine_dir.is_dir():
-        logger.debug("Context engine '%s' not found in %s", name, _CONTEXT_ENGINE_PLUGINS_DIR)
+        logger.debug("Context engine '%s' not found in %s", name, engine_dir)
         return None
 
     try:
-        engine = _load_engine_from_dir(engine_dir)
+        engine = _load_engine_from_dir(engine_dir, config=config)
         if engine:
             return engine
         logger.warning("Context engine '%s' loaded but no engine instance found", name)
@@ -97,7 +97,7 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
         return None
 
 
-def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
+def _load_engine_from_dir(engine_dir: Path, config: Optional[dict] = None) -> Optional["ContextEngine"]:
     """Import an engine module and extract the ContextEngine instance.
 
     The module must have either:
@@ -188,10 +188,13 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
         attr = getattr(mod, attr_name, None)
         if (isinstance(attr, type) and issubclass(attr, ContextEngine)
                 and attr is not ContextEngine):
+            constructor = cast(Any, attr)
             try:
-                return attr()
-            except Exception:
-                pass
+                return constructor(config=config) if config is not None else constructor()
+            except TypeError:
+                if config is not None:
+                    return constructor()
+                raise
 
     return None
 

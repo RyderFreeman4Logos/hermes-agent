@@ -196,6 +196,55 @@ def test_production_map_records_primary_and_fallback_physical_sends(monkeypatch)
     assert engine.last_trace.benchmark_admissible is False
 
 
+def test_production_map_amends_invalid_physical_primary_before_fallback():
+    from agent.agent_init import _build_checkpoint_map_caller
+    from agent.auxiliary_client import _FallbackDestination
+
+    primary = MagicMock()
+    primary.base_url = "https://primary.example/v1"
+    primary.chat.completions.create.return_value = SimpleNamespace()
+    fallback = MagicMock()
+    fallback.base_url = "https://fallback.example/v1"
+    fallback.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "schema_version": 1, "source_event_ids": [1], "facts": [],
+        })), finish_reason="stop")],
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=4),
+    )
+    agent = SimpleNamespace(
+        provider="configured-provider", model="configured-model",
+        base_url="https://configured.example/v1", api_key="key", api_mode="chat_completions",
+    )
+    engine = CheckpointContextEngine(
+        {"mode": "live", "trace": True, "map_routes": [{"model": "primary-model", "structured_output": True}]},
+        map_caller=_build_checkpoint_map_caller(agent),
+    )
+
+    with (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("auto", "primary-model", None, None, None)),
+        patch("agent.auxiliary_client._get_cached_client", return_value=(primary, "primary-model")),
+        patch("agent.auxiliary_client._try_configured_fallback_chain",
+              return_value=(fallback, "fallback-model", "fallback_chain[0](fallback-provider)")),
+        patch("agent.auxiliary_client._fallback_destination", return_value=_FallbackDestination(
+            "fallback-provider", "https://fallback.example/v1", None, "fallback-model",
+        )),
+        patch("agent.auxiliary_client._replan_synchronous_cache_sections", side_effect=lambda messages, tools, **_k: (messages, tools)),
+    ):
+        engine.compress([{"role": "user", "content": "source", "_row_id": 1}])
+
+    records = engine.last_trace.map_attempt_records
+    assert primary.chat.completions.create.call_count == 1
+    assert fallback.chat.completions.create.call_count == 1
+    assert [(record.configured_route, record.physical_model)
+            for record in records] == [
+        ("auto", "primary-model"),
+        ("fallback-provider", "fallback-model"),
+    ]
+    assert records[0].fallback_rejection and "rejected" in records[0].fallback_rejection
+    assert engine.last_trace.benchmark_admissible is False
+
+
 def test_parser_rejects_model_text_without_evidence_and_uses_host_span_text():
     from agent.checkpoint_engine import parse_map_response
 

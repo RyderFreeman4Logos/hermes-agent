@@ -3629,6 +3629,21 @@ def _record_checkpoint_attempt(
     }))
 
 
+def _amend_checkpoint_attempt_validation_rejection(error: Exception) -> None:
+    """Classify the just-recorded physical response before fallback can run."""
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    attempts = context.get("checkpoint_attempts") if context else None
+    if not isinstance(attempts, list) or not attempts:
+        return
+    attempt = attempts[-1]
+    if not isinstance(attempt, Mapping) or attempt.get("fallback_rejection") is not None:
+        return
+    attempts[-1] = MappingProxyType({
+        **attempt,
+        "fallback_rejection": f"rejected: {type(error).__name__}: {error}",
+    })
+
+
 async def _relay_async_completion(
     client: Any,
     kwargs: dict[str, Any],
@@ -9249,9 +9264,11 @@ def _validate_llm_response(
     keeps the model (read from the response itself) with an empty route.
     """
     if response is None:
-        raise RuntimeError(
+        error = RuntimeError(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
+        _amend_checkpoint_attempt_validation_rejection(error)
+        raise error
     from agent.aux_accounting import record_aux_usage
     record_aux_usage(response, task, provider=provider, base_url=base_url)
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
@@ -9268,12 +9285,14 @@ def _validate_llm_response(
             return recovered
         response_type = type(response).__name__
         response_preview = str(response)[:120]
-        raise RuntimeError(
+        error = RuntimeError(
             f"Auxiliary {task or 'call'}: LLM returned invalid response "
             f"(type={response_type}): {response_preview!r}. "
             f"Expected object with .choices[0].message — check provider "
             f"adapter or custom endpoint compatibility."
-        ) from exc
+        )
+        _amend_checkpoint_attempt_validation_rejection(error)
+        raise error from exc
     _record_relay_auxiliary_response_model(response)
     _complete_relay_auxiliary_call()
     return response

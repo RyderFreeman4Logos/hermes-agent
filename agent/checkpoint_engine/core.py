@@ -301,16 +301,20 @@ class MapResponse:
     def schema(
         cls, source_event_ids: Sequence[int] = (), source_texts: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        event_indexes = list(range(len(source_event_ids)))
         span_properties: dict[str, Any] = {
-            "event_index": {"type": "integer", "enum": event_indexes},
             "start_char": {"type": "integer", "minimum": 0},
             "end_char": {"type": "integer", "minimum": 0},
         }
+        required = ["start_char", "end_char"]
+        if len(source_event_ids) != 1:
+            span_properties["event_index"] = {
+                "type": "integer", "enum": list(range(len(source_event_ids))),
+            }
+            required.insert(0, "event_index")
         span_item: dict[str, Any] = {
             "type": "object", "additionalProperties": False,
             "properties": span_properties,
-            "required": ["event_index", "start_char", "end_char"],
+            "required": required,
         }
         if source_texts is not None:
             if len(source_texts) != len(source_event_ids):
@@ -354,6 +358,13 @@ def _event_index(span: Mapping[str, Any], source_count: int) -> int:
     return index
 
 
+def _evidence_char(span: Mapping[str, Any], name: str) -> int:
+    value = span.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"missing evidence {name}")
+    return value
+
+
 def parse_map_response(
     raw: str | Mapping[str, Any], *, expected_source_event_ids: tuple[int, ...],
     source_events: Mapping[str | int, str] | None = None,
@@ -380,7 +391,7 @@ def parse_map_response(
         evidence = tuple(
             EvidenceSpan(
                 str(source_ids[0] if len(source_ids) == 1 else source_ids[_event_index(span, len(source_ids))]),
-                int(span["start_char"]), int(span["end_char"]),
+                _evidence_char(span, "start_char"), _evidence_char(span, "end_char"),
             )
             for span in raw_evidence
         )

@@ -17,7 +17,8 @@ def test_required_map_schema_keeps_identity_host_owned_and_binds_single_evidence
         fact = schema["properties"]["facts"]["items"]
         assert "source_event_ids" not in fact["properties"]
         evidence = fact["properties"]["evidence"]["items"]
-        assert evidence["properties"]["event_index"]["enum"] == [0]
+        assert "event_index" not in evidence["properties"]
+        assert "event_index" not in evidence["required"]
         assert "event_id" not in evidence["properties"]
         # Replay none's free-form event ID: a one-event shard binds it to host ID 1.
         return {
@@ -26,7 +27,7 @@ def test_required_map_schema_keeps_identity_host_owned_and_binds_single_evidence
             "facts": [{
                 "kind": "observation",
                 "source_event_ids": [1],
-                "evidence": [{"event_id": "source_event_ids", "start_char": 0, "end_char": 6}],
+                "evidence": [{"start_char": 0, "end_char": 6}],
             }],
         }
 
@@ -38,6 +39,48 @@ def test_required_map_schema_keeps_identity_host_owned_and_binds_single_evidence
     assert requests
     checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
     assert "observed observation: source" in checkpoint
+
+
+def test_map_host_dispositions_hidden_events_without_a_map_request():
+    requests = []
+
+    def caller(request):
+        payload = json.loads(request["messages"][0]["content"])
+        requests.append(payload)
+        assert payload["messages"] == [{"role": "user", "content": "real source"}]
+        return {"facts": [{
+            "kind": "observation",
+            "evidence": [{"start_char": 0, "end_char": 4}],
+        }]}
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "protect_first_n": 0, "protect_last_n": 0}, map_caller=caller,
+    )
+    messages = [
+        {"role": "system", "display_kind": "hidden", "content": "[Agent loop timing]\nCurrent loop start: 2026-08-26T20:34:42-07:00", "_row_id": 25},
+        {"role": "user", "content": "real source", "_row_id": 26},
+    ]
+
+    result = engine.compress(messages)
+
+    assert result is not messages
+    assert len(requests) == 1
+    assert engine.last_rejection is None
+    assert "observed observation: real" in result[1]["content"]
+
+
+@pytest.mark.parametrize(("span", "error"), [
+    ({"end_char": 1}, "missing evidence start_char"),
+    ({"start_char": 0}, "missing evidence end_char"),
+    ({"start_char": "0", "end_char": 1}, "missing evidence start_char"),
+    ({"start_char": 0, "end_char": "1"}, "missing evidence end_char"),
+])
+def test_map_parser_rejects_missing_or_non_integer_evidence_chars_without_salvage(span, error):
+    with pytest.raises(ValueError, match=f"^{error}$"):
+        parse_map_response(
+            {"facts": [{"kind": "text", "evidence": [span]}]},
+            expected_source_event_ids=(25,), source_events={"25": "host text"},
+        )
 
 
 def test_map_rejects_free_form_evidence_id_for_multi_event_shard():
@@ -180,7 +223,7 @@ def test_required_map_binds_evidence_bounds_and_parser_to_wire_excerpt():
     map_body = {
         "facts": [{
             "kind": "tool_result",
-            "evidence": [{"event_index": 0, "start_char": 0, "end_char": 168}],
+            "evidence": [{"start_char": 0, "end_char": 168}],
         }],
     }
 

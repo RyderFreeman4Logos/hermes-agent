@@ -190,23 +190,27 @@ class CheckpointContextEngine(ContextEngine):
         return tuple(groups)
 
     def _plan_map_shards(self, messages: Sequence[Mapping[str, Any]]) -> tuple[tuple[int, ...], ...]:
-        groups = self._plan_causal_groups(messages)
+        groups = tuple(
+            tuple(i for i in group.event_indices if messages[i].get("display_kind") != "hidden")
+            for group in self._plan_causal_groups(messages)
+        )
+        groups = tuple(group for group in groups if group)
         if self.policy is StructuredOutputPolicy.REQUIRED:
             shards: list[tuple[int, ...]] = []
             for group in groups:
-                if self._estimate_map_output_tokens(messages, group.event_indices) > self.effective_map_output_tokens:
+                if self._estimate_map_output_tokens(messages, group) > self.effective_map_output_tokens:
                     raise CheckpointRejected(
                         "causal Map group exceeds effective Map output cap "
                         f"({self.effective_map_output_tokens})"
                     )
-                shards.append(group.event_indices)
+                shards.append(group)
             if len(shards) > self.max_map_shards:
                 raise CheckpointRejected("Map plan exceeds configured shard limit")
             return tuple(shards)
         size = max(1, (len(groups) + self.max_map_shards - 1) // self.max_map_shards)
         shards: list[tuple[int, ...]] = []
         for n in range(0, len(groups), size):
-            indices = tuple(i for group in groups[n:n + size] for i in group.event_indices)
+            indices = tuple(i for group in groups[n:n + size] for i in group)
             if indices:
                 shards.append(indices)
         return tuple(shards[:self.max_map_shards])
@@ -451,6 +455,11 @@ class CheckpointContextEngine(ContextEngine):
             self._map_artifact_ids = set()
             shards = tuple(self._call_map(source_messages, ids) for ids in self._plan_map_shards(source_messages))
             reduced = self._reduce(lanes, shards, source_messages, host_events=self._host_events)
+            reduced = replace(reduced, dispositions=(*reduced.dispositions, *(
+                MapDisposition(self._row_id(message, index), "host_dispositioned")
+                for index, message in enumerate(source_messages)
+                if message.get("display_kind") == "hidden"
+            )))
             reduced = replace(reduced, artifacts=tuple(sorted(self._map_artifact_ids)))
             checkpoint = self._render_checkpoint(reduced)
             artifact = self.externalize_artifact(checkpoint)

@@ -48,6 +48,7 @@ class CheckpointContextEngine(ContextEngine):
         self.session_id = session_id
         self._map_caller = map_caller
         self._map_routes = tuple(cfg.get("map_routes", ()))
+        self._before_commit: Callable[[], Any] | None = None
 
     @property
     def name(self) -> str:
@@ -212,6 +213,8 @@ class CheckpointContextEngine(ContextEngine):
             if self._estimate_wire_tokens(candidate) > self.hard_max_wire_tokens:
                 raise CheckpointRejected("projected request exceeds hard wire budget")
             generation = CheckpointGeneration(self.generation + 1, revision.revision, revision.source_event_ids, DurableCheckpointStore.signature(candidate), self.mode)
+            if self._before_commit:
+                self._before_commit()
             if self.mode == "live" and not self._store.compare_and_swap(self.session_id, revision, generation):
                 raise CheckpointRejected("transcript changed during checkpoint")
             self.generation = generation.generation

@@ -4825,14 +4825,44 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     "fallback_label": str(fallback_label),
                 }
 
-        digests = [first_digest]
-        for ci, segment in jobs[1:]:
-            try:
-                digests.append(_digest_one(ci, segment, route=selected_route))
-            except BaseException as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                    raise
-                digests.append(_unavailable(ci, exc))
+        from concurrent.futures import ThreadPoolExecutor
+        from agent.auxiliary_client import _get_task_max_concurrency
+
+        configured = _get_task_max_concurrency("compression")
+        remaining = jobs[1:]
+        if not remaining:
+            digests = [first_digest]
+        else:
+            workers = len(remaining) if configured is None else min(configured, len(remaining))
+            # ponytail: pool size capped at _LEAN_DIGEST_MAX_CHUNKS; raise only if
+            # the chunk ceiling itself is lifted.
+            workers = max(1, min(workers, _LEAN_DIGEST_MAX_CHUNKS))
+            if workers == 1 or len(remaining) == 1:
+                sibling_digests = [
+                    _digest_one(ci, segment, route=selected_route)
+                    for ci, segment in remaining
+                ]
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        pool.submit(
+                            contextvars.copy_context().run,
+                            _digest_one,
+                            ci,
+                            segment,
+                            route=selected_route,
+                        )
+                        for ci, segment in remaining
+                    ]
+                    sibling_digests = []
+                    for future, (ci, _segment) in zip(futures, remaining):
+                        try:
+                            sibling_digests.append(future.result())
+                        except BaseException as exc:
+                            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                                raise
+                            sibling_digests.append(_unavailable(ci, exc))
+            digests = [first_digest, *sibling_digests]
         return (
             "\n\n" + _LEAN_DIGESTS_HEADING + "\n"
             + "\n\n".join(digests)

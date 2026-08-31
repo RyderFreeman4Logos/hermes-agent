@@ -1,3 +1,5 @@
+import json
+
 from agent.checkpoint_engine import CheckpointContextEngine
 
 
@@ -53,6 +55,35 @@ def test_required_map_length_is_inadmissible_before_json_parse():
     assert "finish_reason=length" in (engine.last_rejection or "")
     assert [(record.actual_wire_mode, record.finish_reason, record.output_tokens)
             for record in engine._map_attempt_records] == [("structured", "length", 16_384)]
+
+
+def test_required_map_externalizes_an_oversized_tool_result_before_planning():
+    requests = []
+
+    def caller(request):
+        requests.append(request)
+        payload = json.loads(request["messages"][0]["content"])
+        return {"schema_version": 1, "source_event_ids": payload["source_event_ids"], "facts": []}
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "map": {"max_output_tokens": 32_768}}, map_caller=caller,
+    )
+    tool_body = "x" * 70_000
+    messages = [
+        {"role": "assistant", "content": None, "_row_id": 1,
+         "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": tool_body, "_row_id": 2},
+    ]
+
+    result = engine.compress(messages)
+
+    assert result is not messages
+    assert engine.last_rejection is None
+    assert requests and all(request["max_tokens"] == 16_384 for request in requests)
+    payload = json.loads(requests[0]["messages"][0]["content"])
+    tool_pointer = payload["messages"][1]["content"]
+    assert tool_body not in requests[0]["messages"][0]["content"]
+    assert engine.checkpoint_artifact_read(tool_pointer["artifact_id"]) == tool_body
 
 
 def test_required_map_rejects_a_causal_group_over_effective_output_cap_before_send():

@@ -77,6 +77,7 @@ class CheckpointContextEngine(ContextEngine):
         self._last_route_attempts: list[str] = []
         self._map_route_attempts: list[str] = []
         self._map_attempt_records: list[MapAttemptRecord] = []
+        self._map_artifact_ids: set[str] = set()
         self._artifacts = ContentAddressedArtifacts(artifact_root) if artifact_root else None
 
     @property
@@ -208,16 +209,29 @@ class CheckpointContextEngine(ContextEngine):
                 shards.append(indices)
         return tuple(shards[:self.max_map_shards])
 
+    def _map_payload(
+        self, messages: Sequence[Mapping[str, Any]], event_ids: Sequence[int],
+    ) -> dict[str, Any]:
+        source_ids = tuple(self._row_id(messages[i], i) for i in event_ids)
+        map_messages: list[dict[str, Any]] = []
+        for i in event_ids:
+            message = dict(messages[i])
+            content = message.get("content")
+            if self._role(message) == "tool" and isinstance(content, str):
+                artifact = self.externalize_artifact(content)
+                self._map_artifact_ids.add(artifact.artifact_id)
+                message["content"] = {
+                    "artifact_id": artifact.artifact_id,
+                    "media_type": artifact.media_type,
+                    "source_event_id": self._row_id(messages[i], i),
+                }
+            map_messages.append(message)
+        return {"source_event_ids": source_ids, "messages": map_messages}
+
     def _estimate_map_output_tokens(
         self, messages: Sequence[Mapping[str, Any]], event_ids: Sequence[int],
     ) -> int:
-        # ponytail: source payload is the conservative response proxy; use a
-        # route-specific output estimator if one becomes available.
-        source_ids = tuple(self._row_id(messages[i], i) for i in event_ids)
-        return count_request_tokens({
-            "source_event_ids": source_ids,
-            "messages": [messages[i] for i in event_ids],
-        })
+        return count_request_tokens(self._map_payload(messages, event_ids))
 
     def _local_map(self, messages: Sequence[Mapping[str, Any]], event_ids: tuple[int, ...]) -> MapShard:
         # Deterministic facts are observations only.  Assistant prose cannot
@@ -242,7 +256,8 @@ class CheckpointContextEngine(ContextEngine):
             str(self._row_id(messages[i], i)): str(messages[i].get("content", ""))
             for i in event_ids
         }
-        prompt = [{"role": "user", "content": json.dumps({"source_event_ids": source_ids, "messages": [messages[i] for i in event_ids]}, default=str)}]
+        payload = self._map_payload(messages, event_ids)
+        prompt = [{"role": "user", "content": json.dumps(payload, default=str)}]
         routes = self._map_routes or ({},)
         last_error: Exception | None = None
         for route in routes:
@@ -410,11 +425,12 @@ class CheckpointContextEngine(ContextEngine):
             lanes = self._extract_deterministic_lanes(source_messages, tool_receipts=self._tool_receipts)
             self._map_attempt_records = []
             self._map_route_attempts = []
+            self._map_artifact_ids = set()
             shards = tuple(self._call_map(source_messages, ids) for ids in self._plan_map_shards(source_messages))
             reduced = self._reduce(lanes, shards, source_messages, host_events=self._host_events)
             checkpoint = self._render_checkpoint(reduced)
             artifact = self.externalize_artifact(checkpoint)
-            reduced = replace(reduced, artifacts=(artifact.artifact_id,))
+            reduced = replace(reduced, artifacts=(*sorted(self._map_artifact_ids), artifact.artifact_id))
             candidate = self._projection(source_messages, checkpoint)
             if self._estimate_wire_tokens(candidate) > self.hard_max_wire_tokens:
                 raise CheckpointRejected("projected request exceeds hard wire budget")

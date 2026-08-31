@@ -258,11 +258,13 @@ class CheckpointContextEngine(ContextEngine):
                 raise CheckpointRejected("no configured structured-capable map route")
             return self._local_map(messages, event_ids)
         source_ids = tuple(self._row_id(messages[i], i) for i in event_ids)
-        source_events = {
-            str(self._row_id(messages[i], i)): str(messages[i].get("content", ""))
-            for i in event_ids
-        }
         payload = self._map_payload(messages, event_ids)
+        source_events: dict[str | int, str] = {}
+        for source_id, message in zip(source_ids, payload["messages"]):
+            content = message.get("content")
+            evidence = content.get("evidence") if isinstance(content, Mapping) else None
+            excerpt = evidence[0].get("text") if isinstance(evidence, list) and evidence and isinstance(evidence[0], Mapping) else None
+            source_events[str(source_id)] = excerpt if isinstance(excerpt, str) else str(content)
         prompt = [{"role": "user", "content": json.dumps(payload, default=str)}]
         routes = self._map_routes or ({},)
         last_error: Exception | None = None

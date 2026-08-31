@@ -86,6 +86,61 @@ def test_required_map_externalizes_an_oversized_tool_result_before_planning():
     assert engine.checkpoint_artifact_read(tool_pointer["artifact_id"]) == tool_body
 
 
+def test_required_map_rejects_externalized_evidence_past_host_excerpt():
+    tool_body = "host-visible evidence\n" + "x" * 70_000
+
+    def caller(request):
+        payload = json.loads(request["messages"][0]["content"])
+        return {
+            "schema_version": 1,
+            "source_event_ids": payload["source_event_ids"],
+            "facts": [{
+                "kind": "tool_result", "source_event_ids": [2],
+                "evidence": [{"event_id": "2", "start_char": 0, "end_char": len(tool_body)}],
+            }],
+        }
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "protect_last_n": 0}, map_caller=caller,
+    )
+    messages = [
+        {"role": "assistant", "content": None, "_row_id": 1,
+         "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": tool_body, "_row_id": 2},
+    ]
+
+    assert engine.compress(messages) is messages
+    assert "evidence span exceeds source bounds" in (engine.last_rejection or "")
+
+
+def test_required_map_extracts_only_host_excerpt_from_externalized_evidence():
+    tool_body = "host-visible evidence\n" + "x" * 70_000
+
+    def caller(request):
+        payload = json.loads(request["messages"][0]["content"])
+        return {
+            "schema_version": 1,
+            "source_event_ids": payload["source_event_ids"],
+            "facts": [{
+                "kind": "tool_result", "source_event_ids": [2],
+                "evidence": [{"event_id": "2", "start_char": 0, "end_char": 21}],
+            }],
+        }
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "protect_last_n": 0}, map_caller=caller,
+    )
+    result = engine.compress([
+        {"role": "assistant", "content": None, "_row_id": 1,
+         "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": tool_body, "_row_id": 2},
+    ])
+
+    checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
+    assert "observed tool_result: host-visible evidence" in checkpoint
+    assert tool_body not in checkpoint
+
+
 def test_checkpoint_keeps_externalized_tool_artifact_after_tail_eviction():
     def caller(request):
         payload = json.loads(request["messages"][0]["content"])

@@ -55,6 +55,47 @@ def test_production_auxiliary_map_adapter_reaches_required_structured_route(monk
     assert engine._last_route_attempts == ["map-model"]
 
 
+def test_production_map_forwards_the_effective_output_cap(monkeypatch):
+    from agent.agent_init import _build_checkpoint_map_caller
+
+    calls = []
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "schema_version": 1, "source_event_ids": [1], "facts": [],
+            })))],
+            usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
+        ),
+    )
+    agent = SimpleNamespace(
+        provider="configured-provider", model="configured-model",
+        base_url="https://configured.example/v1", api_key="key", api_mode="chat_completions",
+    )
+    engine = CheckpointContextEngine(
+        {
+            "mode": "live", "map": {"max_output_tokens": 32_768},
+            "map_routes": [{"model": "map-model", "structured_output": True}],
+        },
+        map_caller=_build_checkpoint_map_caller(agent),
+    )
+
+    engine.compress([{"role": "user", "content": "source", "_row_id": 1}])
+
+    assert calls[0]["max_tokens"] == 16_384
+
+
+def test_checkpoint_transport_keeps_its_configured_output_cap_on_the_wire():
+    from agent.auxiliary_client import _build_call_kwargs
+
+    request = _build_call_kwargs(
+        "custom", "map-model", [{"role": "user", "content": "source"}],
+        max_tokens=16_384, task="checkpoint",
+    )
+
+    assert request["max_tokens"] == 16_384
+
+
 def test_production_map_does_not_replay_structured_rejection_prompt_only():
     from agent.agent_init import _build_checkpoint_map_caller
 

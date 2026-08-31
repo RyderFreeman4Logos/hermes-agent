@@ -23,6 +23,8 @@ from .core import (
 class CheckpointContextEngine(ContextEngine):
     """Host-owned checkpoint projection with an optional auxiliary Map step."""
 
+    _EFFECTIVE_MAP_OUTPUT_CAP = 16_384
+
     def __init__(self, config: Mapping[str, Any] | None = None, *, store: DurableCheckpointStore | None = None, session_id: str = "default", map_caller: Callable[..., Any] | None = None, artifact_root: str | None = None) -> None:
         cfg = config or {}
         self.mode = str(cfg.get("mode", "shadow"))
@@ -35,6 +37,17 @@ class CheckpointContextEngine(ContextEngine):
         self.hard_max_wire_tokens = int(cfg.get("hard_max_wire_tokens", 60_000))
         self.map_concurrency = int(cfg.get("map_concurrency", 2))
         self.max_map_shards = int(cfg.get("max_map_shards", 32))
+        map_cfg = cfg.get("map", {})
+        configured_map_output = (
+            map_cfg.get("max_output_tokens", self._EFFECTIVE_MAP_OUTPUT_CAP)
+            if isinstance(map_cfg, Mapping) else self._EFFECTIVE_MAP_OUTPUT_CAP
+        )
+        if isinstance(configured_map_output, bool) or not isinstance(configured_map_output, int) or configured_map_output <= 0:
+            raise ValueError("checkpoint map output cap is invalid")
+        self.map_max_output_tokens = configured_map_output
+        self.effective_map_output_tokens = min(
+            configured_map_output, self._EFFECTIVE_MAP_OUTPUT_CAP,
+        )
         if self.target_wire_tokens <= 0 or self.hard_max_wire_tokens < self.target_wire_tokens:
             raise ValueError("checkpoint wire budgets are invalid")
         if self.map_concurrency < 1 or self.max_map_shards < 1:
@@ -175,6 +188,18 @@ class CheckpointContextEngine(ContextEngine):
 
     def _plan_map_shards(self, messages: Sequence[Mapping[str, Any]]) -> tuple[tuple[int, ...], ...]:
         groups = self._plan_causal_groups(messages)
+        if self.policy is StructuredOutputPolicy.REQUIRED:
+            shards: list[tuple[int, ...]] = []
+            for group in groups:
+                if self._estimate_map_output_tokens(messages, group.event_indices) > self.effective_map_output_tokens:
+                    raise CheckpointRejected(
+                        "causal Map group exceeds effective Map output cap "
+                        f"({self.effective_map_output_tokens})"
+                    )
+                shards.append(group.event_indices)
+            if len(shards) > self.max_map_shards:
+                raise CheckpointRejected("Map plan exceeds configured shard limit")
+            return tuple(shards)
         size = max(1, (len(groups) + self.max_map_shards - 1) // self.max_map_shards)
         shards: list[tuple[int, ...]] = []
         for n in range(0, len(groups), size):
@@ -182,6 +207,17 @@ class CheckpointContextEngine(ContextEngine):
             if indices:
                 shards.append(indices)
         return tuple(shards[:self.max_map_shards])
+
+    def _estimate_map_output_tokens(
+        self, messages: Sequence[Mapping[str, Any]], event_ids: Sequence[int],
+    ) -> int:
+        # ponytail: source payload is the conservative response proxy; use a
+        # route-specific output estimator if one becomes available.
+        source_ids = tuple(self._row_id(messages[i], i) for i in event_ids)
+        return count_request_tokens({
+            "source_event_ids": source_ids,
+            "messages": [messages[i] for i in event_ids],
+        })
 
     def _local_map(self, messages: Sequence[Mapping[str, Any]], event_ids: tuple[int, ...]) -> MapShard:
         # Deterministic facts are observations only.  Assistant prose cannot
@@ -217,6 +253,7 @@ class CheckpointContextEngine(ContextEngine):
                 continue
             try:
                 request = prepare_provider_request(prompt, model=route.get("model"), policy=self.policy, schema=MapResponse.schema(), route_capabilities=route)
+                request["max_tokens"] = self.effective_map_output_tokens
                 raw = self._map_caller(request)
                 if isinstance(raw, Mapping):
                     identities = raw.get("_checkpoint_attempt_identities")
@@ -226,6 +263,13 @@ class CheckpointContextEngine(ContextEngine):
                                 self._record_map_attempt(identity)
                     elif "_checkpoint_identity" in raw:
                         self._record_map_attempt(raw["_checkpoint_identity"])
+                    if self.policy is StructuredOutputPolicy.REQUIRED and any(
+                        record.finish_reason == "length"
+                        for record in self._map_attempt_records
+                    ):
+                        raise CheckpointRejected(
+                            "required Map output truncated (finish_reason=length)"
+                        )
                 if isinstance(raw, Mapping) and "content" in raw:
                     raw = raw["content"]
                 elif isinstance(raw, Mapping) and "choices" in raw:

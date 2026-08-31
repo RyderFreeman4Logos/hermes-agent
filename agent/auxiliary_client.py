@@ -9079,6 +9079,7 @@ def _build_call_kwargs(
             or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
         )
         _is_moa = bool(task) and str(task) == "moa_reference"
+        _is_checkpoint = bool(task) and str(task) == "checkpoint"
         # Gemini's native generateContent maps max_tokens → maxOutputTokens and,
         # when it is omitted, applies a fixed 65,535-token ceiling rather than
         # "the model's full budget" (see gemini_native_adapter.build_gemini_request).
@@ -9104,6 +9105,7 @@ def _build_call_kwargs(
             or _nous_on_messages
             or _is_nvidia_nim
             or _is_moa
+            or _is_checkpoint
             or _is_gemini_native
         ):
             # Use auxiliary_max_tokens_param() so models that require

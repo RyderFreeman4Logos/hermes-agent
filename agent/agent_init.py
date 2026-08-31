@@ -141,6 +141,7 @@ def _build_checkpoint_map_caller(agent: Any) -> Callable[[dict[str, Any]], dict[
         try:
             response = call_llm(
                 task="checkpoint", model=request.get("model"), messages=request["messages"],
+                max_tokens=int(request["max_tokens"]),
                 extra_body={"response_format": request["response_format"]},
                 main_runtime={
                     "provider": getattr(agent, "provider", ""), "model": getattr(agent, "model", ""),

@@ -53,6 +53,17 @@ def test_map_schema_and_parser_reject_model_owned_fact_text():
         )
 
 
+def test_map_schema_requires_non_empty_fact_evidence_and_parser_rejects_empty():
+    fact_schema = MapResponse.schema((1,), ("host text",))["properties"]["facts"]["items"]
+
+    assert fact_schema["properties"]["evidence"]["minItems"] == 1
+    with pytest.raises(ValueError, match="^fact requires evidence$"):
+        parse_map_response(
+            {"facts": [{"kind": "observation", "evidence": []}]},
+            expected_source_event_ids=(1,), source_events={"1": "host text"},
+        )
+
+
 def test_map_summary_is_bounded_in_schema_and_parser():
     fact_schema = MapResponse.schema((1,), ("host text",))["properties"]["facts"]["items"]
 

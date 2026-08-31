@@ -332,7 +332,7 @@ class MapResponse:
                         "kind": {"type": "string"},
                         "summary": {"type": "string", "maxLength": cls._SUMMARY_MAX_LENGTH},
                         "uncertain": {"type": "boolean"},
-                        "evidence": {"type": "array", "items": span_item},
+                        "evidence": {"type": "array", "items": span_item, "minItems": 1},
                     },
                     "required": ["kind", "evidence"],
                 }},

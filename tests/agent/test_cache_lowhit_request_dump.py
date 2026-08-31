@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
+
+from agent.usage_pricing import normalize_usage
+
 
 _FORBIDDEN_KEYS = (
     "prefix",
@@ -177,16 +180,42 @@ def test_dump_module_is_loaded_from_this_checkout() -> None:
     assert Path(dump.__file__).is_relative_to(Path(__file__).parents[2])
 
 
-def test_transport_capture_remembers_exact_request(monkeypatch) -> None:
+def test_normalize_usage_canonical_telemetry_drives_dump(monkeypatch, tmp_path) -> None:
+    from agent import cache_lowhit_request_dump as dump
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    dump.reset_for_tests()
+    _remember_pair(dump, "UNREDACTED-PREFIX-A", "UNREDACTED-PREFIX-B")
+
+    usage = normalize_usage(
+        SimpleNamespace(
+            prompt_tokens=10_000,
+            completion_tokens=100,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        ),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+
+    assert usage.cache_telemetry == "reported"
+    files = _dump_files(tmp_path)
+    assert len(files) == 1
+    _assert_fingerprint_only(json.loads(files[0].read_text(encoding="utf-8")))
+
+
+def test_normalize_usage_without_cache_fields_marks_telemetry_unavailable() -> None:
+    usage = normalize_usage(
+        SimpleNamespace(prompt_tokens=10_000, completion_tokens=100),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+
+    assert usage.cache_telemetry == "unavailable"
+
+
+def test_relay_send_paths_remember_exact_request_and_api_mode(monkeypatch) -> None:
     from agent import cache_lowhit_request_dump as dump
     from agent import relay_llm
-
-    capture = getattr(relay_llm, "capture_transport_request", None)
-    context = getattr(relay_llm, "_transport_capture_context", None)
-    if not callable(capture) or not callable(context):
-        return
-    capture = cast(Callable[[dict[str, Any]], None], capture)
-    context = cast(Any, context)
 
     remembered: list[tuple[dict[str, Any], str]] = []
     monkeypatch.setattr(
@@ -194,9 +223,114 @@ def test_transport_capture_remembers_exact_request(monkeypatch) -> None:
         "remember_sent_request",
         lambda request, *, api_mode: remembered.append((request, api_mode)),
     )
-    request = {"messages": [{"role": "system", "content": "exact-send"}]}
+    for api_mode in ("chat_completions", "codex_responses", "anthropic_messages"):
+        request = {
+            "model": "gpt-test",
+            "messages": [{"role": "system", "content": "exact-send"}],
+            "api_mode_marker": api_mode,
+        }
+        metadata = {"api_mode": api_mode}
+        observed: list[dict[str, Any]] = []
 
-    with context(name="openai", model_name="gpt-test", metadata={"api_mode": "chat_completions"}):
-        capture(request)
+        relay_llm.execute(
+            request,
+            lambda sent: observed.append(sent) or {"ok": True},
+            session_id="no-live-session",
+            name="openai",
+            model_name="gpt-test",
+            metadata=metadata,
+        )
 
-    assert remembered == [(request, "chat_completions")]
+        async def async_provider(sent: dict[str, Any]) -> dict[str, Any]:
+            observed.append(sent)
+            return {"ok": True}
+
+        asyncio.run(
+            relay_llm.execute_async(
+                request,
+                async_provider,
+                session_id="no-live-session",
+                name="openai",
+                model_name="gpt-test",
+                metadata=metadata,
+            )
+        )
+
+        stream = relay_llm.stream_current(
+            request,
+            lambda sent: observed.append(sent) or iter(({"ok": True},)),
+            name="openai",
+            model_name="gpt-test",
+            finalizer=dict,
+            metadata=metadata,
+        )
+        assert list(stream) == [{"ok": True}]
+        assert observed == [request, request, request]
+
+    assert [(request["api_mode_marker"], mode) for request, mode in remembered] == [
+        (api_mode, api_mode)
+        for api_mode in ("chat_completions", "codex_responses", "anthropic_messages")
+        for _ in range(3)
+    ]
+
+
+def test_current_wrappers_do_not_double_remember(monkeypatch) -> None:
+    from agent import cache_lowhit_request_dump as dump
+    from agent import relay_llm, relay_runtime
+
+    remembered: list[tuple[dict[str, Any], str]] = []
+    monkeypatch.setattr(
+        dump,
+        "remember_sent_request",
+        lambda request, *, api_mode: remembered.append((request, api_mode)),
+    )
+    monkeypatch.setattr(
+        relay_runtime,
+        "active_turn",
+        lambda _session_id=None: SimpleNamespace(
+            lease=SimpleNamespace(
+                host=object(), session=None, session_id="no-live-session"
+            ),
+            handle=None,
+            relay_enabled=True,
+            closed=False,
+        ),
+    )
+
+    request = {"model": "gpt-test", "messages": [], "api_mode_marker": "sync"}
+    relay_llm.execute_current(
+        request,
+        lambda sent: {"ok": sent["api_mode_marker"]},
+        name="openai",
+        model_name="gpt-test",
+        metadata={"api_mode": "chat_completions"},
+    )
+
+    async def async_provider(sent: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": sent["api_mode_marker"]}
+
+    asyncio.run(
+        relay_llm.execute_current_async(
+            {"model": "gpt-test", "messages": [], "api_mode_marker": "async"},
+            async_provider,
+            name="openai",
+            model_name="gpt-test",
+            metadata={"api_mode": "codex_responses"},
+        )
+    )
+
+    stream = relay_llm.stream_current(
+        {"model": "gpt-test", "messages": [], "api_mode_marker": "stream"},
+        lambda _sent: iter(({"ok": True},)),
+        name="openai",
+        model_name="gpt-test",
+        finalizer=dict,
+        metadata={"api_mode": "anthropic_messages"},
+    )
+    assert list(stream) == [{"ok": True}]
+
+    assert [(request["api_mode_marker"], mode) for request, mode in remembered] == [
+        ("sync", "chat_completions"),
+        ("async", "codex_responses"),
+        ("stream", "anthropic_messages"),
+    ]

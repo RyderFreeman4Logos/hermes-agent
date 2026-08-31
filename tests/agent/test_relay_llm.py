@@ -141,6 +141,75 @@ async def test_async_execution_uses_canonical_relay_operation_name(
     assert observed_names == ["openai.responses"]
 
 
+def test_managed_current_sends_remember_once_and_retain_distinct_fingerprints(
+    relay_turn, monkeypatch, tmp_path
+):
+    from agent import cache_lowhit_request_dump as dump
+    from agent.usage_pricing import CanonicalUsage
+
+    dump.reset_for_tests()
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    remembered = []
+    original_remember = dump.remember_sent_request
+
+    def remember(request, *, api_mode):
+        remembered.append((request, api_mode))
+        original_remember(request, api_mode=api_mode)
+
+    monkeypatch.setattr(dump, "remember_sent_request", remember)
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+
+    request_a = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "managed-a"}],
+    }
+    request_b = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "managed-b"}],
+    }
+
+    relay_llm.execute_current(
+        request_a,
+        lambda _request: {"content": "done-a"},
+        name="custom",
+        model_name="test-model",
+        metadata={"api_mode": "chat_completions"},
+    )
+
+    async def provider(_request):
+        return {"content": "done-b"}
+
+    asyncio.run(
+        relay_llm.execute_current_async(
+            request_b,
+            provider,
+            name="custom",
+            model_name="test-model",
+            metadata={"api_mode": "chat_completions"},
+        )
+    )
+
+    assert len(remembered) == 2
+    assert [request["messages"][0]["content"] for request, _mode in remembered] == [
+        "managed-a",
+        "managed-b",
+    ]
+
+    dump.maybe_dump_on_usage(
+        CanonicalUsage(
+            cache_read_tokens=0,
+            input_tokens=10_000,
+            cache_telemetry="reported",
+        )
+    )
+    files = list((tmp_path / "observability" / "cache_lowhit").glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    fingerprints = [request["fingerprint"] for request in payload["requests"]]
+    assert len(fingerprints) == 2
+    assert len(set(fingerprints)) == 2
+
+
 def test_stream_execution_uses_canonical_relay_operation_name(relay_turn, monkeypatch):
     relay, _turn = relay_turn
     observed_names = []

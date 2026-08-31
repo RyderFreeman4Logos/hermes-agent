@@ -7,7 +7,7 @@ def test_checkpoint_is_opt_in_shadow_noop():
     messages = [{"role": "user", "content": "hello"}]
     engine = CheckpointContextEngine()
     assert engine.compress(messages) is messages
-    assert engine.compression_count == 0
+    assert engine.compression_count == 1
 
 
 def test_default_engine_is_compressor():

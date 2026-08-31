@@ -91,7 +91,7 @@ class CheckpointContextEngine(ContextEngine):
             if self._role(m) != "tool":
                 continue
             rid = str(m.get("tool_call_id", f"tool:{i}"))
-            status = "failed" if str(m.get("status", "")).lower() in {"error", "failed"} else "observed"
+            status = "failed" if str(m.get("status", "")).lower() in {"error", "failed"} else ("succeeded" if str(m.get("status", "")).lower() in {"success", "succeeded"} else "observed")
             effects.append(Effect(rid, m.get("name"), status, (i,), (self._row_id(m, i),)))
         recent = tuple(range(max(0, len(messages) - self.protect_last_n), len(messages)))
         return DeterministicLanes(active, tuple(effects), (), recent)

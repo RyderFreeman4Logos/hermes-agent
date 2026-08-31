@@ -189,7 +189,12 @@ class CheckpointContextEngine(ContextEngine):
         system = [dict(m) for m in messages if self._role(m) == "system"]
         users = [dict(m) for m in messages if self._role(m) == "user"]
         latest = users[-1:] if users else []
-        recent = [dict(messages[i]) for i in range(max(0, len(messages) - self.protect_last_n), len(messages))]
+        tail_start = max(0, len(messages) - self.protect_last_n)
+        recent_indices: set[int] = set()
+        for group in self._plan_causal_groups(messages):
+            if any(i >= tail_start for i in group.event_indices):
+                recent_indices.update(group.event_indices)
+        recent = [dict(messages[i]) for i in sorted(recent_indices)]
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
         for m in system + [{"role": "assistant", "content": checkpoint}] + latest + recent:

@@ -7,5 +7,6 @@ from .core import (
     count_request_tokens, parse_map_response, prepare_provider_request,
 )
 from .engine import CheckpointContextEngine
+from .budget import final_request_exceeds_hard_wire_budget
 
 __all__ = [name for name in globals() if not name.startswith("_")]

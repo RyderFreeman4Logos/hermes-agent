@@ -377,12 +377,12 @@ def test_production_map_amends_invalid_physical_primary_before_fallback():
     assert engine.last_trace.benchmark_admissible is False
 
 
-def test_parser_rejects_model_text_without_evidence_and_uses_host_span_text():
+def test_parser_requires_evidence_and_uses_host_span_text():
     from agent.checkpoint_engine import parse_map_response
 
     payload = {
         "facts": [{
-            "kind": "instruction", "text": "model paraphrase",
+            "kind": "instruction",
             "evidence": [{"start_char": 0, "end_char": 9}],
         }],
     }

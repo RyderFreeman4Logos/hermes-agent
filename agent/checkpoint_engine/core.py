@@ -297,6 +297,8 @@ class MapAttemptRecord:
 
 
 class MapResponse:
+    _SUMMARY_MAX_LENGTH = 512
+
     @classmethod
     def schema(
         cls, source_event_ids: Sequence[int] = (), source_texts: Sequence[str] | None = None,
@@ -328,8 +330,7 @@ class MapResponse:
                     "additionalProperties": False,
                     "properties": {
                         "kind": {"type": "string"},
-                        "text": {"type": "string"},
-                        "summary": {"type": "string"},
+                        "summary": {"type": "string", "maxLength": cls._SUMMARY_MAX_LENGTH},
                         "uncertain": {"type": "boolean"},
                         "evidence": {"type": "array", "items": span_item},
                     },
@@ -362,8 +363,13 @@ def parse_map_response(
         raise ValueError("invalid map schema")
     facts: list[MapFact] = []
     for item in payload.get("facts", ()):
-        if not isinstance(item, Mapping) or set(item) - {"kind", "text", "summary", "uncertain", "evidence"}:
+        if not isinstance(item, Mapping) or set(item) - {"kind", "summary", "uncertain", "evidence"}:
             raise ValueError("invalid map fact")
+        summary = item.get("summary", "")
+        if not isinstance(summary, str):
+            raise ValueError("invalid map fact")
+        if len(summary) > MapResponse._SUMMARY_MAX_LENGTH:
+            raise ValueError("summary exceeds maximum length")
         raw_evidence = item.get("evidence", ())
         if (not isinstance(raw_evidence, (list, tuple))
                 or not all(isinstance(span, Mapping) for span in raw_evidence)):
@@ -392,7 +398,7 @@ def parse_map_response(
         facts.append(MapFact(
             str(item.get("kind", "observation")), canonical_text, ids, evidence,
             bool(item.get("uncertain", False)), fact_id,
-            str(item.get("summary", item.get("text", ""))),
+            summary,
         ))
     dispositions = tuple(
         MapDisposition(event_id, "unresolved", recovery_ref=f"session-event:{event_id}")

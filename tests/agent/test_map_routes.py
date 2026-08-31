@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from agent.checkpoint_engine import CheckpointContextEngine, parse_map_response
+from agent.checkpoint_engine import CheckpointContextEngine, MapResponse, parse_map_response
 
 
 def test_required_map_schema_keeps_identity_host_owned_and_binds_single_evidence():
@@ -35,6 +35,37 @@ def test_required_map_schema_keeps_identity_host_owned_and_binds_single_evidence
     assert requests
     checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
     assert "observed observation: source" in checkpoint
+
+
+def test_map_schema_and_parser_reject_model_owned_fact_text():
+    excerpt = "x" * 7_576
+    fact_schema = MapResponse.schema((1,), (excerpt,))["properties"]["facts"]["items"]
+
+    assert "text" not in fact_schema["properties"]
+
+    with pytest.raises(ValueError, match="^invalid map fact$"):
+        parse_map_response(
+            {"facts": [{
+                "kind": "tool_result", "text": excerpt,
+                "evidence": [{"start_char": 0, "end_char": len(excerpt)}],
+            }]},
+            expected_source_event_ids=(1,), source_events={"1": excerpt},
+        )
+
+
+def test_map_summary_is_bounded_in_schema_and_parser():
+    fact_schema = MapResponse.schema((1,), ("host text",))["properties"]["facts"]["items"]
+
+    assert fact_schema["properties"]["summary"]["maxLength"] == 512
+
+    with pytest.raises(ValueError, match="^summary exceeds maximum length$"):
+        parse_map_response(
+            {"facts": [{
+                "kind": "observation", "summary": "x" * 513,
+                "evidence": [{"start_char": 0, "end_char": 4}],
+            }]},
+            expected_source_event_ids=(1,), source_events={"1": "host text"},
+        )
 
 
 def test_map_requests_one_textual_host_source_and_host_disposes_empty_assistant():

@@ -1710,8 +1710,12 @@ class _CodexCompletionsAdapter:
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
 
+        max_tokens = kwargs.get("max_tokens")
+        if max_tokens is not None:
+            resp_kwargs["max_output_tokens"] = max_tokens
+
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
-        # support max_output_tokens or temperature — omit to avoid 400 errors.
+        # support temperature — omit to avoid 400 errors.
 
         # Translate extra_body.reasoning (chat.completions shape) into the
         # Responses API's top-level reasoning + include fields.  Mirrors
@@ -2081,10 +2085,20 @@ class _CodexCompletionsAdapter:
             content=content,
             tool_calls=tool_calls_raw or None,
         )
+        incomplete_details = _item_get(final, "incomplete_details")
+        incomplete_reason = str(
+            _item_get(incomplete_details, "reason", "")
+        ).strip().lower()
+        finish_reason = (
+            "length"
+            if _item_get(final, "status") == "incomplete"
+            and incomplete_reason == "max_output_tokens"
+            else "tool_calls" if tool_calls_raw else "stop"
+        )
         choice = SimpleNamespace(
             index=0,
             message=message,
-            finish_reason="stop" if not tool_calls_raw else "tool_calls",
+            finish_reason=finish_reason,
         )
         return SimpleNamespace(
             choices=[choice],

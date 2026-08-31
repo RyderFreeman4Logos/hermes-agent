@@ -96,6 +96,57 @@ def test_checkpoint_transport_keeps_its_configured_output_cap_on_the_wire():
     assert request["max_tokens"] == 16_384
 
 
+def test_production_codex_responses_map_forwards_cap_and_rejects_truncated_json(monkeypatch):
+    """The real auxiliary Responses adapter must preserve both Map guards."""
+    from agent.agent_init import _build_checkpoint_map_caller
+    from agent.auxiliary_client import CodexAuxiliaryClient
+
+    valid_map_json = json.dumps({"schema_version": 1, "source_event_ids": [1], "facts": []})
+
+    class FakeResponses:
+        def __init__(self):
+            self.kwargs = None
+
+        def create(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(
+                status="incomplete",
+                incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                output=[SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text=valid_map_json)],
+                )],
+                usage=SimpleNamespace(input_tokens=3, output_tokens=16_384, total_tokens=16_387),
+            )
+
+    real_client = SimpleNamespace(
+        api_key="key", base_url="https://chatgpt.com/backend-api/codex", responses=FakeResponses(),
+    )
+    client = CodexAuxiliaryClient(real_client, "map-model")
+    agent = SimpleNamespace(
+        provider="configured-provider", model="configured-model",
+        base_url="https://configured.example/v1", api_key="key", api_mode="codex_responses",
+    )
+    engine = CheckpointContextEngine(
+        {"mode": "live", "trace": True, "map_routes": [{"model": "map-model", "structured_output": True}]},
+        map_caller=_build_checkpoint_map_caller(agent),
+    )
+
+    with (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("openai-codex", "map-model", None, None, "codex_responses")),
+        patch("agent.auxiliary_client._get_cached_client", return_value=(client, "map-model")),
+    ):
+        source = [{"role": "user", "content": "source", "_row_id": 1}]
+        assert engine.compress(source) is source
+
+    wire_kwargs = dict(real_client.responses.kwargs)
+    wire_kwargs.update(wire_kwargs.get("extra_body") or {})
+    assert wire_kwargs["max_output_tokens"] == 16_384
+    assert engine._map_attempt_records[-1].finish_reason == "length"
+    assert "finish_reason=length" in (engine.last_rejection or "")
+
+
 def test_production_map_does_not_replay_structured_rejection_prompt_only():
     from agent.agent_init import _build_checkpoint_map_caller
 

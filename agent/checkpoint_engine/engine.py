@@ -5,6 +5,7 @@ from dataclasses import asdict
 import hashlib
 import json
 from collections.abc import Iterable
+from threading import Lock
 from typing import Any
 
 from agent.context_engine import ContextEngine
@@ -50,17 +51,27 @@ class CheckpointContextEngine(ContextEngine):
         self.last_trace: TraceRecord | None = None
         self._store = store or DurableCheckpointStore()
         self.session_id = session_id
+        previous = self._store.generation(session_id)
+        self.generation = previous.generation if previous else 0
         self._map_caller = map_caller
         self._map_routes = tuple(cfg.get("map_routes", ()))
         self._before_commit: Callable[[], Any] | None = None
         self._host_events: tuple[HostLifecycleEvent, ...] = ()
         self._tool_receipts: tuple[ToolExecutionReceipt, ...] = ()
+        self._tool_receipt_lock = Lock()
         self._last_route_attempts: list[str] = []
         self._artifacts = ContentAddressedArtifacts(artifact_root) if artifact_root else None
 
     @property
     def name(self) -> str:
         return "checkpoint"
+
+    def record_tool_receipt(self, receipt: ToolExecutionReceipt) -> None:
+        """Record host authority from the actual tool-dispatch boundary."""
+        if not isinstance(receipt, ToolExecutionReceipt):
+            raise TypeError("checkpoint receipt must be typed")
+        with self._tool_receipt_lock:
+            self._tool_receipts = (*self._tool_receipts, receipt)
 
     def update_from_response(self, usage: Mapping[str, Any]) -> None:
         self.last_prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
@@ -118,11 +129,9 @@ class CheckpointContextEngine(ContextEngine):
                 continue
             rid = str(m.get("tool_call_id", f"tool:{i}"))
             receipt = receipt_by_call.get(rid)
-            message_status = str(m.get("status", "")).lower()
-            status = receipt.status if receipt else (
-                "failed" if message_status in {"error", "failed"} else
-                ("succeeded" if message_status in {"success", "succeeded"} else "observed")
-            )
+            # A transcript field is display data.  Only a host receipt can
+            # authorize an effect; absent one, this remains observational.
+            status = receipt.status if receipt else "observed"
             source_ids = receipt.source_event_ids if receipt else (self._row_id(m, i),)
             typed_receipt = ToolReceipt(
                 receipt.tool_call_id, receipt.tool_name, receipt.status,
@@ -168,8 +177,7 @@ class CheckpointContextEngine(ContextEngine):
         for i in event_ids:
             m = messages[i]
             if self._role(m) == "tool":
-                status = str(m.get("status", "observed"))
-                facts.append(MapFact("tool_result", str(m.get("content", "")), (self._row_id(m, i),), uncertain=status not in {"success", "succeeded"}, fact_id=f"local:{i}"))
+                facts.append(MapFact("tool_result", str(m.get("content", "")), (self._row_id(m, i),), uncertain=True, fact_id=f"local:{i}"))
         dispositions = tuple(MapDisposition(self._row_id(messages[i], i), "observed") for i in event_ids)
         return MapShard(tuple(self._row_id(messages[i], i) for i in event_ids), tuple(facts), dispositions)
 
@@ -178,7 +186,12 @@ class CheckpointContextEngine(ContextEngine):
         if self._map_caller is None:
             self._last_route_attempts.append("local")
             return self._local_map(messages, event_ids)
-        prompt = [{"role": "user", "content": json.dumps({"source_event_ids": event_ids, "messages": [messages[i] for i in event_ids]}, default=str)}]
+        source_ids = tuple(self._row_id(messages[i], i) for i in event_ids)
+        source_events = {
+            str(self._row_id(messages[i], i)): str(messages[i].get("content", ""))
+            for i in event_ids
+        }
+        prompt = [{"role": "user", "content": json.dumps({"source_event_ids": source_ids, "messages": [messages[i] for i in event_ids]}, default=str)}]
         routes = self._map_routes or ({},)
         last_error: Exception | None = None
         for route in routes:
@@ -191,7 +204,7 @@ class CheckpointContextEngine(ContextEngine):
                 raw = self._map_caller(request)
                 if isinstance(raw, Mapping) and "choices" in raw:
                     raw = raw["choices"][0]["message"]["content"]
-                return parse_map_response(raw, expected_source_event_ids=event_ids)
+                return parse_map_response(raw, expected_source_event_ids=source_ids, source_events=source_events)
             except (RuntimeError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
                 last_error = exc
         if last_error:
@@ -283,10 +296,16 @@ class CheckpointContextEngine(ContextEngine):
             candidate = self._projection(source_messages, checkpoint)
             if self._estimate_wire_tokens(candidate) > self.hard_max_wire_tokens:
                 raise CheckpointRejected("projected request exceeds hard wire budget")
-            generation = CheckpointGeneration(self.generation + 1, revision.revision, revision.source_event_ids, DurableCheckpointStore.signature(candidate), self.mode)
+            raw_ids = tuple(self._row_id(message, index) for index, message in enumerate(source_messages))
+            raw_ranges = self._event_ranges(raw_ids)
+            generation = CheckpointGeneration(
+                self.generation + 1, revision.revision, raw_ids,
+                DurableCheckpointStore.signature(candidate), self.mode,
+                self.generation or None, raw_ranges, reduced.artifacts,
+            )
             if self._before_commit:
                 self._before_commit()
-            if self.mode == "live" and not self._store.compare_and_swap(self.session_id, revision, generation):
+            if not self._store.compare_and_swap(self.session_id, revision, generation):
                 raise CheckpointRejected("transcript changed during checkpoint")
             self.generation = generation.generation
             self.compression_count += 1
@@ -295,22 +314,64 @@ class CheckpointContextEngine(ContextEngine):
                 reduced_hash = hashlib.sha256(json.dumps(asdict(reduced), default=str, sort_keys=True).encode()).hexdigest()
                 prompt_hash = hashlib.sha256(json.dumps(candidate, default=str, sort_keys=True).encode()).hexdigest()
                 schema_hash = hashlib.sha256(json.dumps(MapResponse.schema(), sort_keys=True).encode()).hexdigest()
+                code_snapshot = dict(kwargs.get("code_snapshot") or {})
+                commit_snapshot = dict(kwargs.get("commit_code_snapshot") or code_snapshot)
+                if code_snapshot and commit_snapshot and code_snapshot != commit_snapshot:
+                    raise CheckpointRejected("host code changed during checkpoint")
+                code_head = str(code_snapshot.get("head", ""))
+                code_tree = str(code_snapshot.get("tree", ""))
+                dirty = bool(code_snapshot.get("dirty", False))
+                dirty_diff_hash = str(code_snapshot.get("dirty_diff_hash", ""))
+                configured_route = str(kwargs.get("configured_route", ""))
+                physical_model = str(kwargs.get("physical_model", ""))
+                final_request = prepare_provider_request(
+                    candidate, model=physical_model or None, policy=StructuredOutputPolicy.DISABLED
+                )
+                identity_complete = bool(
+                    code_head and code_tree and "dirty" in code_snapshot
+                    and "dirty_diff_hash" in code_snapshot and physical_model
+                    and (configured_route or self._last_route_attempts)
+                )
                 self.last_trace = TraceRecord(
                     self.generation, revision.revision, "auxiliary",
                     tuple(self._last_route_attempts), self.policy.value, schema_hash,
                     prompt_hash, reduced_hash, count_request_tokens(candidate), 0,
                     0, "stop", hashlib.sha256(checkpoint.encode()).hexdigest(),
-                    "unknown", False, source="raw_transcript",
+                    code_tree, dirty, source="raw_transcript",
                     projection_hash=prompt_hash,
                     artifact_graph_hash=hashlib.sha256(json.dumps(reduced.artifacts, sort_keys=True).encode()).hexdigest(),
                     execution_provenance_hash=hashlib.sha256(json.dumps([asdict(effect) for effect in reduced.effects], default=str, sort_keys=True).encode()).hexdigest(),
                     continuation_window_hash=hashlib.sha256(json.dumps(candidate[-self.protect_last_n:], default=str, sort_keys=True).encode()).hexdigest(),
-                    physical_model=str(kwargs.get("physical_model", "unknown")),
+                    physical_model=physical_model,
                     extractor_hash=hashlib.sha256(b"checkpoint-extractor-v1").hexdigest(),
                     tokens_counting_mode="conservative_4_chars",
+                    configured_route=configured_route,
+                    actual_wire_mode=str(kwargs.get("wire_mode", self.policy.value)),
+                    fallback_rejection=str(kwargs.get("fallback_rejection", "")),
+                    final_request_hash=hashlib.sha256(json.dumps(final_request, sort_keys=True, default=str).encode()).hexdigest(),
+                    code_head=code_head,
+                    dirty_diff_hash=dirty_diff_hash,
+                    map_shard_provenance=tuple(shard.source_event_ids for shard in shards),
+                    execution_identity_complete=identity_complete,
+                    benchmark_admissible=identity_complete,
                 )
                 self._store.append_trace(self.session_id, self.last_trace)
             return messages if self.mode == "shadow" else candidate
         except (CheckpointRejected, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             self.last_rejection = str(exc)
             return messages
+
+    @staticmethod
+    def _event_ranges(event_ids: Sequence[int]) -> tuple[tuple[int, int], ...]:
+        if not event_ids:
+            return ()
+        ordered = sorted(set(event_ids))
+        ranges: list[tuple[int, int]] = []
+        start = previous = ordered[0]
+        for event_id in ordered[1:]:
+            if event_id != previous + 1:
+                ranges.append((start, previous))
+                start = event_id
+            previous = event_id
+        ranges.append((start, previous))
+        return tuple(ranges)

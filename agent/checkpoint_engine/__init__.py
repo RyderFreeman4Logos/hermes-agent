@@ -4,7 +4,8 @@ from .core import (
     Effect, EvidenceSpan, HostLifecycleEvent, MapDisposition, MapFact, MapResponse, MapShard,
     ReducedState, StructuredOutputPolicy, StructuredOutputUnavailable,
     TaskEpoch, ToolExecutionReceipt, ToolReceipt, TraceRecord, TranscriptRevision,
-    count_request_tokens, parse_map_response, prepare_provider_request,
+    count_request_tokens, extract_canonical_evidence, parse_map_response,
+    prepare_provider_request,
 )
 from .engine import CheckpointContextEngine
 from .budget import final_request_exceeds_hard_wire_budget

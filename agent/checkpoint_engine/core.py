@@ -114,7 +114,21 @@ class EvidenceSpan:
             raise ValueError("invalid evidence span")
 
     def text(self, source: str) -> str:
+        if self.end_char > len(source):
+            raise ValueError("evidence span exceeds source bounds")
         return source[self.start_char:self.end_char]
+
+
+def extract_canonical_evidence(
+    span: EvidenceSpan, events: Mapping[str | int, str]
+) -> str:
+    """Extract evidence from the host-owned event, never model text."""
+    source = events.get(span.event_id)
+    if source is None:
+        source = events.get(int(span.event_id)) if str(span.event_id).isdigit() else None
+    if not isinstance(source, str):
+        raise ValueError("evidence event not found")
+    return span.text(source)
 
 
 @dataclass(frozen=True)
@@ -213,6 +227,9 @@ class CheckpointGeneration:
     source_event_ids: tuple[int, ...]
     checkpoint_hash: str
     mode: str
+    parent_generation: int | None = None
+    raw_event_ranges: tuple[tuple[int, int], ...] = ()
+    artifact_dependencies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -241,6 +258,15 @@ class TraceRecord:
     prompt_hash_version: str = "v1"
     extractor_hash: str = ""
     tokens_counting_mode: str = "conservative"
+    configured_route: str = ""
+    actual_wire_mode: str = ""
+    fallback_rejection: str = ""
+    final_request_hash: str = ""
+    code_head: str = ""
+    dirty_diff_hash: str = ""
+    map_shard_provenance: tuple[tuple[int, ...], ...] = ()
+    execution_identity_complete: bool = False
+    benchmark_admissible: bool = False
 
 
 class MapResponse:
@@ -279,7 +305,10 @@ class MapResponse:
         }
 
 
-def parse_map_response(raw: str | Mapping[str, Any], *, expected_source_event_ids: tuple[int, ...]) -> MapShard:
+def parse_map_response(
+    raw: str | Mapping[str, Any], *, expected_source_event_ids: tuple[int, ...],
+    source_events: Mapping[str | int, str] | None = None,
+) -> MapShard:
     """Parse only the canonical schema; no fences, aliases, or salvage."""
     payload = json.loads(raw) if isinstance(raw, str) else raw
     if not isinstance(payload, Mapping) or payload.get("schema_version") != MapResponse.VERSION:
@@ -295,6 +324,9 @@ def parse_map_response(raw: str | Mapping[str, Any], *, expected_source_event_id
         if not ids or not set(ids) <= set(source_ids):
             raise ValueError("fact has invalid source ids")
         evidence = tuple(EvidenceSpan(str(s["event_id"]), int(s["start_char"]), int(s["end_char"])) for s in item.get("evidence", ()))
+        if source_events is not None:
+            for span in evidence:
+                extract_canonical_evidence(span, source_events)
         identity = json.dumps(
             [str(item.get("kind", "observation")), str(item.get("text", "")), ids,
              [(e.event_id, e.start_char, e.end_char) for e in evidence]],
@@ -318,6 +350,47 @@ class DurableCheckpointStore:
         self._generations: dict[str, CheckpointGeneration] = {}
         self._traces: dict[str, list[TraceRecord]] = {}
         self._raw_events: dict[str, list[dict[str, Any]]] = {}
+        self._load()
+
+    @property
+    def _state_path(self) -> Path | None:
+        return self.root / "checkpoint-state.json" if self.root else None
+
+    def _load(self) -> None:
+        path = self._state_path
+        if path is None or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            for session_id, item in payload.get("revisions", {}).items():
+                self._revisions[session_id] = TranscriptRevision(**item)
+            for session_id, item in payload.get("generations", {}).items():
+                item["source_event_ids"] = tuple(item.get("source_event_ids", ()))
+                item["raw_event_ranges"] = tuple(tuple(pair) for pair in item.get("raw_event_ranges", ()))
+                item["artifact_dependencies"] = tuple(item.get("artifact_dependencies", ()))
+                self._generations[session_id] = CheckpointGeneration(**item)
+            for session_id, items in payload.get("traces", {}).items():
+                self._traces[session_id] = [TraceRecord(**item) for item in items]
+            self._raw_events = {
+                session_id: [dict(event) for event in events]
+                for session_id, events in payload.get("raw_events", {}).items()
+            }
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            # An incomplete optional store must not make shadow operation crash.
+            return
+
+    def _persist(self) -> None:
+        path = self._state_path
+        if path is None:
+            return
+        payload = {
+            "revisions": {key: asdict(value) for key, value in self._revisions.items()},
+            "generations": {key: asdict(value) for key, value in self._generations.items()},
+            "traces": {key: [asdict(value) for value in values] for key, values in self._traces.items()},
+            "raw_events": self._raw_events,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str), encoding="utf-8")
 
     @staticmethod
     def signature(messages: Sequence[Mapping[str, Any]]) -> str:
@@ -332,6 +405,7 @@ class DurableCheckpointStore:
             if old is None or old.signature != signature:
                 old = TranscriptRevision((old.revision + 1 if old else 1), ids, signature)
                 self._revisions[session_id] = old
+                self._persist()
             return old
 
     def compare_and_swap(self, session_id: str, revision: TranscriptRevision, generation: CheckpointGeneration) -> bool:
@@ -339,6 +413,7 @@ class DurableCheckpointStore:
             if self._revisions.get(session_id) != revision:
                 return False
             self._generations[session_id] = generation
+            self._persist()
             return True
 
     def generation(self, session_id: str) -> CheckpointGeneration | None:
@@ -347,6 +422,7 @@ class DurableCheckpointStore:
     def append_trace(self, session_id: str, trace: TraceRecord) -> None:
         with self._lock:
             self._traces.setdefault(session_id, []).append(trace)
+            self._persist()
 
     def traces(self, session_id: str) -> tuple[TraceRecord, ...]:
         return tuple(self._traces.get(session_id, ()))
@@ -366,6 +442,7 @@ class DurableCheckpointStore:
                 if row_id is None:
                     event["_row_id"] = len(events)
                 events.append(event)
+            self._persist()
 
     def raw_messages(self, session_id: str) -> tuple[dict[str, Any], ...]:
         with self._lock:

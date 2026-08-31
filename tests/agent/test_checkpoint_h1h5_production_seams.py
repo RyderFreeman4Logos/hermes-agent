@@ -87,7 +87,7 @@ def test_production_map_externalization_sends_bounded_host_evidence(monkeypatch)
     ])
 
     outbound = calls[0]["messages"][0]["content"]
-    tool_payload = json.loads(outbound)["messages"][1]["content"]
+    tool_payload = json.loads(outbound)["messages"][0]["content"]
     assert tool_body not in outbound
     assert "artifact_id" not in tool_payload
     assert "source_event_id" not in tool_payload
@@ -383,7 +383,7 @@ def test_parser_rejects_model_text_without_evidence_and_uses_host_span_text():
     payload = {
         "facts": [{
             "kind": "instruction", "text": "model paraphrase",
-            "evidence": [{"event_index": 0, "start_char": 0, "end_char": 9}],
+            "evidence": [{"start_char": 0, "end_char": 9}],
         }],
     }
     parsed = parse_map_response(payload, expected_source_event_ids=(1,), source_events={"1": "host text only"})

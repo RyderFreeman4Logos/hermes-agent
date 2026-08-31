@@ -301,35 +301,24 @@ class MapResponse:
     def schema(
         cls, source_event_ids: Sequence[int] = (), source_texts: Sequence[str] | None = None,
     ) -> dict[str, Any]:
+        if len(source_event_ids) > 1:
+            raise ValueError("Map request requires one host source")
         span_properties: dict[str, Any] = {
             "start_char": {"type": "integer", "minimum": 0},
             "end_char": {"type": "integer", "minimum": 0},
         }
-        required = ["start_char", "end_char"]
-        if len(source_event_ids) != 1:
-            span_properties["event_index"] = {
-                "type": "integer", "enum": list(range(len(source_event_ids))),
-            }
-            required.insert(0, "event_index")
         span_item: dict[str, Any] = {
             "type": "object", "additionalProperties": False,
             "properties": span_properties,
-            "required": required,
+            "required": ["start_char", "end_char"],
         }
         if source_texts is not None:
             if len(source_texts) != len(source_event_ids):
                 raise ValueError("map source bounds do not match source events")
-            bounds = [len(text) for text in source_texts]
+            if len(source_texts) > 1:
+                raise ValueError("Map request requires one host source")
             for name in ("start_char", "end_char"):
-                span_properties[name]["maximum"] = max(bounds, default=0)
-            span_item["allOf"] = [{"anyOf": [
-                {"properties": {
-                    "event_index": {"enum": [index]},
-                    "start_char": {"maximum": bound},
-                    "end_char": {"maximum": bound},
-                }}
-                for index, bound in enumerate(bounds)
-            ]}]
+                span_properties[name]["maximum"] = len(source_texts[0]) if source_texts else 0
         return {
             "type": "object",
             "additionalProperties": False,
@@ -351,13 +340,6 @@ class MapResponse:
         }
 
 
-def _event_index(span: Mapping[str, Any], source_count: int) -> int:
-    index = span.get("event_index")
-    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < source_count:
-        raise ValueError("invalid evidence event index")
-    return index
-
-
 def _evidence_char(span: Mapping[str, Any], name: str) -> int:
     value = span.get(name)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -374,23 +356,21 @@ def parse_map_response(
     if not isinstance(payload, Mapping) or "facts" not in payload:
         raise ValueError("invalid map schema")
     source_ids = tuple(expected_source_event_ids)
-    if set(payload) - {"schema_version", "source_event_ids", "facts"}:
+    if len(source_ids) != 1:
+        raise ValueError("Map response requires one host source")
+    if set(payload) - {"facts"}:
         raise ValueError("invalid map schema")
-    if "source_event_ids" in payload and tuple(payload["source_event_ids"]) != source_ids:
-        raise ValueError("map source range mismatch")
     facts: list[MapFact] = []
     for item in payload.get("facts", ()):
-        if not isinstance(item, Mapping) or set(item) - {"kind", "text", "summary", "source_event_ids", "uncertain", "evidence"}:
+        if not isinstance(item, Mapping) or set(item) - {"kind", "text", "summary", "uncertain", "evidence"}:
             raise ValueError("invalid map fact")
-        if "source_event_ids" in item and not set(item["source_event_ids"]) <= set(source_ids):
-            raise ValueError("fact has invalid source ids")
         raw_evidence = item.get("evidence", ())
         if (not isinstance(raw_evidence, (list, tuple))
                 or not all(isinstance(span, Mapping) for span in raw_evidence)):
             raise ValueError("invalid evidence")
         evidence = tuple(
             EvidenceSpan(
-                str(source_ids[0] if len(source_ids) == 1 else source_ids[_event_index(span, len(source_ids))]),
+                str(source_ids[0]),
                 _evidence_char(span, "start_char"), _evidence_char(span, "end_char"),
             )
             for span in raw_evidence

@@ -189,12 +189,12 @@ class CheckpointContextEngine(ContextEngine):
                 used.add(i)
         return tuple(groups)
 
+    @staticmethod
+    def _is_map_source(message: Mapping[str, Any]) -> bool:
+        return message.get("display_kind") != "hidden" and isinstance(message.get("content"), str) and bool(message["content"].strip())
+
     def _plan_map_shards(self, messages: Sequence[Mapping[str, Any]]) -> tuple[tuple[int, ...], ...]:
-        groups = tuple(
-            tuple(i for i in group.event_indices if messages[i].get("display_kind") != "hidden")
-            for group in self._plan_causal_groups(messages)
-        )
-        groups = tuple(group for group in groups if group)
+        groups = tuple((i,) for i, message in enumerate(messages) if self._is_map_source(message))
         if self.policy is StructuredOutputPolicy.REQUIRED:
             shards: list[tuple[int, ...]] = []
             for group in groups:
@@ -458,7 +458,7 @@ class CheckpointContextEngine(ContextEngine):
             reduced = replace(reduced, dispositions=(*reduced.dispositions, *(
                 MapDisposition(self._row_id(message, index), "host_dispositioned")
                 for index, message in enumerate(source_messages)
-                if message.get("display_kind") == "hidden"
+                if not self._is_map_source(message)
             )))
             reduced = replace(reduced, artifacts=tuple(sorted(self._map_artifact_ids)))
             checkpoint = self._render_checkpoint(reduced)

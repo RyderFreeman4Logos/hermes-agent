@@ -78,11 +78,7 @@ def test_canonical_evidence_is_host_extracted_and_fail_closed():
 def test_two_generations_reload_raw_lineage_and_ignore_rendered_decoy(tmp_path):
     store = DurableCheckpointStore(tmp_path)
     first = [{"role": "user", "content": "first", "_row_id": 1}]
-    map_caller = lambda request: {
-        "schema_version": 1,
-        "source_event_ids": json.loads(request["messages"][0]["content"])["source_event_ids"],
-        "facts": [],
-    }
+    map_caller = lambda request: {"facts": []}
     engine = CheckpointContextEngine(
         {"mode": "live", "trace": True}, store=store, session_id="s", map_caller=map_caller
     )

@@ -1,6 +1,94 @@
 import json
 
-from agent.checkpoint_engine import CheckpointContextEngine
+import pytest
+
+from agent.checkpoint_engine import CheckpointContextEngine, parse_map_response
+
+
+def test_required_map_schema_keeps_identity_host_owned_and_binds_single_evidence():
+    requests = []
+
+    def caller(request):
+        requests.append(request)
+        payload = json.loads(request["messages"][0]["content"])
+        assert "source_event_ids" not in payload
+        schema = request["response_format"]["json_schema"]["schema"]
+        assert set(schema["properties"]) == {"facts"}
+        fact = schema["properties"]["facts"]["items"]
+        assert "source_event_ids" not in fact["properties"]
+        evidence = fact["properties"]["evidence"]["items"]
+        assert evidence["properties"]["event_index"]["enum"] == [0]
+        assert "event_id" not in evidence["properties"]
+        # Replay none's free-form event ID: a one-event shard binds it to host ID 1.
+        return {
+            "schema_version": 1,
+            "source_event_ids": [1],
+            "facts": [{
+                "kind": "observation",
+                "source_event_ids": [1],
+                "evidence": [{"event_id": "source_event_ids", "start_char": 0, "end_char": 6}],
+            }],
+        }
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "protect_last_n": 0}, map_caller=caller,
+    )
+    result = engine.compress([{"role": "user", "content": "source text", "_row_id": 1}])
+
+    assert requests
+    checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
+    assert "observed observation: source" in checkpoint
+
+
+def test_map_rejects_free_form_evidence_id_for_multi_event_shard():
+    with pytest.raises(ValueError, match="invalid evidence event index"):
+        parse_map_response(
+            {"facts": [{
+                "kind": "observation",
+                "evidence": [{"event_id": "source_event_ids", "start_char": 0, "end_char": 1}],
+            }]},
+            expected_source_event_ids=(1, 2), source_events={"1": "one", "2": "two"},
+        )
+
+
+def test_map_rejects_model_source_id_not_in_host_shard():
+    with pytest.raises(ValueError, match="map source range mismatch"):
+        parse_map_response(
+            {"source_event_ids": [99], "facts": []},
+            expected_source_event_ids=(1, 2), source_events={"1": "one", "2": "two"},
+        )
+
+
+def test_required_map_hides_externalized_artifact_identity_from_model():
+    requests = []
+
+    def caller(request):
+        requests.append(request)
+        payload = json.loads(request["messages"][0]["content"])
+        tool_content = payload["messages"][1]["content"]
+        assert "artifact_id" not in tool_content
+        assert "source_event_id" not in tool_content
+        assert tool_content["evidence"][0]["text"].startswith("host excerpt")
+        schema = request["response_format"]["json_schema"]["schema"]
+        evidence = schema["properties"]["facts"]["items"]["properties"]["evidence"]["items"]
+        assert evidence["properties"]["event_index"]["enum"] == [0, 1]
+        return {"facts": [{
+            "kind": "tool_result",
+            "evidence": [{"event_index": 1, "start_char": 0, "end_char": 12}],
+        }]}
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "protect_last_n": 0}, map_caller=caller,
+    )
+    result = engine.compress([
+        {"role": "assistant", "content": None, "_row_id": 1,
+         "tool_calls": [{"id": "call-1", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "host excerpt plus hidden artifact", "_row_id": 2},
+    ])
+
+    assert requests
+    checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
+    assert "observed tool_result: host excerpt" in checkpoint
 
 
 def test_required_map_uses_only_configured_structured_fallback():
@@ -10,7 +98,7 @@ def test_required_map_uses_only_configured_structured_fallback():
         calls.append(request["model"])
         if request["model"] == "bad":
             raise RuntimeError("route unavailable")
-        return {"schema_version": 1, "source_event_ids": [0], "facts": []}
+        return {"facts": []}
 
     engine = CheckpointContextEngine({
         "mode": "shadow", "structured_output": "required",
@@ -28,7 +116,7 @@ def test_preferred_route_visibly_downgrades_wire_request():
 
     def caller(payload):
         request.append(payload)
-        return {"schema_version": 1, "source_event_ids": [0], "facts": []}
+        return {"facts": []}
 
     engine = CheckpointContextEngine({
         "structured_output": "preferred", "map_routes": [{"model": "plain", "structured_output": False}],
@@ -62,8 +150,7 @@ def test_required_map_externalizes_an_oversized_tool_result_before_planning():
 
     def caller(request):
         requests.append(request)
-        payload = json.loads(request["messages"][0]["content"])
-        return {"schema_version": 1, "source_event_ids": payload["source_event_ids"], "facts": []}
+        return {"facts": []}
 
     engine = CheckpointContextEngine(
         {"mode": "live", "map": {"max_output_tokens": 32_768}}, map_caller=caller,
@@ -83,20 +170,19 @@ def test_required_map_externalizes_an_oversized_tool_result_before_planning():
     payload = json.loads(requests[0]["messages"][0]["content"])
     tool_pointer = payload["messages"][1]["content"]
     assert tool_body not in requests[0]["messages"][0]["content"]
-    assert engine.checkpoint_artifact_read(tool_pointer["artifact_id"]) == tool_body
+    assert "artifact_id" not in tool_pointer
+    assert len(engine._map_artifact_ids) == 1
+    assert engine.checkpoint_artifact_read(next(iter(engine._map_artifact_ids))) == tool_body
 
 
 def test_required_map_rejects_externalized_evidence_past_host_excerpt():
     tool_body = "host-visible evidence\n" + "x" * 70_000
 
     def caller(request):
-        payload = json.loads(request["messages"][0]["content"])
         return {
-            "schema_version": 1,
-            "source_event_ids": payload["source_event_ids"],
             "facts": [{
-                "kind": "tool_result", "source_event_ids": [2],
-                "evidence": [{"event_id": "2", "start_char": 0, "end_char": len(tool_body)}],
+                "kind": "tool_result",
+                "evidence": [{"event_index": 1, "start_char": 0, "end_char": len(tool_body)}],
             }],
         }
 
@@ -117,13 +203,10 @@ def test_required_map_extracts_only_host_excerpt_from_externalized_evidence():
     tool_body = "host-visible evidence\n" + "x" * 70_000
 
     def caller(request):
-        payload = json.loads(request["messages"][0]["content"])
         return {
-            "schema_version": 1,
-            "source_event_ids": payload["source_event_ids"],
             "facts": [{
-                "kind": "tool_result", "source_event_ids": [2],
-                "evidence": [{"event_id": "2", "start_char": 0, "end_char": 21}],
+                "kind": "tool_result",
+                "evidence": [{"event_index": 1, "start_char": 0, "end_char": 21}],
             }],
         }
 
@@ -143,8 +226,7 @@ def test_required_map_extracts_only_host_excerpt_from_externalized_evidence():
 
 def test_checkpoint_keeps_externalized_tool_artifact_after_tail_eviction():
     def caller(request):
-        payload = json.loads(request["messages"][0]["content"])
-        return {"schema_version": 1, "source_event_ids": payload["source_event_ids"], "facts": []}
+        return {"facts": []}
 
     tool_body = "durable artifact result\n" + "x" * 70_000
     engine = CheckpointContextEngine(
@@ -187,7 +269,7 @@ def test_required_map_caps_configured_output_at_effective_route_limit():
 
     def caller(request):
         requests.append(request)
-        return {"schema_version": 1, "source_event_ids": [1], "facts": []}
+        return {"facts": []}
 
     engine = CheckpointContextEngine(
         {"mode": "live", "map": {"max_output_tokens": 32_768}}, map_caller=caller,

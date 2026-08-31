@@ -11,11 +11,7 @@ def test_only_tool_receipt_can_mark_effect_succeeded():
     ]
     result = CheckpointContextEngine(
         {"mode": "live"},
-        map_caller=lambda request: {
-            "schema_version": 1,
-            "source_event_ids": json.loads(request["messages"][0]["content"])["source_event_ids"],
-            "facts": [],
-        },
+        map_caller=lambda request: {"facts": []},
     ).compress(messages)
     rendered = "\n".join(str(m.get("content")) for m in result)
     assert "Observed effect c1: observed" in rendered

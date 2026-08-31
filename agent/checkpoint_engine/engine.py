@@ -213,18 +213,24 @@ class CheckpointContextEngine(ContextEngine):
     def _map_payload(
         self, messages: Sequence[Mapping[str, Any]], event_ids: Sequence[int],
     ) -> dict[str, Any]:
-        source_ids = tuple(self._row_id(messages[i], i) for i in event_ids)
         map_messages: list[dict[str, Any]] = []
         for i in event_ids:
-            message = dict(messages[i])
+            message = {
+                key: value for key, value in messages[i].items()
+                if key not in {"_row_id", "event_id", "source_event_id", "source_event_ids", "artifact_id", "tool_call_id"}
+            }
+            if isinstance(message.get("tool_calls"), list):
+                message["tool_calls"] = [
+                    {key: value for key, value in call.items() if key != "id"}
+                    if isinstance(call, Mapping) else call
+                    for call in message["tool_calls"]
+                ]
             content = message.get("content")
             if self._role(message) == "tool" and isinstance(content, str):
                 artifact = self.externalize_artifact(content)
                 self._map_artifact_ids.add(artifact.artifact_id)
                 message["content"] = {
-                    "artifact_id": artifact.artifact_id,
                     "media_type": artifact.media_type,
-                    "source_event_id": self._row_id(messages[i], i),
                     "evidence": [{
                         "start_char": 0,
                         "end_char": min(len(content), self._MAP_ARTIFACT_EVIDENCE_CHARS),
@@ -232,7 +238,7 @@ class CheckpointContextEngine(ContextEngine):
                     }],
                 }
             map_messages.append(message)
-        return {"source_event_ids": source_ids, "messages": map_messages}
+        return {"messages": map_messages}
 
     def _estimate_map_output_tokens(
         self, messages: Sequence[Mapping[str, Any]], event_ids: Sequence[int],
@@ -275,7 +281,7 @@ class CheckpointContextEngine(ContextEngine):
             if self.policy is StructuredOutputPolicy.REQUIRED and route.get("structured_output") is False:
                 continue
             try:
-                request = prepare_provider_request(prompt, model=route.get("model"), policy=self.policy, schema=MapResponse.schema(), route_capabilities=route)
+                request = prepare_provider_request(prompt, model=route.get("model"), policy=self.policy, schema=MapResponse.schema(source_ids), route_capabilities=route)
                 request["max_tokens"] = self.effective_map_output_tokens
                 raw = self._map_caller(request)
                 if isinstance(raw, Mapping):
@@ -462,7 +468,9 @@ class CheckpointContextEngine(ContextEngine):
             if self.trace:
                 reduced_hash = hashlib.sha256(json.dumps(asdict(reduced), default=str, sort_keys=True).encode()).hexdigest()
                 prompt_hash = hashlib.sha256(json.dumps(candidate, default=str, sort_keys=True).encode()).hexdigest()
-                schema_hash = hashlib.sha256(json.dumps(MapResponse.schema(), sort_keys=True).encode()).hexdigest()
+                schema_hash = hashlib.sha256(json.dumps(
+                    [MapResponse.schema(shard.source_event_ids) for shard in shards], sort_keys=True,
+                ).encode()).hexdigest()
                 records = tuple(self._map_attempt_records)
                 identity = records[-1] if records else MapAttemptRecord()
                 code_head, code_tree = identity.code_head or "", identity.code_tree or ""

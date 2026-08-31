@@ -297,16 +297,13 @@ class MapAttemptRecord:
 
 
 class MapResponse:
-    VERSION = 1
-
     @classmethod
-    def schema(cls) -> dict[str, Any]:
+    def schema(cls, source_event_ids: Sequence[int] = ()) -> dict[str, Any]:
+        event_indexes = list(range(len(source_event_ids)))
         return {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "schema_version": {"type": "integer", "enum": [cls.VERSION]},
-                "source_event_ids": {"type": "array", "items": {"type": "integer"}},
                 "facts": {"type": "array", "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -314,23 +311,29 @@ class MapResponse:
                         "kind": {"type": "string"},
                         "text": {"type": "string"},
                         "summary": {"type": "string"},
-                        "source_event_ids": {"type": "array", "items": {"type": "integer"}},
                         "uncertain": {"type": "boolean"},
                         "evidence": {"type": "array", "items": {
                             "type": "object", "additionalProperties": False,
                             "properties": {
-                                "event_id": {"type": "string"},
+                                "event_index": {"type": "integer", "enum": event_indexes},
                                 "start_char": {"type": "integer", "minimum": 0},
                                 "end_char": {"type": "integer", "minimum": 0},
                             },
-                            "required": ["event_id", "start_char", "end_char"],
+                            "required": ["event_index", "start_char", "end_char"],
                         }},
                     },
-                    "required": ["kind", "source_event_ids", "evidence"],
+                    "required": ["kind", "evidence"],
                 }},
             },
-            "required": ["schema_version", "source_event_ids", "facts"],
+            "required": ["facts"],
         }
+
+
+def _event_index(span: Mapping[str, Any], source_count: int) -> int:
+    index = span.get("event_index")
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < source_count:
+        raise ValueError("invalid evidence event index")
+    return index
 
 
 def parse_map_response(
@@ -339,19 +342,30 @@ def parse_map_response(
 ) -> MapShard:
     """Parse only the canonical schema; no fences, aliases, or salvage."""
     payload = json.loads(raw) if isinstance(raw, str) else raw
-    if not isinstance(payload, Mapping) or payload.get("schema_version") != MapResponse.VERSION:
+    if not isinstance(payload, Mapping) or "facts" not in payload:
         raise ValueError("invalid map schema")
-    source_ids = tuple(payload.get("source_event_ids", ()))
-    if source_ids != tuple(expected_source_event_ids):
+    source_ids = tuple(expected_source_event_ids)
+    if set(payload) - {"schema_version", "source_event_ids", "facts"}:
+        raise ValueError("invalid map schema")
+    if "source_event_ids" in payload and tuple(payload["source_event_ids"]) != source_ids:
         raise ValueError("map source range mismatch")
     facts: list[MapFact] = []
     for item in payload.get("facts", ()):
         if not isinstance(item, Mapping) or set(item) - {"kind", "text", "summary", "source_event_ids", "uncertain", "evidence"}:
             raise ValueError("invalid map fact")
-        ids = tuple(item.get("source_event_ids", ()))
-        if not ids or not set(ids) <= set(source_ids):
+        if "source_event_ids" in item and not set(item["source_event_ids"]) <= set(source_ids):
             raise ValueError("fact has invalid source ids")
-        evidence = tuple(EvidenceSpan(str(s["event_id"]), int(s["start_char"]), int(s["end_char"])) for s in item.get("evidence", ()))
+        raw_evidence = item.get("evidence", ())
+        if (not isinstance(raw_evidence, (list, tuple))
+                or not all(isinstance(span, Mapping) for span in raw_evidence)):
+            raise ValueError("invalid evidence")
+        evidence = tuple(
+            EvidenceSpan(
+                str(source_ids[0] if len(source_ids) == 1 else source_ids[_event_index(span, len(source_ids))]),
+                int(span["start_char"]), int(span["end_char"]),
+            )
+            for span in raw_evidence
+        )
         if not evidence:
             raise ValueError("fact requires evidence")
         if source_events is None:
@@ -359,6 +373,7 @@ def parse_map_response(
         canonical_text = "\n".join(
             extract_canonical_evidence(span, source_events) for span in evidence
         )
+        ids = tuple(dict.fromkeys(int(span.event_id) for span in evidence))
         identity = json.dumps(
             [str(item.get("kind", "observation")), canonical_text, ids,
              [(e.event_id, e.start_char, e.end_char) for e in evidence]],

@@ -28,7 +28,7 @@ def test_disabled_sends_no_structured_request():
 
 
 def test_map_parser_rejects_repair_and_evidence_is_typed():
-    payload = {"schema_version": 1, "facts": [], "source_event_ids": [1]}
+    payload = {"facts": []}
     with pytest.raises(ValueError):
         parse_map_response("```json\\n" + json.dumps(payload) + "\\n```", expected_source_event_ids=(1,))
     assert EvidenceSpan("e1", 0, 2).text("abcd") == "ab"

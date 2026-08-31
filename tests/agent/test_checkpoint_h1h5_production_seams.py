@@ -33,7 +33,7 @@ def test_production_auxiliary_map_adapter_reaches_required_structured_route(monk
         calls.append(kwargs)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-                "schema_version": 1, "source_event_ids": [1], "facts": [],
+                "facts": [],
             })))],
             usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
         )
@@ -62,10 +62,9 @@ def test_production_map_externalization_sends_bounded_host_evidence(monkeypatch)
 
     def call_llm(**kwargs):
         calls.append(kwargs)
-        payload = json.loads(kwargs["messages"][0]["content"])
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-                "schema_version": 1, "source_event_ids": payload["source_event_ids"], "facts": [],
+                "facts": [],
             })))],
             usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
         )
@@ -90,7 +89,8 @@ def test_production_map_externalization_sends_bounded_host_evidence(monkeypatch)
     outbound = calls[0]["messages"][0]["content"]
     tool_payload = json.loads(outbound)["messages"][1]["content"]
     assert tool_body not in outbound
-    assert tool_payload["artifact_id"]
+    assert "artifact_id" not in tool_payload
+    assert "source_event_id" not in tool_payload
     assert tool_payload["evidence"][0]["text"] == tool_body[:tool_payload["evidence"][0]["end_char"]]
     assert len(tool_payload["evidence"][0]["text"]) < len(tool_body)
 
@@ -103,7 +103,7 @@ def test_production_map_forwards_the_effective_output_cap(monkeypatch):
         "agent.auxiliary_client.call_llm",
         lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-                "schema_version": 1, "source_event_ids": [1], "facts": [],
+                "facts": [],
             })))],
             usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
         ),
@@ -141,7 +141,7 @@ def test_production_codex_responses_map_forwards_cap_and_rejects_truncated_json(
     from agent.agent_init import _build_checkpoint_map_caller
     from agent.auxiliary_client import CodexAuxiliaryClient
 
-    valid_map_json = json.dumps({"schema_version": 1, "source_event_ids": [1], "facts": []})
+    valid_map_json = json.dumps({"facts": []})
 
     class FakeResponses:
         def __init__(self):
@@ -196,7 +196,7 @@ def test_production_map_does_not_replay_structured_rejection_prompt_only():
         RuntimeError("HTTP 400: This response_format type is unavailable now"),
         SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-                "schema_version": 1, "source_event_ids": [1], "facts": [],
+                "facts": [],
             })))],
             usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
         ),
@@ -232,7 +232,7 @@ def test_production_map_records_each_transient_physical_send(monkeypatch):
         RuntimeError("connection reset"),
         SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-                "schema_version": 1, "source_event_ids": [1], "facts": [],
+                "facts": [],
             })), finish_reason="stop")],
             usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
         ),
@@ -283,7 +283,7 @@ def test_production_map_records_primary_and_fallback_physical_sends(monkeypatch)
     fallback.base_url = "https://fallback.example/v1"
     fallback.chat.completions.create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-            "schema_version": 1, "source_event_ids": [1], "facts": [],
+            "facts": [],
         })), finish_reason="stop")],
         usage=SimpleNamespace(prompt_tokens=5, completion_tokens=4),
     )
@@ -339,7 +339,7 @@ def test_production_map_amends_invalid_physical_primary_before_fallback():
     fallback.base_url = "https://fallback.example/v1"
     fallback.chat.completions.create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-            "schema_version": 1, "source_event_ids": [1], "facts": [],
+            "facts": [],
         })), finish_reason="stop")],
         usage=SimpleNamespace(prompt_tokens=5, completion_tokens=4),
     )
@@ -381,11 +381,9 @@ def test_parser_rejects_model_text_without_evidence_and_uses_host_span_text():
     from agent.checkpoint_engine import parse_map_response
 
     payload = {
-        "schema_version": 1,
-        "source_event_ids": [1],
         "facts": [{
-            "kind": "instruction", "text": "model paraphrase", "source_event_ids": [1],
-            "evidence": [{"event_id": "1", "start_char": 0, "end_char": 9}],
+            "kind": "instruction", "text": "model paraphrase",
+            "evidence": [{"event_index": 0, "start_char": 0, "end_char": 9}],
         }],
     }
     parsed = parse_map_response(payload, expected_source_event_ids=(1,), source_events={"1": "host text only"})
@@ -411,7 +409,7 @@ def test_compress_kwargs_cannot_make_trace_benchmark_admissible():
 def test_trace_requires_every_map_attempt_to_be_complete_and_structured():
     attempts = iter([
         {
-            "content": {"schema_version": 1, "source_event_ids": [1], "facts": []},
+            "content": {"facts": []},
             "_checkpoint_identity": {
                 "configured_route": "first", "physical_model": "m1",
                 "actual_wire_mode": "prompt_only", "fallback_rejection": "response_format rejected",
@@ -421,7 +419,7 @@ def test_trace_requires_every_map_attempt_to_be_complete_and_structured():
             },
         },
         {
-            "content": {"schema_version": 1, "source_event_ids": [2], "facts": []},
+            "content": {"facts": []},
             "_checkpoint_identity": {
                 "configured_route": "last", "physical_model": "m2",
                 "actual_wire_mode": "structured", "fallback_rejection": "",
@@ -459,7 +457,7 @@ def test_rejected_physical_route_is_retained_when_next_structured_route_succeeds
         calls += 1
         if calls == 1:
             raise CheckpointMapCallRejected(identity, RuntimeError("response_format rejected"))
-        return {"content": {"schema_version": 1, "source_event_ids": [1], "facts": []}, "_checkpoint_identity": {
+        return {"content": {"facts": []}, "_checkpoint_identity": {
             **identity, "configured_route": "second", "physical_model": "m2",
             "fallback_rejection": None, "input_tokens": 3, "output_tokens": 2,
             "finish_reason": "stop", "response_hash": "ok",
@@ -492,11 +490,7 @@ def test_artifact_recovery_is_advertised_dispatched_and_reloaded(tmp_path):
 
 def test_production_bound_store_persists_compaction_artifact_across_restore(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
-    map_caller = lambda request: {
-        "schema_version": 1,
-        "source_event_ids": json.loads(request["messages"][0]["content"])["source_event_ids"],
-        "facts": [],
-    }
+    map_caller = lambda request: {"facts": []}
     first = CheckpointContextEngine({"mode": "live"}, session_id="s", map_caller=map_caller)
     first.bind_session_state(db, "s")
     first.compress([{"role": "user", "content": "durable source", "_row_id": 1}])

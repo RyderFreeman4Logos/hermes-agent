@@ -55,7 +55,7 @@ def prepare_provider_request(
         request["model"] = model
     if tools:
         request["tools"] = [dict(tool) for tool in tools]
-    if policy is not StructuredOutputPolicy.DISABLED and schema is not None:
+    if policy is not StructuredOutputPolicy.DISABLED and schema is not None and caps.get("structured_output", True) is not False:
         request["response_format"] = {
             "type": "json_schema",
             "json_schema": {"name": "checkpoint_map", "strict": True, "schema": dict(schema)},

@@ -11,7 +11,7 @@ from agent.context_engine import ContextEngine
 from .core import (
     ActiveIntent, CausalGroup, CheckpointGeneration, CheckpointRejected,
     DeterministicLanes, DurableCheckpointStore, Effect, MapDisposition,
-    MapFact, MapShard, ReducedState, StructuredOutputPolicy, TaskEpoch,
+    MapFact, MapResponse, MapShard, ReducedState, StructuredOutputPolicy, TaskEpoch,
     TraceRecord, count_request_tokens, parse_map_response, prepare_provider_request,
 )
 
@@ -47,6 +47,7 @@ class CheckpointContextEngine(ContextEngine):
         self._store = store or DurableCheckpointStore()
         self.session_id = session_id
         self._map_caller = map_caller
+        self._map_routes = tuple(cfg.get("map_routes", ()))
 
     @property
     def name(self) -> str:
@@ -141,11 +142,23 @@ class CheckpointContextEngine(ContextEngine):
         if self._map_caller is None:
             return self._local_map(messages, event_ids)
         prompt = [{"role": "user", "content": json.dumps({"source_event_ids": event_ids, "messages": [messages[i] for i in event_ids]}, default=str)}]
-        request = prepare_provider_request(prompt, policy=self.policy, schema=__import__("agent.checkpoint_engine.core", fromlist=["MapResponse"]).MapResponse.schema())
-        raw = self._map_caller(request)
-        if isinstance(raw, Mapping) and "choices" in raw:
-            raw = raw["choices"][0]["message"]["content"]
-        return parse_map_response(raw, expected_source_event_ids=event_ids)
+        routes = self._map_routes or ({},)
+        last_error: Exception | None = None
+        for route in routes:
+            route = dict(route)
+            if self.policy is StructuredOutputPolicy.REQUIRED and route.get("structured_output") is False:
+                continue
+            try:
+                request = prepare_provider_request(prompt, model=route.get("model"), policy=self.policy, schema=MapResponse.schema(), route_capabilities=route)
+                raw = self._map_caller(request)
+                if isinstance(raw, Mapping) and "choices" in raw:
+                    raw = raw["choices"][0]["message"]["content"]
+                return parse_map_response(raw, expected_source_event_ids=event_ids)
+            except (RuntimeError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
+                last_error = exc
+        if last_error:
+            raise last_error
+        raise CheckpointRejected("no configured structured-capable map route")
 
     def _reduce(self, lanes: DeterministicLanes, shards: Iterable[MapShard], messages: Sequence[Mapping[str, Any]]) -> ReducedState:
         all_facts: list[MapFact] = []

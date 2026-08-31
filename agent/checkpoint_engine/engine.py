@@ -200,6 +200,9 @@ class CheckpointContextEngine(ContextEngine):
     def _estimate_wire_tokens(self, messages: Sequence[Mapping[str, Any]]) -> int:
         return count_request_tokens({"messages": list(messages)})
 
+    def prepare_provider_request(self, messages: Sequence[Mapping[str, Any]], *, model: str | None = None, tools: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+        return prepare_provider_request(messages, model=model, tools=tools, policy=StructuredOutputPolicy.DISABLED)
+
     def compress(self, messages: list[dict[str, Any]], current_tokens: int | None = None, focus_topic: str | None = None, force: bool = False, memory_context: str = "", **kwargs: Any) -> list[dict[str, Any]]:
         if not isinstance(messages, list) or self._has_inflight_tools(messages):
             return messages
@@ -222,7 +225,9 @@ class CheckpointContextEngine(ContextEngine):
             self.last_rejection = None
             if self.trace:
                 reduced_hash = hashlib.sha256(json.dumps(asdict(reduced), default=str, sort_keys=True).encode()).hexdigest()
-                self.last_trace = TraceRecord(self.generation, revision.revision, "auxiliary", ("configured",), self.policy.value, "", "", reduced_hash, count_request_tokens(candidate), 0, 0, "stop", hashlib.sha256(checkpoint.encode()).hexdigest(), "unknown", False)
+                prompt_hash = hashlib.sha256(json.dumps(candidate, default=str, sort_keys=True).encode()).hexdigest()
+                schema_hash = hashlib.sha256(json.dumps(MapResponse.schema(), sort_keys=True).encode()).hexdigest()
+                self.last_trace = TraceRecord(self.generation, revision.revision, "auxiliary", ("configured",), self.policy.value, schema_hash, prompt_hash, reduced_hash, count_request_tokens(candidate), 0, 0, "stop", hashlib.sha256(checkpoint.encode()).hexdigest(), "unknown", False)
                 self._store.append_trace(self.session_id, self.last_trace)
             return messages if self.mode == "shadow" else candidate
         except (CheckpointRejected, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:

@@ -7,7 +7,8 @@ def test_trace_contains_reproducible_input_and_output_hashes():
     assert engine.last_trace is not None
     assert engine.last_trace.prompt_hash
     assert engine.last_trace.schema_hash
-    assert engine.last_trace.response_hash
+    assert not engine.last_trace.response_hash
+    assert engine.last_trace.benchmark_admissible is False
 
 
 def test_final_request_uses_one_provider_preparation_boundary():

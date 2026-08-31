@@ -2024,6 +2024,7 @@ DEFAULT_CONFIG = {
         "checkpoint": {
             "mode": "shadow",
             "trace": False,
+            "structured_output": "required",
             "target_wire_tokens": 48000,
             "hard_max_wire_tokens": 60000,
             "map_concurrency": 2,

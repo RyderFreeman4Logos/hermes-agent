@@ -1312,9 +1312,13 @@ def handle_function_call(
     _dispatch_start = time.monotonic()
 
     def _return_bridge_result(result: Any) -> Any:
+        observed_status, observed_error_type, _ = _tool_result_observer_fields(
+            function_name, result,
+        )
         _emit_checkpoint_receipt(
             receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
-            status="succeeded",
+            status="failed" if observed_status == "error" else "succeeded",
+            error_type=observed_error_type,
         )
         _emit_post_tool_call_hook(
             function_name=function_name,
@@ -1622,9 +1626,13 @@ def handle_function_call(
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
+        observed_status, observed_error_type, _ = _tool_result_observer_fields(
+            function_name, result,
+        )
         _emit_checkpoint_receipt(
             receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
-            status="succeeded",
+            status="failed" if observed_status == "error" else "succeeded",
+            error_type=observed_error_type,
         )
 
         _emit_post_tool_call_hook(

@@ -20,13 +20,16 @@ preserved.
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -102,6 +105,63 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _capture_checkpoint_code_snapshot() -> dict[str, Any]:
+    """Capture code identity once at engine construction, never per checkpoint."""
+    root = Path(__file__).resolve().parents[1]
+    try:
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(root), *args], check=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            ).stdout.strip()
+        head = git("rev-parse", "HEAD")
+        tree = git("rev-parse", "HEAD^{tree}")
+        diff = git("diff", "--no-ext-diff")
+        return {"head": head, "tree": tree, "dirty": bool(diff),
+                "dirty_diff_hash": hashlib.sha256(diff.encode()).hexdigest()}
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+
+def _build_checkpoint_map_caller(agent: Any) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """Bind checkpoint Map calls to the configured auxiliary provider route."""
+    code_snapshot = _capture_checkpoint_code_snapshot()
+
+    def call(request: dict[str, Any]) -> dict[str, Any]:
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+        route_info: dict[str, str] = {}
+        latency_info: dict[str, int] = {}
+        response = call_llm(
+            task="checkpoint", model=request.get("model"), messages=request["messages"],
+            extra_body={"response_format": request["response_format"]},
+            main_runtime={
+                "provider": getattr(agent, "provider", ""), "model": getattr(agent, "model", ""),
+                "base_url": getattr(agent, "base_url", ""), "api_key": getattr(agent, "api_key", ""),
+                "api_mode": getattr(agent, "api_mode", ""),
+            }, route_info=route_info, latency_info=latency_info,
+        )
+        content = extract_content_or_reasoning(response)
+        usage = getattr(response, "usage", None)
+        choice = (getattr(response, "choices", None) or [None])[0]
+        return {
+            "content": content,
+            "_checkpoint_identity": {
+                "configured_route": route_info.get("provider", ""),
+                "physical_model": route_info.get("model", request.get("model", "")),
+                "actual_wire_mode": "structured",
+                "fallback_rejection": "",
+                "input_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                "output_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                "latency_ms": int(latency_info.get("summary_generation_ms", 0)),
+                "finish_reason": str(getattr(choice, "finish_reason", "") or ""),
+                "response_hash": hashlib.sha256(content.encode()).hexdigest(),
+                "code_snapshot": code_snapshot,
+            },
+        }
+    return call
 
 
 def _moa_reference_output_allowed(agent: Any) -> bool:
@@ -2694,13 +2754,21 @@ def init_agent(
         pass
 
     if _engine_name != "compressor":
-        # Try loading from plugins/context_engine/<name>/
+        # Checkpoint Map is a production auxiliary call, not a test-only callback.
         try:
-            from plugins.context_engine import load_context_engine
-            _selected_engine = load_context_engine(
-                _engine_name,
-                _ctx_cfg.get("checkpoint", {}) if isinstance(_ctx_cfg, dict) else None,
-            )
+            if _engine_name == "checkpoint":
+                from agent.checkpoint_engine import CheckpointContextEngine
+                _selected_engine = CheckpointContextEngine(
+                    _ctx_cfg.get("checkpoint", {}) if isinstance(_ctx_cfg, dict) else None,
+                    session_id=getattr(agent, "session_id", "default") or "default",
+                    map_caller=_build_checkpoint_map_caller(agent),
+                )
+            else:
+                from plugins.context_engine import load_context_engine
+                _selected_engine = load_context_engine(
+                    _engine_name,
+                    _ctx_cfg.get("checkpoint", {}) if isinstance(_ctx_cfg, dict) else None,
+                )
         except Exception as _ce_load_err:
             _ra().logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
 

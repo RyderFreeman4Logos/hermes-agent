@@ -171,6 +171,7 @@ class MapFact:
     evidence: tuple[EvidenceSpan, ...] = ()
     uncertain: bool = False
     fact_id: str | None = None
+    summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -286,6 +287,7 @@ class MapResponse:
                     "properties": {
                         "kind": {"type": "string"},
                         "text": {"type": "string"},
+                        "summary": {"type": "string"},
                         "source_event_ids": {"type": "array", "items": {"type": "integer"}},
                         "uncertain": {"type": "boolean"},
                         "evidence": {"type": "array", "items": {
@@ -298,7 +300,7 @@ class MapResponse:
                             "required": ["event_id", "start_char", "end_char"],
                         }},
                     },
-                    "required": ["kind", "text", "source_event_ids"],
+                    "required": ["kind", "source_event_ids", "evidence"],
                 }},
             },
             "required": ["schema_version", "source_event_ids", "facts"],
@@ -318,22 +320,30 @@ def parse_map_response(
         raise ValueError("map source range mismatch")
     facts: list[MapFact] = []
     for item in payload.get("facts", ()):
-        if not isinstance(item, Mapping) or set(item) - {"kind", "text", "source_event_ids", "uncertain", "evidence"}:
+        if not isinstance(item, Mapping) or set(item) - {"kind", "text", "summary", "source_event_ids", "uncertain", "evidence"}:
             raise ValueError("invalid map fact")
         ids = tuple(item.get("source_event_ids", ()))
         if not ids or not set(ids) <= set(source_ids):
             raise ValueError("fact has invalid source ids")
         evidence = tuple(EvidenceSpan(str(s["event_id"]), int(s["start_char"]), int(s["end_char"])) for s in item.get("evidence", ()))
-        if source_events is not None:
-            for span in evidence:
-                extract_canonical_evidence(span, source_events)
+        if not evidence:
+            raise ValueError("fact requires evidence")
+        if source_events is None:
+            raise ValueError("fact evidence requires source events")
+        canonical_text = "\n".join(
+            extract_canonical_evidence(span, source_events) for span in evidence
+        )
         identity = json.dumps(
-            [str(item.get("kind", "observation")), str(item.get("text", "")), ids,
+            [str(item.get("kind", "observation")), canonical_text, ids,
              [(e.event_id, e.start_char, e.end_char) for e in evidence]],
             sort_keys=True, separators=(",", ":"),
         )
         fact_id = "fact:" + sha256(identity.encode()).hexdigest()[:16]
-        facts.append(MapFact(str(item.get("kind", "observation")), str(item.get("text", "")), ids, evidence, bool(item.get("uncertain", False)), fact_id))
+        facts.append(MapFact(
+            str(item.get("kind", "observation")), canonical_text, ids, evidence,
+            bool(item.get("uncertain", False)), fact_id,
+            str(item.get("summary", item.get("text", ""))),
+        ))
     dispositions = tuple(
         MapDisposition(event_id, "unresolved", recovery_ref=f"session-event:{event_id}")
         for event_id in source_ids
@@ -350,6 +360,7 @@ class DurableCheckpointStore:
         self._generations: dict[str, CheckpointGeneration] = {}
         self._traces: dict[str, list[TraceRecord]] = {}
         self._raw_events: dict[str, list[dict[str, Any]]] = {}
+        self._artifacts: dict[str, str] = {}
         self._load()
 
     @property
@@ -375,6 +386,10 @@ class DurableCheckpointStore:
                 session_id: [dict(event) for event in events]
                 for session_id, events in payload.get("raw_events", {}).items()
             }
+            self._artifacts = {
+                str(digest): str(content)
+                for digest, content in payload.get("artifacts", {}).items()
+            }
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             # An incomplete optional store must not make shadow operation crash.
             return
@@ -388,6 +403,7 @@ class DurableCheckpointStore:
             "generations": {key: asdict(value) for key, value in self._generations.items()},
             "traces": {key: [asdict(value) for value in values] for key, values in self._traces.items()},
             "raw_events": self._raw_events,
+            "artifacts": self._artifacts,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str), encoding="utf-8")
@@ -447,6 +463,20 @@ class DurableCheckpointStore:
     def raw_messages(self, session_id: str) -> tuple[dict[str, Any], ...]:
         with self._lock:
             return tuple(dict(event) for event in self._raw_events.get(session_id, ()))
+
+    def put_artifact(self, content: str) -> str:
+        digest = sha256(content.encode()).hexdigest()
+        with self._lock:
+            self._artifacts.setdefault(digest, content)
+            self._persist()
+        return digest
+
+    def read_artifact(self, digest: str) -> str:
+        with self._lock:
+            content = self._artifacts[digest]
+        if sha256(content.encode()).hexdigest() != digest:
+            raise ValueError("artifact hash mismatch")
+        return content
 
 
 class ContentAddressedArtifacts:

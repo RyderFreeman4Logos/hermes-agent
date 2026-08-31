@@ -38,7 +38,7 @@ class CheckpointContextEngine(ContextEngine):
             raise ValueError("checkpoint wire budgets are invalid")
         if self.map_concurrency < 1 or self.max_map_shards < 1:
             raise ValueError("checkpoint scheduler limits are invalid")
-        self.policy = StructuredOutputPolicy(str(cfg.get("structured_output", cfg.get("policy", "preferred"))).lower())
+        self.policy = StructuredOutputPolicy(str(cfg.get("structured_output", cfg.get("policy", "required"))).lower())
         self.context_length = int(cfg.get("context_length", self.hard_max_wire_tokens))
         self.threshold_percent = float(cfg.get("threshold_percent", .75))
         self.threshold_tokens = int(self.context_length * self.threshold_percent)
@@ -60,6 +60,7 @@ class CheckpointContextEngine(ContextEngine):
         self._tool_receipts: tuple[ToolExecutionReceipt, ...] = ()
         self._tool_receipt_lock = Lock()
         self._last_route_attempts: list[str] = []
+        self._last_map_identity: dict[str, Any] = {}
         self._artifacts = ContentAddressedArtifacts(artifact_root) if artifact_root else None
 
     @property
@@ -184,7 +185,9 @@ class CheckpointContextEngine(ContextEngine):
     def _call_map(self, messages: Sequence[Mapping[str, Any]], event_ids: tuple[int, ...]) -> MapShard:
         self._last_route_attempts = []
         if self._map_caller is None:
-            self._last_route_attempts.append("local")
+            self._last_route_attempts.append("unconfigured")
+            if self.mode == "live":
+                raise CheckpointRejected("no configured structured-capable map route")
             return self._local_map(messages, event_ids)
         source_ids = tuple(self._row_id(messages[i], i) for i in event_ids)
         source_events = {
@@ -202,7 +205,11 @@ class CheckpointContextEngine(ContextEngine):
             try:
                 request = prepare_provider_request(prompt, model=route.get("model"), policy=self.policy, schema=MapResponse.schema(), route_capabilities=route)
                 raw = self._map_caller(request)
-                if isinstance(raw, Mapping) and "choices" in raw:
+                if isinstance(raw, Mapping) and "_checkpoint_identity" in raw:
+                    self._last_map_identity = dict(raw["_checkpoint_identity"] or {})
+                if isinstance(raw, Mapping) and "content" in raw:
+                    raw = raw["content"]
+                elif isinstance(raw, Mapping) and "choices" in raw:
                     raw = raw["choices"][0]["message"]["content"]
                 return parse_map_response(raw, expected_source_event_ids=source_ids, source_events=source_events)
             except (RuntimeError, ValueError, TypeError, KeyError, IndexError, json.JSONDecodeError) as exc:
@@ -231,14 +238,33 @@ class CheckpointContextEngine(ContextEngine):
         return self._reduce(lanes, shards, messages, host_events=host_events)
 
     def externalize_artifact(self, content: str, *, media_type: str = "text/plain") -> ArtifactReference:
-        if self._artifacts is None:
-            raise CheckpointRejected("artifact store is not configured")
-        return ArtifactReference(self._artifacts.put(content), media_type)
+        artifact_id = self._store.put_artifact(content)
+        if self._artifacts is not None:
+            self._artifacts.put(content)
+        return ArtifactReference(artifact_id, media_type)
 
     def checkpoint_artifact_read(self, artifact_id: str) -> str:
-        if self._artifacts is None:
-            raise CheckpointRejected("artifact store is not configured")
-        return self._artifacts.read(artifact_id)
+        return self._store.read_artifact(artifact_id)
+
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
+        return [{
+            "name": "checkpoint_artifact_read",
+            "description": "Read an exact checkpoint artifact by its content hash.",
+            "parameters": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"artifact_id": {"type": "string"}},
+                "required": ["artifact_id"],
+            },
+        }]
+
+    def handle_tool_call(self, name: str, args: dict[str, Any], **kwargs: Any) -> str:
+        if name != "checkpoint_artifact_read":
+            return json.dumps({"error": f"Unknown context engine tool: {name}"})
+        try:
+            artifact_id = str(args["artifact_id"])
+            return json.dumps({"artifact_id": artifact_id, "content": self.checkpoint_artifact_read(artifact_id)})
+        except (KeyError, OSError, ValueError):
+            return json.dumps({"error": "checkpoint artifact is unavailable"})
 
     def _render_checkpoint(self, reduced: ReducedState) -> str:
         lines = ["CHECKPOINT (host-authored; raw transcript remains authoritative)"]
@@ -314,29 +340,29 @@ class CheckpointContextEngine(ContextEngine):
                 reduced_hash = hashlib.sha256(json.dumps(asdict(reduced), default=str, sort_keys=True).encode()).hexdigest()
                 prompt_hash = hashlib.sha256(json.dumps(candidate, default=str, sort_keys=True).encode()).hexdigest()
                 schema_hash = hashlib.sha256(json.dumps(MapResponse.schema(), sort_keys=True).encode()).hexdigest()
-                code_snapshot = dict(kwargs.get("code_snapshot") or {})
-                commit_snapshot = dict(kwargs.get("commit_code_snapshot") or code_snapshot)
-                if code_snapshot and commit_snapshot and code_snapshot != commit_snapshot:
-                    raise CheckpointRejected("host code changed during checkpoint")
+                identity = dict(self._last_map_identity)
+                code_snapshot = dict(identity.get("code_snapshot") or {})
                 code_head = str(code_snapshot.get("head", ""))
                 code_tree = str(code_snapshot.get("tree", ""))
                 dirty = bool(code_snapshot.get("dirty", False))
                 dirty_diff_hash = str(code_snapshot.get("dirty_diff_hash", ""))
-                configured_route = str(kwargs.get("configured_route", ""))
-                physical_model = str(kwargs.get("physical_model", ""))
+                configured_route = str(identity.get("configured_route", ""))
+                physical_model = str(identity.get("physical_model", ""))
                 final_request = prepare_provider_request(
                     candidate, model=physical_model or None, policy=StructuredOutputPolicy.DISABLED
                 )
                 identity_complete = bool(
                     code_head and code_tree and "dirty" in code_snapshot
                     and "dirty_diff_hash" in code_snapshot and physical_model
-                    and (configured_route or self._last_route_attempts)
+                    and configured_route and identity.get("actual_wire_mode")
+                    and identity.get("response_hash") and identity.get("finish_reason")
                 )
                 self.last_trace = TraceRecord(
                     self.generation, revision.revision, "auxiliary",
                     tuple(self._last_route_attempts), self.policy.value, schema_hash,
-                    prompt_hash, reduced_hash, count_request_tokens(candidate), 0,
-                    0, "stop", hashlib.sha256(checkpoint.encode()).hexdigest(),
+                    prompt_hash, reduced_hash, int(identity.get("input_tokens", count_request_tokens(candidate))),
+                    int(identity.get("output_tokens", 0)), int(identity.get("latency_ms", 0)),
+                    str(identity.get("finish_reason", "")), str(identity.get("response_hash", "")),
                     code_tree, dirty, source="raw_transcript",
                     projection_hash=prompt_hash,
                     artifact_graph_hash=hashlib.sha256(json.dumps(reduced.artifacts, sort_keys=True).encode()).hexdigest(),
@@ -346,8 +372,8 @@ class CheckpointContextEngine(ContextEngine):
                     extractor_hash=hashlib.sha256(b"checkpoint-extractor-v1").hexdigest(),
                     tokens_counting_mode="conservative_4_chars",
                     configured_route=configured_route,
-                    actual_wire_mode=str(kwargs.get("wire_mode", self.policy.value)),
-                    fallback_rejection=str(kwargs.get("fallback_rejection", "")),
+                    actual_wire_mode=str(identity.get("actual_wire_mode", "")),
+                    fallback_rejection=str(identity.get("fallback_rejection", "")),
                     final_request_hash=hashlib.sha256(json.dumps(final_request, sort_keys=True, default=str).encode()).hexdigest(),
                     code_head=code_head,
                     dirty_diff_hash=dirty_diff_hash,

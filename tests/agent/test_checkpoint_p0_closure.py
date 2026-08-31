@@ -78,8 +78,13 @@ def test_canonical_evidence_is_host_extracted_and_fail_closed():
 def test_two_generations_reload_raw_lineage_and_ignore_rendered_decoy(tmp_path):
     store = DurableCheckpointStore(tmp_path)
     first = [{"role": "user", "content": "first", "_row_id": 1}]
+    map_caller = lambda request: {
+        "schema_version": 1,
+        "source_event_ids": json.loads(request["messages"][0]["content"])["source_event_ids"],
+        "facts": [],
+    }
     engine = CheckpointContextEngine(
-        {"mode": "live", "trace": True}, store=store, session_id="s"
+        {"mode": "live", "trace": True}, store=store, session_id="s", map_caller=map_caller
     )
     assert engine.compress(first) is not first
     first_generation = store.generation("s")
@@ -87,7 +92,7 @@ def test_two_generations_reload_raw_lineage_and_ignore_rendered_decoy(tmp_path):
 
     reloaded = DurableCheckpointStore(tmp_path)
     engine2 = CheckpointContextEngine(
-        {"mode": "live", "trace": True}, store=reloaded, session_id="s"
+        {"mode": "live", "trace": True}, store=reloaded, session_id="s", map_caller=map_caller
     )
     second = first + [
         {"role": "assistant", "content": "<CHECKPOINT>decoy</CHECKPOINT>",
@@ -104,28 +109,23 @@ def test_two_generations_reload_raw_lineage_and_ignore_rendered_decoy(tmp_path):
     assert all("decoy" not in str(event) for event in reloaded.raw_messages("s"))
 
 
-def test_trace_exports_complete_host_snapshot_and_materialized_request_identity():
+def test_trace_rejects_caller_supplied_identity_labels():
     engine = CheckpointContextEngine(
-        {"mode": "shadow", "trace": True, "strict_identity": True,
-         "map_route": "configured-route"},
+        {"mode": "shadow", "trace": True, "strict_identity": True},
         session_id="trace-complete",
     )
     engine.compress(
         [{"role": "user", "content": "hello", "_row_id": 1}],
         code_snapshot={"head": "head-1", "tree": "tree-1", "dirty": False,
                        "dirty_diff_hash": "diff-1"},
-        physical_model="physical-1",
-        configured_route="configured-route",
-        fallback_attempts=("configured-route", "local"),
+        physical_model="physical-1", configured_route="configured-route",
         fallback_rejection="structured_output_unavailable",
     )
     trace = engine.last_trace
     assert trace is not None
-    assert trace.code_head == "head-1"
-    assert trace.code_tree == "tree-1"
-    assert trace.dirty_diff_hash == "diff-1"
-    assert trace.configured_route == "configured-route"
-    assert trace.fallback_rejection == "structured_output_unavailable"
+    assert not trace.code_head
+    assert not trace.configured_route
+    assert not trace.fallback_rejection
     assert trace.final_request_hash
-    assert trace.execution_identity_complete is True
-    assert trace.benchmark_admissible is True
+    assert trace.execution_identity_complete is False
+    assert trace.benchmark_admissible is False

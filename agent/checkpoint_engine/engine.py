@@ -24,6 +24,8 @@ class CheckpointContextEngine(ContextEngine):
         self.mode = str(cfg.get("mode", "shadow"))
         if self.mode not in {"shadow", "live"}:
             raise ValueError("checkpoint.mode must be shadow or live")
+        if self.mode == "live" and cfg.get("raw_history", True) is False:
+            raise ValueError("live checkpoint mode requires retained raw history")
         self.trace = bool(cfg.get("trace", False))
         self.target_wire_tokens = int(cfg.get("target_wire_tokens", 48_000))
         self.hard_max_wire_tokens = int(cfg.get("hard_max_wire_tokens", 60_000))

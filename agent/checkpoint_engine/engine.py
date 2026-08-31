@@ -10,6 +10,7 @@ from threading import Lock
 from typing import Any
 
 from agent.context_engine import ContextEngine
+from agent.turn_context import substitute_api_content
 from .core import (
     ActiveIntent, CausalGroup, CheckpointGeneration, CheckpointMapCallRejected, CheckpointRejected,
     ArtifactReference, ContentAddressedArtifacts, DeterministicLanes,
@@ -219,6 +220,7 @@ class CheckpointContextEngine(ContextEngine):
                 key: value for key, value in messages[i].items()
                 if key not in {"_row_id", "event_id", "source_event_id", "source_event_ids", "artifact_id", "tool_call_id"}
             }
+            substitute_api_content(message)
             if isinstance(message.get("tool_calls"), list):
                 message["tool_calls"] = [
                     {key: value for key, value in call.items() if key != "id"}
@@ -281,7 +283,12 @@ class CheckpointContextEngine(ContextEngine):
             if self.policy is StructuredOutputPolicy.REQUIRED and route.get("structured_output") is False:
                 continue
             try:
-                request = prepare_provider_request(prompt, model=route.get("model"), policy=self.policy, schema=MapResponse.schema(source_ids), route_capabilities=route)
+                request = prepare_provider_request(
+                    prompt, model=route.get("model"), policy=self.policy,
+                    schema=MapResponse.schema(
+                        source_ids, tuple(source_events[str(source_id)] for source_id in source_ids),
+                    ), route_capabilities=route,
+                )
                 request["max_tokens"] = self.effective_map_output_tokens
                 raw = self._map_caller(request)
                 if isinstance(raw, Mapping):

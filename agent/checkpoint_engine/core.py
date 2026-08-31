@@ -298,8 +298,34 @@ class MapAttemptRecord:
 
 class MapResponse:
     @classmethod
-    def schema(cls, source_event_ids: Sequence[int] = ()) -> dict[str, Any]:
+    def schema(
+        cls, source_event_ids: Sequence[int] = (), source_texts: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         event_indexes = list(range(len(source_event_ids)))
+        span_properties: dict[str, Any] = {
+            "event_index": {"type": "integer", "enum": event_indexes},
+            "start_char": {"type": "integer", "minimum": 0},
+            "end_char": {"type": "integer", "minimum": 0},
+        }
+        span_item: dict[str, Any] = {
+            "type": "object", "additionalProperties": False,
+            "properties": span_properties,
+            "required": ["event_index", "start_char", "end_char"],
+        }
+        if source_texts is not None:
+            if len(source_texts) != len(source_event_ids):
+                raise ValueError("map source bounds do not match source events")
+            bounds = [len(text) for text in source_texts]
+            for name in ("start_char", "end_char"):
+                span_properties[name]["maximum"] = max(bounds, default=0)
+            span_item["allOf"] = [{"anyOf": [
+                {"properties": {
+                    "event_index": {"enum": [index]},
+                    "start_char": {"maximum": bound},
+                    "end_char": {"maximum": bound},
+                }}
+                for index, bound in enumerate(bounds)
+            ]}]
         return {
             "type": "object",
             "additionalProperties": False,
@@ -312,15 +338,7 @@ class MapResponse:
                         "text": {"type": "string"},
                         "summary": {"type": "string"},
                         "uncertain": {"type": "boolean"},
-                        "evidence": {"type": "array", "items": {
-                            "type": "object", "additionalProperties": False,
-                            "properties": {
-                                "event_index": {"type": "integer", "enum": event_indexes},
-                                "start_char": {"type": "integer", "minimum": 0},
-                                "end_char": {"type": "integer", "minimum": 0},
-                            },
-                            "required": ["event_index", "start_char", "end_char"],
-                        }},
+                        "evidence": {"type": "array", "items": span_item},
                     },
                     "required": ["kind", "evidence"],
                 }},

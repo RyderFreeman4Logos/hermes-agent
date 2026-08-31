@@ -175,6 +175,37 @@ def test_required_map_externalizes_an_oversized_tool_result_before_planning():
     assert engine.checkpoint_artifact_read(next(iter(engine._map_artifact_ids))) == tool_body
 
 
+def test_required_map_binds_evidence_bounds_and_parser_to_wire_excerpt():
+    excerpt = "x" * 5_339
+    map_body = {
+        "facts": [{
+            "kind": "tool_result",
+            "evidence": [{"event_index": 0, "start_char": 0, "end_char": 168}],
+        }],
+    }
+
+    def caller(request):
+        payload = json.loads(request["messages"][0]["content"])
+        wire_message = payload["messages"][0]
+        assert "api_content" not in wire_message
+        wire_excerpt = wire_message["content"]
+        span_schema = request["response_format"]["json_schema"]["schema"]["properties"]["facts"]["items"]["properties"]["evidence"]["items"]
+        assert len(wire_excerpt) == len(excerpt)
+        assert span_schema["properties"]["start_char"]["maximum"] == len(wire_excerpt)
+        assert span_schema["properties"]["end_char"]["maximum"] == len(wire_excerpt)
+        return map_body
+
+    engine = CheckpointContextEngine(
+        {"mode": "live", "protect_last_n": 0}, map_caller=caller,
+    )
+    result = engine.compress([{
+        "role": "user", "content": "clean", "api_content": excerpt, "_row_id": 1,
+    }])
+
+    checkpoint = next(message["content"] for message in result if message.get("checkpoint_projection"))
+    assert "observed tool_result: " + excerpt[:168] in checkpoint
+
+
 def test_required_map_rejects_externalized_evidence_past_host_excerpt():
     tool_body = "host-visible evidence\n" + "x" * 70_000
 

@@ -10,7 +10,7 @@ import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 from agent import relay_runtime
 
@@ -24,25 +24,6 @@ def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -
         remember_sent_request(request, api_mode=api_mode)
     except Exception:
         logger.debug("cache low-hit remember failed", exc_info=True)
-
-
-_cache_capture_module = globals().get("cache_request_capture")
-_capture_provider_request = getattr(
-    _cache_capture_module, "capture_provider_request", None
-)
-if callable(_capture_provider_request):
-    capture_provider_request = cast(Callable[..., None], _capture_provider_request)
-    _cache_capture_module = cast(Any, _cache_capture_module)
-
-    def _capture_provider_request_with_lowhit(
-        request: dict[str, Any], **kwargs: Any
-    ) -> None:
-        _remember_lowhit_transport_request(
-            request, str(kwargs.get("api_mode") or "unknown")
-        )
-        capture_provider_request(request, **kwargs)
-
-    _cache_capture_module.capture_provider_request = _capture_provider_request_with_lowhit
 
 
 _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
@@ -98,6 +79,32 @@ def _relay_metadata(
     return relay_metadata
 
 
+class _RememberingSend:
+    def __init__(self, callback: Callable[[dict[str, Any]], Any], api_mode: str) -> None:
+        self._callback = callback
+        self._api_mode = api_mode
+
+    def __call__(self, request: dict[str, Any]) -> Any:
+        _remember_lowhit_transport_request(request, self._api_mode)
+        return self._callback(request)
+
+
+def _remembering_callback(
+    callback: Callable[[dict[str, Any]], Any], api_mode: str
+) -> Callable[[dict[str, Any]], Any]:
+    if isinstance(callback, _RememberingSend):
+        return callback
+    return _RememberingSend(callback, api_mode)
+
+
+def _remembering_stream_factory(
+    stream_factory: Callable[[dict[str, Any]], Any], api_mode: str
+) -> Callable[[dict[str, Any]], Any]:
+    if isinstance(stream_factory, _RememberingSend):
+        return stream_factory
+    return _RememberingSend(stream_factory, api_mode)
+
+
 def execute(
     request: dict[str, Any],
     callback: Callable[[dict[str, Any]], Any],
@@ -109,6 +116,9 @@ def execute(
     defer_logical_completion: bool = False,
 ) -> Any:
     """Run one non-streaming physical provider attempt through Relay."""
+    callback = _remembering_callback(
+        callback, str((metadata or {}).get("api_mode") or "unknown")
+    )
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return callback(request)
@@ -201,6 +211,9 @@ async def execute_async(
     defer_logical_completion: bool = False,
 ) -> Any:
     """Run one asynchronous physical provider attempt through Relay."""
+    callback = _remembering_callback(
+        callback, str((metadata or {}).get("api_mode") or "unknown")
+    )
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return await callback(request)
@@ -294,6 +307,9 @@ def execute_current(
 ) -> Any:
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
+    callback = _remembering_callback(
+        callback, str((metadata or {}).get("api_mode") or "unknown")
+    )
     if turn is None:
         return callback(request)
     return execute(
@@ -318,6 +334,9 @@ async def execute_current_async(
 ) -> Any:
     """Run an async provider attempt under the inherited turn when present."""
     turn = relay_runtime.active_turn()
+    callback = _remembering_callback(
+        callback, str((metadata or {}).get("api_mode") or "unknown")
+    )
     if turn is None:
         return await callback(request)
     return await execute_async(
@@ -368,6 +387,9 @@ def stream_current(
     returns.
     """
     turn = relay_runtime.active_turn()
+    stream_factory = _remembering_stream_factory(
+        stream_factory, str((metadata or {}).get("api_mode") or "unknown")
+    )
     if turn is None:
         return stream_factory(request)
     if _has_running_event_loop():
@@ -483,6 +505,9 @@ class ManagedLlmStream(Iterator[Any]):
         self._raw_chunks: list[tuple[Any, Any]] = []
         self._prefetched_chunks: list[Any] = []
         self.output_modified = False
+        stream_factory = _remembering_stream_factory(
+            stream_factory, str((metadata or {}).get("api_mode") or "unknown")
+        )
         callback_context = contextvars.copy_context()
 
         def run_callback(callback: Callable[..., Any], *args: Any) -> Any:

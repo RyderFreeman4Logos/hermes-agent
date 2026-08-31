@@ -7157,6 +7157,15 @@ def _compress_session_history(
         if int(session.get("history_version", 0)) != history_version:
             # External mutation during compaction — drop the compressed
             # result so we don't clobber concurrent edits.
+            agent._awaiting_cache_usage_after_compression = (
+                _replay_cache_pending_before
+            )
+            if _replay_compressor is not None and hasattr(
+                _replay_compressor, "awaiting_real_usage_after_compression"
+            ):
+                _replay_compressor.awaiting_real_usage_after_compression = (
+                    _replay_real_usage_pending_before
+                )
             finalize_context_engine_compression_notification(
                 agent,
                 committed=False,

@@ -110,6 +110,23 @@ def test_map_schema_bounds_facts_from_live_output_cap_and_summary_limit():
     assert fact_schema["maxItems"] < 62
 
 
+def test_map_uncertain_is_host_default_and_not_model_owned():
+    fact_schema = MapResponse.schema((1,), ("host text",))["properties"]["facts"]["items"]
+
+    assert "uncertain" not in fact_schema["properties"]
+    parsed = parse_map_response(
+        {"facts": [{"kind": "observation"}]},
+        expected_source_event_ids=(1,), source_events={"1": "host text"},
+    )
+    assert parsed.facts[0].uncertain is False
+
+    with pytest.raises(ValueError, match="^invalid map fact$"):
+        parse_map_response(
+            {"facts": [{"kind": "observation", "uncertain": True}]},
+            expected_source_event_ids=(1,), source_events={"1": "host text"},
+        )
+
+
 def test_map_schema_and_parser_reject_model_owned_fact_text():
     excerpt = "x" * 7_576
     fact_schema = MapResponse.schema((1,), (excerpt,))["properties"]["facts"]["items"]

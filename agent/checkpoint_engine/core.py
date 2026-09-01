@@ -327,7 +327,6 @@ class MapResponse:
                 "properties": {
                     "kind": {"type": "string"},
                     "summary": {"type": "string", "maxLength": cls._SUMMARY_MAX_LENGTH},
-                    "uncertain": {"type": "boolean"},
                 },
                 "required": ["kind"],
             },
@@ -366,7 +365,7 @@ def parse_map_response(
         raise ValueError("map fact limit exceeded")
     facts: list[MapFact] = []
     for item in raw_facts:
-        if not isinstance(item, Mapping) or set(item) - {"kind", "summary", "uncertain", "evidence"}:
+        if not isinstance(item, Mapping) or set(item) - {"kind", "summary", "evidence"}:
             raise ValueError("invalid map fact")
         summary = item.get("summary", "")
         if not isinstance(summary, str):
@@ -396,7 +395,7 @@ def parse_map_response(
         fact_id = "fact:" + sha256(identity.encode()).hexdigest()[:16]
         facts.append(MapFact(
             str(item.get("kind", "observation")), canonical_text, ids, evidence,
-            bool(item.get("uncertain", False)), fact_id,
+            False, fact_id,
             summary,
         ))
     dispositions = tuple(

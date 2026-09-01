@@ -54,13 +54,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Callable, Dict, List, NamedTuple, Tuple
 
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 _MAX_WORKERS = 8
 _LINUX_SUPERVISOR_ARG = "--_hermes-supervise"
+_LINUX_CLEANUP_SECONDS = 0.2
 _LINUX_CONTAINMENT_PROPERTIES = (
     "KillMode=control-group",
     "KillSignal=SIGKILL",
@@ -134,15 +135,21 @@ def _linux_enable_subreaper() -> bool:
         return False
 
 
-def _linux_terminate_and_reap_descendants() -> bool:
-    """Kill adopted test descendants, then prove that none remain."""
+def _linux_terminate_and_reap_descendants(
+    deadline: float | None = None, watch_lost: Callable[[], bool] | None = None,
+) -> int:
+    """Boundedly kill and reap adopted descendants after test completion."""
     import signal
 
+    deadline = deadline or time.monotonic() + _LINUX_CLEANUP_SECONDS
+    watch_lost = watch_lost or (lambda: False)
     while True:
+        if watch_lost():
+            return 137
         try:
             pid, _ = os.waitpid(-1, os.WNOHANG)
         except ChildProcessError:
-            return True
+            return 0
         if pid != 0:
             continue
         try:
@@ -150,79 +157,89 @@ def _linux_terminate_and_reap_descendants() -> bool:
                 encoding="utf-8"
             ).split()
             if not children:
-                return False
+                return 1
             for child_pid in children:
                 try:
                     os.kill(int(child_pid), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            os.waitpid(-1, 0)
         except (OSError, ValueError, ChildProcessError):
-            return False
+            return 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 1
+        time.sleep(min(0.01, remaining))
 
 
-def _linux_supervise(
-    repo_root: str, completion_path: str, environment_path: str, cmd: List[str],
-) -> int:
+def _linux_watch_lost(poller, stdin_fd: int) -> bool:
+    """Consume a closed runner watch pipe without blocking cleanup."""
+    if not poller.poll(0):
+        return False
+    try:
+        return not os.read(stdin_fd, 1)
+    except OSError:
+        return True
+
+
+def _linux_supervise(repo_root: str, completion_path: str, cmd: List[str]) -> int:
     """Run one test and let its systemd cgroup die with this supervisor."""
     import select
 
     try:
-        try:
-            environment = json.loads(Path(environment_path).read_text(encoding="utf-8"))
-            if not isinstance(environment, dict) or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in environment.items()
-            ):
-                return 1
-        except (OSError, ValueError):
+        environment = json.loads(sys.stdin.buffer.readline())
+        if not isinstance(environment, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
             return 1
-        if not _linux_enable_subreaper():
-            return 1
-        before_events = _read_linux_resource_events()
-        child = subprocess.Popen(cmd, cwd=repo_root, env=environment, stdin=subprocess.DEVNULL)
-        stdin_fd = sys.stdin.fileno()
-        poller = select.poll()
-        poller.register(stdin_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
-        while child.poll() is None:
-            if not poller.poll(100):
-                continue
-            try:
-                if os.read(stdin_fd, 1):
-                    continue
-            except OSError:
-                pass
+    except (OSError, ValueError):
+        return 1
+    if not _linux_enable_subreaper():
+        return 1
+    before_events = _read_linux_resource_events()
+    child = subprocess.Popen(cmd, cwd=repo_root, env=environment, stdin=subprocess.DEVNULL)
+    stdin_fd = sys.stdin.fileno()
+    poller = select.poll()
+    poller.register(stdin_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while child.poll() is None:
+        if not poller.poll(100):
+            continue
+        if _linux_watch_lost(poller, stdin_fd):
             # systemd KillMode=control-group terminates child descendants when
             # this supervisor exits, including after the parent runner is SIGKILL'd.
             return 137
-        if not _linux_terminate_and_reap_descendants():
-            return 1
-        rc = _normalize_returncode(child.returncode)
-        after_events = _read_linux_resource_events()
-        if after_events is None:
-            return 1
-        if not _linux_terminate_and_reap_descendants():
-            return 1
-        final_events = _read_linux_resource_events()
-        events = (
-            None
-            if before_events is None or final_events is None
-            else {
-                field: final_events[field] - before_events[field]
-                for field in _LINUX_RESOURCE_EVENT_FIELDS
-            }
-        )
-        Path(completion_path).write_text(
-            json.dumps({
-                "kind": "pytest",
-                "returncode": rc,
-                "resource_events": events,
-            }),
-            encoding="utf-8",
-        )
-        return rc
-    finally:
-        Path(environment_path).unlink(missing_ok=True)
+    cleanup_deadline = time.monotonic() + _LINUX_CLEANUP_SECONDS
+    cleanup_status = _linux_terminate_and_reap_descendants(
+        cleanup_deadline, lambda: _linux_watch_lost(poller, stdin_fd),
+    )
+    if cleanup_status:
+        return cleanup_status
+    rc = _normalize_returncode(child.returncode)
+    if _read_linux_resource_events() is None:
+        return 1
+    cleanup_status = _linux_terminate_and_reap_descendants(
+        cleanup_deadline, lambda: _linux_watch_lost(poller, stdin_fd),
+    )
+    if cleanup_status:
+        return cleanup_status
+    final_events = _read_linux_resource_events()
+    events = (
+        None
+        if before_events is None or final_events is None
+        else {
+            field: final_events[field] - before_events[field]
+            for field in _LINUX_RESOURCE_EVENT_FIELDS
+        }
+    )
+    Path(completion_path).write_text(
+        json.dumps({
+            "kind": "pytest",
+            "returncode": rc,
+            "resource_events": events,
+        }),
+        encoding="utf-8",
+    )
+    return rc
 
 
 def _linux_launcher_environment(env: dict[str, str]) -> dict[str, str]:
@@ -270,7 +287,6 @@ def _spawn_test_process(
         _LINUX_SUPERVISOR_ARG,
         str(repo_root),
         str(completion_path),
-        str(completion_path.with_name("environment.json")),
         *cmd,
     ]
     systemd_cmd = [
@@ -301,6 +317,20 @@ def _spawn_test_process(
         os.close(watch_w)
         raise
     os.close(watch_r)
+    payload = json.dumps(env).encode("utf-8") + b"\n"
+    try:
+        while payload:
+            written = os.write(watch_w, payload)
+            if written == 0:
+                raise OSError("short environment write to supervisor")
+            payload = payload[written:]
+    except BaseException:
+        os.close(watch_w)
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        raise
     return proc, watch_w
 
 
@@ -763,11 +793,7 @@ def _run_one_file_once(
     temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
     try:
         completion_path = Path(temproot) / "completion.json"
-        environment_path = Path(temproot) / "environment.json"
         env["PYTEST_DEBUG_TEMPROOT"] = temproot
-        environment_fd = os.open(environment_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(environment_fd, "w", encoding="utf-8") as environment_file:
-            json.dump(env, environment_file)
         proc, watch_fd = _spawn_test_process(cmd, repo_root, env, completion_path)
     except BaseException:
         shutil.rmtree(temproot, ignore_errors=True)
@@ -1649,6 +1675,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 4 and sys.argv[1] == _LINUX_SUPERVISOR_ARG:
-        sys.exit(_linux_supervise(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]))
+    if len(sys.argv) > 3 and sys.argv[1] == _LINUX_SUPERVISOR_ARG:
+        sys.exit(_linux_supervise(sys.argv[2], sys.argv[3], sys.argv[4:]))
     sys.exit(main())

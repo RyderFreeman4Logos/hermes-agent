@@ -58,8 +58,8 @@ import threading
 import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
-from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -1710,8 +1710,12 @@ class _CodexCompletionsAdapter:
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
 
+        max_tokens = kwargs.get("max_tokens")
+        if max_tokens is not None:
+            resp_kwargs["max_output_tokens"] = max_tokens
+
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
-        # support max_output_tokens or temperature — omit to avoid 400 errors.
+        # support temperature — omit to avoid 400 errors.
 
         # Translate extra_body.reasoning (chat.completions shape) into the
         # Responses API's top-level reasoning + include fields.  Mirrors
@@ -2081,10 +2085,20 @@ class _CodexCompletionsAdapter:
             content=content,
             tool_calls=tool_calls_raw or None,
         )
+        incomplete_details = _item_get(final, "incomplete_details")
+        incomplete_reason = str(
+            _item_get(incomplete_details, "reason", "")
+        ).strip().lower()
+        finish_reason = (
+            "length"
+            if _item_get(final, "status") == "incomplete"
+            and incomplete_reason == "max_output_tokens"
+            else "tool_calls" if tool_calls_raw else "stop"
+        )
         choice = SimpleNamespace(
             index=0,
             message=message,
-            finish_reason="stop" if not tool_calls_raw else "tool_calls",
+            finish_reason=finish_reason,
         )
         return SimpleNamespace(
             choices=[choice],
@@ -3463,6 +3477,7 @@ def _relay_auxiliary_call(callback):
             "model": "",
             "response_model": None,
             "api_mode": "chat_completions",
+            "checkpoint_attempts": kwargs.get("checkpoint_attempts"),
         })
         try:
             return callback(*args, **kwargs)
@@ -3557,22 +3572,90 @@ def _relay_sync_completion(
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    started_at = time.monotonic()
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
-    if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
+    try:
+        if route is None:
+            response = _run_protected_sync_provider_call(callback, kwargs)
+        else:
+            provider_name, fallback_model, metadata = route
+            from agent import relay_llm
 
-    return relay_llm.execute_current(
-        kwargs,
-        lambda request: _run_protected_sync_provider_call(callback, request),
-        name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model),
-        metadata=metadata,
-        defer_logical_completion=True,
+            response = relay_llm.execute_current(
+                kwargs,
+                lambda request: _run_protected_sync_provider_call(callback, request),
+                name=provider_name,
+                model_name=str(kwargs.get("model") or fallback_model),
+                metadata=metadata,
+                defer_logical_completion=True,
+            )
+    except Exception as exc:
+        _record_checkpoint_attempt(kwargs, provider, started_at, error=exc)
+        raise
+    _record_checkpoint_attempt(kwargs, provider, started_at, response=response)
+    return response
+
+
+def _record_checkpoint_attempt(
+    kwargs: Mapping[str, Any],
+    provider: str | None,
+    started_at: float,
+    *,
+    response: Any = None,
+    error: Exception | None = None,
+) -> None:
+    """Capture one checkpoint request at the dispatch boundary, if requested."""
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    attempts = context.get("checkpoint_attempts") if context else None
+    if not isinstance(attempts, list):
+        return
+    extra_body = kwargs.get("extra_body")
+    wire_mode = (
+        "structured"
+        if isinstance(extra_body, Mapping) and extra_body.get("response_format")
+        else "prompt_only"
     )
+    content = ""
+    usage = choice = None
+    if response is not None:
+        try:
+            content = extract_content_or_reasoning(response)
+            usage = getattr(response, "usage", None)
+            choice = (getattr(response, "choices", None) or [None])[0]
+        except (AttributeError, IndexError, TypeError):
+            pass
+    rejection = None
+    if error is not None:
+        retry_class = "transient" if _is_transient_transport_error(error) else "rejected"
+        rejection = f"{retry_class}: {type(error).__name__}: {error}"
+    attempts.append(MappingProxyType({
+        "configured_route": provider or None,
+        "physical_model": kwargs.get("model") or None,
+        "actual_wire_mode": wire_mode,
+        "fallback_rejection": rejection,
+        "input_tokens": getattr(usage, "prompt_tokens", None),
+        "output_tokens": getattr(usage, "completion_tokens", None),
+        "latency_ms": int((time.monotonic() - started_at) * 1000),
+        "finish_reason": getattr(choice, "finish_reason", None),
+        "response_hash": hashlib.sha256(content.encode()).hexdigest() if response is not None else None,
+    }))
+
+
+def _amend_checkpoint_attempt_validation_rejection(error: Exception) -> None:
+    """Classify the just-recorded physical response before fallback can run."""
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    attempts = context.get("checkpoint_attempts") if context else None
+    if not isinstance(attempts, list) or not attempts:
+        return
+    attempt = attempts[-1]
+    if not isinstance(attempt, Mapping) or attempt.get("fallback_rejection") is not None:
+        return
+    attempts[-1] = MappingProxyType({
+        **attempt,
+        "fallback_rejection": f"rejected: {type(error).__name__}: {error}",
+    })
 
 
 async def _relay_async_completion(
@@ -9010,6 +9093,7 @@ def _build_call_kwargs(
             or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
         )
         _is_moa = bool(task) and str(task) == "moa_reference"
+        _is_checkpoint = bool(task) and str(task) == "checkpoint"
         # Gemini's native generateContent maps max_tokens → maxOutputTokens and,
         # when it is omitted, applies a fixed 65,535-token ceiling rather than
         # "the model's full budget" (see gemini_native_adapter.build_gemini_request).
@@ -9035,6 +9119,7 @@ def _build_call_kwargs(
             or _nous_on_messages
             or _is_nvidia_nim
             or _is_moa
+            or _is_checkpoint
             or _is_gemini_native
         ):
             # Use auxiliary_max_tokens_param() so models that require
@@ -9195,9 +9280,11 @@ def _validate_llm_response(
     keeps the model (read from the response itself) with an empty route.
     """
     if response is None:
-        raise RuntimeError(
+        error = RuntimeError(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
+        _amend_checkpoint_attempt_validation_rejection(error)
+        raise error
     from agent.aux_accounting import record_aux_usage
     record_aux_usage(response, task, provider=provider, base_url=base_url)
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
@@ -9214,12 +9301,14 @@ def _validate_llm_response(
             return recovered
         response_type = type(response).__name__
         response_preview = str(response)[:120]
-        raise RuntimeError(
+        error = RuntimeError(
             f"Auxiliary {task or 'call'}: LLM returned invalid response "
             f"(type={response_type}): {response_preview!r}. "
             f"Expected object with .choices[0].message — check provider "
             f"adapter or custom endpoint compatibility."
-        ) from exc
+        )
+        _amend_checkpoint_attempt_validation_rejection(error)
+        raise error from exc
     _record_relay_auxiliary_response_model(response)
     _complete_relay_auxiliary_call()
     return response
@@ -9709,6 +9798,8 @@ def call_llm(
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
+    structured_output_required: bool = False,
+    checkpoint_attempts: Optional[list[Any]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()
@@ -9763,6 +9854,7 @@ def call_llm(
                 stream=stream,
                 stream_options=stream_options,
                 route_info=route_info,
+                structured_output_required=structured_output_required,
             )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -9813,6 +9905,7 @@ def _call_llm_impl(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    structured_output_required: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -10155,7 +10248,9 @@ def _call_llm_impl(
                 first_err = retry_err
                 kwargs = retry_kwargs
 
-        if _is_structured_output_rejection(first_err):
+        if structured_output_required and _is_structured_output_rejection(first_err):
+            raise first_err
+        if not structured_output_required and _is_structured_output_rejection(first_err):
             retry_kwargs = _without_structured_output_format(kwargs)
             if retry_kwargs is not None:
                 logger.info(

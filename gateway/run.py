@@ -5887,6 +5887,8 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
+        self._runner._attach_model_switch_after_compression(ctx.session_key, agent)
+
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -7016,6 +7018,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sessions:
             return None
         return sessions.get(session_key)
+
+    def _attach_model_switch_after_compression(
+        self,
+        session_key: Optional[str],
+        agent: Any,
+    ) -> None:
+        """Bind conversation-scoped deferred route state to a live agent."""
+        if not session_key:
+            return
+        state = self._peek_session_state(session_key)
+        pending = (
+            state.conversation.after_compression_model_switch
+            if state is not None
+            else None
+        )
+        if pending is None:
+            return
+
+        from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+        def _on_applied(result, old_model, _old_provider):
+            current = self._peek_session_state(session_key)
+            if (
+                current is None
+                or current.conversation.after_compression_model_switch is not result
+            ):
+                return
+            current.conversation.after_compression_model_switch = None
+            current.conversation.model_override = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            }
+            if result.reasoning_config is not None:
+                current.conversation.model_override["reasoning_config"] = dict(
+                    result.reasoning_config
+                )
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            if pending_notes is not None:
+                pending_notes[session_key] = (
+                    f"[Note: model was just switched from {old_model} to "
+                    f"{result.new_model} via "
+                    f"{result.provider_label or result.target_provider}. "
+                    "Adjust your self-identification accordingly.]"
+                )
+
+        schedule_model_switch_after_compression(
+            agent,
+            pending,
+            on_applied=_on_applied,
+        )
 
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
@@ -9741,8 +9796,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if resolved_session_key:
             _r_state = self._peek_session_state(resolved_session_key)
-            if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-                return _r_state.conversation.reasoning_override
+            if _r_state is not None:
+                if _r_state.conversation.reasoning_override is not None:
+                    return _r_state.conversation.reasoning_override
+                model_override = _r_state.conversation.model_override
+                if isinstance(model_override, dict):
+                    model_reasoning = model_override.get("reasoning_config")
+                    if isinstance(model_reasoning, dict):
+                        return dict(model_reasoning)
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(

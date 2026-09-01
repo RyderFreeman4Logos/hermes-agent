@@ -2,9 +2,9 @@
 
 ``GatewayRunner._session_model_overrides`` is in-memory, so before persistence
 a gateway restart silently reverted every session to the global default model.
-The non-secret parts (model/provider/base_url) are now written through to the
-session store (``SessionEntry.model_override`` in sessions.json) and lazily
-rehydrated on first use after a restart, with credentials re-resolved through
+The non-secret parts (model/provider/base_url/reasoning_config) are now written
+through to the session store (``SessionEntry.model_override`` in sessions.json)
+and lazily rehydrated on first use after a restart, with credentials re-resolved through
 the normal runtime provider resolution.
 
 Covers:

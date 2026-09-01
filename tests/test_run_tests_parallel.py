@@ -29,7 +29,7 @@ import textwrap
 import time
 from pathlib import Path
 from types import ModuleType
-from typing import NamedTuple, TextIO
+from typing import NamedTuple
 
 import pytest
 
@@ -177,37 +177,93 @@ def test_linux_normal_completion_never_signals_stale_process_group(
     assert client.kill_calls == 0
 
 
-def test_environment_writer_failure_removes_secret_root(
+def test_environment_pipe_write_failure_removes_secret_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """A partial environment transport is removed before spawn can begin."""
+    """A failed supervisor-pipe write leaves neither root nor live client."""
     runner = _load_runner_module()
     root = tmp_path / "attempt-root"
+
+    class SpawnedClient:
+        def __init__(self) -> None:
+            self.kill_calls = 0
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    client = SpawnedClient()
 
     def make_root(*args: object, **kwargs: object) -> str:
         root.mkdir()
         return str(root)
 
-    def fail_after_partial_write(value: object, target: TextIO) -> None:
-        target.write("partial-secret")
-        raise OSError("injected environment write failure")
-
     monkeypatch.setattr(runner.tempfile, "mkdtemp", make_root)
-    monkeypatch.setattr(runner.json, "dump", fail_after_partial_write)
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/env")
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: client)
+    monkeypatch.setattr(runner.os, "write", lambda *args: (_ for _ in ()).throw(OSError("pipe failed")))
 
-    with pytest.raises(OSError, match="injected environment write failure"):
+    with pytest.raises(OSError, match="pipe failed"):
         runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 1)
 
+    assert client.kill_calls == 1
     assert not root.exists()
 
 
-def test_supervisor_removes_transport_after_watch_parent_loss(tmp_path: Path) -> None:
-    """The scope-side supervisor deletes secrets when its runner disappears."""
+def test_runner_sigkill_before_spawn_leaves_no_secret_transport(tmp_path: Path) -> None:
+    """A killed runner cannot leave a pre-spawn environment file behind."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner_path = repo_root / "scripts" / "run_tests_parallel.py"
+    root = tmp_path / "attempts"
+    root.mkdir()
+    ready = tmp_path / "pre-spawn-ready"
+    secret = "pre-spawn-secret-sentinel"
+    child_code = textwrap.dedent(
+        f"""
+        import importlib.util
+        import sys
+        import time
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location("runner_probe", {str(runner_path)!r})
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+
+        def stop_before_spawn(*args):
+            Path({str(ready)!r}).write_text("ready", encoding="utf-8")
+            time.sleep(600)
+
+        runner._spawn_test_process = stop_before_spawn
+        runner._run_one_file_once(Path("test_probe.py"), [], Path({str(repo_root)!r}), 1)
+        """
+    )
+    env = os.environ.copy()
+    env["TMPDIR"] = str(root)
+    env["PARENT_LOSS_SECRET"] = secret
+    proc = subprocess.Popen([sys.executable, "-c", child_code], env=env)
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "runner did not reach the pre-spawn boundary"
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        transport_files = list(root.rglob("environment.json"))
+        retained = b"".join(path.read_bytes() for path in root.rglob("*") if path.is_file())
+        assert transport_files == []
+        assert secret.encode() not in retained
+    finally:
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_supervisor_exits_after_watch_parent_loss(tmp_path: Path) -> None:
+    """The scope-side supervisor exits without exposing its pipe environment."""
     repo_root = Path(__file__).resolve().parent.parent
     runner = repo_root / "scripts" / "run_tests_parallel.py"
-    transport = tmp_path / "environment.json"
     secret = "parent-loss-secret-sentinel"
-    transport.write_text(json.dumps({"PARENT_LOSS_SECRET": secret}), encoding="utf-8")
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -215,7 +271,6 @@ def test_supervisor_removes_transport_after_watch_parent_loss(tmp_path: Path) ->
             "--_hermes-supervise",
             str(repo_root),
             str(tmp_path / "completion.json"),
-            str(transport),
             sys.executable,
             "-c",
             "import time; time.sleep(0.2)",
@@ -226,11 +281,98 @@ def test_supervisor_removes_transport_after_watch_parent_loss(tmp_path: Path) ->
         text=True,
     )
     assert proc.stdin is not None
+    proc.stdin.write(json.dumps({"PARENT_LOSS_SECRET": secret}) + "\n")
     proc.stdin.close()
     assert proc.wait(timeout=10) == 137
     assert proc.stdout is not None
     assert secret not in proc.stdout.read()
-    assert not transport.exists()
+
+
+def test_linux_descendant_reap_has_an_absolute_deadline(tmp_path: Path) -> None:
+    """An unreapable adopted child cannot block the supervisor forever."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner_path = repo_root / "scripts" / "run_tests_parallel.py"
+    child_code = textwrap.dedent(
+        f"""
+        import importlib.util
+        import sys
+
+        spec = importlib.util.spec_from_file_location("runner_probe", {str(runner_path)!r})
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+        runner.os.waitpid = lambda *args: (0, 0)
+        runner.os.kill = lambda *args: None
+        runner.Path.read_text = lambda *args, **kwargs: "123"
+        assert runner._linux_terminate_and_reap_descendants() == 1
+        """
+    )
+    proc = subprocess.Popen([sys.executable, "-c", child_code])
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        pytest.fail("descendant cleanup blocked in waitpid")
+    assert proc.returncode == 0
+
+
+def test_linux_cleanup_consumes_watch_close_before_reap_deadline(tmp_path: Path) -> None:
+    """Watch-parent loss interrupts a cleanup that cannot reap immediately."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner_path = repo_root / "scripts" / "run_tests_parallel.py"
+    ready = tmp_path / "cleanup-ready"
+    child_code = textwrap.dedent(
+        f"""
+        import importlib.util
+        import json
+        import sys
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location("runner_probe", {str(runner_path)!r})
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+
+        class FinishedChild:
+            returncode = 0
+            def poll(self):
+                return 0
+
+        runner._linux_enable_subreaper = lambda: True
+        runner._read_linux_resource_events = lambda: {{
+            "pids.events": 0, "memory.events": 0, "memory.events.oom": 0,
+            "memory.events.oom_kill": 0,
+        }}
+        runner.subprocess.Popen = lambda *args, **kwargs: FinishedChild()
+        runner.os.waitpid = lambda *args: (0, 0)
+        runner.os.kill = lambda *args: None
+        def children(*args, **kwargs):
+            Path({str(ready)!r}).write_text("ready", encoding="utf-8")
+            return "123"
+        runner.Path.read_text = children
+        raise SystemExit(runner._linux_supervise({str(repo_root)!r}, {str(tmp_path / 'completion.json')!r}, []))
+        """
+    )
+    proc = subprocess.Popen([sys.executable, "-c", child_code], stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps({"SAFE": "value"}).encode() + b"\n")
+    proc.stdin.flush()
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "supervisor did not enter descendant cleanup"
+        proc.stdin.close()
+        assert proc.wait(timeout=1) == 137
+    except subprocess.TimeoutExpired:
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        pytest.fail("watch close did not interrupt descendant cleanup")
+    finally:
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
 
 
 def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> None:
@@ -678,9 +820,9 @@ def _fake_systemd_run(
             cmd = args[args.index("--") + 1:]
             flag = cmd.index("--_hermes-supervise")
             completion = Path(cmd[flag + 2])
-            transport = Path(cmd[flag + 3])
+            transport = sys.stdin.buffer.readline()
             try:
-                private_env = json.loads(transport.read_text())
+                private_env = json.loads(transport)
             except (OSError, ValueError):
                 private_env = os.environ
             state = Path(private_env["FAKE_SYSTEMD_STATE"])
@@ -729,7 +871,12 @@ def _fake_systemd_run(
             record = private_env.get("FAKE_SYSTEMD_ARGV_RECORD")
             if record:
                 Path(record).write_text(json.dumps(sys.argv))
-            os.execv(cmd[0], cmd)
+            child = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            child.stdin.write(transport)
+            child.stdin.flush()
+            status = child.wait()
+            child.stdin.close()
+            raise SystemExit(status)
             """
         ).lstrip(),
         encoding="utf-8",

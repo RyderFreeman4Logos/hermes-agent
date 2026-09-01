@@ -36,6 +36,7 @@ from agent.auxiliary_client import (
 )
 from agent.conversation_compression import (
     CompressionCommitFence,
+    resolve_context_compression_timeouts,
     run_compress_context_with_progress_timeout,
 )
 
@@ -147,6 +148,22 @@ class TestHostCandidateDeadlineAdvancesFallback:
         assert resolve(aux_timeout=1700.0, host_candidate_deadline=None) == 1700.0
         with host_cm(0.2):
             assert _aux_stream_total_ceiling(30.0) == 0.2
+
+    def test_fallback_candidate_budget_expands_host_ceiling(self):
+        idle, ceiling = resolve_context_compression_timeouts({
+            "context_timeout_seconds": 120,
+            "context_total_ceiling_seconds": 600,
+            "auxiliary": {
+                "compression": {
+                    "fallback_chain": [
+                        {"provider": "local", "model": "slow", "timeout": 1700},
+                        {"provider": "local", "model": "slower", "timeout": 3300},
+                    ],
+                },
+            },
+        })
+        assert idle == 120.0
+        assert ceiling == 3300.0
 
     @pytest.mark.parametrize(
         "invalid", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0]

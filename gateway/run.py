@@ -7085,6 +7085,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 current.conversation.model_override["reasoning_config"] = dict(
                     result.reasoning_config
                 )
+            async_store = getattr(self, "_async_session_store", None)
+            if async_store is not None:
+                loop = getattr(self, "_gateway_loop", None)
+                if loop is None or not loop.is_running():
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                if loop is not None and loop.is_running():
+                    persist = safe_schedule_threadsafe(
+                        async_store.set_model_override(
+                            session_key,
+                            current.conversation.model_override,
+                        ),
+                        loop,
+                        logger=logger,
+                        log_message="Failed to schedule deferred session model override persistence",
+                    )
+
+                    def _log_persist_failure(future):
+                        try:
+                            future.result()
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist deferred session model override",
+                                exc_info=True,
+                            )
+
+                    if persist is not None:
+                        persist.add_done_callback(_log_persist_failure)
+                else:
+                    store = getattr(self, "session_store", None)
+                    if store is not None:
+                        try:
+                            store.set_model_override(
+                                session_key,
+                                current.conversation.model_override,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist deferred session model override",
+                                exc_info=True,
+                            )
             pending_notes = getattr(self, "_pending_model_notes", None)
             if pending_notes is not None:
                 pending_notes[session_key] = (
@@ -27358,6 +27401,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
         }
+        if isinstance(persisted.get("reasoning_config"), dict):
+            override["reasoning_config"] = dict(persisted["reasoning_config"])
         provider = persisted.get("provider")
         if provider:
             # Re-resolve credentials for the persisted provider. On failure

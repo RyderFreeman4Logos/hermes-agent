@@ -1101,6 +1101,27 @@ def resolve_context_compression_timeouts(
                     aux_timeout = parsed
             except (TypeError, ValueError):
                 pass
+        fallback_chain = (
+            auxiliary_compression.get("fallback_chain")
+            if isinstance(auxiliary_compression, dict)
+            else None
+        )
+        if isinstance(fallback_chain, list):
+            for entry in fallback_chain:
+                if not isinstance(entry, dict):
+                    continue
+                if not str(entry.get("provider") or "").strip():
+                    continue
+                if not str(entry.get("model") or "").strip():
+                    continue
+                raw_timeout = entry.get("timeout")
+                if (
+                    isinstance(raw_timeout, (int, float))
+                    and not isinstance(raw_timeout, bool)
+                    and math.isfinite(raw_timeout)
+                    and raw_timeout > 0
+                ):
+                    aux_timeout = max(aux_timeout or 0.0, float(raw_timeout))
     else:
         cfg = {}
     if isinstance(cfg, dict):

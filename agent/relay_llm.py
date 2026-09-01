@@ -1569,6 +1569,8 @@ def _execute_with_physical_attempt(
 ) -> Any:
     if _cache_scope_base is None:
         request = _physical_request_with_cache_scope(request, session_id)
+    if isinstance(callback, _RememberingSend):
+        callback = callback._callback
 
     def record_then_callback(final_request: dict[str, Any]) -> Any:
         _record_attempt(final_request, name=name, model_name=model_name, metadata=metadata)
@@ -1600,6 +1602,8 @@ async def _execute_async_with_physical_attempt(
 ) -> Any:
     if _cache_scope_base is None:
         request = _physical_request_with_cache_scope(request, session_id)
+    if isinstance(callback, _RememberingSend):
+        callback = callback._callback
 
     async def record_then_callback(final_request: dict[str, Any]) -> Any:
         _record_attempt(final_request, name=name, model_name=model_name, metadata=metadata)
@@ -1636,6 +1640,8 @@ def _stream_with_physical_attempt(
     defer_logical_completion: bool = False,
 ) -> "ManagedLlmStream":
     request = _physical_request_with_cache_scope(request, session_id)
+    if isinstance(stream_factory, _RememberingSend):
+        stream_factory = stream_factory._callback
 
     def record_then_stream(final_request: dict[str, Any]) -> Any:
         _record_attempt(final_request, name=name, model_name=model_name, metadata=metadata)

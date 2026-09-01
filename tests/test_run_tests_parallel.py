@@ -177,6 +177,91 @@ def test_linux_normal_completion_never_signals_stale_process_group(
     assert client.kill_calls == 0
 
 
+@pytest.mark.parametrize("prefill_pipe", [False, True])
+def test_environment_pipe_backpressure_is_bounded_and_private(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prefill_pipe: bool,
+) -> None:
+    """A retained nonreading supervisor pipe cannot block or expose its environment."""
+    runner = _load_runner_module()
+    secret = "watch-pipe-backpressure-sentinel-" + "x" * (1024 * 1024)
+    writes: list[int] = []
+    commands: list[list[str]] = []
+    launcher_envs: list[dict[str, str]] = []
+    original_pipe = runner.os.pipe
+    original_write = runner.os.write
+
+    class NonreadingClient:
+        def __init__(self, stdin_fd: int) -> None:
+            self.read_fd = os.dup(stdin_fd)
+            self.kill_calls = 0
+            self.communicate_timeouts: list[float] = []
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def communicate(self, timeout: float) -> tuple[str, None]:
+            self.communicate_timeouts.append(timeout)
+            return "", None
+
+    client: NonreadingClient | None = None
+
+    def pipe() -> tuple[int, int]:
+        read_fd, write_fd = original_pipe()
+        if prefill_pipe:
+            os.set_blocking(write_fd, False)
+            while True:
+                try:
+                    original_write(write_fd, b"x" * 65536)
+                except BlockingIOError:
+                    return read_fd, write_fd
+        return read_fd, write_fd
+
+    def write(fd: int, payload: bytes) -> int:
+        count = original_write(fd, payload)
+        writes.append(count)
+        return count
+
+    def popen(*args: object, **kwargs: object) -> NonreadingClient:
+        nonlocal client
+        command = args[0]
+        stdin_fd = kwargs["stdin"]
+        launcher_env = kwargs["env"]
+        assert isinstance(command, list)
+        assert isinstance(stdin_fd, int)
+        assert isinstance(launcher_env, dict)
+        commands.append(command)
+        launcher_envs.append(launcher_env)
+        client = NonreadingClient(stdin_fd)
+        return client
+
+    monkeypatch.setenv("WATCH_PIPE_BACKPRESSURE_SECRET", secret)
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/env")
+    monkeypatch.setattr(runner.os, "pipe", pipe)
+    monkeypatch.setattr(runner.os, "write", write)
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="environment pipe write timed out") as exc_info:
+            runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 0.1)
+    finally:
+        if client is not None:
+            os.close(client.read_fd)
+
+    assert time.monotonic() - started < 2
+    assert client is not None
+    assert client.kill_calls == 1
+    assert client.communicate_timeouts
+    assert secret not in str(exc_info.value)
+    assert len(commands) == len(launcher_envs) == 1
+    assert secret not in " ".join(commands[0])
+    assert secret not in launcher_envs[0].values()
+    if prefill_pipe:
+        assert writes == []
+    else:
+        assert writes and writes[0] < len(secret)
+
+
 def test_environment_pipe_write_failure_removes_secret_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -187,9 +272,14 @@ def test_environment_pipe_write_failure_removes_secret_root(
     class SpawnedClient:
         def __init__(self) -> None:
             self.kill_calls = 0
+            self.communicate_calls = 0
 
         def kill(self) -> None:
             self.kill_calls += 1
+
+        def communicate(self, timeout: float) -> tuple[str, None]:
+            self.communicate_calls += 1
+            return "", None
 
     client = SpawnedClient()
 
@@ -206,6 +296,7 @@ def test_environment_pipe_write_failure_removes_secret_root(
         runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 1)
 
     assert client.kill_calls == 1
+    assert client.communicate_calls == 1
     assert not root.exists()
 
 

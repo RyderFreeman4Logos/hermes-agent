@@ -60,6 +60,106 @@ from typing import Dict, List, Tuple
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 _MAX_WORKERS = 8
+_LINUX_SUPERVISOR_ARG = "--_hermes-supervise"
+_LINUX_CONTAINMENT_PROPERTIES = (
+    "KillMode=control-group",
+    "KillSignal=SIGKILL",
+    "TasksAccounting=yes",
+    "TasksMax=512",
+    "MemoryHigh=1G",
+    "MemoryMax=2G",
+    "CPUQuota=100%",
+    "CPUWeight=100",
+    "IOWeight=100",
+    "OOMPolicy=stop",
+)
+
+
+def _linux_supervise(repo_root: str, cmd: List[str]) -> int:
+    """Run one test and let its systemd cgroup die with this supervisor."""
+    import select
+
+    child = subprocess.Popen(cmd, cwd=repo_root, stdin=subprocess.DEVNULL)
+    stdin_fd = sys.stdin.fileno()
+    poller = select.poll()
+    poller.register(stdin_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while child.poll() is None:
+        if not poller.poll(100):
+            continue
+        try:
+            if os.read(stdin_fd, 1):
+                continue
+        except OSError:
+            pass
+        # systemd KillMode=control-group terminates child descendants when
+        # this supervisor exits, including after the parent runner is SIGKILL'd.
+        return 137
+    return child.returncode if child.returncode is not None else 1
+
+
+def _spawn_test_process(
+    cmd: List[str],
+    repo_root: Path,
+    env: dict[str, str],
+) -> Tuple["subprocess.Popen[str]", int | None]:
+    if sys.platform != "linux":
+        return (subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=env,
+            start_new_session=True,
+        ), None)
+
+    systemd_run = shutil.which("systemd-run")
+    env_binary = shutil.which("env") or "/usr/bin/env"
+    if systemd_run is None or not os.access(env_binary, os.X_OK):
+        raise RuntimeError(
+            "Linux test containment requires executable systemd-run and env"
+        )
+
+    watch_r, watch_w = os.pipe()
+    unit = f"hermes-pytest-{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}"
+    contained_cmd = [env_binary, "-i"]
+    contained_cmd.extend(f"{key}={value}" for key, value in env.items())
+    contained_cmd.extend([
+        sys.executable,
+        str(Path(__file__).resolve()),
+        _LINUX_SUPERVISOR_ARG,
+        str(repo_root),
+        *cmd,
+    ])
+    systemd_cmd = [
+        systemd_run,
+        "--user",
+        f"--unit={unit}",
+        "--service-type=exec",
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--quiet",
+    ]
+    systemd_cmd.extend(f"--property={prop}" for prop in _LINUX_CONTAINMENT_PROPERTIES)
+    systemd_cmd.extend(["--", *contained_cmd])
+    try:
+        proc = subprocess.Popen(
+            systemd_cmd,
+            cwd=repo_root,
+            stdin=watch_r,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=env,
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(watch_r)
+        os.close(watch_w)
+        raise
+    os.close(watch_r)
+    return proc, watch_w
 
 
 def _clamp_workers(requested: int) -> int:
@@ -78,15 +178,17 @@ def _strip_mise_shims(path: str) -> str:
     for entry in path.split(os.pathsep):
         if _is_mise_shim_path(entry):
             continue
-        rustup = Path(entry) / "rustup"
-        try:
-            if rustup.is_symlink():
-                resolved = rustup.resolve()
-                if _is_mise_shim_path(str(resolved)) or resolved.name.casefold() in {"mise", "mise.exe"}:
-                    continue
-        except OSError:
-            pass
-        clean.append(entry)
+        for tool in ("rustup", "cargo", "rustc"):
+            tool_path = Path(entry) / tool
+            try:
+                if tool_path.is_symlink():
+                    resolved = tool_path.resolve()
+                    if _is_mise_shim_path(str(resolved)) or resolved.name.casefold() in {"mise", "mise.exe"}:
+                        break
+            except OSError:
+                pass
+        else:
+            clean.append(entry)
     return os.pathsep.join(clean)
 
 
@@ -368,10 +470,10 @@ def _run_one_file(
     not a failure mode.
 
     On per-file timeout (``file_timeout`` seconds) or any other exception
-    during ``communicate()``, we kill the whole process group / process
-    tree so grandchildren (uvicorn servers, async runtimes, etc.) do not
-    orphan onto PID 1. This outer timeout exists only to
-    bound a pathologically slow or hung file as a whole.
+    during ``communicate()``, Linux uses the transient systemd cgroup's
+    control-group kill semantics; other POSIX platforms use the captured
+    process group. This bounds test descendants even when the parent runner
+    cannot execute cleanup after SIGKILL.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
         file, pytest_args, repo_root, file_timeout
@@ -438,20 +540,12 @@ def _run_one_file_once(
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
 
     subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=env,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    watch_fd: int | None = None
+    try:
+        proc, watch_fd = _spawn_test_process(cmd, repo_root, env)
+    except BaseException:
+        shutil.rmtree(temproot, ignore_errors=True)
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -490,6 +584,8 @@ def _run_one_file_once(
 
         output +=  "\n"
     finally:
+        if watch_fd is not None:
+            os.close(watch_fd)
         # Delete the temp root for this attempt. Nothing reads it after the
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite.
@@ -1295,4 +1391,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == _LINUX_SUPERVISOR_ARG:
+        sys.exit(_linux_supervise(sys.argv[2], sys.argv[3:]))
     sys.exit(main())

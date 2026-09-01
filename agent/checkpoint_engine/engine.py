@@ -283,6 +283,7 @@ class CheckpointContextEngine(ContextEngine):
                     prompt, model=route.get("model"), policy=self.policy,
                     schema=MapResponse.schema(
                         source_ids, tuple(source_events[str(source_id)] for source_id in source_ids),
+                        max_output_tokens=self.effective_map_output_tokens,
                     ), route_capabilities=route,
                 )
                 request["max_tokens"] = self.effective_map_output_tokens
@@ -306,7 +307,12 @@ class CheckpointContextEngine(ContextEngine):
                     raw = raw["content"]
                 elif isinstance(raw, Mapping) and "choices" in raw:
                     raw = raw["choices"][0]["message"]["content"]
-                return parse_map_response(raw, expected_source_event_ids=source_ids, source_events=source_events)
+                return parse_map_response(
+                    raw,
+                    expected_source_event_ids=source_ids,
+                    source_events=source_events,
+                    max_facts=max(1, self.effective_map_output_tokens // MapResponse._SUMMARY_MAX_LENGTH),
+                )
             except CheckpointMapCallRejected as exc:
                 identities = exc.identity.get("_checkpoint_attempt_identities")
                 if isinstance(identities, (list, tuple)):
@@ -480,7 +486,10 @@ class CheckpointContextEngine(ContextEngine):
                 reduced_hash = hashlib.sha256(json.dumps(asdict(reduced), default=str, sort_keys=True).encode()).hexdigest()
                 prompt_hash = hashlib.sha256(json.dumps(candidate, default=str, sort_keys=True).encode()).hexdigest()
                 schema_hash = hashlib.sha256(json.dumps(
-                    [MapResponse.schema(shard.source_event_ids) for shard in shards], sort_keys=True,
+                    [MapResponse.schema(
+                        shard.source_event_ids,
+                        max_output_tokens=self.effective_map_output_tokens,
+                    ) for shard in shards], sort_keys=True,
                 ).encode()).hexdigest()
                 records = tuple(self._map_attempt_records)
                 identity = records[-1] if records else MapAttemptRecord()

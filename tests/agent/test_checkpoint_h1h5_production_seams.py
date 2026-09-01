@@ -123,6 +123,7 @@ def test_production_map_forwards_the_effective_output_cap(monkeypatch):
     engine.compress([{"role": "user", "content": "source", "_row_id": 1}])
 
     assert calls[0]["max_tokens"] == 16_384
+    assert calls[0]["extra_body"]["response_format"]["json_schema"]["schema"]["properties"]["facts"]["maxItems"] == 32
 
 
 def test_checkpoint_transport_keeps_its_configured_output_cap_on_the_wire():
@@ -377,21 +378,22 @@ def test_production_map_amends_invalid_physical_primary_before_fallback():
     assert engine.last_trace.benchmark_admissible is False
 
 
-def test_parser_requires_evidence_and_uses_host_span_text():
+def test_parser_binds_host_evidence_and_rejects_model_geometry():
     from agent.checkpoint_engine import parse_map_response
 
     payload = {
         "facts": [{
             "kind": "instruction",
-            "evidence": [{"start_char": 0, "end_char": 9}],
         }],
     }
     parsed = parse_map_response(payload, expected_source_event_ids=(1,), source_events={"1": "host text only"})
-    assert parsed.facts[0].text == "host text"
+    assert parsed.facts[0].text == "host text only"
 
-    payload["facts"][0].pop("evidence")
-    with pytest.raises(ValueError, match="evidence"):
-        parse_map_response(payload, expected_source_event_ids=(1,), source_events={"1": "host text only"})
+    with pytest.raises(ValueError, match="invalid map fact"):
+        parse_map_response(
+            {"facts": [{"kind": "instruction", "evidence": [{"start_char": 0, "end_char": 9}]}]},
+            expected_source_event_ids=(1,), source_events={"1": "host text only"},
+        )
 
 
 def test_compress_kwargs_cannot_make_trace_benchmark_admissible():

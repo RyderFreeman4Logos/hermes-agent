@@ -301,58 +301,53 @@ class MapResponse:
 
     @classmethod
     def schema(
-        cls, source_event_ids: Sequence[int] = (), source_texts: Sequence[str] | None = None,
+        cls,
+        source_event_ids: Sequence[int] = (),
+        source_texts: Sequence[str] | None = None,
+        *,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         if len(source_event_ids) > 1:
             raise ValueError("Map request requires one host source")
-        span_properties: dict[str, Any] = {
-            "start_char": {"type": "integer", "minimum": 0},
-            "end_char": {"type": "integer", "minimum": 0},
-        }
-        span_item: dict[str, Any] = {
-            "type": "object", "additionalProperties": False,
-            "properties": span_properties,
-            "required": ["start_char", "end_char"],
-        }
         if source_texts is not None:
             if len(source_texts) != len(source_event_ids):
                 raise ValueError("map source bounds do not match source events")
             if len(source_texts) > 1:
                 raise ValueError("Map request requires one host source")
-            for name in ("start_char", "end_char"):
-                span_properties[name]["maximum"] = len(source_texts[0]) if source_texts else 0
+        if (max_output_tokens is not None
+                and (isinstance(max_output_tokens, bool)
+                     or not isinstance(max_output_tokens, int)
+                     or max_output_tokens <= 0)):
+            raise ValueError("map output token cap is invalid")
+        facts: dict[str, Any] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "kind": {"type": "string"},
+                    "summary": {"type": "string", "maxLength": cls._SUMMARY_MAX_LENGTH},
+                    "uncertain": {"type": "boolean"},
+                },
+                "required": ["kind"],
+            },
+        }
+        if max_output_tokens is not None:
+            facts["maxItems"] = max(1, max_output_tokens // cls._SUMMARY_MAX_LENGTH)
         return {
             "type": "object",
             "additionalProperties": False,
-            "properties": {
-                "facts": {"type": "array", "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "kind": {"type": "string"},
-                        "summary": {"type": "string", "maxLength": cls._SUMMARY_MAX_LENGTH},
-                        "uncertain": {"type": "boolean"},
-                        "evidence": {"type": "array", "items": span_item, "minItems": 1},
-                    },
-                    "required": ["kind", "evidence"],
-                }},
-            },
+            "properties": {"facts": facts},
             "required": ["facts"],
         }
-
-
-def _evidence_char(span: Mapping[str, Any], name: str) -> int:
-    value = span.get(name)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"missing evidence {name}")
-    return value
 
 
 def parse_map_response(
     raw: str | Mapping[str, Any], *, expected_source_event_ids: tuple[int, ...],
     source_events: Mapping[str | int, str] | None = None,
+    max_facts: int | None = None,
 ) -> MapShard:
-    """Parse only the canonical schema; no fences, aliases, or salvage."""
+    """Parse canonical facts and bind their evidence to the host source."""
     payload = json.loads(raw) if isinstance(raw, str) else raw
     if not isinstance(payload, Mapping) or "facts" not in payload:
         raise ValueError("invalid map schema")
@@ -361,8 +356,16 @@ def parse_map_response(
         raise ValueError("Map response requires one host source")
     if set(payload) - {"facts"}:
         raise ValueError("invalid map schema")
+    raw_facts = payload["facts"]
+    if not isinstance(raw_facts, (list, tuple)):
+        raise ValueError("invalid map schema")
+    if (max_facts is not None
+            and (isinstance(max_facts, bool) or not isinstance(max_facts, int) or max_facts < 1)):
+        raise ValueError("map fact limit is invalid")
+    if max_facts is not None and len(raw_facts) > max_facts:
+        raise ValueError("map fact limit exceeded")
     facts: list[MapFact] = []
-    for item in payload.get("facts", ()):
+    for item in raw_facts:
         if not isinstance(item, Mapping) or set(item) - {"kind", "summary", "uncertain", "evidence"}:
             raise ValueError("invalid map fact")
         summary = item.get("summary", "")
@@ -370,25 +373,21 @@ def parse_map_response(
             raise ValueError("invalid map fact")
         if len(summary) > MapResponse._SUMMARY_MAX_LENGTH:
             raise ValueError("summary exceeds maximum length")
-        raw_evidence = item.get("evidence", ())
-        if (not isinstance(raw_evidence, (list, tuple))
-                or not all(isinstance(span, Mapping) for span in raw_evidence)):
-            raise ValueError("invalid evidence")
-        evidence = tuple(
-            EvidenceSpan(
-                str(source_ids[0]),
-                _evidence_char(span, "start_char"), _evidence_char(span, "end_char"),
-            )
-            for span in raw_evidence
-        )
-        if not evidence:
-            raise ValueError("fact requires evidence")
+        if "evidence" in item:
+            if not item["evidence"]:
+                raise ValueError("fact requires evidence")
+            raise ValueError("invalid map fact")
         if source_events is None:
             raise ValueError("fact evidence requires source events")
-        canonical_text = "\n".join(
-            extract_canonical_evidence(span, source_events) for span in evidence
-        )
-        ids = tuple(dict.fromkeys(int(span.event_id) for span in evidence))
+        source_key = str(source_ids[0])
+        source_text = source_events.get(source_key)
+        if source_text is None:
+            source_text = source_events.get(source_ids[0])
+        if not isinstance(source_text, str):
+            raise ValueError("fact evidence requires source events")
+        evidence = (EvidenceSpan(source_key, 0, len(source_text)),)
+        canonical_text = extract_canonical_evidence(evidence[0], source_events)
+        ids = (source_ids[0],)
         identity = json.dumps(
             [str(item.get("kind", "observation")), canonical_text, ids,
              [(e.event_id, e.start_char, e.end_char) for e in evidence]],

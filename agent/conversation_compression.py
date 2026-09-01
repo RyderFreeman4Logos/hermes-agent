@@ -969,33 +969,83 @@ def resolve_context_compression_timeouts(
     """
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+    aux_timeout = None
+    config_root = compression_cfg
     cfg = compression_cfg
     if cfg is None:
         try:
             from hermes_cli.config import load_config
 
             raw = load_config()
-            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
-            cfg = maybe if isinstance(maybe, dict) else {}
+            config_root = raw if isinstance(raw, dict) else {}
         except Exception:
-            cfg = {}
+            config_root = {}
+    if isinstance(config_root, dict):
+        maybe = config_root.get("compression")
+        cfg = maybe if isinstance(maybe, dict) else config_root
+        auxiliary = config_root.get("auxiliary", {})
+        auxiliary_compression = (
+            auxiliary.get("compression", {})
+            if isinstance(auxiliary, dict)
+            else {}
+        )
+        raw_aux_timeout = (
+            auxiliary_compression.get("timeout")
+            if isinstance(auxiliary_compression, dict)
+            else None
+        )
+        if raw_aux_timeout is not None:
+            try:
+                parsed = float(raw_aux_timeout)
+                if math.isfinite(parsed) and parsed > 0:
+                    aux_timeout = parsed
+            except (TypeError, ValueError):
+                pass
+        fallback_chain = (
+            auxiliary_compression.get("fallback_chain")
+            if isinstance(auxiliary_compression, dict)
+            else None
+        )
+        if isinstance(fallback_chain, list):
+            for entry in fallback_chain:
+                if not isinstance(entry, dict):
+                    continue
+                if not str(entry.get("provider") or "").strip():
+                    continue
+                if not str(entry.get("model") or "").strip():
+                    continue
+                raw_timeout = entry.get("timeout")
+                if (
+                    isinstance(raw_timeout, (int, float))
+                    and not isinstance(raw_timeout, bool)
+                    and math.isfinite(raw_timeout)
+                    and raw_timeout > 0
+                ):
+                    aux_timeout = max(aux_timeout or 0.0, float(raw_timeout))
+    else:
+        cfg = {}
     if isinstance(cfg, dict):
         raw_idle = cfg.get("context_timeout_seconds")
         if raw_idle is not None:
             try:
                 parsed = float(raw_idle)
                 # Explicit 0/negative disables; positive values win.
-                idle = parsed
+                if math.isfinite(parsed):
+                    idle = parsed
             except (TypeError, ValueError):
                 pass
         raw_ceiling = cfg.get("context_total_ceiling_seconds")
         if raw_ceiling is not None:
             try:
                 parsed = float(raw_ceiling)
-                if parsed > 0:
+                if math.isfinite(parsed) and parsed > 0:
                     ceiling = parsed
             except (TypeError, ValueError):
                 pass
+    if aux_timeout is not None:
+        # The host must not preempt a longer configured compression request.
+        # Its own idle budget still detects a silent provider.
+        ceiling = max(ceiling, aux_timeout)
     if idle > 0:
         ceiling = max(ceiling, idle)
     return idle, ceiling

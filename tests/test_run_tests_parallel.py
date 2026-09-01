@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -59,6 +62,72 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+class _ProcessIdentity(NamedTuple):
+    pid: int
+    start_time: int
+    pidfd: int
+
+
+def _proc_start_time(pid: int) -> int | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return int(stat[stat.rfind(")") + 2:].split()[19])
+    except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+        return None
+
+
+def _open_process_identity(pid: int, expected_start: int | None) -> _ProcessIdentity:
+    if expected_start is None or _proc_start_time(pid) != expected_start:
+        raise RuntimeError(f"fixture process {pid} no longer has its recorded identity")
+    pidfd = os.pidfd_open(pid)
+    if _proc_start_time(pid) != expected_start:
+        os.close(pidfd)
+        raise RuntimeError(f"fixture process {pid} changed identity while opening pidfd")
+    return _ProcessIdentity(pid, expected_start, pidfd)
+
+
+def _process_identity_alive(identity: _ProcessIdentity) -> bool:
+    poller = select.poll()
+    poller.register(identity.pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    return not poller.poll(0)
+
+
+def _signal_process_identity(identity: _ProcessIdentity, sig: int) -> bool:
+    if not _process_identity_alive(identity):
+        return False
+    try:
+        signal.pidfd_send_signal(identity.pidfd, sig)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux pidfd identity")
+def test_stale_process_identity_is_not_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exited fixture identity cannot target a reused numeric PID."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    )
+    identity = _open_process_identity(proc.pid, _proc_start_time(proc.pid))
+    assert proc.stdin is not None
+    proc.stdin.close()
+    proc.wait(timeout=10)
+    calls = []
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        lambda *args: calls.append(args),
+    )
+    try:
+        assert not _signal_process_identity(identity, signal.SIGKILL)
+        assert calls == []
+    finally:
+        os.close(identity.pidfd)
 
 
 def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> None:
@@ -242,6 +311,11 @@ def test_runner_sigkill_contains_descendant_tree(tmp_path: Path) -> None:
         f"""
         import json, os, subprocess, sys, time
         from pathlib import Path
+
+        def start_time(pid):
+            stat = Path(f"/proc/{{pid}}/stat").read_text()
+            return int(stat[stat.rfind(")") + 2:].split()[19])
+
         leaf = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(600)"],
             stdin=subprocess.DEVNULL,
@@ -249,7 +323,10 @@ def test_runner_sigkill_contains_descendant_tree(tmp_path: Path) -> None:
             stderr=subprocess.DEVNULL,
         )
         Path({str(handoff)!r}).write_text(json.dumps({{
-            "tree": os.getpid(), "leaf": leaf.pid, "pgid": os.getpgrp()
+            "tree": os.getpid(),
+            "tree_start": start_time(os.getpid()),
+            "leaf": leaf.pid,
+            "leaf_start": start_time(leaf.pid),
         }}))
         time.sleep(600)
         """
@@ -302,33 +379,44 @@ def test_runner_sigkill_contains_descendant_tree(tmp_path: Path) -> None:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        data = None
+        identities: list[_ProcessIdentity] = []
         try:
             deadline = time.monotonic() + 10
             while not handoff.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert handoff.exists(), "runner did not start the synthetic tree"
             data = json.loads(handoff.read_text(encoding="utf-8"))
-            assert data is not None
+            identities.append(_open_process_identity(data["tree"], data["tree_start"]))
+            identities.append(_open_process_identity(data["leaf"], data["leaf_start"]))
             os.kill(proc.pid, 9)
             proc.wait(timeout=10)
             assert proc.returncode in (-9, 137)
             assert "=== Summary:" not in output_path.read_text(encoding="utf-8")
-            pids = (data["tree"], data["leaf"])
             deadline = time.monotonic() + 5
-            while any(_pid_alive(pid) for pid in pids) and time.monotonic() < deadline:
+            while (
+                any(_process_identity_alive(identity) for identity in identities)
+                and time.monotonic() < deadline
+            ):
                 time.sleep(0.05)
-            assert not any(_pid_alive(pid) for pid in pids), f"descendants survived: {pids}"
+            assert not any(
+                _process_identity_alive(identity) for identity in identities
+            ), f"descendants survived: {[identity.pid for identity in identities]}"
         finally:
             if proc.poll() is None:
                 os.kill(proc.pid, 9)
                 proc.wait(timeout=10)
-            if data is not None:
-                try:
-                    if any(_pid_alive(pid) for pid in (data["tree"], data["leaf"])):
-                        os.killpg(data["pgid"], 9)
-                except (ProcessLookupError, PermissionError):
-                    pass
+            try:
+                for identity in identities:
+                    _signal_process_identity(identity, signal.SIGKILL)
+                deadline = time.monotonic() + 5
+                while (
+                    any(_process_identity_alive(identity) for identity in identities)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.05)
+            finally:
+                for identity in identities:
+                    os.close(identity.pidfd)
             probe.unlink(missing_ok=True)
             shutil.rmtree(probe_dir, ignore_errors=True)
 
@@ -465,6 +553,136 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
     assert "retry output" in proc.stdout
 
 
+def _fake_systemd_run(tmp_path: Path) -> Path:
+    """Create a non-unit launcher that can fail before running the service."""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    launcher = fake_bin / "systemd-run"
+    launcher.write_text(
+        textwrap.dedent(
+            """
+            #!/usr/bin/python3
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            state = Path(os.environ["FAKE_SYSTEMD_STATE"])
+            attempt = int(state.read_text()) + 1 if state.exists() else 1
+            state.write_text(str(attempt))
+            mode = os.environ["FAKE_SYSTEMD_MODE"]
+            if attempt == 1 and mode == "fatal-137":
+                print("service killed by resource containment", flush=True)
+                raise SystemExit(137)
+            if attempt == 1 and mode == "startup":
+                print("Failed to start transient service unit", flush=True)
+                raise SystemExit(125)
+            if attempt == 1 and mode == "missing-status":
+                print("1 failed in 0.01s", flush=True)
+                raise SystemExit(1)
+            args = sys.argv[1:]
+            cmd = args[args.index("--") + 1:]
+            if attempt == 1 and mode == "typed-exit4":
+                flag = cmd.index("--_hermes-supervise")
+                Path(cmd[flag + 2]).write_text(json.dumps({
+                    "kind": "pytest", "returncode": 4,
+                }))
+                print("ERROR: file or directory not found", flush=True)
+                raise SystemExit(4)
+            os.execv(cmd[0], cmd)
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    return fake_bin
+
+
+def _run_fake_systemd_retry(
+    tmp_path: Path,
+    mode: str,
+    probe_source: str = "def test_probe():\n    assert True\n",
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    repo_root = Path(__file__).resolve().parent.parent
+    probe_dir = repo_root / f".runner-retry-probe-{os.getpid()}-{tmp_path.name}"
+    probe_dir.mkdir()
+    probe = probe_dir / "test_retry_boundary.py"
+    probe.write_text(probe_source, encoding="utf-8")
+    state = tmp_path / "attempts"
+    env = os.environ.copy()
+    env["FAKE_SYSTEMD_MODE"] = mode
+    env["FAKE_SYSTEMD_STATE"] = str(state)
+    env["PATH"] = os.pathsep.join((str(_fake_systemd_run(tmp_path)), "/usr/bin", "/bin"))
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "run_tests_parallel.py"),
+                "--files",
+                str(probe),
+                "--file-retries",
+                "1",
+                "-j",
+                "1",
+                "-q",
+                f"--rootdir={repo_root}",
+            ],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    return proc, int(state.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("mode", ("fatal-137", "startup", "missing-status"))
+def test_non_pytest_attempt_cannot_retry_to_green(tmp_path: Path, mode: str) -> None:
+    """A fatal systemd-boundary result is terminal even if retry would pass."""
+    proc, attempts = _run_fake_systemd_retry(tmp_path, mode)
+
+    assert proc.returncode == 1, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert "1 file failed" in proc.stdout
+    assert "FLAKY" not in proc.stdout
+
+
+def test_typed_pytest_failure_can_retry_to_green(tmp_path: Path) -> None:
+    """A real pytest assertion failure remains explicitly retry-eligible."""
+    marker = tmp_path / "failed-once"
+    proc, attempts = _run_fake_systemd_retry(
+        tmp_path,
+        "pytest",
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_probe():
+                marker = Path({str(marker)!r})
+                if not marker.exists():
+                    marker.write_text("failed")
+                    assert False, "retry-eligible pytest failure"
+            """
+        ),
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert attempts == 2, proc.stdout
+    assert "FLAKY file" in proc.stdout
+    assert "retry-eligible pytest failure" in proc.stdout
+
+
+def test_typed_exit4_for_existing_file_can_retry_to_green(tmp_path: Path) -> None:
+    """Preserve the intentional loaded-runner exit-4 retry contract."""
+    proc, attempts = _run_fake_systemd_retry(tmp_path, "typed-exit4")
+
+    assert proc.returncode == 0, proc.stdout
+    assert attempts == 2, proc.stdout
+    assert "FLAKY file" in proc.stdout
+    assert "file or directory not found" in proc.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +849,31 @@ def test_worker_path_excludes_mise_tool_shims(tmp_path: Path) -> None:
         (safe_bin / tool).chmod(0o755)
         exposed_bins.append(exposed)
 
+    aliased_bins = []
+    suffix_bins = []
+    for tool in ("rustup", "cargo", "rustc"):
+        real_mise = tmp_path / f"regular-{tool}" / "mise"
+        real_shims = real_mise / "shims"
+        real_shims.mkdir(parents=True)
+        regular_shim = real_shims / tool
+        regular_shim.write_text(
+            "#!/bin/sh" + chr(10) + f"echo \"$0\" >> {executions!s}" + chr(10),
+            encoding="utf-8",
+        )
+        regular_shim.chmod(0o755)
+        alias = tmp_path / f"aliased-{tool}"
+        alias.symlink_to(real_mise, target_is_directory=True)
+        aliased_bins.append(alias / "shims")
+
+        suffix_bin = tmp_path / f"suffix-{tool}"
+        suffix_bin.mkdir()
+        (suffix_bin / f"{tool}.exe").symlink_to(mise_executable)
+        suffix_bins.append(suffix_bin)
+
+    uncertain_bin = tmp_path / "uncertain-bin"
+    uncertain_bin.mkdir()
+    (uncertain_bin / "cargo").symlink_to(tmp_path / "missing-mise-target")
+
     probe = probe_dir / "test_worker_path.py"
     probe.write_text(
         textwrap.dedent(
@@ -652,7 +895,16 @@ def test_worker_path_excludes_mise_tool_shims(tmp_path: Path) -> None:
 
     env = os.environ.copy()
     env["PATH"] = os.pathsep.join(
-        (str(mise_shims), *(str(path) for path in exposed_bins), str(safe_bin), "/usr/bin", "/bin")
+        (
+            str(mise_shims),
+            *(str(path) for path in exposed_bins),
+            *(str(path) for path in aliased_bins),
+            *(str(path) for path in suffix_bins),
+            str(uncertain_bin),
+            str(safe_bin),
+            "/usr/bin",
+            "/bin",
+        )
     )
     proc = subprocess.run(
         [
@@ -681,6 +933,9 @@ def test_worker_path_excludes_mise_tool_shims(tmp_path: Path) -> None:
     path_entries = data["path"].split(os.pathsep)
     assert not any(Path(entry).as_posix().rstrip("/").endswith("/mise/shims") for entry in path_entries)
     assert not any(str(path) in path_entries for path in exposed_bins)
+    assert not any(str(path) in path_entries for path in aliased_bins)
+    assert not any(str(path) in path_entries for path in suffix_bins)
+    assert str(uncertain_bin) not in path_entries
     assert data["tools"] == {tool: str(safe_bin / tool) for tool in ("rustup", "cargo", "rustc")}
     assert not executions.exists(), "ordinary worker executed a mise Rust-tool shim"
     shutil.rmtree(probe_dir, ignore_errors=True)

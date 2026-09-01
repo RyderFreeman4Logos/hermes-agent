@@ -251,11 +251,28 @@ def _linux_launcher_environment(env: dict[str, str]) -> dict[str, str]:
     }
 
 
+def _close_watch_and_reap_client(proc: "subprocess.Popen[str]", watch_w: int) -> None:
+    """Close failed transport and boundedly reap its systemd-run client."""
+    try:
+        os.close(watch_w)
+    except OSError:
+        pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.communicate(timeout=_LINUX_CLEANUP_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _spawn_test_process(
     cmd: List[str],
     repo_root: Path,
     env: dict[str, str],
     completion_path: Path | None = None,
+    deadline: float | None = None,
 ) -> Tuple["subprocess.Popen[str]", int | None]:
     if sys.platform != "linux":
         return (subprocess.Popen(
@@ -317,19 +334,25 @@ def _spawn_test_process(
         os.close(watch_w)
         raise
     os.close(watch_r)
-    payload = json.dumps(env).encode("utf-8") + b"\n"
     try:
+        payload = json.dumps(env).encode("utf-8") + b"\n"
+        deadline = deadline or time.monotonic() + _LINUX_CLEANUP_SECONDS
+        os.set_blocking(watch_w, False)
+        import select
+
         while payload:
-            written = os.write(watch_w, payload)
+            try:
+                written = os.write(watch_w, payload)
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([], [watch_w], [], remaining)[1]:
+                    raise TimeoutError("environment pipe write timed out")
+                continue
             if written == 0:
                 raise OSError("short environment write to supervisor")
             payload = payload[written:]
     except BaseException:
-        os.close(watch_w)
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
+        _close_watch_and_reap_client(proc, watch_w)
         raise
     return proc, watch_w
 
@@ -791,15 +814,17 @@ def _run_one_file_once(
     # version probe fall through to mise.
     env["PATH"] = _strip_mise_shims(env.get("PATH", ""), repo_root)
     temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
+    subproc_start = time.monotonic()
+    attempt_deadline = subproc_start + file_timeout
     try:
         completion_path = Path(temproot) / "completion.json"
         env["PYTEST_DEBUG_TEMPROOT"] = temproot
-        proc, watch_fd = _spawn_test_process(cmd, repo_root, env, completion_path)
+        proc, watch_fd = _spawn_test_process(
+            cmd, repo_root, env, completion_path, attempt_deadline,
+        )
     except BaseException:
         shutil.rmtree(temproot, ignore_errors=True)
         raise
-
-    subproc_start = time.monotonic()
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -814,7 +839,10 @@ def _run_one_file_once(
 
     authoritative = sys.platform != "linux"
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
+        remaining = attempt_deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, file_timeout)
+        output, _ = proc.communicate(timeout=remaining)
         wrapper_rc = _normalize_returncode(proc.returncode)
         if sys.platform == "linux":
             rc, authoritative, diagnostic = _read_linux_completion(

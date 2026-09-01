@@ -37,7 +37,7 @@ Environment:
                          ';' also works and drive letters are handled;
                          default: 'tests')
 
-Exit code: 0 if every file's pytest exited 0; 1 otherwise.
+Exit code: 0 if every file has an authoritative passing pytest outcome; 1 otherwise.
 """
 
 from __future__ import annotations
@@ -54,12 +54,342 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, NamedTuple, Tuple
 
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
 _MAX_WORKERS = 8
+_LINUX_SUPERVISOR_ARG = "--_hermes-supervise"
+_LINUX_CLEANUP_SECONDS = 0.2
+_LINUX_CONTAINMENT_PROPERTIES = (
+    "KillMode=control-group",
+    "KillSignal=SIGKILL",
+    "TasksAccounting=yes",
+    "TasksMax=512",
+    "MemoryHigh=1G",
+    "MemoryMax=2G",
+    "CPUQuota=100%",
+    "CPUWeight=100",
+    "IOWeight=100",
+    "OOMPolicy=stop",
+)
+
+
+_LINUX_RESOURCE_EVENT_FIELDS = {
+    "pids.events": "max",
+    "memory.events": "max",
+    "memory.events.oom": "oom",
+    "memory.events.oom_kill": "oom_kill",
+}
+
+
+def _normalize_returncode(returncode: int | None) -> int:
+    """Normalize Popen's negative signal codes to shell exit statuses."""
+    if returncode is None:
+        return 1
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def _read_linux_resource_events() -> dict[str, int] | None:
+    """Read the fresh service cgroup's fatal-resource counters."""
+    try:
+        cgroup_path = next(
+            line.partition("::")[2]
+            for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+            if line.startswith("0::")
+        )
+        cgroup_root = Path("/sys/fs/cgroup") / cgroup_path.lstrip("/")
+        pids = _read_cgroup_event_file(cgroup_root / "pids.events")
+        memory = _read_cgroup_event_file(cgroup_root / "memory.events")
+        return {
+            "pids.events": pids["max"],
+            "memory.events": memory["max"],
+            "memory.events.oom": memory["oom"],
+            "memory.events.oom_kill": memory["oom_kill"],
+        }
+    except (OSError, StopIteration, ValueError, KeyError):
+        return None
+
+
+def _read_cgroup_event_file(path: Path) -> dict[str, int]:
+    """Parse one cgroup event file without accepting malformed counters."""
+    events: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name, value = line.split(maxsplit=1)
+        count = int(value)
+        if count < 0:
+            raise ValueError("negative cgroup event counter")
+        events[name] = count
+    return events
+
+
+def _linux_enable_subreaper() -> bool:
+    """Adopt orphaned test descendants so their exit is observable."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
+    except (AttributeError, OSError):
+        return False
+
+
+def _linux_terminate_and_reap_descendants(
+    deadline: float | None = None, watch_lost: Callable[[], bool] | None = None,
+) -> int:
+    """Boundedly kill and reap adopted descendants after test completion."""
+    import signal
+
+    deadline = deadline or time.monotonic() + _LINUX_CLEANUP_SECONDS
+    watch_lost = watch_lost or (lambda: False)
+    while True:
+        if watch_lost():
+            return 137
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return 0
+        if pid != 0:
+            continue
+        try:
+            children = Path(f"/proc/self/task/{threading.get_native_id()}/children").read_text(
+                encoding="utf-8"
+            ).split()
+            if not children:
+                return 1
+            for child_pid in children:
+                try:
+                    os.kill(int(child_pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        except (OSError, ValueError, ChildProcessError):
+            return 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 1
+        time.sleep(min(0.01, remaining))
+
+
+def _linux_watch_lost(poller, stdin_fd: int) -> bool:
+    """Consume a closed runner watch pipe without blocking cleanup."""
+    if not poller.poll(0):
+        return False
+    try:
+        return not os.read(stdin_fd, 1)
+    except OSError:
+        return True
+
+
+def _linux_supervise(repo_root: str, completion_path: str, cmd: List[str]) -> int:
+    """Run one test and let its systemd cgroup die with this supervisor."""
+    import select
+
+    try:
+        environment = json.loads(sys.stdin.buffer.readline())
+        if not isinstance(environment, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            return 1
+    except (OSError, ValueError):
+        return 1
+    if not _linux_enable_subreaper():
+        return 1
+    before_events = _read_linux_resource_events()
+    child = subprocess.Popen(cmd, cwd=repo_root, env=environment, stdin=subprocess.DEVNULL)
+    stdin_fd = sys.stdin.fileno()
+    poller = select.poll()
+    poller.register(stdin_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    while child.poll() is None:
+        if not poller.poll(100):
+            continue
+        if _linux_watch_lost(poller, stdin_fd):
+            # systemd KillMode=control-group terminates child descendants when
+            # this supervisor exits, including after the parent runner is SIGKILL'd.
+            return 137
+    cleanup_deadline = time.monotonic() + _LINUX_CLEANUP_SECONDS
+    cleanup_status = _linux_terminate_and_reap_descendants(
+        cleanup_deadline, lambda: _linux_watch_lost(poller, stdin_fd),
+    )
+    if cleanup_status:
+        return cleanup_status
+    rc = _normalize_returncode(child.returncode)
+    if _read_linux_resource_events() is None:
+        return 1
+    cleanup_status = _linux_terminate_and_reap_descendants(
+        cleanup_deadline, lambda: _linux_watch_lost(poller, stdin_fd),
+    )
+    if cleanup_status:
+        return cleanup_status
+    final_events = _read_linux_resource_events()
+    events = (
+        None
+        if before_events is None or final_events is None
+        else {
+            field: final_events[field] - before_events[field]
+            for field in _LINUX_RESOURCE_EVENT_FIELDS
+        }
+    )
+    Path(completion_path).write_text(
+        json.dumps({
+            "kind": "pytest",
+            "returncode": rc,
+            "resource_events": events,
+        }),
+        encoding="utf-8",
+    )
+    return rc
+
+
+def _linux_launcher_environment(env: dict[str, str]) -> dict[str, str]:
+    """Keep only user-systemd routing coordinates on the launcher process."""
+    return {
+        key: env[key]
+        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+        if env.get(key)
+    }
+
+
+def _close_watch_and_reap_client(proc: "subprocess.Popen[str]", watch_w: int) -> None:
+    """Close failed transport and boundedly reap its systemd-run client."""
+    try:
+        os.close(watch_w)
+    except OSError:
+        pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.communicate(timeout=_LINUX_CLEANUP_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _spawn_test_process(
+    cmd: List[str],
+    repo_root: Path,
+    env: dict[str, str],
+    completion_path: Path | None = None,
+    deadline: float | None = None,
+) -> Tuple["subprocess.Popen[str]", int | None]:
+    if sys.platform != "linux":
+        return (subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=env,
+            start_new_session=True,
+        ), None)
+
+    systemd_run = shutil.which("systemd-run")
+    env_binary = shutil.which("env") or "/usr/bin/env"
+    if systemd_run is None or not os.access(env_binary, os.X_OK):
+        raise RuntimeError(
+            "Linux test containment requires executable systemd-run and env"
+        )
+    if completion_path is None:
+        raise RuntimeError("Linux test containment requires a completion path")
+
+    watch_r, watch_w = os.pipe()
+    unit = f"hermes-pytest-{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}"
+    contained_cmd = [
+        env_binary,
+        "-i",
+        sys.executable,
+        str(Path(__file__).resolve()),
+        _LINUX_SUPERVISOR_ARG,
+        str(repo_root),
+        str(completion_path),
+        *cmd,
+    ]
+    systemd_cmd = [
+        systemd_run,
+        "--user",
+        f"--unit={unit}",
+        "--service-type=exec",
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--quiet",
+    ]
+    systemd_cmd.extend(f"--property={prop}" for prop in _LINUX_CONTAINMENT_PROPERTIES)
+    systemd_cmd.extend(["--", *contained_cmd])
+    try:
+        proc = subprocess.Popen(
+            systemd_cmd,
+            cwd=repo_root,
+            stdin=watch_r,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=_linux_launcher_environment(env),
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(watch_r)
+        os.close(watch_w)
+        raise
+    os.close(watch_r)
+    try:
+        payload = json.dumps(env).encode("utf-8") + b"\n"
+        deadline = deadline or time.monotonic() + _LINUX_CLEANUP_SECONDS
+        os.set_blocking(watch_w, False)
+        import select
+
+        while payload:
+            try:
+                written = os.write(watch_w, payload)
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([], [watch_w], [], remaining)[1]:
+                    raise TimeoutError("environment pipe write timed out")
+                continue
+            if written == 0:
+                raise OSError("short environment write to supervisor")
+            payload = payload[written:]
+    except BaseException:
+        _close_watch_and_reap_client(proc, watch_w)
+        raise
+    return proc, watch_w
+
+
+def _read_linux_completion(path: Path, wrapper_rc: int) -> Tuple[int, bool, str]:
+    """Validate the service-authored pytest status against systemd-run."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return wrapper_rc or 1, False, f"missing/invalid pytest completion status: {exc}"
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"kind", "returncode", "resource_events"}
+        or payload.get("kind") != "pytest"
+        or type(payload.get("returncode")) is not int
+        or not 0 <= payload["returncode"] <= 255
+        or not _valid_resource_events(payload.get("resource_events"))
+    ):
+        return wrapper_rc or 1, False, "invalid pytest completion status schema"
+    pytest_rc = payload["returncode"]
+    if pytest_rc != wrapper_rc:
+        return wrapper_rc or 1, False, (
+            f"pytest completion status {pytest_rc} disagrees with systemd-run {wrapper_rc}"
+        )
+    resource_events = payload["resource_events"]
+    if any(resource_events.values()):
+        return wrapper_rc or 1, False, "fatal cgroup resource event"
+    return pytest_rc, True, ""
+
+
+def _valid_resource_events(value: object) -> bool:
+    """Accept only the exact cgroup-event receipt emitted by the supervisor."""
+    return (
+        isinstance(value, dict)
+        and set(value) == set(_LINUX_RESOURCE_EVENT_FIELDS)
+        and all(type(count) is int and count >= 0 for count in value.values())
+    )
 
 
 def _clamp_workers(requested: int) -> int:
@@ -68,25 +398,69 @@ def _clamp_workers(requested: int) -> int:
 
 
 def _is_mise_shim_path(path: str) -> bool:
-    normalized = path.replace("\\", "/").rstrip("/")
+    normalized = path.replace("\\", "/").rstrip("/").casefold()
     return normalized.endswith("/mise/shims") or "/mise/shims/" in normalized
 
 
-def _strip_mise_shims(path: str) -> str:
+def _resolve_path_candidate(path: Path) -> Tuple[Path | None, bool]:
+    """Return (resolved path, uncertain); absence alone is not uncertainty."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None, False
+    except OSError:
+        return None, True
+    try:
+        return path.resolve(strict=True), False
+    except OSError:
+        return None, True
+
+
+def _strip_mise_shims(path: str, lookup_cwd: Path) -> str:
     """Remove mise shim directories and PATH entries exposing a shim."""
+    suffixes = ["", ".exe"]
+    for suffix in os.environ.get("PATHEXT", "").replace(os.pathsep, ";").split(";"):
+        if suffix and not suffix.startswith("."):
+            suffix = f".{suffix}"
+        if suffix and suffix.casefold() not in {item.casefold() for item in suffixes}:
+            suffixes.append(suffix)
+
     clean: List[str] = []
     for entry in path.split(os.pathsep):
+        raw_entry_path = Path(entry or ".")
+        entry_path = (
+            raw_entry_path
+            if raw_entry_path.is_absolute()
+            else lookup_cwd / raw_entry_path
+        )
         if _is_mise_shim_path(entry):
             continue
-        rustup = Path(entry) / "rustup"
-        try:
-            if rustup.is_symlink():
-                resolved = rustup.resolve()
-                if _is_mise_shim_path(str(resolved)) or resolved.name.casefold() in {"mise", "mise.exe"}:
+        resolved_entry, uncertain = _resolve_path_candidate(entry_path)
+        if uncertain or (
+            resolved_entry is not None and _is_mise_shim_path(str(resolved_entry))
+        ):
+            continue
+
+        unsafe = False
+        for tool in ("rustup", "cargo", "rustc"):
+            for suffix in suffixes:
+                candidate = entry_path / f"{tool}{suffix}"
+                resolved, uncertain = _resolve_path_candidate(candidate)
+                if uncertain:
+                    unsafe = True
+                    break
+                if resolved is None:
                     continue
-        except OSError:
-            pass
-        clean.append(entry)
+                if (
+                    _is_mise_shim_path(str(resolved))
+                    or resolved.name.casefold() in {"mise", "mise.exe"}
+                ):
+                    unsafe = True
+                    break
+            if unsafe:
+                break
+        if not unsafe:
+            clean.append(entry)
     return os.pathsep.join(clean)
 
 
@@ -121,12 +495,9 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
 
-# One-shot retry of failing test FILES. A file that exits non-zero is re-run
-# once in a fresh subprocess; if the re-run passes, the file counts as passed
-# but is loudly reported as FLAKY so it gets fixed rather than hidden.
-# Deterministic failures fail both attempts — a real regression can never be
-# laundered into green by this (it would have to flake in our favor twice in
-# a row on the same runner, which is exactly the definition of a flake).
+# One-shot retry of explicitly eligible pytest failures. Wrapper, containment,
+# resource, signal, timeout, and missing-status failures are terminal.
+# A pass-on-retry counts as passed but is loudly reported as FLAKY.
 # Set to 0 to disable (env: HERMES_TEST_FILE_RETRIES).
 _DEFAULT_FILE_RETRIES = 1
 
@@ -334,6 +705,15 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+class _AttemptResult(NamedTuple):
+    file: Path
+    returncode: int
+    output: str
+    summary: dict[str, int]
+    wall_seconds: float
+    retry_eligible: bool
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
@@ -345,12 +725,8 @@ def _run_one_file(
 
     Returns (file, returncode, captured_combined_output, summary_counts, subprocess_wall_seconds).
 
-    ``retries`` > 0 enables the one-shot flake retry: a non-zero exit is
-    re-run in a fresh subprocess; if the re-run passes, the file counts as
-    passed but the output is prefixed with a FLAKY banner and the file/output
-    are recorded in ``_FLAKY_RESULTS`` so the summary can call it out. A
-    deterministic failure fails every attempt, so real regressions cannot
-    be laundered green.
+    ``retries`` > 0 retries only a typed pytest assertion failure or the
+    intentional exit-4/present-file transient. Boundary failures are terminal.
 
     ``summary_counts`` is the result of ``_parse_pytest_summary(output)`` —
 
@@ -368,32 +744,35 @@ def _run_one_file(
     not a failure mode.
 
     On per-file timeout (``file_timeout`` seconds) or any other exception
-    during ``communicate()``, we kill the whole process group / process
-    tree so grandchildren (uvicorn servers, async runtimes, etc.) do not
-    orphan onto PID 1. This outer timeout exists only to
-    bound a pathologically slow or hung file as a whole.
+    during ``communicate()``, Linux uses the transient systemd cgroup's
+    control-group kill semantics; other POSIX platforms use the captured
+    process group. This bounds test descendants even when the parent runner
+    cannot execute cleanup after SIGKILL.
     """
-    file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
-    )
+    result = _run_one_file_once(file, pytest_args, repo_root, file_timeout)
     attempt = 0
-    while rc != 0 and attempt < retries:
+    first_output = result.output
+    while result.retry_eligible and attempt < retries:
         attempt += 1
-        first_output = output
-        file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
-        )
-        subproc_wall += subproc_wall2
-        if rc == 0:
+        retry = _run_one_file_once(file, pytest_args, repo_root, file_timeout)
+        result = retry._replace(wall_seconds=result.wall_seconds + retry.wall_seconds)
+        if result.returncode == 0:
             output = (
                 f"⚠ FLAKY: failed on attempt 1, passed on retry "
                 f"(attempt {attempt + 1}). Fix the flake — do not ignore this.\n"
                 f"--- first-attempt output ---\n{first_output}\n"
-                f"--- retry output ---\n{output}"
+                f"--- retry output ---\n{result.output}"
             )
+            result = result._replace(output=output)
             with _flaky_lock:
                 _FLAKY_RESULTS.append((file, output))
-    return file, rc, output, summary, subproc_wall
+    return (
+        result.file,
+        result.returncode,
+        result.output,
+        result.summary,
+        result.wall_seconds,
+    )
 
 
 # Files that failed once and passed on retry, with both attempts' output.
@@ -409,7 +788,7 @@ def _run_one_file_once(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
-) -> Tuple[Path, int, str, dict[str, int], float]:
+) -> _AttemptResult:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
 
@@ -433,47 +812,58 @@ def _run_one_file_once(
     # A shim can also be exposed by a broader PATH entry (for example
     # /usr/local/bin/rustup), so remove that entry instead of letting a
     # version probe fall through to mise.
-    env["PATH"] = _strip_mise_shims(env.get("PATH", ""))
+    env["PATH"] = _strip_mise_shims(env.get("PATH", ""), repo_root)
     temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
-    env["PYTEST_DEBUG_TEMPROOT"] = temproot
-
     subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=env,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    attempt_deadline = subproc_start + file_timeout
+    try:
+        completion_path = Path(temproot) / "completion.json"
+        env["PYTEST_DEBUG_TEMPROOT"] = temproot
+        proc, watch_fd = _spawn_test_process(
+            cmd, repo_root, env, completion_path, attempt_deadline,
+        )
+    except BaseException:
+        shutil.rmtree(temproot, ignore_errors=True)
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
     # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+    # the whole cleanup. Linux delegates this lifecycle to systemd.
     pgid: int | None = None
-    if sys.platform != "win32":
+    if sys.platform not in ("win32", "linux"):
         try:
             pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, PermissionError):
             pgid = None
 
+    authoritative = sys.platform != "linux"
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
+        remaining = attempt_deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, file_timeout)
+        output, _ = proc.communicate(timeout=remaining)
+        wrapper_rc = _normalize_returncode(proc.returncode)
+        if sys.platform == "linux":
+            rc, authoritative, diagnostic = _read_linux_completion(
+                completion_path, wrapper_rc
+            )
+            if diagnostic:
+                output = f"(containment failure: {diagnostic})\n{output}"
+        else:
+            rc = wrapper_rc
     except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
+        if sys.platform == "linux" and watch_fd is not None:
+            os.close(watch_fd)
+            watch_fd = None
+        else:
+            _kill_tree(proc, pgid=pgid)
         try:
             output, _ = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             output = "(file timeout exceeded; output unavailable)"
         rc = 124  # de facto convention for "killed by timeout".
+        authoritative = False
         output = (
             f"({file_timeout:.0f}s exceeded; "
             f"process tree SIGKILL'd)\n{output}"
@@ -481,21 +871,24 @@ def _run_one_file_once(
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
+        if sys.platform == "linux" and watch_fd is not None:
+            os.close(watch_fd)
+            watch_fd = None
+        else:
+            _kill_tree(proc, pgid=pgid)
         raise
     else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
-
-        output +=  "\n"
+        # systemd owns Linux scope collection after --wait --collect.
+        output += "\n"
     finally:
+        if watch_fd is not None:
+            os.close(watch_fd)
         # Delete the temp root for this attempt. Nothing reads it after the
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite.
         shutil.rmtree(temproot, ignore_errors=True)
 
-    if rc == 5:
+    if authoritative and rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
         # platform-gated or fully-marker-filtered file (e.g. a win32-only
         # suite on Linux) collects nothing and must not fail the suite.
@@ -504,8 +897,18 @@ def _run_one_file_once(
         # (venv without pytest, -k that matches nothing) can't report green.
         rc = 0
     summary = _parse_pytest_summary(output)
-    subproc_wall = time.monotonic() - subproc_start
-    return file, rc, output, summary, subproc_wall
+    retry_eligible = authoritative and (
+        (rc == 1 and summary.get("failed", 0) > 0)
+        or (rc == 4 and file.exists())
+    )
+    return _AttemptResult(
+        file,
+        rc,
+        output,
+        summary,
+        time.monotonic() - subproc_start,
+        retry_eligible,
+    )
 
 
 def _parse_pytest_summary(output: str) -> dict[str, int]:
@@ -852,8 +1255,9 @@ def main() -> int:
             os.environ.get("HERMES_TEST_FILE_RETRIES", _DEFAULT_FILE_RETRIES)
         ),
         help=(
-            "Re-run a failing test FILE this many times in a fresh subprocess "
-            "before declaring it failed. A pass-on-retry counts as passed but "
+            "Re-run an eligible pytest failure this many times in a fresh subprocess "
+            "before declaring it failed. Boundary failures never retry. A pass-on-retry "
+            "counts as passed but "
             "is reported as FLAKY in the summary. 0 disables. "
             f"Default: {_DEFAULT_FILE_RETRIES}, env: HERMES_TEST_FILE_RETRIES."
         ),
@@ -1178,7 +1582,11 @@ def main() -> int:
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
     skipped_note = f", {tests_skipped} skipped" if tests_skipped else ""
-    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+    failed_files_note = (
+        f", {fail_count} file{'s' if fail_count != 1 else ''} failed"
+        if fail_count else ""
+    )
+    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{skipped_note}{failed_files_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
 
     # Host-OS gating note: tests marked for another OS were skipped by the
     # conftest hook, not run. Say so explicitly — a green local run on Linux
@@ -1295,4 +1703,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 3 and sys.argv[1] == _LINUX_SUPERVISOR_ARG:
+        sys.exit(_linux_supervise(sys.argv[2], sys.argv[3], sys.argv[4:]))
     sys.exit(main())

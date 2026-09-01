@@ -2269,16 +2269,23 @@ class GatewaySlashCommandsMixin:
                         "gateway.model.error_prefix",
                         error="--after-compression requires a live session.",
                     )
-                try:
-                    from hermes_cli.model_switch import schedule_model_switch_after_compression
-
-                    schedule_model_switch_after_compression(cached_entry[0], result)
-                except Exception as exc:
-                    return t("gateway.model.error_prefix", error=f"Could not schedule model switch: {exc}")
-                return (
-                    f"Deferred model switch scheduled after compression: "
-                    f"{result.new_model}"
+                state = self._session_state(session_key)
+                replaced = state.conversation.after_compression_model_switch
+                state.conversation.after_compression_model_switch = result
+                self._attach_model_switch_after_compression(
+                    session_key,
+                    cached_entry[0],
                 )
+                lines = [
+                    "Deferred model switch scheduled after compression "
+                    f"(the next successful compression): `{result.new_model}`",
+                    f"Provider: {result.provider_label or result.target_provider}",
+                ]
+                if replaced is not None:
+                    lines.append(
+                        "_(replaced the previously scheduled model switch)_"
+                    )
+                return "\n".join(lines)
 
             if cached_entry and cached_entry[0] is not None:
                 try:

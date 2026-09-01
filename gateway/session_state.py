@@ -93,6 +93,8 @@ class ConversationState:
 
     # /model per-session override (model/provider/api_key/base_url/api_mode).
     model_override: Optional[Dict[str, Any]] = None
+    # Deferred /model --after-compression result, waiting for a live agent.
+    after_compression_model_switch: Any = None
     # /model --once restore snapshot.
     one_turn_restore: Optional[Dict[str, Any]] = None
     # /reasoning per-session override.
@@ -118,6 +120,7 @@ class ConversationState:
         automatically.
         """
         self.model_override = None
+        self.after_compression_model_switch = None
         self.one_turn_restore = None
         self.reasoning_override = None
         self.service_tier_override = _UNSET_TIER

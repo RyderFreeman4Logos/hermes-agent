@@ -553,8 +553,8 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
     assert "retry output" in proc.stdout
 
 
-def _fake_systemd_run(tmp_path: Path) -> Path:
-    """Create a non-unit launcher that can fail before running the service."""
+def _fake_systemd_run(tmp_path: Path, tasksmax_event: bool = False) -> Path:
+    """Create a non-unit launcher with an optional fake cgroup event reader."""
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     launcher = fake_bin / "systemd-run"
@@ -564,13 +564,24 @@ def _fake_systemd_run(tmp_path: Path) -> Path:
             #!/usr/bin/python3
             import json
             import os
+            import subprocess
             import sys
+            import time
             from pathlib import Path
 
-            state = Path(os.environ["FAKE_SYSTEMD_STATE"])
+            args = sys.argv[1:]
+            cmd = args[args.index("--") + 1:]
+            flag = cmd.index("--_hermes-supervise")
+            completion = Path(cmd[flag + 2])
+            transport = Path(cmd[flag + 3])
+            try:
+                private_env = json.loads(transport.read_text())
+            except (OSError, ValueError):
+                private_env = os.environ
+            state = Path(private_env["FAKE_SYSTEMD_STATE"])
             attempt = int(state.read_text()) + 1 if state.exists() else 1
             state.write_text(str(attempt))
-            mode = os.environ["FAKE_SYSTEMD_MODE"]
+            mode = private_env["FAKE_SYSTEMD_MODE"]
             if attempt == 1 and mode == "fatal-137":
                 print("service killed by resource containment", flush=True)
                 raise SystemExit(137)
@@ -580,21 +591,78 @@ def _fake_systemd_run(tmp_path: Path) -> Path:
             if attempt == 1 and mode == "missing-status":
                 print("1 failed in 0.01s", flush=True)
                 raise SystemExit(1)
-            args = sys.argv[1:]
-            cmd = args[args.index("--") + 1:]
+            if attempt == 1 and mode == "malformed-status":
+                completion.write_text("not json")
+                raise SystemExit(1)
+            if attempt == 1 and mode == "mismatched-status":
+                completion.write_text(json.dumps({
+                    "kind": "pytest", "returncode": 0,
+                    "resource_events": {
+                        "pids.events": 0,
+                        "memory.events": 0,
+                        "memory.events.oom": 0,
+                        "memory.events.oom_kill": 0,
+                    },
+                }))
+                raise SystemExit(1)
+            if attempt == 1 and mode == "timeout":
+                time.sleep(2)
+                raise SystemExit(1)
             if attempt == 1 and mode == "typed-exit4":
-                flag = cmd.index("--_hermes-supervise")
-                Path(cmd[flag + 2]).write_text(json.dumps({
-                    "kind": "pytest", "returncode": 4,
+                completion.write_text(json.dumps({
+                    "kind": "pytest",
+                    "returncode": 4,
+                    "resource_events": {
+                        "pids.events": 0,
+                        "memory.events": 0,
+                        "memory.events.oom": 0,
+                        "memory.events.oom_kill": 0,
+                    },
                 }))
                 print("ERROR: file or directory not found", flush=True)
                 raise SystemExit(4)
+            record = private_env.get("FAKE_SYSTEMD_ARGV_RECORD")
+            if record:
+                Path(record).write_text(json.dumps(sys.argv))
             os.execv(cmd[0], cmd)
             """
         ).lstrip(),
         encoding="utf-8",
     )
     launcher.chmod(0o755)
+    if tasksmax_event:
+        site_dir = tmp_path / "fake-site"
+        site_dir.mkdir()
+        (site_dir / "sitecustomize.py").write_text(
+            textwrap.dedent(
+                """
+                import pathlib
+
+                _read_text = pathlib.Path.read_text
+                _pids_events_reads = 0
+
+                def _fake_cgroup_read_text(self, *args, **kwargs):
+                    global _pids_events_reads
+                    if str(self) == "/proc/self/cgroup":
+                        return "0::/fake\\n"
+                    if str(self) == "/sys/fs/cgroup/fake/pids.events":
+                        _pids_events_reads += 1
+                        return f"max {_pids_events_reads - 1}\\n"
+                    if str(self) == "/sys/fs/cgroup/fake/memory.events":
+                        return "max 0\\noom 0\\noom_kill 0\\n"
+                    return _read_text(self, *args, **kwargs)
+
+                pathlib.Path.read_text = _fake_cgroup_read_text
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        env_binary = fake_bin / "env"
+        env_binary.write_text(
+            "#!/bin/sh\nshift\nexec /usr/bin/env -i PYTHONPATH=" + str(site_dir) + " \"$@\"\n",
+            encoding="utf-8",
+        )
+        env_binary.chmod(0o755)
     return fake_bin
 
 
@@ -602,6 +670,10 @@ def _run_fake_systemd_retry(
     tmp_path: Path,
     mode: str,
     probe_source: str = "def test_probe():\n    assert True\n",
+    *,
+    file_timeout: float = 30,
+    tasksmax_event: bool = False,
+    secret: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], int]:
     repo_root = Path(__file__).resolve().parent.parent
     probe_dir = repo_root / f".runner-retry-probe-{os.getpid()}-{tmp_path.name}"
@@ -612,7 +684,12 @@ def _run_fake_systemd_retry(
     env = os.environ.copy()
     env["FAKE_SYSTEMD_MODE"] = mode
     env["FAKE_SYSTEMD_STATE"] = str(state)
-    env["PATH"] = os.pathsep.join((str(_fake_systemd_run(tmp_path)), "/usr/bin", "/bin"))
+    if secret is not None:
+        env["DIRECT_RUNNER_SECRET"] = secret
+        env["FAKE_SYSTEMD_ARGV_RECORD"] = str(tmp_path / "launcher-argv.json")
+    env["PATH"] = os.pathsep.join((
+        str(_fake_systemd_run(tmp_path, tasksmax_event)), "/usr/bin", "/bin",
+    ))
     try:
         proc = subprocess.run(
             [
@@ -622,6 +699,8 @@ def _run_fake_systemd_retry(
                 str(probe),
                 "--file-retries",
                 "1",
+                "--file-timeout",
+                str(file_timeout),
                 "-j",
                 "1",
                 "-q",
@@ -673,6 +752,58 @@ def test_typed_pytest_failure_can_retry_to_green(tmp_path: Path) -> None:
     assert attempts == 2, proc.stdout
     assert "FLAKY file" in proc.stdout
     assert "retry-eligible pytest failure" in proc.stdout
+
+
+def test_tasksmax_event_cannot_retry_to_green(tmp_path: Path) -> None:
+    """A pids-controller denial is terminal even when its pytest retry passes."""
+    marker = tmp_path / "failed-once"
+    proc, attempts = _run_fake_systemd_retry(
+        tmp_path,
+        "pytest",
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_probe():
+                marker = Path({str(marker)!r})
+                if not marker.exists():
+                    marker.write_text("failed")
+                    assert False, "simulated TasksMax EAGAIN"
+            """
+        ),
+        tasksmax_event=True,
+    )
+
+    assert proc.returncode == 1, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert "fatal cgroup resource event" in proc.stdout
+    assert "FLAKY" not in proc.stdout
+
+
+@pytest.mark.parametrize("mode", ("malformed-status", "mismatched-status", "timeout"))
+def test_non_authoritative_attempt_siblings_cannot_retry_to_green(
+    tmp_path: Path, mode: str,
+) -> None:
+    """Malformed, mismatched, and timeout boundaries stay terminal."""
+    proc, attempts = _run_fake_systemd_retry(
+        tmp_path, mode, file_timeout=0.1 if mode == "timeout" else 30,
+    )
+
+    assert proc.returncode == 1, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert "FLAKY" not in proc.stdout
+
+
+def test_direct_linux_runner_keeps_secrets_out_of_launcher_argv(tmp_path: Path) -> None:
+    """The direct Python entrypoint never places inherited secrets in argv."""
+    secret = "direct-runner-secret-sentinel"
+    proc, attempts = _run_fake_systemd_retry(tmp_path, "pytest", secret=secret)
+    argv = (tmp_path / "launcher-argv.json").read_text(encoding="utf-8")
+
+    assert proc.returncode == 0, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert secret not in argv
+    assert secret not in proc.stdout
 
 
 def test_typed_exit4_for_existing_file_can_retry_to_green(tmp_path: Path) -> None:
@@ -939,3 +1070,83 @@ def test_worker_path_excludes_mise_tool_shims(tmp_path: Path) -> None:
     assert data["tools"] == {tool: str(safe_bin / tool) for tool in ("rustup", "cargo", "rustc")}
     assert not executions.exists(), "ordinary worker executed a mise Rust-tool shim"
     shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+def test_direct_runner_resolves_empty_and_relative_path_at_repo_root(tmp_path: Path) -> None:
+    """Direct invocation filters empty and dot PATH entries using the child CWD."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = repo_root / f".runner-relative-mise-probe-{os.getpid()}-{tmp_path.name}"
+    parent_cwd = tmp_path / "safe-parent"
+    capture = tmp_path / "worker-env.json"
+    executions = tmp_path / "mise-tool-executions"
+    safe_bin = tmp_path / "safe-bin"
+    mise = tmp_path / "mise"
+    root_tools = [repo_root / tool for tool in ("rustup", "cargo", "rustc")]
+    probe_dir.mkdir()
+    parent_cwd.mkdir()
+    safe_bin.mkdir()
+    try:
+        assert not any(path.exists() or path.is_symlink() for path in root_tools)
+        mise.write_text(
+            "#!/bin/sh\n" + f"echo \"$0\" >> {executions!s}\n",
+            encoding="utf-8",
+        )
+        mise.chmod(0o755)
+        for tool, root_tool in zip(("rustup", "cargo", "rustc"), root_tools):
+            root_tool.symlink_to(mise)
+            safe_tool = safe_bin / tool
+            safe_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            safe_tool.chmod(0o755)
+        probe = probe_dir / "test_worker_path.py"
+        probe.write_text(
+            textwrap.dedent(
+                f"""
+                import json
+                import os
+                import shutil
+                from pathlib import Path
+
+                def test_worker_path_is_sanitized():
+                    Path({str(capture)!r}).write_text(json.dumps({{
+                        "path": os.environ["PATH"],
+                        "tools": {{tool: shutil.which(tool) for tool in ("rustup", "cargo", "rustc")}},
+                    }}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["PATH"] = os.pathsep.join(("", str(safe_bin), ".", "/usr/bin", "/bin"))
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(runner),
+                "--files",
+                str(probe),
+                "--file-retries",
+                "0",
+                "-j",
+                "1",
+                "-q",
+                f"--rootdir={repo_root}",
+            ],
+            cwd=parent_cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+        assert proc.returncode == 0, proc.stdout
+        data = json.loads(capture.read_text(encoding="utf-8"))
+        assert "" not in data["path"].split(os.pathsep)
+        assert "." not in data["path"].split(os.pathsep)
+        assert data["tools"] == {tool: str(safe_bin / tool) for tool in ("rustup", "cargo", "rustc")}
+        assert not executions.exists(), "ordinary worker executed a mise Rust-tool shim"
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        for root_tool in root_tools:
+            root_tool.unlink(missing_ok=True)

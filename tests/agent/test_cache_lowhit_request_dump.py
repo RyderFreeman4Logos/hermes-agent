@@ -90,6 +90,24 @@ def test_default_off_does_not_retain_or_dump(monkeypatch, tmp_path):
     assert _dump_files(tmp_path) == []
 
 
+def test_disabling_capture_revokes_retained_snapshot(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+    from agent import cache_request_capture as capture
+
+    settings = {"enabled": True}
+    monkeypatch.setattr(capture, "_settings", lambda: settings)
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    dump.reset_for_tests()
+    dump.remember_sent_request({"model": "gpt-test", "messages": []})
+    assert list(dump._LAST)
+
+    settings["enabled"] = False
+    dump.maybe_dump_on_usage(_usage(cache_read=0, prompt=10_000))
+
+    assert list(dump._LAST) == []
+    assert _dump_files(tmp_path) == []
+
+
 def test_opt_in_dump_retains_redacted_payload_and_exact_body(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
     from agent import cache_request_capture as capture

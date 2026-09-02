@@ -113,6 +113,44 @@ def test_paired_digests_are_default_off(monkeypatch, tmp_path):
     assert not (tmp_path / "observability").exists()
 
 
+def test_disabling_diagnostics_revokes_retained_snapshot(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    settings = [True]
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(settings[0]))
+    diagnostics._LAST_ATTEMPT.clear()
+    diagnostics.start_attempt(
+        {"model": "model", "messages": []},
+        api_mode="chat_completions",
+        route="chat_completions",
+        provider="provider",
+        model="model",
+        retry=0,
+        loop=1,
+        correlation="revoke",
+    )
+    records_path = tmp_path / "observability" / "physical_attempt_digests.jsonl"
+    records_before_disable = records_path.read_text(encoding="utf-8")
+    assert diagnostics._LAST_ATTEMPT
+
+    settings[0] = False
+    assert diagnostics.start_attempt(
+        {"model": "model", "messages": []},
+        api_mode="chat_completions",
+        route="chat_completions",
+        provider="provider",
+        model="model",
+        retry=0,
+        loop=2,
+        correlation="revoke",
+    ) is None
+
+    assert diagnostics._LAST_ATTEMPT == {}
+    assert records_path.read_text(encoding="utf-8") == records_before_disable
+
+
 def test_pair_emits_digests_and_redacted_payloads_for_final_then_next_first_attempt(
     monkeypatch, tmp_path
 ):

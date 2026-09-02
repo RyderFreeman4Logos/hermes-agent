@@ -20,6 +20,12 @@ def _usage(*, cache_read: int, prompt: int, telemetry: str = "reported") -> Any:
     )
 
 
+def _enable(monkeypatch) -> None:
+    from agent import cache_request_capture as capture
+
+    monkeypatch.setattr(capture, "_settings", lambda: {"enabled": True})
+
+
 def _request(marker: str) -> dict[str, Any]:
     return {
         "model": "grok-4.6",
@@ -62,6 +68,7 @@ def _assert_exact_pair(payload: dict[str, Any], *markers: str) -> None:
 def test_near_zero_dump_contains_redacted_payload_and_exact_body_bytes(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
+    _enable(monkeypatch)
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
     dump.reset_for_tests()
     dump.remember_sent_request(_request("hello"), api_mode="chat_completions")
@@ -78,6 +85,7 @@ def test_near_zero_dump_contains_redacted_payload_and_exact_body_bytes(monkeypat
 def test_near_zero_zero_read_dumps_last_two_payloads(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
+    _enable(monkeypatch)
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "PREFIX-A", "PREFIX-B")
@@ -89,6 +97,7 @@ def test_near_zero_zero_read_dumps_last_two_payloads(monkeypatch, tmp_path):
 def test_near_zero_sub_percent_read_dumps_last_two_payloads(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
+    _enable(monkeypatch)
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "PREFIX-A", "PREFIX-B")
@@ -97,9 +106,24 @@ def test_near_zero_sub_percent_read_dumps_last_two_payloads(monkeypatch, tmp_pat
     _assert_exact_pair(payload, "PREFIX-A", "PREFIX-B")
 
 
+def test_default_off_does_not_retain_or_dump(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+    from agent import cache_request_capture as capture
+
+    monkeypatch.setattr(capture, "_settings", lambda: {"enabled": False})
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    dump.reset_for_tests()
+    dump.remember_sent_request(_request("default-off"))
+
+    assert list(dump._LAST) == []
+    dump.maybe_dump_on_usage(_usage(cache_read=0, prompt=10_000))
+    assert _files(tmp_path) == []
+
+
 def test_high_hit_and_unavailable_telemetry_do_not_dump(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
+    _enable(monkeypatch)
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
     dump.reset_for_tests()
     dump.remember_sent_request(_request("secret"))
@@ -114,6 +138,7 @@ def test_high_hit_and_unavailable_telemetry_do_not_dump(monkeypatch, tmp_path):
 def test_retention_overwrites_oldest(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
+    _enable(monkeypatch)
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "OLD-0", "NEW-0")
@@ -140,6 +165,7 @@ def test_dump_module_is_loaded_from_this_checkout() -> None:
 def test_normalize_usage_canonical_telemetry_drives_dump(monkeypatch, tmp_path) -> None:
     from agent import cache_lowhit_request_dump as dump
 
+    _enable(monkeypatch)
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "PREFIX-A", "PREFIX-B")

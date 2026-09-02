@@ -9,7 +9,7 @@ import time
 from collections import deque
 from typing import Any
 
-from agent.cache_request_capture import _redact, _serialize_body
+from agent.cache_request_capture import _redact, _serialize_body, enabled
 from agent.usage_pricing import CanonicalUsage
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -34,6 +34,8 @@ def remember_sent_request(
     provider: str = "unknown",
 ) -> None:
     """Keep the last two redacted payload/body pairs, never raw provider data."""
+    if not enabled():
+        return
     payload = _redact(request)
     body = _serialize_body(payload)
     snapshot = {
@@ -60,8 +62,8 @@ def _is_near_zero(usage: CanonicalUsage) -> bool:
 
 
 def maybe_dump_on_usage(usage: CanonicalUsage) -> None:
-    """Persist the last two exact pairs only for an explicit near-zero hit."""
-    if not _is_near_zero(usage):
+    """Persist the last two exact pairs only when capture is explicitly enabled."""
+    if not enabled() or not _is_near_zero(usage):
         return
     with _LOCK:
         requests = list(_LAST)

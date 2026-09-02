@@ -1240,8 +1240,10 @@ def test_managed_current_sends_remember_once_and_retain_distinct_payloads(
     relay_turn, monkeypatch, tmp_path
 ):
     from agent import cache_lowhit_request_dump as dump
+    from agent import cache_request_capture as capture
     from agent.usage_pricing import CanonicalUsage
 
+    monkeypatch.setattr(capture, "_settings", lambda: {"enabled": True})
     dump.reset_for_tests()
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
     remembered = []

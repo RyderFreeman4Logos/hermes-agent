@@ -43,6 +43,7 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -67,6 +68,15 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_INSERTION_COMPACT_THRESHOLD_CHARS = 32_000
+_HIGH_VOLUME_TOOL_NAMES = frozenset({
+    "execute_code",
+    "process",
+    "search_files",
+    "terminal",
+    "web_extract",
+    "web_search",
+})
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_once = False
@@ -311,6 +321,18 @@ def extract_persisted_path(content: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _needs_insertion_compaction(tool_name: str, content: str) -> bool:
+    if tool_name in _HIGH_VOLUME_TOOL_NAMES:
+        return True
+    stripped = content.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return False
+    try:
+        return isinstance(json.loads(stripped), (dict, list))
+    except (TypeError, ValueError):
+        return False
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -318,6 +340,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    history_suffix: str = "",
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -332,17 +355,33 @@ def maybe_persist_tool_result(
         env: The active BaseEnvironment instance, or None.
         config: BudgetConfig controlling thresholds and preview size.
         threshold: Explicit override; takes precedence over config resolution.
+        history_suffix: Text appended after persistence; its size is reserved
+            before deciding whether the raw result fits in history.
 
     Returns:
-        Original content if small, or <persisted-output> replacement.
+        Original content plus history suffix if small, or a
+        <persisted-output> replacement plus that suffix.
     """
-    effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
+    configured_threshold = (
+        threshold if threshold is not None else config.resolve_threshold(tool_name)
+    )
 
-    if effective_threshold == float("inf"):
-        return content
+    if configured_threshold == float("inf"):
+        return content + history_suffix
+
+    history_threshold = configured_threshold
+    if threshold is None and _needs_insertion_compaction(tool_name, content):
+        history_threshold = min(
+            history_threshold,
+            _INSERTION_COMPACT_THRESHOLD_CHARS,
+        )
+    effective_threshold = max(0, history_threshold - len(history_suffix))
+    history_limited = (
+        len(content) <= configured_threshold and len(content) > effective_threshold
+    )
 
     if len(content) <= effective_threshold:
-        return content
+        return content + history_suffix
 
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
@@ -358,7 +397,10 @@ def maybe_persist_tool_result(
                 "Persisted large tool result: %s (%s, %d chars -> %s)",
                 tool_name, tool_use_id, len(content), host_path,
             )
-            return _build_persisted_message(preview, has_more, len(content), host_path)
+            return (
+                _build_persisted_message(preview, has_more, len(content), host_path)
+                + history_suffix
+            )
     elif env is not None:
         # Remote backend: the spillover dir is auto-mounted (docker) or
         # file-synced (modal/ssh/daytona) into the sandbox, so reference the
@@ -370,7 +412,10 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s [host: %s])",
                     tool_name, tool_use_id, len(content), visible, host_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), visible)
+                return (
+                    _build_persisted_message(preview, has_more, len(content), visible)
+                    + history_suffix
+                )
         # Fallback: write into the sandbox temp dir (pre-existing containers
         # without the spillover mount, translation/probe failures).
         storage_dir = _resolve_storage_dir(env)
@@ -381,9 +426,19 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+                return (
+                    _build_persisted_message(preview, has_more, len(content), remote_path)
+                    + history_suffix
+                )
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+
+    if history_limited:
+        logger.warning(
+            "Keeping recoverable %s result inline after sandbox write failed",
+            tool_name,
+        )
+        return content + history_suffix
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
@@ -392,7 +447,7 @@ def maybe_persist_tool_result(
     return (
         f"{preview}\n\n"
         f"[Truncated: tool response was {len(content):,} chars. "
-        f"Full output could not be saved to sandbox.]"
+        f"Full output could not be saved to sandbox.]" + history_suffix
     )
 
 

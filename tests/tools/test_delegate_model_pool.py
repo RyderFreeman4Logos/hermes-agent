@@ -174,6 +174,34 @@ class TestModelProfileResolution:
         assert seen[1]["model"] == "deepseek-v4-flash"
         assert seen[0]["fallback_model"][0]["model"] == "tiny-backup"
 
+    def test_explicit_profile_missing_standard_fails_before_child_construction(self):
+        cfg = {"model_pool": {"fast": STANDARD_POOL["test"]}}
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", side_effect=AssertionError("must not construct")
+        ):
+            payload = json.loads(
+                delegate_task(goal="do work", model_profile="fast", parent_agent=_parent())
+            )
+        assert "error" in payload and "standard" in payload["error"].lower()
+
+    def test_per_task_profile_missing_standard_fails_before_child_construction(self):
+        cfg = {"model_pool": {"fast": STANDARD_POOL["test"]}}
+        tasks = [
+            {"goal": "use fast profile", "model_profile": "fast"},
+            {"goal": "use the inherited profile"},
+        ]
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", side_effect=AssertionError("must not construct")
+        ):
+            payload = json.loads(
+                delegate_task(
+                    tasks=tasks,
+                    model_profile="fast",
+                    parent_agent=_parent(),
+                )
+            )
+        assert "error" in payload and "standard" in payload["error"].lower()
+
     def test_dispatch_forwards_model_profile(self):
         from run_agent import AIAgent
 

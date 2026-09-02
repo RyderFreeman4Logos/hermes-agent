@@ -4487,13 +4487,13 @@ def _credentials_for_model_profile(
     """Resolve child creds; an explicit unknown profile fails closed."""
     name = str(profile_name or "").strip() or None
     pool = _model_pool(cfg)
+    if pool and "standard" not in _available_model_profile_names(cfg):
+        raise ValueError(
+            "Non-empty model_pool requires an explicit 'standard' profile."
+        )
     if name is None:
         if pool:
             name = _default_model_profile_name(cfg)
-            if name is None:
-                raise ValueError(
-                    "Non-empty model_pool requires an explicit 'standard' profile."
-                )
         else:
             creds = _resolve_delegation_credentials(cfg, parent_agent)
             creds.setdefault("fallback_chain", None)

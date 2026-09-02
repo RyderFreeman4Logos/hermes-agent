@@ -373,6 +373,41 @@ def test_retirement_admission_failure_cancels_rebind_publication():
     assert new_provider.shutdown_calls == 1
 
 
+def test_memory_builder_does_not_construct_builtin_store():
+    from agent.agent_init import build_memory_subsystem
+    import tools.memory_tool as memory_tool
+
+    agent = SimpleNamespace(
+        enabled_toolsets=["memory"],
+        disabled_toolsets=[],
+        _memory_store=None,
+        _memory_enabled=True,
+        _user_profile_enabled=False,
+        platform="tui",
+    )
+    with patch.object(
+        memory_tool,
+        "MemoryStore",
+        side_effect=AssertionError("built-in store belongs to upstream init"),
+    ):
+        state = build_memory_subsystem(
+            agent,
+            {
+                "memory": {
+                    "memory_enabled": True,
+                    "user_profile_enabled": False,
+                }
+            },
+            skip_memory=True,
+            provider_mode="hybrid",
+            session_id="target-session",
+        )
+
+    assert state["store"] is None
+    assert state["memory_enabled"] is True
+    assert state["user_profile_enabled"] is False
+
+
 def test_partial_memory_builder_failure_shuts_unregistered_provider():
     from agent.agent_init import build_memory_subsystem
 

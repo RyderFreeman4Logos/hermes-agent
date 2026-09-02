@@ -518,6 +518,7 @@ def test_usage_without_any_cache_fields_still_normalizes():
 
     assert normalized.cache_read_tokens == 0
     assert normalized.input_tokens == 500
+    assert normalized.cache_telemetry == "unavailable"
 
 
 def test_normalize_usage_handles_dict_shaped_usage():

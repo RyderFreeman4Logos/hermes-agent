@@ -42,6 +42,11 @@ DEFAULT_CONFIG = {
         # behavior everywhere.
         "terminal_continue": True,
     },
+    "observability": {
+        "physical_attempt_digests": {
+            "enabled": False,
+        },
+    },
     "debug": {
         "cache_requests": {
             "enabled": False,

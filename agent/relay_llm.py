@@ -13,9 +13,58 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from agent import cache_request_capture, relay_runtime
+from agent import cache_request_capture, physical_attempt_diagnostics, relay_runtime
 
 logger = logging.getLogger(__name__)
+
+
+def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -> None:
+    try:
+        from agent.cache_lowhit_request_dump import remember_sent_request
+
+        remember_sent_request(request, api_mode=api_mode)
+    except Exception:
+        logger.debug("cache low-hit remember failed", exc_info=True)
+
+
+class _RememberingSend:
+    def __init__(self, callback: Callable[[dict[str, Any]], Any], api_mode: str) -> None:
+        self._callback = callback
+        self._api_mode = api_mode
+
+    def __call__(self, request: dict[str, Any]) -> Any:
+        _remember_lowhit_transport_request(request, self._api_mode)
+        return self._callback(request)
+
+
+def _remembering_callback(
+    callback: Callable[[dict[str, Any]], Any], api_mode: str
+) -> Callable[[dict[str, Any]], Any]:
+    if isinstance(callback, _RememberingSend):
+        return callback
+    return _RememberingSend(callback, api_mode)
+
+
+def _remembering_stream_factory(
+    stream_factory: Callable[[dict[str, Any]], Any], api_mode: str
+) -> Callable[[dict[str, Any]], Any]:
+    if isinstance(stream_factory, _RememberingSend):
+        return stream_factory
+    return _RememberingSend(stream_factory, api_mode)
+
+
+def _request_with_cache_scope(request: dict[str, Any], session_id: str) -> dict[str, Any]:
+    extra_body = request.get("extra_body")
+    cache_scope = request.get("prompt_cache_key")
+    if cache_scope is None and isinstance(extra_body, dict):
+        cache_scope = extra_body.get("prompt_cache_key")
+    if cache_scope is None:
+        cache_scope = session_id
+    scope = physical_attempt_diagnostics.prepare_cache_scope(cache_scope)
+    return request if scope is None else {
+        **request,
+        "_hermes_physical_attempt_cache_scope": scope,
+    }
 
 
 _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
@@ -52,6 +101,30 @@ def capture_transport_request(request: dict[str, Any]) -> None:
         retry = int(metadata.get("retry_count") or 0)
     except (TypeError, ValueError):
         retry = 0
+    try:
+        loop = int(metadata.get("loop", retry))
+    except (TypeError, ValueError):
+        loop = retry
+    request_id_raw = str(metadata.get("api_request_id") or "")
+    correlation, marker, loop_text = request_id_raw.rpartition(":api:")
+    try:
+        loop_number = int(loop_text) if marker and correlation else loop
+    except ValueError:
+        loop_number = loop
+        correlation = request_id or f"capture-{id(request)}"
+    else:
+        correlation = correlation or request_id or f"capture-{id(request)}"
+    physical_attempt_diagnostics.start_attempt(
+        request,
+        api_mode=str(metadata.get("api_mode") or "unknown"),
+        route=str(metadata.get("route") or metadata.get("api_mode") or "unknown"),
+        provider=name,
+        model=model_name,
+        retry=retry,
+        loop=loop_number,
+        correlation=correlation,
+        scope=physical_attempt_diagnostics.take_cache_scope(request),
+    )
     cache_request_capture.capture_provider_request(
         request,
         api_mode=str(metadata.get("api_mode") or "unknown"),
@@ -120,6 +193,12 @@ def execute(
     defer_logical_completion: bool = False,
 ) -> Any:
     """Run one non-streaming physical provider attempt through Relay."""
+    if isinstance(callback, _RememberingSend):
+        callback = callback._callback
+    callback = _remembering_callback(
+        callback, str((metadata or {}).get("api_mode") or "unknown")
+    )
+    request = _request_with_cache_scope(request, session_id)
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         with _transport_capture_context(
@@ -218,6 +297,12 @@ async def execute_async(
     defer_logical_completion: bool = False,
 ) -> Any:
     """Run one asynchronous physical provider attempt through Relay."""
+    if isinstance(callback, _RememberingSend):
+        callback = callback._callback
+    callback = _remembering_callback(
+        callback, str((metadata or {}).get("api_mode") or "unknown")
+    )
+    request = _request_with_cache_scope(request, session_id)
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         with _transport_capture_context(
@@ -341,6 +426,9 @@ def execute_current(
 ) -> Any:
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
+    callback = _remembering_callback(
+        callback, str((metadata or {}).get("api_mode") or "unknown")
+    )
     if turn is None:
         return _execute_attempt(
             request, callback, name=name, model_name=model_name, metadata=metadata
@@ -367,6 +455,9 @@ async def execute_current_async(
 ) -> Any:
     """Run an async provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
+    callback = _remembering_callback(
+        callback, str((metadata or {}).get("api_mode") or "unknown")
+    )
     if turn is None:
         return await _execute_attempt_async(
             request, callback, name=name, model_name=model_name, metadata=metadata
@@ -419,6 +510,9 @@ def stream_current(
     returns.
     """
     turn = relay_runtime.active_turn()
+    stream_factory = _remembering_stream_factory(
+        stream_factory, str((metadata or {}).get("api_mode") or "unknown")
+    )
     if turn is None:
         with _transport_capture_context(
             name=name, model_name=model_name, metadata=metadata
@@ -477,6 +571,12 @@ def stream(
     defer_logical_completion: bool = False,
 ) -> "ManagedLlmStream":
     """Return a synchronous view of one Relay-managed provider stream."""
+    if isinstance(stream_factory, _RememberingSend):
+        stream_factory = stream_factory._callback
+    stream_factory = _remembering_stream_factory(
+        stream_factory, str((metadata or {}).get("api_mode") or "unknown")
+    )
+    request = _request_with_cache_scope(request, session_id)
     return ManagedLlmStream(
         request,
         stream_factory,
@@ -1210,6 +1310,7 @@ def _provider_request(
             baseline=baseline,
             intercepted=intercepted,
         )
+    final.pop("_hermes_physical_attempt_cache_scope", None)
     headers = getattr(request, "headers", None)
     if isinstance(headers, dict):
         headers = {
@@ -1235,6 +1336,7 @@ def _relay_request_body(
     # protocol. Preserve it for the original callback request, but never pass
     # it to Relay intercepts or routed transports.
     body.pop("timeout", None)
+    body.pop("_hermes_physical_attempt_cache_scope", None)
     # The Responses SDK accepts ``tools=None`` as "no tools", while Relay's
     # typed Responses codec correctly expects either an array or an absent
     # field. Normalize only the codec-facing copy; the original provider

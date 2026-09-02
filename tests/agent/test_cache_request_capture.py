@@ -614,3 +614,33 @@ def test_bedrock_stream_fallback_captures_each_final_opener(monkeypatch, tmp_pat
 
     assert result == {"response": "ok"}
     assert captured == opened
+
+
+def test_exact_capture_persists_redacted_payload_and_serialized_body_bytes(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    request = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": {"Authorization": "Bearer secret-body-marker"},
+    }
+
+    _capture(request)
+
+    saved = _captures(tmp_path)[0]
+    assert saved["request"] == {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello"}],
+        "headers": {"Authorization": "[REDACTED]"},
+    }
+    assert saved["body_bytes"]["encoding"] == "base64"
+    import base64
+
+    body = base64.b64decode(saved["body_bytes"]["data"])
+    assert body == (
+        b'{"headers":{"Authorization":"[REDACTED]"},"messages":[{"content":"hello",'
+        b'"role":"user"}],"model":"m"}'
+    )
+    assert b"secret-body-marker" not in body

@@ -1,7 +1,8 @@
-"""Opt-in, content-free digests for adjacent physical provider attempts."""
+"""Opt-in digests and redacted payloads for adjacent provider attempts."""
 
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent.cache_request_capture import _redact, _serialize_body
 from hermes_constants import get_hermes_home
 
 __all__ = ["Attempt", "enabled", "prepare_cache_scope", "start_attempt"]
@@ -44,6 +46,8 @@ class Attempt:
     """Private in-memory identity for one provider request."""
 
     digest: str
+    request: dict[str, Any]
+    body_bytes: dict[str, str]
     route: str
     provider: str
     model: str
@@ -94,11 +98,14 @@ def start_attempt(
     correlation: str,
     scope: dict[str, str] | None = None,
 ) -> Attempt | None:
-    """Record an opt-in HMAC-only request identity and adjacent-loop pair."""
+    """Record an opt-in HMAC identity and adjacent-loop pair."""
     if not enabled() or loop is None or loop < 0 or not correlation:
         return None
     try:
         key = _key()
+        safe_request = _redact(request)
+        body = _serialize_body(safe_request)
+        body_record = {"encoding": "base64", "data": _base64(body)}
         component_values = {
             "prefix": _prefix(request),
             "tools": request.get("tools") or request.get("toolConfig") or [],
@@ -115,6 +122,8 @@ def start_attempt(
         byte_lengths = {name: len(value) for name, value in component_bytes.items()}
         attempt = Attempt(
             digest=hmac.new(key, b"attempt\0" + secrets.token_bytes(32), hashlib.sha256).hexdigest(),
+            request=safe_request,
+            body_bytes=body_record,
             route=_label(route, key),
             provider=_label(provider, key),
             model=_label(model, key),
@@ -125,7 +134,7 @@ def start_attempt(
             byte_lengths=byte_lengths,
         )
         _append({
-            "schema": "hermes.physical_attempt.v1",
+            "schema": "hermes.physical_attempt.v2",
             "phase": "attempt",
             "timestamp_ns": time.time_ns(),
             "attempt_digest": attempt.digest,
@@ -134,6 +143,8 @@ def start_attempt(
             "model": attempt.model,
             "loop": attempt.loop,
             "retry": attempt.retry,
+            "request": attempt.request,
+            "body_bytes": attempt.body_bytes,
             "digests": components,
             "byte_lengths": byte_lengths,
         })
@@ -155,7 +166,7 @@ def _pair(current: Attempt) -> None:
     names = ("prefix", "tools", "cache_scope", "later_history")
     equal = {name: previous.components[name] == current.components[name] for name in names}
     _append({
-        "schema": "hermes.physical_attempt.v1",
+        "schema": "hermes.physical_attempt.v2",
         "phase": "pair",
         "timestamp_ns": time.time_ns(),
         "route": current.route,
@@ -166,6 +177,8 @@ def _pair(current: Attempt) -> None:
         "previous_loop": previous.loop,
         "current_loop": current.loop,
         "previous_attempt_retry": previous.retry,
+        "previous": _snapshot(previous),
+        "current": _snapshot(current),
         "digests": {
             name: current.components[name]
             for name in ("cache_scope", "later_history", "prefix", "tools")
@@ -176,6 +189,14 @@ def _pair(current: Attempt) -> None:
             (name for name in names if not equal[name]), "none"
         ),
     })
+
+
+def _snapshot(attempt: Attempt) -> dict[str, Any]:
+    return {
+        "request": attempt.request,
+        "body_bytes": attempt.body_bytes,
+        "byte_lengths": attempt.byte_lengths,
+    }
 
 
 def _prefix(request: dict[str, Any]) -> Any:
@@ -236,6 +257,10 @@ def _label(value: Any, key: bytes) -> str:
         return hmac.new(key, b"label\0" + text.encode("utf-8"), hashlib.sha256).hexdigest()
     except Exception:
         return "unknown"
+
+
+def _base64(value: bytes) -> str:
+    return base64.b64encode(value).decode("ascii")
 
 
 def _root() -> Path:

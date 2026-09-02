@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -68,6 +69,27 @@ def test_capture_is_disabled_by_default(monkeypatch, tmp_path):
         "strict_write": False,
     }
     assert not (tmp_path / "debug").exists()
+
+
+def test_capture_persists_redacted_serialized_body_bytes(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    request = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello"}],
+        "Authorization": "Bearer secret",
+        "callback_url": "https://user:secret@example.test/callback",
+    }
+
+    _capture(request)
+
+    captured = _captures(tmp_path)[0]
+    assert captured["request"]["Authorization"] == "[REDACTED]"
+    assert "secret" not in json.dumps(captured)
+    body = base64.b64decode(captured["body_bytes"]["data"])
+    assert body == json.dumps(
+        captured["request"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
 
 
 def test_exact_capture_preserves_one_character_system_prompt_diff(monkeypatch, tmp_path):

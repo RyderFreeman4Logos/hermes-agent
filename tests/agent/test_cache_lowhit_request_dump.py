@@ -1,24 +1,24 @@
-"""Send-time last-2 fingerprint dump on economically near-zero cache hits."""
+"""Send-time last-2 exact request/body dump on economically near-zero cache hits."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent.usage_pricing import normalize_usage
 
 
-_FORBIDDEN_KEYS = (
-    "prefix",
-    "messages",
-    "input",
-    "tools",
-    "prompt_cache_key",
-    "later_history",
-)
+@pytest.fixture(autouse=True)
+def _enable_cache_request_capture(monkeypatch):
+    from agent import cache_request_capture as capture
+
+    monkeypatch.setattr(capture, "_settings", lambda: {"enabled": True})
 
 
 def _usage(*, cache_read: int, prompt: int, telemetry: str = "reported") -> Any:
@@ -57,29 +57,12 @@ def _dump_files(root: Path) -> list[Path]:
     return sorted(path for path in directory.iterdir() if path.suffix == ".json")
 
 
-def _keys(value: Any) -> set[str]:
-    found: set[str] = set()
-    if isinstance(value, dict):
-        for key, child in value.items():
-            found.add(str(key))
-            found.update(_keys(child))
-    elif isinstance(value, list):
-        for child in value:
-            found.update(_keys(child))
-    return found
-
-
-def _assert_fingerprint_only(payload: dict[str, Any], *secrets: str) -> None:
+def _assert_exact_pairs(payload: dict[str, Any]) -> None:
+    assert payload["schema"] == "hermes.cache_lowhit.v2"
     assert "cache_read_tokens" in payload
     assert "prompt_tokens" in payload
     requests = payload["requests"]
     assert len(requests) == 2
-    keys = _keys(payload)
-    for forbidden in _FORBIDDEN_KEYS:
-        assert forbidden not in keys
-    text = json.dumps(payload)
-    for secret in secrets:
-        assert secret not in text
     for request in requests:
         fingerprint = request.get("fingerprint")
         sizes = request.get("sizes")
@@ -87,9 +70,53 @@ def _assert_fingerprint_only(payload: dict[str, Any], *secrets: str) -> None:
         int(fingerprint, 16)
         assert sizes
         assert request.get("model") == "grok-4.6"
+        assert request["api_mode"] == "chat_completions"
+        saved = request["request"]
+        body = base64.b64decode(request["body_bytes"]["data"])
+        assert json.loads(body) == saved
 
 
-def test_near_zero_zero_read_dumps_last_two_fingerprints(monkeypatch, tmp_path):
+def test_default_off_does_not_retain_or_dump(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+    from agent import cache_request_capture as capture
+
+    monkeypatch.setattr(capture, "_settings", lambda: {"enabled": False})
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    dump.reset_for_tests()
+    dump.remember_sent_request({"model": "gpt-test", "messages": []})
+
+    assert list(dump._LAST) == []
+    dump.maybe_dump_on_usage(_usage(cache_read=0, prompt=10_000))
+    assert _dump_files(tmp_path) == []
+
+
+def test_opt_in_dump_retains_redacted_payload_and_exact_body(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+    from agent import cache_request_capture as capture
+
+    monkeypatch.setattr(capture, "_settings", lambda: {"enabled": True})
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    dump.reset_for_tests()
+    request = {
+        "model": "gpt-test",
+        "messages": [{"role": "user", "content": "keep-this"}],
+        "headers": {"Authorization": "Bearer ACTUAL-SECRET"},
+        "endpoint": "https://user:password@api.example.test/v1",
+    }
+    dump.remember_sent_request(request, api_mode="chat_completions")
+    dump.maybe_dump_on_usage(_usage(cache_read=0, prompt=10_000))
+
+    payload = json.loads(_dump_files(tmp_path)[0].read_text(encoding="utf-8"))
+    assert payload["schema"] == "hermes.cache_lowhit.v2"
+    saved = payload["requests"][0]
+    assert saved["request"]["headers"]["Authorization"] == "[REDACTED]"
+    body = base64.b64decode(saved["body_bytes"]["data"])
+    assert json.loads(body) == saved["request"]
+    assert b"ACTUAL-SECRET" not in body
+    assert b"password@" not in body
+
+
+def test_near_zero_zero_read_dumps_last_two_exact_pairs(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
@@ -101,17 +128,10 @@ def test_near_zero_zero_read_dumps_last_two_fingerprints(monkeypatch, tmp_path):
     files = _dump_files(tmp_path)
     assert len(files) == 1
     payload = json.loads(files[0].read_text(encoding="utf-8"))
-    _assert_fingerprint_only(
-        payload,
-        "UNREDACTED-PREFIX-A",
-        "UNREDACTED-PREFIX-B",
-        "INPUT-UNREDACTED-PREFIX-A",
-        "TOOL-UNREDACTED-PREFIX-A",
-        "PCK-UNREDACTED-PREFIX-A",
-    )
+    _assert_exact_pairs(payload)
 
 
-def test_near_zero_sub_percent_read_dumps_last_two_fingerprints(monkeypatch, tmp_path):
+def test_near_zero_sub_percent_read_dumps_last_two_exact_pairs(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
@@ -121,7 +141,7 @@ def test_near_zero_sub_percent_read_dumps_last_two_fingerprints(monkeypatch, tmp
     dump.maybe_dump_on_usage(_usage(cache_read=512, prompt=60_246))
 
     payload = json.loads(_dump_files(tmp_path)[0].read_text(encoding="utf-8"))
-    _assert_fingerprint_only(payload, "UNREDACTED-PREFIX-A", "UNREDACTED-PREFIX-B")
+    _assert_exact_pairs(payload)
 
 
 def test_high_hit_does_not_dump(monkeypatch, tmp_path):
@@ -171,7 +191,7 @@ def test_retention_overwrites_oldest(monkeypatch, tmp_path):
     assert "OLD-0" not in joined
     assert "NEW-0" not in joined
     for path in files:
-        _assert_fingerprint_only(json.loads(path.read_text(encoding="utf-8")))
+        _assert_exact_pairs(json.loads(path.read_text(encoding="utf-8")))
 
 
 def test_dump_module_is_loaded_from_this_checkout() -> None:
@@ -200,7 +220,7 @@ def test_normalize_usage_canonical_telemetry_drives_dump(monkeypatch, tmp_path) 
     assert usage.cache_telemetry == "reported"
     files = _dump_files(tmp_path)
     assert len(files) == 1
-    _assert_fingerprint_only(json.loads(files[0].read_text(encoding="utf-8")))
+    _assert_exact_pairs(json.loads(files[0].read_text(encoding="utf-8")))
 
 
 def test_normalize_usage_without_cache_fields_marks_telemetry_unavailable() -> None:

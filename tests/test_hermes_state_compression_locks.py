@@ -48,10 +48,10 @@ def test_busy_acquire_retries_with_jitter_then_succeeds(
 ) -> None:
     blocker = _hold_sqlite_writer(db)
     db._conn.execute("PRAGMA busy_timeout=0")
-    jitters: list[float] = []
+    jitters: list[tuple[float, float]] = []
 
-    def jitter(_low: float, _high: float) -> float:
-        jitters.append(0.02)
+    def jitter(low: float, high: float) -> float:
+        jitters.append((low, high))
         return 0.02
 
     def release_writer() -> None:
@@ -72,6 +72,7 @@ def test_busy_acquire_retries_with_jitter_then_succeeds(
 
     assert not releaser.is_alive()
     assert jitters
+    assert all(bounds == (0.020, 0.150) for bounds in jitters)
     assert db.get_compression_lock_holder("busy-session") == "winner"
 
 
@@ -135,8 +136,49 @@ def test_lock_acquire_uses_short_budget_and_disables_fts_recovery(
     monkeypatch.setattr(db, "_execute_write", execute_write)
 
     assert db.try_acquire_compression_lock("budget-session", "holder") is True
-    assert observed["patience_s"] == db._COMPRESSION_LOCK_ACQUIRE_PATIENCE_S
+    assert db._COMPRESSION_LOCK_ACQUIRE_PATIENCE_S == 1.0
+    assert observed["patience_s"] == 1.0
+    assert observed["max_retries"] == 15
     assert observed["recover_fts_errors"] is False
+
+
+def test_busy_acquire_stops_after_fifteen_attempts(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocker = _hold_sqlite_writer(db)
+    db._conn.execute("PRAGMA busy_timeout=0")
+    begin_attempts: list[str] = []
+    fake_now = 1000.0
+
+    def monotonic() -> float:
+        return fake_now
+
+    def sleep(duration: float) -> None:
+        nonlocal fake_now
+        fake_now += duration
+
+    def jitter(low: float, high: float) -> float:
+        assert (low, high) == (0.020, 0.150)
+        return 0.02
+
+    def trace(statement: str) -> None:
+        if statement == "BEGIN IMMEDIATE":
+            begin_attempts.append(statement)
+
+    monkeypatch.setattr(
+        hermes_state,
+        "time",
+        SimpleNamespace(monotonic=monotonic, sleep=sleep, time=time.time),
+    )
+    monkeypatch.setattr(hermes_state.random, "uniform", jitter)
+    db._conn.set_trace_callback(trace)
+    try:
+        assert db.try_acquire_compression_lock("busy-session", "candidate") is False
+        assert len(begin_attempts) == 15
+    finally:
+        db._conn.set_trace_callback(None)
+        blocker.rollback()
+        blocker.close()
 
 
 def test_acquire_propagates_non_busy_sqlite_error(

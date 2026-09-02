@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import multiprocessing
 import threading
@@ -40,6 +41,56 @@ def _config(enabled: bool) -> dict[str, object]:
     return {"observability": {"physical_attempt_digests": {"enabled": enabled}}}
 
 
+def test_opt_in_attempt_records_include_redacted_payload_and_body(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    diagnostics._LAST_ATTEMPT.clear()
+    request = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "keep-this"}],
+        "headers": {"Authorization": "Bearer ACTUAL-SECRET"},
+        "endpoint": "https://user:password@api.example.test/v1",
+    }
+    diagnostics.start_attempt(
+        request,
+        api_mode="chat_completions",
+        route="chat_completions",
+        provider="provider",
+        model="model",
+        retry=0,
+        loop=1,
+        correlation="payload",
+    )
+    diagnostics.start_attempt(
+        {**request, "messages": [{"role": "user", "content": "keep-this-2"}]},
+        api_mode="chat_completions",
+        route="chat_completions",
+        provider="provider",
+        model="model",
+        retry=0,
+        loop=2,
+        correlation="payload",
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "observability" / "physical_attempt_digests.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    pair = next(record for record in records if record["phase"] == "pair")
+    saved = pair["current"]
+    assert pair["schema"] == "hermes.physical_attempt.v2"
+    assert saved["request"]["headers"]["Authorization"] == "[REDACTED]"
+    body = base64.b64decode(saved["body_bytes"]["data"])
+    assert json.loads(body) == saved["request"]
+    assert b"ACTUAL-SECRET" not in body
+    assert b"password@" not in body
+
+
 def test_paired_digests_are_default_off(monkeypatch, tmp_path):
     from agent import physical_attempt_diagnostics as diagnostics
     from hermes_cli import config
@@ -62,7 +113,7 @@ def test_paired_digests_are_default_off(monkeypatch, tmp_path):
     assert not (tmp_path / "observability").exists()
 
 
-def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
+def test_pair_emits_digests_and_redacted_payloads_for_final_then_next_first_attempt(
     monkeypatch, tmp_path
 ):
     from agent import physical_attempt_diagnostics as diagnostics
@@ -183,11 +234,13 @@ def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
         set(record["byte_lengths"]) == {"cache_scope", "later_history", "prefix", "tools"}
         for record in records
     )
-    assert sentinel not in json.dumps(records, sort_keys=True)
-    assert all(
-        forbidden not in json.dumps(records, sort_keys=True)
-        for forbidden in ("messages", "extra_headers", "authorization", "cookies", "private.example")
-    )
+    serialized = json.dumps(records, sort_keys=True)
+    assert f"Bearer {sentinel}" not in serialized
+    assert '"cookies": "[REDACTED]"' in serialized
+    assert '"authorization": "[REDACTED]"' in serialized
+    assert sentinel + "-old" in serialized
+    assert sentinel + "-next" in serialized
+    assert '"messages"' in serialized
 
 
 def test_pair_does_not_cross_provider_or_model_routes(monkeypatch, tmp_path):

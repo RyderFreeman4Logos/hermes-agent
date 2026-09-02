@@ -999,7 +999,7 @@ def resolve_context_compression_timeouts(
                 parsed = float(raw_aux_timeout)
                 if math.isfinite(parsed) and parsed > 0:
                     aux_timeout = parsed
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
         fallback_chain = (
             auxiliary_compression.get("fallback_chain")
@@ -1018,10 +1018,13 @@ def resolve_context_compression_timeouts(
                 if (
                     isinstance(raw_timeout, (int, float))
                     and not isinstance(raw_timeout, bool)
-                    and math.isfinite(raw_timeout)
-                    and raw_timeout > 0
                 ):
-                    aux_timeout = max(aux_timeout or 0.0, float(raw_timeout))
+                    try:
+                        parsed = float(raw_timeout)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if math.isfinite(parsed) and parsed > 0:
+                        aux_timeout = max(aux_timeout or 0.0, parsed)
     else:
         cfg = {}
     if isinstance(cfg, dict):
@@ -1032,7 +1035,7 @@ def resolve_context_compression_timeouts(
                 # Explicit 0/negative disables; positive values win.
                 if math.isfinite(parsed):
                     idle = parsed
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
         raw_ceiling = cfg.get("context_total_ceiling_seconds")
         if raw_ceiling is not None:
@@ -1040,7 +1043,7 @@ def resolve_context_compression_timeouts(
                 parsed = float(raw_ceiling)
                 if math.isfinite(parsed) and parsed > 0:
                     ceiling = parsed
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
     if aux_timeout is not None:
         # The host must not preempt a longer configured compression request.

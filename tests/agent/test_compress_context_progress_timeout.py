@@ -60,6 +60,39 @@ class TestResolveContextCompressionTimeouts:
         assert idle == 120.0
         assert ceiling == 3300.0
 
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"auxiliary": {"compression": {"timeout": 10**310}}},
+            {
+                "auxiliary": {
+                    "compression": {
+                        "fallback_chain": [
+                            {"provider": "local", "model": "huge", "timeout": 10**310}
+                        ]
+                    }
+                }
+            },
+            {
+                "auxiliary": {
+                    "compression": {
+                        "fallback_chain": [
+                            {
+                                "provider": "local",
+                                "model": "negative",
+                                "timeout": -(10**310),
+                            }
+                        ]
+                    }
+                }
+            },
+            {"context_timeout_seconds": 10**310},
+            {"context_total_ceiling_seconds": 10**310},
+        ],
+    )
+    def test_unrepresentable_timeout_values_are_ignored(self, config):
+        assert resolve_context_compression_timeouts(config) == (120.0, 600.0)
+
 
 class TestRunCompressContextWithProgressTimeout:
     def test_silent_worker_times_out_and_preserves_messages(self):

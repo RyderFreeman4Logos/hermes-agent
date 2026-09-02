@@ -145,7 +145,10 @@ def test_managed_current_sends_remember_once_and_retain_distinct_fingerprints(
     relay_turn, monkeypatch, tmp_path
 ):
     from agent import cache_lowhit_request_dump as dump
+    from agent import cache_request_capture as capture
     from agent.usage_pricing import CanonicalUsage
+
+    monkeypatch.setattr(capture, "_settings", lambda: {"enabled": True})
 
     dump.reset_for_tests()
     monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
@@ -784,7 +787,10 @@ def test_cache_scope_envelope_is_digested_then_removed_before_relay_and_provider
     assert attempts[0]["digests"]["cache_scope"] != attempts[1]["digests"]["cache_scope"]
     assert all("_hermes_physical_attempt_cache_scope" not in request for request in relay_requests)
     assert all("_hermes_physical_attempt_cache_scope" not in request for request in provider_requests)
-    assert sentinel not in json.dumps(records, sort_keys=True)
+    serialized = json.dumps(records, sort_keys=True)
+    assert sentinel + "-one" in serialized
+    assert sentinel + "-two" in serialized
+    assert "_hermes_physical_attempt_cache_scope" not in serialized
 
 
 def test_real_config_records_codex_input_history_through_relay(relay_turn, tmp_path):
@@ -841,7 +847,9 @@ def test_real_config_records_codex_input_history_through_relay(relay_turn, tmp_p
         "prefix": True,
         "tools": True,
     }
-    assert sentinel not in json.dumps(records, sort_keys=True)
+    serialized = json.dumps(records, sort_keys=True)
+    assert sentinel + "-old" in serialized
+    assert sentinel + "-new" in serialized
 
 
 def test_unrelated_extra_body_keeps_session_cache_scope_fallback(monkeypatch):

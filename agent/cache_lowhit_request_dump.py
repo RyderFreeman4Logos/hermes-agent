@@ -1,7 +1,8 @@
-"""Fingerprint-only last-2 send-time dump on economically near-zero cache hits."""
+"""Opt-in exact last-2 send-time dump on economically near-zero cache hits."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -14,6 +15,7 @@ from typing import Any
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
+from agent import cache_request_capture
 from agent.usage_pricing import CanonicalUsage
 
 __all__ = [
@@ -86,7 +88,11 @@ def _digest(key: bytes, label: str, value: Any) -> str:
 def remember_sent_request(
     request: dict[str, Any], *, api_mode: str = "chat_completions"
 ) -> None:
-    """Keep the last two send-time fingerprints and sizes, never raw bodies."""
+    """Keep the last two opt-in send-time request/body pairs."""
+    if not cache_request_capture.enabled():
+        return
+    redacted_request = cache_request_capture._redact(request)
+    body_bytes = cache_request_capture._serialize_body(redacted_request)
     components = {
         "prefix": _prefix(request),
         "messages": request.get("messages"),
@@ -101,6 +107,12 @@ def remember_sent_request(
             f"{name}_bytes": len(_serialized(value)) for name, value in components.items()
         },
         "model": request.get("model"),
+        "api_mode": api_mode,
+        "request": redacted_request,
+        "body_bytes": {
+            "encoding": "base64",
+            "data": base64.b64encode(body_bytes).decode("ascii"),
+        },
     }
     with _LOCK:
         _LAST.append(snapshot)
@@ -117,8 +129,8 @@ def _is_near_zero(usage: CanonicalUsage) -> bool:
 
 
 def maybe_dump_on_usage(usage: CanonicalUsage) -> None:
-    """Write the last two fingerprints when the hit is economically near-zero."""
-    if not _is_near_zero(usage):
+    """Write the last two request/body pairs on economically near-zero hits."""
+    if not cache_request_capture.enabled() or not _is_near_zero(usage):
         return
     with _LOCK:
         requests = list(_LAST)
@@ -134,7 +146,7 @@ def maybe_dump_on_usage(usage: CanonicalUsage) -> None:
     atomic_json_write(
         path,
         {
-            "schema": "hermes.cache_lowhit.v1",
+            "schema": "hermes.cache_lowhit.v2",
             "cache_read_tokens": usage.cache_read_tokens,
             "prompt_tokens": usage.prompt_tokens,
             "requests": requests,

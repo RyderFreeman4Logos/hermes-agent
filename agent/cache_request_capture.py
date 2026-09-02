@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -29,6 +30,7 @@ _API_OR_ACCESS_KEY_TOKEN = re.compile(
 _URI_USERINFO = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@]*@", re.IGNORECASE)
 _PRESERVE_KEYS = {
     "body",
+    "bodybytes",
     "cachecontrol",
     "input",
     "message",
@@ -91,6 +93,8 @@ def capture_provider_request(
     except (TypeError, ValueError):
         retry_value = 0
     try:
+        request_payload = _redact(request)
+        body_bytes = _serialize_body(request_payload)
         _persist(
             {
                 "schema": _SCHEMA,
@@ -106,12 +110,26 @@ def capture_provider_request(
                     "attempt_id": attempt_id,
                     "retry": retry_value,
                 },
-                "request": _redact(request),
+                "request": request_payload,
+                "body_bytes": {
+                    "encoding": "base64",
+                    "data": base64.b64encode(body_bytes).decode("ascii"),
+                },
             }
         )
     except Exception:
         if strict_write_enabled():
             raise
+
+
+def _serialize_body(request: dict[str, Any]) -> bytes:
+    """Serialize the sanitized provider payload exactly once for persistence."""
+    return json.dumps(
+        request,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _identity_value(value: Any) -> str | None:
@@ -126,6 +144,8 @@ def _redact(value: Any, *, preserve: bool = False) -> Any:
             normalized = _NORMALIZE_KEY.sub("", str(key).lower())
             if _is_secret_key(key):
                 result[str(key)] = _REDACTED
+            elif normalized == "bodybytes":
+                result[str(key)] = _copy_exact(child)
             elif preserve or normalized in _PRESERVE_KEYS:
                 result[str(key)] = _redact(child, preserve=True)
             else:
@@ -138,6 +158,14 @@ def _redact(value: Any, *, preserve: bool = False) -> Any:
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return _redact_scalar(str(value))
+
+
+def _copy_exact(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _copy_exact(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_copy_exact(child) for child in value]
+    return value
 
 
 def _redact_scalar(value: str) -> str:

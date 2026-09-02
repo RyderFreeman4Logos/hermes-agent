@@ -101,32 +101,18 @@ def build_memory_subsystem(
     provider_mode: str,
     session_id: str,
 ) -> Dict[str, Any]:
-    """Construct and initialize one complete memory subsystem off to the side."""
-    from tools.memory_tool import (
-        MemoryStore,
-        get_builtin_memory_config,
-        get_builtin_memory_store_flags,
-    )
+    """Construct and initialize the external provider off to the side."""
+    from tools.memory_tool import get_builtin_memory_config
 
-    enabled = False
-    profile_enabled = False
-    store = None
+    enabled = bool(getattr(agent, "_memory_enabled", False))
+    profile_enabled = bool(getattr(agent, "_user_profile_enabled", False))
+    store = getattr(agent, "_memory_store", None)
     manager = None
-    mem_config: Dict[str, Any] = {}
-    enabled_toolsets = getattr(agent, "enabled_toolsets", None) or []
-    disabled_toolsets = getattr(agent, "disabled_toolsets", None) or []
-    memory_requested = "memory" in enabled_toolsets and "memory" not in disabled_toolsets
-    if not skip_memory or memory_requested:
-        mem_config = get_builtin_memory_config(config)
-        enabled, profile_enabled = get_builtin_memory_store_flags(config)
-        if enabled or profile_enabled:
-            store = MemoryStore(
-                memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                user_char_limit=mem_config.get("user_char_limit", 1375),
-                memory_enabled=enabled,
-                user_profile_enabled=profile_enabled,
-            )
-            store.load_from_disk()
+    mem_config: Dict[str, Any] = (
+        get_builtin_memory_config(config)
+        if not skip_memory
+        else dict(getattr(agent, "_memory_config", {}) or {})
+    )
 
     if not skip_memory:
         provider_name = str(mem_config.get("provider", "") or "").strip()
@@ -2023,13 +2009,21 @@ def init_agent(
                 agent._memory_provider_mode
             )
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+            if agent._memory_enabled or agent._user_profile_enabled:
+                from tools.memory_tool import MemoryStore
+
+                agent._memory_store = MemoryStore(
+                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                    user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_enabled=agent._memory_enabled,
+                    user_profile_enabled=agent._user_profile_enabled,
+                )
+                agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init
-    
 
 
-    # Build the provider and built-in store together so construction and rebind
-    # publish the same memory surface.
+    # Build only the external provider here; built-in store gating is upstream.
     agent._memory_manager = None
     try:
         _memory_state = build_memory_subsystem(

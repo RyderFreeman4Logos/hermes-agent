@@ -3644,7 +3644,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # refused rather than allowed to land a stale turn in a session whose
     # compression is genuinely long-running or wedged.
     _COMPRESSION_BUSY_WAIT_S = 5.0
-    _COMPRESSION_LOCK_ACQUIRE_PATIENCE_S = 2.0
+    _COMPRESSION_LOCK_ACQUIRE_PATIENCE_S = 1.0
+    _COMPRESSION_LOCK_MAX_RETRIES = 15
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
@@ -4465,6 +4466,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         patience_s: Optional[float] = None,
         *,
         recover_fts_errors: bool = True,
+        max_retries: Optional[int] = None,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -4492,11 +4494,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         single ``BEGIN IMMEDIATE`` cannot overrun the wall-time deadline.
         ``recover_fts_errors=False`` disables the generic derived-index repair
         path for latency-sensitive writes such as compression-lock acquire.
+        ``max_retries`` optionally caps the total number of attempts, including
+        the initial attempt.
 
         Returns whatever *fn* returns.
         """
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
+        retry_limit = None if max_retries is None else max(1, max_retries)
         deadline = time.monotonic() + patience_s
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
@@ -4512,7 +4517,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        retry_count = 0
         while True:
+            retry_count += 1
             try:
                 with self._lock:
                     assert self._conn is not None
@@ -4577,7 +4584,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
-                    if self._sleep_before_write_retry(deadline, patience_s):
+                    if (
+                        (retry_limit is None or retry_count < retry_limit)
+                        and self._sleep_before_write_retry(deadline, patience_s)
+                    ):
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
@@ -4588,12 +4598,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     ) from exc
-                if recover_fts_errors and _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if (
+                    recover_fts_errors
+                    and _is_no_more_rows(exc)
+                    and (retry_limit is None or retry_count < retry_limit)
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
                     continue
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
-                if recover_fts_errors and _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if (
+                    recover_fts_errors
+                    and _is_no_more_rows(exc)
+                    and (retry_limit is None or retry_count < retry_limit)
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
                     continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
@@ -4613,7 +4633,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # subclass) or another sqlite3.Error class outside the two
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
-                if recover_fts_errors and _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if (
+                    recover_fts_errors
+                    and _is_no_more_rows(exc)
+                    and (retry_limit is None or retry_count < retry_limit)
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
                     continue
                 raise
 
@@ -7033,6 +7058,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 _do,
                 patience_s=self._COMPRESSION_LOCK_ACQUIRE_PATIENCE_S,
                 recover_fts_errors=False,
+                max_retries=self._COMPRESSION_LOCK_MAX_RETRIES,
             )
             if reclaimed_holder:
                 logger.warning(

@@ -1406,3 +1406,45 @@ def test_malformed_endpoint_continues_in_main_fallback_chain(caplog):
     assert resolved == ["good"]
     assert list(destinations) == ["openai-codex"]
     assert endpoint not in caplog.text
+
+
+def test_lean_digest_workers_reuse_selected_codex_route_settings():
+    """Parallel lean workers carry the selected entry-owned route controls."""
+    calls = []
+
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        assert task == "compression"
+        calls.append(kwargs)
+        route_info = kwargs.get("route_info")
+        if route_info is not None and not route_info:
+            route_info.update(
+                provider="openai-codex",
+                model="codex-model",
+                fallback_label="fallback_chain[1](openai-codex)",
+            )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="DIGEST"))]
+        )
+        return response
+
+    turns = [
+        {"role": "user", "content": "MARKER-A " + ("a" * 70)},
+        {"role": "user", "content": "MARKER-B " + ("b" * 70)},
+        {"role": "user", "content": "MARKER-C " + ("c" * 70)},
+    ]
+    compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
+    with (
+        patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", 88),
+        patch("agent.auxiliary_client.call_llm", fake_call_llm),
+        patch("agent.auxiliary_client._get_task_max_concurrency", return_value=3),
+    ):
+        compressor._build_chunk_digests(turns)
+
+    assert len(calls) == 3
+    assert calls[0]["route_info"]["fallback_label"] == "fallback_chain[1](openai-codex)"
+    for call in calls[1:]:
+        assert call["provider"] == "openai-codex"
+        assert call["model"] == "codex-model"
+        assert call["route_info"] == {
+            "fallback_label": "fallback_chain[1](openai-codex)"
+        }

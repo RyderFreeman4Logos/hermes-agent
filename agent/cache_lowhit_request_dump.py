@@ -85,11 +85,19 @@ def _digest(key: bytes, label: str, value: Any) -> str:
     return hmac.new(key, label.encode() + b"\0" + encoded, hashlib.sha256).hexdigest()
 
 
+def _capture_enabled() -> bool:
+    if cache_request_capture.enabled():
+        return True
+    with _LOCK:
+        _LAST.clear()
+    return False
+
+
 def remember_sent_request(
     request: dict[str, Any], *, api_mode: str = "chat_completions"
 ) -> None:
     """Keep the last two opt-in send-time request/body pairs."""
-    if not cache_request_capture.enabled():
+    if not _capture_enabled():
         return
     redacted_request = cache_request_capture._redact(request)
     body_bytes = cache_request_capture._serialize_body(redacted_request)
@@ -130,7 +138,7 @@ def _is_near_zero(usage: CanonicalUsage) -> bool:
 
 def maybe_dump_on_usage(usage: CanonicalUsage) -> None:
     """Write the last two request/body pairs on economically near-zero hits."""
-    if not cache_request_capture.enabled() or not _is_near_zero(usage):
+    if not _capture_enabled() or not _is_near_zero(usage):
         return
     with _LOCK:
         requests = list(_LAST)

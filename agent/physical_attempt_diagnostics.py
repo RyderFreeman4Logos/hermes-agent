@@ -65,9 +65,13 @@ def enabled() -> bool:
 
         config = read_raw_config_readonly() or {}
         value = config.get("observability", {}).get("physical_attempt_digests", {})
-        return isinstance(value, dict) and value.get("enabled") is True
+        is_enabled = isinstance(value, dict) and value.get("enabled") is True
     except Exception:
-        return False
+        is_enabled = False
+    if not is_enabled:
+        with _LOCK:
+            _LAST_ATTEMPT.clear()
+    return is_enabled
 
 
 def prepare_cache_scope(value: Any) -> dict[str, str] | None:

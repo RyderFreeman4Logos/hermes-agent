@@ -49,7 +49,13 @@ from agent.credential_pool import (
 )
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
-from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+from utils import (
+    atomic_json_write,
+    base_url_host_matches,
+    base_url_hostname,
+    env_var_enabled,
+    normalize_route_base_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1458,6 +1464,21 @@ def try_recover_primary_transport(
     ):
         return False
 
+    rt = agent._primary_runtime
+    from agent.agent_init import _RequestOverrideProjectionError
+
+    try:
+        projected_overrides = _project_request_overrides_for_runtime(
+            agent,
+            provider=rt["provider"],
+            model=rt["model"],
+            base_url=rt["base_url"],
+            service_tier=getattr(agent, "service_tier", None),
+            legacy_request_overrides=rt.get("request_overrides"),
+        )
+    except _RequestOverrideProjectionError:
+        return False
+
     try:
         # Retire the existing client to release stale connections. #70773:
         # never hard-close the shared client here — this runs on the
@@ -1475,7 +1496,6 @@ def try_recover_primary_transport(
                 pass
 
         # Rebuild from primary snapshot
-        rt = agent._primary_runtime
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent.model = rt["model"]
         agent.provider = rt["provider"]
@@ -1485,6 +1505,7 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        agent.request_overrides = projected_overrides
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
 
         if agent.api_mode == "anthropic_messages":
@@ -1737,6 +1758,20 @@ def restore_primary_runtime(agent) -> bool:
     provider_fallback_active = bool(
         getattr(agent, "_provider_fallback_active", False)
     )
+    from agent.agent_init import _RequestOverrideProjectionError
+
+    try:
+        projected_overrides = _project_request_overrides_for_runtime(
+            agent,
+            provider=rt["provider"],
+            model=rt["model"],
+            base_url=rt["base_url"],
+            service_tier=getattr(agent, "service_tier", None),
+            legacy_request_overrides=rt.get("request_overrides"),
+        )
+    except _RequestOverrideProjectionError:
+        return False
+
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
@@ -1749,6 +1784,7 @@ def restore_primary_runtime(agent) -> bool:
         agent.api_key = rt["api_key"]
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
         agent._client_kwargs = dict(rt["client_kwargs"])
+        agent.request_overrides = projected_overrides
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
         # native-vs-proxy split (older sessions saved before this PR).
@@ -2842,6 +2878,68 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
+_RUNTIME_OVERRIDE_UNSET = object()
+
+
+def _project_request_overrides_for_runtime(
+    agent,
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    service_tier: Optional[str],
+    legacy_request_overrides: Any = _RUNTIME_OVERRIDE_UNSET,
+) -> Dict[str, Any]:
+    """Stage one detached request mapping for an explicit target runtime."""
+    custom_providers = getattr(agent, "_custom_providers", [])
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            load_config_readonly,
+        )
+
+        custom_providers = get_compatible_custom_providers(load_config_readonly())
+    except Exception:
+        logger.debug("runtime override rebuild skipped: custom_provider_resolution_failed")
+
+    derived_overrides = {}
+    if service_tier:
+        try:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            derived_overrides = resolve_fast_mode_overrides(model) or {}
+        except Exception:
+            logger.debug("runtime override rebuild skipped: fast_mode_resolution_failed")
+
+    from agent.agent_init import (
+        _RequestOverrideProjectionError,
+        _project_request_overrides,
+    )
+
+    caller_overrides = (
+        getattr(agent, "_caller_request_overrides", {})
+        if legacy_request_overrides is _RUNTIME_OVERRIDE_UNSET
+        or hasattr(agent, "_caller_request_overrides")
+        else legacy_request_overrides
+    )
+    try:
+        return _project_request_overrides(
+            agent,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            service_tier=service_tier,
+            derived_overrides=derived_overrides,
+            custom_providers=custom_providers,
+            caller_overrides=caller_overrides,
+        )
+    except _RequestOverrideProjectionError:
+        logger.debug("runtime override rebuild failed: request_override_copy_rejected")
+        raise _RequestOverrideProjectionError(
+            "request override projection rejected"
+        ) from None
+
+
 def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
     """Switch the model/provider in-place for a live agent.
 
@@ -2856,7 +2954,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     change persists across turns (unlike fallback which is
     turn-scoped).
     """
+    from hermes_cli.model_switch import _inject_deferred_model_switch_fault
     from hermes_cli.providers import determine_api_mode
+
+    _is_deferred_boundary_switch = bool(
+        getattr(agent, "_applying_model_switch_after_compression", False)
+    )
 
     # ── Determine api_mode if not provided ──
     # Pass model so dual-wire providers (Nous Portal anthropic/* → Messages)
@@ -2882,6 +2985,32 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     old_model = agent.model
     old_provider = agent.provider
+    old_base_url = agent.base_url
+
+    old_norm_provider = (old_provider or "").strip().lower()
+    new_norm_provider = (new_provider or "").strip().lower()
+    if base_url:
+        target_base_url = base_url
+    elif old_norm_provider == new_norm_provider:
+        target_base_url = old_base_url
+    else:
+        raise ValueError(
+            f"switch_model: no base_url resolved for provider "
+            f"'{new_provider}' (switching from '{old_provider}'); "
+            "refusing to keep the previous provider's endpoint"
+        )
+    if new_norm_provider == "moa":
+        target_base_url = "moa://local"
+        api_mode = "chat_completions"
+    base_url = target_base_url
+    projected_overrides = _project_request_overrides_for_runtime(
+        agent,
+        provider=new_provider,
+        model=new_model,
+        base_url=target_base_url,
+        service_tier=getattr(agent, "service_tier", None),
+    )
+    from agent.agent_init import _copy_request_override_graph
 
     # ── Snapshot all fields the swap+rebuild can mutate ──
     # If the rebuild raises (bad API key, network error, build_anthropic_client
@@ -2913,9 +3042,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_reasoning_echo_flag",
         )
     }
-    # _client_kwargs is a dict — snapshot a shallow copy so mutating the
-    # live dict doesn't poison the rollback target.
-    _snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    # Mutable request state needs an independent rollback copy.
+    _snapshot["_client_kwargs"] = getattr(agent, "_client_kwargs", _MISSING)
+    _old_request_overrides = getattr(agent, "request_overrides", _MISSING)
+    _snapshot["request_overrides"] = (
+        _copy_request_override_graph(_old_request_overrides)
+        if _old_request_overrides is not _MISSING
+        else _MISSING
+    )
     # Snapshot the credential pool reference so a failed client rebuild can
     # restore the original pool (issue #52727: pool reload is part of this
     # switch and must be reversible on rollback).
@@ -2927,7 +3061,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     def _restore_snapshot() -> None:
         for _name, _value in _snapshot.items():
             if _value is _MISSING:
-                # Attribute did not exist before the swap — don't fabricate it.
+                if _name == "request_overrides":
+                    try:
+                        delattr(agent, _name)
+                    except AttributeError:
+                        pass
                 continue
             try:
                 setattr(agent, _name, _value)
@@ -2961,22 +3099,16 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # provider genuinely has none. Re-selecting the SAME provider with
         # an empty base_url (e.g. a credential-only refresh) is still fine
         # to keep the current URL. See #47828.
-        old_norm_provider = (old_provider or "").strip().lower()
-        new_norm_provider = (new_provider or "").strip().lower()
-        if base_url:
-            agent.base_url = base_url
-        elif old_norm_provider != new_norm_provider:
-            raise ValueError(
-                f"switch_model: no base_url resolved for provider "
-                f"'{new_provider}' (switching from '{old_provider}'); "
-                "refusing to keep the previous provider's endpoint"
-            )
+        agent.base_url = target_base_url
         agent.api_mode = api_mode
+        agent.request_overrides = projected_overrides
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         if api_key:
             agent.api_key = api_key
+        if _is_deferred_boundary_switch:
+            _inject_deferred_model_switch_fault(agent, "provider_resolve")
 
         # ── Reload credential pool for the new provider (issue #52727) ──
         # Without this, ``recover_with_credential_pool`` sees a
@@ -3099,6 +3231,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             )
 
         sync_credential_pool_entry_id(agent)
+        if _is_deferred_boundary_switch:
+            _inject_deferred_model_switch_fault(agent, "client_construct")
     except Exception:
         # Rollback every mutated field to the pre-swap snapshot so the agent
         # is left consistent (old model + old provider + old client) and the
@@ -3110,36 +3244,46 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     # ── LM Studio: preload before probing context length ──
     _sm_custom_providers = None
-    try:
-        from hermes_cli.config import (
-            get_compatible_custom_providers,
-            get_custom_provider_context_length,
-            load_config,
+    if _is_deferred_boundary_switch:
+        # The deferred result already resolved the destination context intent;
+        # do not probe or prewarm another provider at the commit boundary.
+        _destination_context_intent = getattr(
+            agent, "_deferred_model_switch_context_length", None
         )
+        agent._config_context_length = _destination_context_intent
+        _runtime_context_length = _destination_context_intent
+        _effective_context_length = _destination_context_intent
+    else:
+        try:
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                get_custom_provider_context_length,
+                load_config,
+            )
 
-        _sm_cfg = load_config()
-        _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
-        _destination_context_intent = get_custom_provider_context_length(
-            model=agent.model,
-            base_url=agent.base_url,
-            custom_providers=_sm_custom_providers,
+            _sm_cfg = load_config()
+            _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
+            _destination_context_intent = get_custom_provider_context_length(
+                model=agent.model,
+                base_url=agent.base_url,
+                custom_providers=_sm_custom_providers,
+            )
+        except Exception:
+            _destination_context_intent = None
+        agent._config_context_length = _destination_context_intent
+        _runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+            _destination_context_intent
         )
-    except Exception:
-        _destination_context_intent = None
-    agent._config_context_length = _destination_context_intent
-    _runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
-        _destination_context_intent
-    )
-    if agent._lmstudio_load_was_unverified(_runtime_context_length):
-        logger.warning(
-            "LM Studio model activation was rejected or completed without a "
-            "verifiable active context length during model switch; continuing "
-            "with configured context"
+        if agent._lmstudio_load_was_unverified(_runtime_context_length):
+            logger.warning(
+                "LM Studio model activation was rejected or completed without a "
+                "verifiable active context length during model switch; continuing "
+                "with configured context"
+            )
+        _effective_context_length = agent._effective_lmstudio_context_length(
+            _destination_context_intent,
+            _runtime_context_length,
         )
-    _effective_context_length = agent._effective_lmstudio_context_length(
-        _destination_context_intent,
-        _runtime_context_length,
-    )
 
     # ── Re-evaluate prompt caching ──
     # Refresh the custom-provider snapshot from the config just loaded above
@@ -3160,53 +3304,66 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     # ── Update context compressor ──
     if hasattr(agent, "context_compressor") and agent.context_compressor:
-        from agent.model_metadata import get_model_context_length
-        if _sm_custom_providers is None:
-            try:
-                from hermes_cli.config import get_compatible_custom_providers, load_config
-                _sm_custom_providers = get_compatible_custom_providers(load_config())
-            except Exception:
-                _sm_custom_providers = None
-        # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
-        # token provider). ``get_model_context_length`` expects a
-        # string for its live-probe paths; for Foundry the context
-        # length normally resolves via config or static catalogs and
-        # never hits a probe, but coerce to empty string defensively.
-        _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
-        new_context_length = get_model_context_length(
-            agent.model,
-            base_url=agent.base_url,
-            api_key=_ctx_api_key,
-            provider=agent.provider,
-            config_context_length=_effective_context_length,
-            custom_providers=_sm_custom_providers,
-        )
+        if _is_deferred_boundary_switch:
+            new_context_length = _effective_context_length or getattr(
+                agent.context_compressor, "context_length", None
+            )
+        else:
+            from agent.model_metadata import get_model_context_length
+            if _sm_custom_providers is None:
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers, load_config
+                    _sm_custom_providers = get_compatible_custom_providers(load_config())
+                except Exception:
+                    _sm_custom_providers = None
+            # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
+            # token provider). ``get_model_context_length`` expects a
+            # string for its live-probe paths; for Foundry the context
+            # length normally resolves via config or static catalogs and
+            # never hits a probe, but coerce to empty string defensively.
+            _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+            new_context_length = get_model_context_length(
+                agent.model,
+                base_url=agent.base_url,
+                api_key=_ctx_api_key,
+                provider=agent.provider,
+                config_context_length=_effective_context_length,
+                custom_providers=_sm_custom_providers,
+            )
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=new_context_length,
             base_url=agent.base_url,
-            api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
+            api_key=agent.api_key,
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
+        if _is_deferred_boundary_switch:
+            _inject_deferred_model_switch_fault(agent, "compressor_update")
 
     # ── Re-resolve reasoning_config from per-model override ──
     # The new model may have a different reasoning_effort override. Re-read
     # config so the override takes effect immediately on /model switch —
     # resolved through the shared chokepoint (per-model > global; YAML
     # boolean False = disabled).
-    try:
-        from hermes_constants import resolve_reasoning_config
-        from hermes_cli.config import load_config as _sm_load_config
-
-        _reasoning_cfg = _sm_load_config() or {}
-        agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
-        logger.info(
-            "switch_model: reasoning_config resolved for %s: %s",
-            agent.model, agent.reasoning_config,
+    if _is_deferred_boundary_switch:
+        agent.reasoning_config = copy.deepcopy(
+            getattr(agent, "_deferred_model_switch_reasoning_config", None)
         )
-    except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+        _inject_deferred_model_switch_fault(agent, "overrides")
+    else:
+        try:
+            from hermes_constants import resolve_reasoning_config
+            from hermes_cli.config import load_config as _sm_load_config
+
+            _reasoning_cfg = _sm_load_config() or {}
+            agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
+            logger.info(
+                "switch_model: reasoning_config resolved for %s: %s",
+                agent.model, agent.reasoning_config,
+            )
+        except Exception as _reasoning_err:
+            logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
@@ -3229,6 +3386,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": _copy_request_override_graph(agent.request_overrides),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
@@ -3285,7 +3443,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # See #48248 for the full bug description.
     _session_db = getattr(agent, "_session_db", None)
     _session_id = getattr(agent, "session_id", None)
-    if _session_db is not None and _session_id:
+    if (
+        not _is_deferred_boundary_switch
+        and _session_db is not None
+        and _session_id
+    ):
         try:
             _session_db.update_session_billing_route(
                 _session_id,
@@ -3298,6 +3460,32 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "Failed to persist billing route after model switch",
                 exc_info=True,
             )
+
+
+_apply_model_switch = switch_model
+
+
+def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    """Serialize a live swap and cancel superseded deferred intent."""
+    from hermes_cli.model_switch import (
+        _emit_deferred_model_switch_status,
+        clear_model_switch_after_compression,
+        model_switch_transaction_lock,
+    )
+
+    with model_switch_transaction_lock(agent):
+        result = _apply_model_switch(
+            agent, new_model, new_provider, api_key, base_url, api_mode
+        )
+        if not getattr(agent, "_applying_model_switch_after_compression", False):
+            cancelled = clear_model_switch_after_compression(agent)
+            if cancelled is not None:
+                _emit_deferred_model_switch_status(
+                    agent,
+                    "Pending after-compression model switch cancelled by "
+                    "the immediate model switch.",
+                )
+        return result
 
 
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
@@ -3433,18 +3621,38 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             target = next_args.get("target", "memory")
             operations = next_args.get("operations")
             from tools.memory_tool import memory_tool as _memory_tool
-            result = _memory_tool(
-                action=next_args.get("action"),
-                target=target,
-                content=next_args.get("content"),
-                old_text=next_args.get("old_text"),
-                operations=operations,
-                store=agent._memory_store,
-            )
+            if getattr(agent, "_memory_provider_mode", "hybrid") == "authoritative":
+                if agent._memory_manager:
+                    result = agent._memory_manager.authoritative_memory_write(
+                        next_args,
+                        metadata=agent._build_memory_write_metadata(
+                            task_id=effective_task_id,
+                            tool_call_id=tool_call_id,
+                        ),
+                    )
+                else:
+                    result = json.dumps({
+                        "success": False,
+                        "error": "Authoritative memory provider is unavailable.",
+                        "error_class": "provider_unavailable",
+                        "provider_mode": "authoritative",
+                    })
+            else:
+                result = _memory_tool(
+                    action=next_args.get("action"),
+                    target=target,
+                    content=next_args.get("content"),
+                    old_text=next_args.get("old_text"),
+                    operations=operations,
+                    store=agent._memory_store,
+                )
             # Mirror successful built-in memory writes to external providers.
             # All gating/op-expansion lives behind the manager interface
             # (MemoryManager.notify_memory_tool_write).
-            if agent._memory_manager:
+            if (
+                getattr(agent, "_memory_provider_mode", "hybrid") != "authoritative"
+                and agent._memory_manager
+            ):
                 agent._memory_manager.notify_memory_tool_write(
                     result,
                     next_args,

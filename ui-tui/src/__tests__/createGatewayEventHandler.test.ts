@@ -183,6 +183,22 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual(todos)
   })
 
+  it('allows the next turn to replace a cached status', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({
+      payload: { kind: 'cache_hit', text: 'cache 87% 3480/4000' },
+      type: 'status.update'
+    } as any)
+    onEvent({ payload: { text: 'first' }, type: 'message.complete' } as any)
+    expect(getUiState().status).toBe('cache 87% 3480/4000')
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { text: 'second' }, type: 'message.complete' } as any)
+    expect(getUiState().status).toBe('ready')
+  })
+
   it('prints compaction progress status into the transcript', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)
@@ -2084,7 +2100,7 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
 
-    it('keeps identical interim and terminal replies as separate messages without response_previewed', () => {
+    it('deduplicates identical commentary and final replies in one turn', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))
 
@@ -2093,7 +2109,48 @@ describe('createGatewayEventHandler', () => {
       onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
 
       const assistantMsgs = appended.filter(m => m.role === 'assistant' && m.text)
+      expect(assistantMsgs).toEqual([{ role: 'assistant', text: 'same reply' }])
+    })
+
+    it('preserves a prefix-distinct final after commentary', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { already_streamed: true, text: 'progress' }, type: 'message.interim' } as any)
+      onEvent({ payload: { text: 'progress complete' }, type: 'message.complete' } as any)
+
+      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([
+        'progress',
+        'progress complete'
+      ])
+    })
+
+    it('preserves a trailing-whitespace-distinct final after commentary', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { already_streamed: true, text: 'same reply  ' }, type: 'message.interim' } as any)
+      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
+
+      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([
+        'same reply  ',
+        'same reply'
+      ])
+    })
+
+    it('preserves a final with trailing whitespace distinct from commentary', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { already_streamed: true, text: 'same reply' }, type: 'message.interim' } as any)
+      onEvent({ payload: { text: 'same reply  ' }, type: 'message.complete' } as any)
+
+      const assistantMsgs = appended.filter(m => m.role === 'assistant' && m.text)
       expect(assistantMsgs).toHaveLength(2)
+      expect(assistantMsgs.map(m => m.text)).toEqual(['same reply', 'same reply'])
     })
 
     it('settles identical terminal reply onto interim when response_previewed', () => {
@@ -2112,21 +2169,35 @@ describe('createGatewayEventHandler', () => {
       expect(assistantMsgs[0]?.text).toBe('same reply')
     })
 
-    it('deduplicates flushed chunks within the terminal message after an interim boundary', () => {
+    it('keeps distinct commentary and final replies visible', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))
 
       onEvent({ payload: {}, type: 'message.start' } as any)
-      // Interim seals the first segment
       onEvent({ payload: { already_streamed: true, text: 'interim answer' }, type: 'message.interim' } as any)
-      // Post-interim deltas that match the final text — these get deduped
       onEvent({ payload: { text: 'final answer' }, type: 'message.delta' } as any)
       onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
 
-      const texts = appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)
-      // interim + final, no duplication of the final
-      expect(texts).toContain('interim answer')
-      expect(texts.filter(t => t === 'final answer')).toHaveLength(1)
+      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([
+        'interim answer',
+        'final answer'
+      ])
+    })
+
+    it('does not suppress identical replies in separate turns', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { already_streamed: true, text: 'same reply' }, type: 'message.interim' } as any)
+      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
+
+      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([
+        'same reply',
+        'same reply'
+      ])
     })
 
     it('ignores malformed message.interim payload', () => {
@@ -2144,6 +2215,207 @@ describe('createGatewayEventHandler', () => {
       // Turn continues without finalizing or throwing
       expect(getUiState().busy).toBe(true)
       expect(appended).toHaveLength(0)
+    })
+  })
+
+  describe('per-loop completion footnote (#126)', () => {
+    it('renders end time and first-call cache hit as one durable line', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 87, prompt_tokens: 4_000, read_tokens: 3_480, state: 'hit' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache 87% 3480/4000' }
+        ])
+        expect(appended.some(msg => msg.text.includes('完成'))).toBe(false)
+        expect(formatTime).toHaveBeenCalledWith('en-GB', {
+          hour: '2-digit',
+          hour12: false,
+          minute: '2-digit',
+          second: '2-digit'
+        })
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('renders a positive sub-percent cache hit as <1% with its token pair', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 0, prompt_tokens: 4_000, read_tokens: 3, state: 'hit' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          {
+            eventTone: 'warn',
+            kind: 'event',
+            role: 'system',
+            text: 'agent loop stop at 14:23:05  cache <1% 3/4000'
+          }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('keeps percent-only when token counts are missing', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 87, state: 'hit' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache 87%' }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('marks a finite cache hit below 50% as a warn event', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 49, prompt_tokens: 4_000, read_tokens: 1_960, state: 'hit' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          {
+            eventTone: 'warn',
+            kind: 'event',
+            role: 'system',
+            text: 'agent loop stop at 14:23:05  cache 49% 1960/4000'
+          }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('renders known cache miss totals on the warn event', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 0, prompt_tokens: 4_000, read_tokens: 0, state: 'miss' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          {
+            eventTone: 'warn',
+            kind: 'event',
+            role: 'system',
+            text: 'agent loop stop at 14:23:05  cache miss 0/4000'
+          }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('renders COLD_WRITE on the same durable line', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 0, prompt_tokens: 2_000, read_tokens: 0, state: 'cold_write' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache COLD_WRITE' }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('renders unavailable on the same durable line', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { state: 'unavailable' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache unavailable' }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('does not invent a footnote when completion metadata is missing', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
+
+      expect(appended).toEqual([{ role: 'assistant', text: 'final answer' }])
     })
   })
 })

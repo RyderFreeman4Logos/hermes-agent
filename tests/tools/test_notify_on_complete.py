@@ -19,6 +19,8 @@ from tools.process_registry import (
     ProcessSession,
 )
 
+_MISSING_EXIT_CODE = object()
+
 
 @pytest.fixture()
 def registry():
@@ -34,6 +36,9 @@ def _make_session(
     exit_code=None,
     output="",
     notify_on_complete=False,
+    delegated_child=False,
+    completion_reason="exited",
+    termination_source="",
 ) -> ProcessSession:
     s = ProcessSession(
         id=sid,
@@ -44,6 +49,9 @@ def _make_session(
         exit_code=exit_code,
         output_buffer=output,
         notify_on_complete=notify_on_complete,
+        delegated_child=delegated_child,
+        completion_reason=completion_reason,
+        termination_source=termination_source,
     )
     return s
 
@@ -130,6 +138,107 @@ class TestCompletionQueue:
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
+    def test_immediate_reader_completion_keeps_notification(self, registry, monkeypatch):
+        """Register notification state before a synchronous reader can finish."""
+        import tools.process_registry as process_registry_module
+
+        def finish(session):
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+
+        monkeypatch.setattr(
+            process_registry_module.subprocess, "Popen", lambda *_args, **_kwargs: MagicMock(pid=123)
+        )
+        monkeypatch.setattr(
+            process_registry_module.threading,
+            "Thread",
+            lambda **kwargs: type("ImmediateThread", (), {"start": lambda self: kwargs["target"](*kwargs["args"])})(),
+        )
+        monkeypatch.setattr(registry, "_reader_loop", finish)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: None)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        session = registry.spawn_local(
+            "true",
+            cwd="/tmp",
+            task_id="task-immediate",
+            session_key="key-immediate",
+            notify_on_complete=True,
+            watcher_metadata={"watcher_platform": "telegram", "parent_session_id": "parent-immediate"},
+        )
+
+        completion = registry.completion_queue.get_nowait()
+        assert registry.completion_queue.empty()
+        assert (
+            completion["platform"],
+            completion["parent_session_id"],
+            completion["session_key"],
+            completion["task_id"],
+        ) == ("telegram", "parent-immediate", "key-immediate", "task-immediate")
+        assert completion["session_id"] == session.id
+
+    @pytest.mark.parametrize(
+        ("exit_code", "completion_reason", "termination_source", "visible"),
+        (
+            (0, "exited", "", False),
+            (1, "exited", "", True),
+            (-1, "lost", "backend_lost", True),
+            (-15, "killed", "process.kill", True),
+            (None, "exited", "", True),
+            (True, "exited", "", True),
+            ("0", "exited", "", True),
+            (_MISSING_EXIT_CODE, "exited", "", True),
+        ),
+        ids=(
+            "success",
+            "nonzero",
+            "lost",
+            "killed",
+            "none",
+            "bool",
+            "string",
+            "missing",
+        ),
+    )
+    def test_delegated_child_suppresses_only_routine_success(
+        self, registry, exit_code, completion_reason, termination_source, visible
+    ):
+        session = _make_session(
+            task_id="sa-9-child",
+            notify_on_complete=True,
+            delegated_child=True,
+            output="child output",
+            exit_code=None if exit_code is _MISSING_EXIT_CODE else exit_code,
+            completion_reason=completion_reason,
+            termination_source=termination_source,
+        )
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        assert not registry.completion_queue.empty()
+        if exit_code is _MISSING_EXIT_CODE:
+            event = registry.completion_queue.get_nowait()
+            del event["exit_code"]
+            registry.completion_queue.put(event)
+
+        notifications = registry.drain_notifications()
+        assert (len(notifications) == 1) is visible
+        assert registry.completion_queue.empty()
+        assert registry._finished[session.id].output_buffer == "child output"
+
+    def test_parent_owned_success_still_notifies(self, registry):
+        session = _make_session(notify_on_complete=True, output="done", exit_code=0)
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        event = registry.completion_queue.get_nowait()
+        assert event["delegated_child"] is False
+        registry.completion_queue.put(event)
+        assert len(registry.drain_notifications()) == 1
+
 
 # =========================================================================
 # Checkpoint persistence
@@ -138,13 +247,14 @@ class TestCompletionQueue:
 class TestCheckpointNotify:
     def test_checkpoint_includes_notify(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
-            s = _make_session(notify_on_complete=True)
+            s = _make_session(notify_on_complete=True, delegated_child=True)
             registry._running[s.id] = s
             registry._write_checkpoint()
 
             data = json.loads((tmp_path / "procs.json").read_text())
             assert len(data) == 1
             assert data[0]["notify_on_complete"] is True
+            assert data[0]["delegated_child"] is True
 
 
     def test_recover_defaults_false(self, registry, tmp_path):
@@ -161,6 +271,7 @@ class TestCheckpointNotify:
             assert recovered == 1
             s = registry.get("proc_live")
             assert s.notify_on_complete is False
+            assert s.delegated_child is False
 
 
 # =========================================================================
@@ -374,6 +485,48 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
         f"Correct usage must not emit a hint, got: {result.get('hint')!r}"
     )
     assert result.get("notify_on_complete") is True
+
+
+def test_notify_is_registered_before_spawn(monkeypatch, tmp_path):
+    """An immediate reader observes notify state and routing metadata at launch."""
+    from types import SimpleNamespace
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    captured = {}
+
+    def capture_spawn(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            id="proc_launch_test", pid=1, watcher_platform="", watcher_interval=0
+        )
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.spawn_local", capture_spawn
+    )
+    try:
+        result = json.loads(
+            tt.terminal_tool("true", background=True, notify_on_complete=True)
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["notify_on_complete"] is True
+    assert captured["notify_on_complete"] is True
+    assert "watcher_metadata" in captured
+
+
+def test_omitted_timeout_auto_promotes_to_notified_background(monkeypatch, tmp_path):
+    """Issue #191: omitted timeout and background is intentionally managed."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    try:
+        result = json.loads(tt.terminal_tool("true"))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["session_id"] == "proc_silent_test"
+    assert result["notify_on_complete"] is True
 
 
 def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):

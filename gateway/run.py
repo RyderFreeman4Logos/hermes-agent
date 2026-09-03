@@ -58,6 +58,7 @@ from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+    resolve_context_compression_timeouts,
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.compaction_display import project_compaction_message_for_display
@@ -3782,6 +3783,30 @@ def _load_gateway_config(config_path: "Path | None" = None) -> dict:
     return raw
 
 
+def _apply_cached_turn_runtime(
+    agent,
+    *,
+    reasoning_config,
+    service_tier,
+    derived_overrides,
+) -> None:
+    """Stage cached-turn request state before publishing live fields."""
+    from agent.agent_init import _project_request_overrides
+
+    projected = _project_request_overrides(
+        agent,
+        provider=getattr(agent, "provider", ""),
+        model=getattr(agent, "model", ""),
+        base_url=getattr(agent, "base_url", ""),
+        service_tier=service_tier,
+        derived_overrides=derived_overrides,
+        custom_providers=getattr(agent, "_custom_providers", []),
+    )
+    agent.reasoning_config = reasoning_config
+    agent.service_tier = service_tier
+    agent.request_overrides = projected
+
+
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:
     """Translate gateway checkpoint config into ``AIAgent`` constructor args.
 
@@ -5849,7 +5874,7 @@ class TurnRunner:
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
                 service_tier=self._runner._service_tier,
-                request_overrides=turn_route.get("request_overrides"),
+                fast_mode_overrides=turn_route.get("request_overrides"),
                 providers_allowed=pr.get("only"),
                 providers_ignored=pr.get("ignore"),
                 providers_order=pr.get("order"),
@@ -5886,6 +5911,8 @@ class TurnRunner:
                     )
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+
+        self._runner._attach_model_switch_after_compression(ctx.session_key, agent)
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -5960,9 +5987,12 @@ class TurnRunner:
         agent.notice_callback = _notice_callback_sync
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
-        agent.reasoning_config = reasoning_config
-        agent.service_tier = self._runner._service_tier
-        agent.request_overrides = turn_route.get("request_overrides") or {}
+        _apply_cached_turn_runtime(
+            agent,
+            reasoning_config=reasoning_config,
+            service_tier=self._runner._service_tier,
+            derived_overrides=turn_route.get("request_overrides") or {},
+        )
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
@@ -7016,6 +7046,102 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sessions:
             return None
         return sessions.get(session_key)
+
+    def _attach_model_switch_after_compression(
+        self,
+        session_key: Optional[str],
+        agent: Any,
+    ) -> None:
+        """Bind conversation-scoped deferred route state to a live agent."""
+        if not session_key:
+            return
+        state = self._peek_session_state(session_key)
+        pending = (
+            state.conversation.after_compression_model_switch
+            if state is not None
+            else None
+        )
+        if pending is None:
+            return
+
+        from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+        def _on_applied(result, old_model, _old_provider):
+            current = self._peek_session_state(session_key)
+            if (
+                current is None
+                or current.conversation.after_compression_model_switch is not result
+            ):
+                return
+            current.conversation.after_compression_model_switch = None
+            current.conversation.model_override = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            }
+            if result.reasoning_config is not None:
+                current.conversation.model_override["reasoning_config"] = dict(
+                    result.reasoning_config
+                )
+            async_store = getattr(self, "_async_session_store", None)
+            if async_store is not None:
+                loop = getattr(self, "_gateway_loop", None)
+                if loop is None or not loop.is_running():
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                if loop is not None and loop.is_running():
+                    persist = safe_schedule_threadsafe(
+                        async_store.set_model_override(
+                            session_key,
+                            current.conversation.model_override,
+                        ),
+                        loop,
+                        logger=logger,
+                        log_message="Failed to schedule deferred session model override persistence",
+                    )
+
+                    def _log_persist_failure(future):
+                        try:
+                            future.result()
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist deferred session model override",
+                                exc_info=True,
+                            )
+
+                    if persist is not None:
+                        persist.add_done_callback(_log_persist_failure)
+                else:
+                    store = getattr(self, "session_store", None)
+                    if store is not None:
+                        try:
+                            store.set_model_override(
+                                session_key,
+                                current.conversation.model_override,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist deferred session model override",
+                                exc_info=True,
+                            )
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            if pending_notes is not None:
+                pending_notes[session_key] = (
+                    f"[Note: model was just switched from {old_model} to "
+                    f"{result.new_model} via "
+                    f"{result.provider_label or result.target_provider}. "
+                    "Adjust your self-identification accordingly.]"
+                )
+
+        schedule_model_switch_after_compression(
+            agent,
+            pending,
+            on_applied=_on_applied,
+        )
 
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
@@ -9741,8 +9867,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if resolved_session_key:
             _r_state = self._peek_session_state(resolved_session_key)
-            if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-                return _r_state.conversation.reasoning_override
+            if _r_state is not None:
+                if _r_state.conversation.reasoning_override is not None:
+                    return _r_state.conversation.reasoning_override
+                model_override = _r_state.conversation.model_override
+                if isinstance(model_override, dict):
+                    model_reasoning = model_override.get("reasoning_config")
+                    if isinstance(model_reasoning, dict):
+                        return dict(model_reasoning)
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -20241,6 +20373,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             except (TypeError, ValueError):
                                 pass
 
+                _hyg_timeout_seconds, _hyg_total_ceiling_seconds = (
+                    resolve_context_compression_timeouts(
+                        {
+                            "context_timeout_seconds": _hyg_timeout_seconds,
+                            "context_total_ceiling_seconds": _hyg_total_ceiling_seconds,
+                            "auxiliary": (
+                                _hyg_data.get("auxiliary", {})
+                                if isinstance(_hyg_data, dict)
+                                else {}
+                            ),
+                        }
+                    )
+                )
+
                 _hyg_configured_model = _hyg_model
                 _hyg_configured_provider = _hyg_provider
                 _hyg_configured_base_url = _hyg_base_url
@@ -20491,6 +20637,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
+                                    _hyg_commit_fence.configure_host_budget(
+                                        idle_timeout_seconds=_hyg_timeout_seconds,
+                                        total_ceiling_seconds=_hyg_total_ceiling_seconds,
+                                    )
                                     _hyg_future = loop.run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(
@@ -20513,16 +20663,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # the turn forever.
                                         _hyg_wait_started = time.monotonic()
                                         while True:
-                                            # #76354 S3: charge the idle budget
-                                            # from the LAST PROGRESS event, not
-                                            # from the start of this wait slice —
-                                            # otherwise silence can approach 2x
-                                            # the configured timeout.
-                                            _slice = max(
-                                                _hyg_timeout_seconds
-                                                - _hyg_commit_fence.seconds_since_progress(),
-                                                0.005,
-                                            )
+                                            _slice = _hyg_commit_fence.next_wait()
+                                            if _slice is None or _slice <= 0:
+                                                raise asyncio.TimeoutError
                                             try:
                                                 _compressed, _ = await asyncio.wait_for(
                                                     asyncio.shield(_hyg_future),
@@ -20532,10 +20675,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             except asyncio.TimeoutError:
                                                 _hyg_waited = time.monotonic() - _hyg_wait_started
                                                 _idle = _hyg_commit_fence.seconds_since_progress()
-                                                if (
-                                                    _idle < _hyg_timeout_seconds
-                                                    and _hyg_waited < _hyg_total_ceiling_seconds
-                                                ):
+                                                if (_hyg_commit_fence.next_wait() or 0.0) > 0:
                                                     logger.info(
                                                         "Session hygiene compression for "
                                                         "session %s still streaming after "
@@ -23478,7 +23618,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
+                    fast_mode_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),
@@ -26888,6 +27028,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "type": "completion",
                         "session_id": session_id,
                         "session_key": session_key,
+                        "task_id": getattr(session, "task_id", ""),
                         "platform": platform_name,
                         "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,
@@ -26901,6 +27042,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "completion_reason": getattr(session, "completion_reason", "exited"),
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
+                        "delegated_child": getattr(session, "delegated_child", False),
                         # Spawning conversation's session-db id (stamped at
                         # spawn time in terminal_tool). Lets the delivery
                         # pre-flight drop this completion when the user closed
@@ -27259,6 +27401,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "provider": persisted.get("provider"),
             "base_url": persisted.get("base_url"),
         }
+        if isinstance(persisted.get("reasoning_config"), dict):
+            override["reasoning_config"] = dict(persisted["reasoning_config"])
         provider = persisted.get("provider")
         if provider:
             # Re-resolve credentials for the persisted provider. On failure

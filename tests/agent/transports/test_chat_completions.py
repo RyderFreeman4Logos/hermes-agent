@@ -146,6 +146,23 @@ class TestChatCompletionsBasic:
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
 
+    def test_build_kwargs_rejects_late_system_message_on_strict_wire(self, transport):
+        """Reproduce the strict Chat Completions 400 at the wire boundary."""
+        payload = transport.build_kwargs(
+            model="test/model",
+            messages=[
+                {"role": "system", "content": "stable instructions"},
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": "[Agent loop timing]"},
+            ],
+        )
+        if any(message.get("role") == "system" for message in payload["messages"][1:]):
+            raise ValueError("HTTP 400: System message must be at the beginning.")
+        assert payload["messages"][-1] == {
+            "role": "user",
+            "content": "[Agent loop timing]",
+        }
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 
@@ -714,6 +731,65 @@ class TestPromptCacheKeyCapability:
             if stream:
                 list(result)
         return captured
+
+    def test_post_compress_request_reuses_explicit_stable_prefix_key(self, transport):
+        """Cache routing is independent of Anthropic wire decoration."""
+        def key(volatile_suffix, *, stable="stable prefix", tools=None, session="session-after-compress"):
+            return transport.build_kwargs(
+                model="cache-model",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"{stable}\n\n{volatile_suffix}",
+                    },
+                    {"role": "user", "content": "next request"},
+                ],
+                tools=tools or [],
+                session_id=session,
+                supports_prompt_cache_key=True,
+                cache_key_instructions=stable,
+            )["prompt_cache_key"]
+
+        before_compress = key("volatile before compression")
+        first_after_compress = key("rebuilt volatile suffix")
+
+        assert first_after_compress == before_compress
+        assert key("rebuilt volatile suffix", stable="changed prefix") != first_after_compress
+        assert key("rebuilt volatile suffix", tools=self._tools()) != first_after_compress
+        assert key("rebuilt volatile suffix", session="different-session") != first_after_compress
+
+    def test_post_compress_request_reuses_unchanged_stable_prefix_key(
+        self, transport
+    ):
+        """List-form prompts keep the explicit stable key after compression."""
+        def request(volatile_suffix):
+            messages = [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "stable prefix"},
+                        {"type": "text", "text": volatile_suffix},
+                    ],
+                },
+                {"role": "user", "content": "next request"},
+            ]
+            return transport.build_kwargs(
+                model="cache-model",
+                messages=messages,
+                tools=[],
+                session_id="session-after-compress",
+                supports_prompt_cache_key=True,
+                cache_key_instructions="stable prefix",
+            )
+
+        before_compress = request("volatile before compression")
+        first_after_compress = request("rebuilt volatile suffix")
+
+        assert first_after_compress["prompt_cache_key"] == before_compress["prompt_cache_key"]
+        assert first_after_compress["messages"][0]["content"] == [
+            {"type": "text", "text": "stable prefix"},
+            {"type": "text", "text": "rebuilt volatile suffix"},
+        ]
 
     def test_profile_capability_emits_content_key_in_nonstream_request_body(self, transport):
         from providers.base import ProviderProfile

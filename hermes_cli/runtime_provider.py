@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ def get_compatible_custom_providers(config=None):
 def normalize_extra_headers(value):
     """Late-bound delegate — see :func:`load_config` for why."""
     return _config_mod.normalize_extra_headers(value)
-from utils import base_url_host_matches, base_url_hostname, env_int
+from utils import base_url_host_matches, base_url_hostname, normalize_route_base_url, env_int
 
 
 def _getenv(name: str, default: str = "") -> str:
@@ -806,6 +806,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
                         result["extra_body"] = dict(extra_body)
+                    if isinstance(entry.get("send_session_id"), bool):
+                        result["send_session_id"] = entry["send_session_id"]
                     _lift_extra_headers(entry, result)
                     # Command that PRINTS a credential, for gateways issuing
                     # short-lived bearers instead of static keys. Propagated
@@ -864,6 +866,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         extra_body = entry.get("extra_body")
         if isinstance(extra_body, dict):
             result["extra_body"] = dict(extra_body)
+        if isinstance(entry.get("send_session_id"), bool):
+            result["send_session_id"] = entry["send_session_id"]
         _lift_extra_headers(entry, result)
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
@@ -1144,14 +1148,14 @@ def is_routable_provider(provider: Optional[str]) -> bool:
 
 
 def _normalize_base_url_for_match(value) -> str:
-    return str(value or "").strip().rstrip("/").lower()
+    return normalize_route_base_url(value)
 
 
 def _custom_provider_request_overrides(custom_provider: Dict[str, Any]) -> Dict[str, Any]:
     extra_body = custom_provider.get("extra_body")
     if not isinstance(extra_body, dict) or not extra_body:
         return {}
-    return {"extra_body": dict(extra_body)}
+    return {"extra_body": extra_body}
 
 
 def _resolve_named_custom_runtime(

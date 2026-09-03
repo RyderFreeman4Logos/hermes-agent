@@ -105,6 +105,361 @@ class TestAuxiliaryMaxTokensParam:
     pass
 
 
+class TestConfiguredAuxiliarySessionId:
+    def test_named_custom_opt_in_adds_stable_session_id_header(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            kwargs = _build_call_kwargs(
+                "pm",
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "summarize"}],
+                task="compression",
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert kwargs["extra_headers"]["session_id"] == "root-session"
+
+    def test_named_custom_provider_does_not_receive_session_id_by_default(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {},
+        )
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            kwargs = _build_call_kwargs(
+                "pm",
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "summarize"}],
+                task="compression",
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert "session_id" not in (kwargs.get("extra_headers") or {})
+
+    def test_configured_sync_fallback_uses_same_opt_in_header(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import (
+            _FallbackDestination,
+            _call_fallback_candidate_sync,
+        )
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        monkeypatch.setattr(
+            aux,
+            "_fallback_destination",
+            lambda *args, **kwargs: _FallbackDestination(
+                "pm", "https://codex.photonmark.com/openai/v1", "codex_responses", "gpt-5.6-luna"
+            ),
+        )
+        monkeypatch.setattr(
+            aux,
+            "_replan_synchronous_cache_sections",
+            lambda messages, tools, *, destination: (messages, tools),
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _call_fallback_candidate_sync(
+                client,
+                "gpt-5.6-luna",
+                "fallback_chain[0](pm)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request = client.chat.completions.create.call_args.kwargs
+        assert request["extra_headers"]["session_id"] == "root-session"
+
+    @pytest.mark.asyncio
+    async def test_configured_async_fallback_uses_same_opt_in_header(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import (
+            _FallbackDestination,
+            _call_fallback_candidate_async,
+        )
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        monkeypatch.setattr(
+            aux,
+            "_fallback_destination",
+            lambda *args, **kwargs: _FallbackDestination(
+                "pm", "https://codex.photonmark.com/openai/v1", "codex_responses", "gpt-5.6-luna"
+            ),
+        )
+        monkeypatch.setattr(
+            aux,
+            "_replan_synchronous_cache_sections",
+            lambda messages, tools, *, destination: (messages, tools),
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create = AsyncMock(return_value=_DummyResponse())
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            await _call_fallback_candidate_async(
+                client,
+                "gpt-5.6-luna",
+                "fallback_chain[0](pm)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request = client.chat.completions.create.call_args.kwargs
+        assert request["extra_headers"]["session_id"] == "root-session"
+
+    def test_primary_sync_preserves_opt_in_session_id_with_caller_headers(self, monkeypatch):
+        """The initial custom-provider request must merge, not replace, headers."""
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _call_llm_impl
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _call_llm_impl(
+                task="compression",
+                provider="pm",
+                model="gpt-5.6-luna",
+                base_url=client.base_url,
+                api_key="pm-key",
+                api_mode="chat_completions",
+                messages=[{"role": "user", "content": "summarize"}],
+                timeout=30.0,
+                extra_headers={"x-initiator": "user"},
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers == {"session_id": "root-session", "x-initiator": "user"}
+
+    def test_primary_sync_uses_explicit_runtime_identity(self, monkeypatch):
+        """Compression passes runtime identity explicitly from its worker."""
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(
+            aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna")
+        )
+
+        aux._call_llm_impl(
+            task="compression",
+            provider="pm",
+            model="gpt-5.6-luna",
+            base_url=client.base_url,
+            api_key="pm-key",
+            api_mode="chat_completions",
+            main_runtime={
+                "provider": "custom:pm",
+                "model": "gpt-5.6-luna",
+                "session_id": "physical-session",
+                "cache_scope": "root-session",
+            },
+            messages=[{"role": "user", "content": "summarize"}],
+            timeout=30.0,
+        )
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers["session_id"] == "root-session"
+
+    def test_caller_session_id_overrides_generated_header(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _merge_auxiliary_extra_headers
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            kwargs = _build_call_kwargs(
+                "pm",
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "summarize"}],
+                task="compression",
+            )
+            _merge_auxiliary_extra_headers(
+                kwargs,
+                {"session_id": "caller-session", "x-initiator": "user"},
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert kwargs["extra_headers"] == {
+            "session_id": "caller-session",
+            "x-initiator": "user",
+        }
+
+    def test_sync_same_provider_retry_preserves_opt_in_session_id_with_caller_headers(self, monkeypatch):
+        """Credential recovery retries must retain generated and caller headers."""
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _retry_same_provider_sync
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _retry_same_provider_sync(
+                task="compression",
+                resolved_provider="pm",
+                resolved_model="gpt-5.6-luna",
+                resolved_base_url=client.base_url,
+                resolved_api_key="pm-key",
+                resolved_api_mode="chat_completions",
+                main_runtime=None,
+                final_model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+                extra_headers={"x-initiator": "user"},
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers == {"session_id": "root-session", "x-initiator": "user"}
+
+    @pytest.mark.asyncio
+    async def test_async_same_provider_retry_preserves_opt_in_session_id_with_caller_headers(self, monkeypatch):
+        """Async credential recovery retries must retain both header sources."""
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _retry_same_provider_async
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create = AsyncMock(return_value=_DummyResponse())
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            await _retry_same_provider_async(
+                task="compression",
+                resolved_provider="pm",
+                resolved_model="gpt-5.6-luna",
+                resolved_base_url=client.base_url,
+                resolved_api_key="pm-key",
+                resolved_api_mode="chat_completions",
+                final_model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+                extra_headers={"x-initiator": "user"},
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers == {"session_id": "root-session", "x-initiator": "user"}
+
+
 
 class TestResolveTaskProviderModel:
     @pytest.mark.parametrize(
@@ -861,10 +1216,10 @@ class TestResolveProviderClientUniversalModelFallback:
 
 
 class TestExpiredCodexFallback:
-    """Test that expired Codex tokens don't block the auto chain."""
+    """Test that expired Codex tokens fail closed in the auto chain."""
 
-    def test_expired_codex_falls_through_to_next(self, tmp_path, monkeypatch):
-        """When Codex token is expired, auto chain should skip it and try next provider."""
+    def test_expired_codex_fails_closed_without_codex_candidate(self, tmp_path, monkeypatch):
+        """An expired Codex token must not fall through to another provider."""
         import base64
         import time as _time
 
@@ -892,12 +1247,13 @@ class TestExpiredCodexFallback:
             mock_build.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto
             client, model = _resolve_auto()
-            # Should NOT be Codex, should be Anthropic (or another available provider)
-            assert not isinstance(client, type(None)), "Should find a provider after expired Codex"
+            assert client is None
+            assert model is None
+            mock_build.assert_not_called()
 
 
-    def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch):
-        """With expired Codex + OpenRouter key, OpenRouter should win (1st in chain)."""
+    def test_expired_codex_does_not_allow_openrouter(self, tmp_path, monkeypatch):
+        """An expired Codex token must not make OpenRouter the auto destination."""
         import base64
         import time as _time
 
@@ -934,9 +1290,9 @@ class TestExpiredCodexFallback:
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto
             client, model = _resolve_auto()
-            assert client is not None
-            # OpenRouter is 1st in chain, should win
-            mock_openai.assert_called()
+            assert client is None
+            assert model is None
+            mock_openai.assert_not_called()
 
 
 
@@ -1695,9 +2051,14 @@ class TestStaleFallbackCandidateSkip:
         fresh_fb.chat.completions.create.return_value = _DummyResponse("fresh-fallback")
 
         def _cached_client(provider, model=None, **kw):
-            if provider == "anthropic":
-                return (fresh_fb, "claude-haiku-4-5-20251001")
             return (primary_client, "gpt-5.5")
+
+        runtime = {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+            "api_key": "fresh-test-key",
+        }
 
         with patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("auto", None, None, None, None)), \
@@ -1708,6 +2069,10 @@ class TestStaleFallbackCandidateSkip:
                    return_value=(None, None, "")), \
              patch("agent.auxiliary_client._try_payment_fallback",
                    return_value=(stale_fb, "claude-haiku-4-5-20251001", "anthropic")), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value=runtime), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fresh_fb, "claude-haiku-4-5-20251001")) as mock_resolve, \
              patch("agent.auxiliary_client._refresh_provider_credentials",
                    return_value=True) as mock_refresh:
             result = call_llm(
@@ -1717,6 +2082,7 @@ class TestStaleFallbackCandidateSkip:
 
         assert result.choices[0].message.content == "fresh-fallback"
         mock_refresh.assert_called_once_with("anthropic")
+        assert mock_resolve.call_args.kwargs["_bound_runtime"] is runtime
         assert stale_fb.chat.completions.create.call_count == 1
         assert fresh_fb.chat.completions.create.call_count == 1
 
@@ -1929,7 +2295,7 @@ class TestAuxiliaryFallbackLayering:
 
 
 class TestTryMainAgentModelFallback:
-    """_try_main_agent_model_fallback resolves the user's main provider+model as a safety net."""
+    """_try_main_agent_model_fallback admits only a Codex main route."""
 
     def test_returns_none_when_main_provider_is_auto(self):
         from agent.auxiliary_client import _try_main_agent_model_fallback
@@ -1939,18 +2305,19 @@ class TestTryMainAgentModelFallback:
         assert client is None and model is None and label == ""
 
 
-    def test_resolves_main_provider_client(self):
+    def test_rejects_non_codex_main_provider(self):
         from agent.auxiliary_client import _try_main_agent_model_fallback
         fake_client = MagicMock()
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4"), \
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
              patch("agent.auxiliary_client.resolve_provider_client",
-                   return_value=(fake_client, "anthropic/claude-sonnet-4")):
-            client, model, label = _try_main_agent_model_fallback("glm", task="vision")
-        assert client is fake_client
-        assert model == "anthropic/claude-sonnet-4"
-        assert label == "main-agent(openrouter)"
+                   return_value=(fake_client, "anthropic/claude-sonnet-4")) as resolve:
+             client, model, label = _try_main_agent_model_fallback("glm", task="vision")
+             assert client is None
+             assert model is None
+             assert label == ""
+             resolve.assert_not_called()
 
 
 
@@ -2895,6 +3262,14 @@ class TestCodexAdapterReasoningTranslation:
         )
         assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
 
+    def test_request_headers_reach_responses_transport(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_headers={"session_id": "root-session"},
+        )
+        assert captured["extra_headers"]["session_id"] == "root-session"
+
 
 
 
@@ -3134,15 +3509,11 @@ class TestCodexAdapterGithubResponsesMessageIdDrop:
 
 
 class TestVisionAutoSkipsKimiCoding:
-    """_resolve_auto vision branch skips providers that have no vision on
-    their main endpoint (e.g. Kimi Coding Plan /coding) and falls through
-    to the aggregator chain instead of handing back a client that will 404
-    on every request (#17076).
-    """
+    """Vision auto skips text-only main providers and stays Codex-only."""
 
-    def test_kimi_coding_skipped_falls_through_to_openrouter(self, monkeypatch):
-        """kimi-coding as main + vision auto → OpenRouter (not kimi)."""
-        fake_or_client = MagicMock(name="openrouter_client")
+    def test_kimi_coding_fails_closed_without_codex(self, monkeypatch):
+        """kimi-coding as main + vision auto → fail closed without Codex."""
+        seen = []
 
         monkeypatch.setattr(
             "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding",
@@ -3150,9 +3521,8 @@ class TestVisionAutoSkipsKimiCoding:
         monkeypatch.setattr(
             "agent.auxiliary_client._read_main_model", lambda: "kimi-code",
         )
-        # Guard: if the skip doesn't fire, _resolve_strict_vision_backend
-        # and resolve_provider_client both would try kimi-coding — detect
-        # either via the main-provider call and fail loud.
+        # Guard: if the skip doesn't fire, resolve_provider_client would try
+        # kimi-coding — detect either via the main-provider call and fail loud.
         rpc_mock = MagicMock(side_effect=AssertionError(
             "resolve_provider_client should NOT be called for kimi-coding "
             "on the vision auto path"))
@@ -3161,9 +3531,8 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         def fake_strict(provider, model=None):
-            if provider == "openrouter":
-                return fake_or_client, "google/gemini-3-flash-preview"
-            if provider == "nous":
+            seen.append(provider)
+            if provider == "openai-codex":
                 return None, None
             raise AssertionError(
                 f"strict vision backend should not be called for {provider!r} "
@@ -3175,9 +3544,8 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         provider, client, model = resolve_vision_provider_client()
-        assert provider == "openrouter"
-        assert client is fake_or_client
-        assert model == "google/gemini-3-flash-preview"
+        assert (provider, client, model) == (None, None, None)
+        assert seen == ["openai-codex"]
 
 
 
@@ -4065,8 +4433,8 @@ class TestCompressionFallbackContextFilter:
         small_client = MagicMock(name="small_client")
         large_client = MagicMock(name="large_client")
         entries = [
-            self._make_chain_entry("small-provider", "tiny-8k"),
-            self._make_chain_entry("big-provider", "huge-1m"),
+            self._make_chain_entry("openai-codex", "tiny-8k"),
+            self._make_chain_entry("openai-codex", "huge-1m"),
         ]
 
         def fake_resolve(entry):
@@ -4095,7 +4463,7 @@ class TestCompressionFallbackContextFilter:
             "L2 bug: chain returned the first reachable candidate without "
             "screening by context window.")
         assert model == "huge-1m"
-        assert "big-provider" in label
+        assert "openai-codex" in label
 
 
     # ── same-provider, different-model chain entries ────────────────────
@@ -4112,7 +4480,7 @@ class TestCompressionFallbackContextFilter:
         from agent.auxiliary_client import _try_configured_fallback_chain
 
         entries = [
-            self._make_chain_entry("nvidia", "deepseek-ai/deepseek-v4-pro"),
+            self._make_chain_entry("openai-codex", "deepseek-ai/deepseek-v4-pro"),
         ]
 
         monkeypatch.setattr(
@@ -4359,6 +4727,16 @@ class TestSynchronousFallbackCachePlans:
             resolved_calls.append((provider, model, kwargs))
             return client, model
 
+        runtime = {
+            "provider": entry["provider"],
+            "base_url": entry["base_url"],
+            "api_mode": entry["api_mode"],
+            "api_key": "test-bound-key",
+        }
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **kwargs: runtime,
+        )
         monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
         monkeypatch.setattr(
             "agent.auxiliary_client._get_auxiliary_task_config",
@@ -4401,15 +4779,12 @@ class TestSynchronousFallbackCachePlans:
             "api_mode": "anthropic_messages",
         })
 
-        assert resolved_calls == [(
-            "anthropic",
-            "claude-sonnet-4-6",
-            {
-                "explicit_base_url": "https://api.anthropic.com",
-                "explicit_api_key": None,
-                "api_mode": "anthropic_messages",
-            },
-        )]
+        provider, model, kwargs = resolved_calls[0]
+        assert (provider, model) == ("anthropic", "claude-sonnet-4-6")
+        assert kwargs["explicit_base_url"] == "https://api.anthropic.com"
+        assert kwargs["explicit_api_key"] == "test-bound-key"
+        assert kwargs["api_mode"] == "anthropic_messages"
+        assert kwargs["_bound_runtime"]["api_key"] == "test-bound-key"
         wire_tools = client.chat.completions.create.call_args.kwargs["tools"]
         assert "cache_control" in wire_tools[-1]
         assert "cache_control" not in tools[-1]
@@ -4457,6 +4832,16 @@ class TestAsynchronousFallbackCachePlans:
             return _DummyResponse()
 
         client.chat.completions.create = MagicMock(side_effect=_create)
+        runtime = {
+            "provider": entry["provider"],
+            "base_url": entry["base_url"],
+            "api_mode": entry["api_mode"],
+            "api_key": "test-bound-key",
+        }
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **kwargs: runtime,
+        )
         monkeypatch.setattr(
             "agent.auxiliary_client.resolve_provider_client",
             lambda provider, model=None, **kwargs: (client, model),

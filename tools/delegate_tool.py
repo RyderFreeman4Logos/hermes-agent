@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+import shutil
 
 logger = logging.getLogger(__name__)
 import os
@@ -907,9 +908,8 @@ def _get_max_async_children() -> int:
     DEPRECATED KNOB: ``delegation.max_async_children`` has been unified into
     ``delegation.max_concurrent_children`` — one cap governs both a single
     synchronous batch's parallelism and how many background delegation units
-    may run at once. When at capacity, a new async dispatch is REJECTED (not
-    queued) so a runaway model can't pile up unbounded background work; the
-    caller falls back to running the work synchronously.
+    may run at once. Additional top-level dispatches stay registered on the
+    background executor queue until worker capacity becomes available.
 
     A leftover ``max_async_children`` in config.yaml is ignored (the config
     migration removes it, folding a raised value into
@@ -1372,7 +1372,6 @@ def _build_child_progress_callback(
     subagent_id: Optional[str] = None,
     parent_id: Optional[str] = None,
     depth: Optional[int] = None,
-    model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
 ) -> Optional[callable]:
@@ -1383,8 +1382,8 @@ def _build_child_progress_callback(
       Gateway: batches tool names and relays to parent's progress callback
 
     The identity kwargs (``subagent_id``, ``parent_id``, ``depth``, ``model``,
-    ``toolsets``) are threaded into every relayed event so the TUI can
-    reconstruct the live spawn tree and route per-branch controls (kill,
+    ``provider``, ``toolsets``) are threaded into relayed events after the child
+    has a successful runtime identity, so the TUI can reconstruct the live
     pause) back by ``subagent_id``.  All are optional for backward compat —
     older callers that ignore them still produce a flat list on the TUI.
 
@@ -1418,8 +1417,14 @@ def _build_child_progress_callback(
             kw["parent_id"] = parent_id
         if depth is not None:
             kw["depth"] = depth
-        if model is not None:
-            kw["model"] = model
+        child = session_ref.get("child") if session_ref else None
+        if getattr(child, "_delegate_has_successful_llm_request", False):
+            runtime_model = getattr(child, "model", None)
+            runtime_provider = getattr(child, "provider", None)
+            if isinstance(runtime_model, str) and runtime_model:
+                kw["model"] = runtime_model
+            if isinstance(runtime_provider, str) and runtime_provider:
+                kw["provider"] = runtime_provider
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
         # The child's own session id — filled into the shared ref once the
@@ -1619,9 +1624,13 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    # Profile fallback_chain (list) wins over parent inherit when provided.
+    override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Resolved delegation model-pool profile, used by child-runtime policy.
+    model_profile: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1741,9 +1750,6 @@ def _build_child_agent(
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
         parent_api_key = parent_agent._client_kwargs.get("api_key")
 
-    # Resolve the child's effective model early so it can ride on every event.
-    effective_model_for_cb = model or getattr(parent_agent, "model", None)
-
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.
@@ -1756,7 +1762,6 @@ def _build_child_agent(
         subagent_id=subagent_id,
         parent_id=parent_subagent_id,
         depth=tui_depth,
-        model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
     )
@@ -1881,11 +1886,13 @@ def _build_child_agent(
     # same class of silent-drag the override_provider filter-clearing below
     # already prevents for OpenRouter routing preferences.  Predictability >
     # liveness for explicit pins: the pinned child fails loudly instead.
-    parent_fallback = (
+    parent_fallback: Any = (
         None
         if override_provider
         else (getattr(parent_agent, "_fallback_chain", None) or None)
     )
+    if override_fallback_chain is not None:
+        parent_fallback = override_fallback_chain or None
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1924,6 +1931,22 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+
+    derived_request_overrides = dict(override_request_overrides or {})
+    service_tier = getattr(parent_agent, "service_tier", None)
+    if isinstance(service_tier, str) and service_tier:
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        derived_request_overrides.update(
+            resolve_fast_mode_overrides(effective_model) or {}
+        )
+    from agent.agent_init import _request_override_projections
+
+    child_caller_overrides, child_fast_overrides = _request_override_projections(
+        parent_agent, derived_request_overrides
+    )
+    if child_fast_overrides:
+        child_optional_kwargs["fast_mode_overrides"] = child_fast_overrides
 
     # Each child gets a DEDICATED SessionDB connection instead of the parent's
     # live object. The parent's handle is owned by the parent's lifecycle
@@ -1993,11 +2016,7 @@ def _build_child_agent(
                 provider_sort=child_provider_sort,
                 provider_require_parameters=child_provider_require_parameters,
                 provider_data_collection=child_provider_data_collection,
-                request_overrides=(
-                    dict(override_request_overrides or {})
-                    if override_provider
-                    else dict(getattr(parent_agent, "request_overrides", {}) or {})
-                ),
+                request_overrides=child_caller_overrides,
                 openrouter_min_coding_score=child_openrouter_min_coding_score,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
@@ -2021,9 +2040,13 @@ def _build_child_agent(
         child._owns_session_db = True
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
+    child_session_ref["child"] = child
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
+    # Preserve the resolved model-pool tier for child-runtime retry policy.
+    child._delegate_model_profile = model_profile
+    child._delegate_has_successful_llm_request = False
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
@@ -3036,6 +3059,25 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
+        _result_billing = result.get("billing_block")
+        _child_model = getattr(child, "model", "")
+        if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and (
+                "grok" not in str(_child_model).lower()
+                or (
+                    getattr(child, "_delegate_model_profile", None) == "standard"
+                    and result.get("billing_unverified", False)
+                )
+            )
+        ):
+            # Do not attach a parent xAI terminal to a child routed elsewhere (#209).
+            summary = (
+                "Subagent failed after an unverified provider billing error."
+                if result.get("billing_unverified", False)
+                else "Subagent failed with a provider error unrelated to its effective model."
+            )
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
@@ -3107,6 +3149,14 @@ def _run_single_child(
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
+        if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and result.get("billing_unverified", False)
+            and getattr(child, "_delegate_model_profile", None) == "standard"
+        ):
+            _model = None
+        _provider = getattr(child, "provider", None)
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -3114,7 +3164,6 @@ def _run_single_child(
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
-            "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
             # Explicit, parent-visible truncation flag. A subagent that
             # exhausts its per-child iteration budget still returns a summary,
@@ -3150,6 +3199,20 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if result.get("completed", False) or getattr(
+            child, "_delegate_has_successful_llm_request", False
+        ):
+            if isinstance(_model, str) and _model:
+                entry["model"] = _model
+            if isinstance(_provider, str) and _provider:
+                entry["provider"] = _provider
+        if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and result.get("billing_unverified", False)
+            and getattr(child, "_delegate_model_profile", None) == "standard"
+        ):
+            entry["model"] = None
         # Per-delegation spend, serialized back to the model alongside
         # tokens/api_calls so the parent can see what each delegation cost.
         # Mirrors _child_cost_usd (which is stripped pre-serialization and
@@ -3516,6 +3579,52 @@ def _finalize_child_results(
                 logger.debug("Subagent cost rollup failed", exc_info=True)
 
 
+def _finalize_unstarted_children(
+    children: List[tuple[int, Dict[str, Any], Any]],
+    parent_agent,
+    status: str,
+) -> None:
+    """Close prebuilt children and balance lifecycle when no runner starts."""
+    with _parent_finalization_lock(parent_agent):
+        try:
+            from hermes_cli.plugins import invoke_hook
+        except Exception:
+            invoke_hook = None
+
+        for _task_index, _task, child in children:
+            child_role = getattr(child, "_delegate_role", None)
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close unstarted delegation child", exc_info=True
+                )
+
+            if hasattr(parent_agent, "_active_children"):
+                try:
+                    parent_agent._active_children.remove(child)
+                except ValueError:
+                    pass
+
+            if invoke_hook is None:
+                continue
+            try:
+                invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                    child_session_id=getattr(child, "session_id", None),
+                    child_role=child_role,
+                    child_summary=None,
+                    child_status=status,
+                    tool_call_history=[],
+                    duration_ms=0,
+                )
+            except Exception:
+                logger.debug("subagent_stop hook invocation failed", exc_info=True)
+
+
 def _run_child_lifecycle(
     task_index: int,
     goal: str,
@@ -3630,10 +3739,12 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    force_background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    model_profile: Optional[str] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -3694,6 +3805,9 @@ def delegate_task(
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
+    force_background = _resolve_force_background(force_background)
+    if force_background:
+        background = True
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -3735,10 +3849,21 @@ def delegate_task(
     # ({provider, model, base_url, api_key, api_mode}); the /review engine
     # uses it to route its reviewer subagent onto ``auxiliary.review``
     # without touching the global delegation pin.
+    top_profile = str(model_profile or "").strip() or None
+    creds_by_profile: Dict[Optional[str], dict] = {}
+    routing_cfg = credentials_cfg if credentials_cfg else cfg
+    if top_profile is None and _model_pool(routing_cfg):
+        top_profile = _default_model_profile_name(routing_cfg)
+
+    def _creds_for(profile_name: Optional[str]) -> dict:
+        if profile_name not in creds_by_profile:
+            creds_by_profile[profile_name] = _credentials_for_model_profile(
+                routing_cfg, parent_agent, profile_name
+            )
+        return creds_by_profile[profile_name]
+
     try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
-        )
+        creds = _creds_for(top_profile)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -3832,6 +3957,7 @@ def delegate_task(
     # live_paths is empty and delegation proceeds exactly as before.
     from tools.delegation_live_log import (
         create_live_transcripts,
+        live_transcript_root,
         update_manifest_statuses,
         wrap_progress_callback,
     )
@@ -3879,6 +4005,21 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        task_profile = str(t.get("model_profile") or "").strip() or None
+        resolved_profile = task_profile or top_profile
+        try:
+            task_creds = _creds_for(resolved_profile)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        logger.info(
+            "delegate_task: resolved profile=%s model=%s provider=%s "
+            "reasoning=%s fallback=%s",
+            resolved_profile,
+            task_creds.get("model"),
+            task_creds.get("provider"),
+            routing_cfg.get("reasoning_effort") or "",
+            task_creds.get("fallback_chain"),
+        )
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -3887,18 +4028,20 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_fallback_chain=task_creds.get("fallback_chain"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
+                model_profile=resolved_profile,
                 role=effective_role,
             )
         except ValueError as exc:
@@ -4140,7 +4283,9 @@ def delegate_task(
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
         except Exception:
-            _async_ok = True
+            # force_background is a no-inline guarantee; an unknown delivery
+            # capability cannot safely fall back to the synchronous path.
+            _async_ok = not force_background
 
         _wake_sid = ""
         if not _async_ok:
@@ -4164,6 +4309,22 @@ def delegate_task(
                     _wake_sid,
                 )
                 _async_ok = True
+
+        if not _async_ok and force_background:
+            _finalize_unstarted_children(children, parent_agent, "error")
+            if live_deleg_id:
+                shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "error": (
+                        "delegation.force_background=true requires a durable async "
+                        "completion route; the child was not started."
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         if not _async_ok:
             logger.info(
@@ -4236,6 +4397,17 @@ def delegate_task(
                 except ValueError:
                     pass
 
+        _not_started_lock = threading.Lock()
+        _not_started_finalized = False
+
+        def _finalize_not_started(status: str) -> None:
+            nonlocal _not_started_finalized
+            with _not_started_lock:
+                if _not_started_finalized:
+                    return
+                _not_started_finalized = True
+            _finalize_unstarted_children(children, parent_agent, status)
+
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
@@ -4297,6 +4469,7 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            on_not_started=_finalize_not_started,
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
@@ -4348,24 +4521,13 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
-        logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
-            dispatch.get("error", "rejected"),
-        )
-        _cap_result = _execute_and_aggregate()
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        _finalize_not_started("error")
+        if live_deleg_id:
+            shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+
+        # A full backlog or submit failure is a scheduling error, not
+        # permission to occupy the foreground turn.
+        return tool_error(dispatch.get("error", "Failed to schedule delegation."))
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
@@ -4454,6 +4616,100 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+def _model_pool(cfg: dict) -> dict:
+    pool = cfg.get("model_pool") or {}
+    return pool if isinstance(pool, dict) else {}
+
+
+def _available_model_profile_names(cfg: Optional[dict] = None) -> List[str]:
+    if cfg is None:
+        cfg = _load_config()
+    return [str(name) for name in _model_pool(cfg) if str(name).strip()]
+
+
+def _default_model_profile_name(cfg: dict) -> Optional[str]:
+    names = _available_model_profile_names(cfg)
+    return "standard" if "standard" in names else None
+
+
+def _normalize_profile_fallback_chain(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    chain: List[Dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        normalized = dict(entry)
+        normalized["provider"] = provider
+        normalized["model"] = model
+        chain.append(normalized)
+    return chain
+
+
+def _credentials_for_model_profile(
+    cfg: dict, parent_agent, profile_name: Optional[str]
+) -> dict:
+    """Resolve child creds; an explicit unknown profile fails closed."""
+    name = str(profile_name or "").strip() or None
+    pool = _model_pool(cfg)
+    if pool and "standard" not in _available_model_profile_names(cfg):
+        raise ValueError(
+            "Non-empty model_pool requires an explicit 'standard' profile."
+        )
+    if name is None:
+        if pool:
+            name = _default_model_profile_name(cfg)
+            if name is None:
+                raise ValueError(
+                    "Non-empty model_pool requires an explicit 'standard' profile."
+                )
+        else:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
+            creds.setdefault("fallback_chain", None)
+            return creds
+
+    if name not in pool:
+        available = ", ".join(_available_model_profile_names(cfg)) or "(none)"
+        raise ValueError(f"Unknown {name!r}. Configured: {available}.")
+    profile = pool[name]
+    if not isinstance(profile, dict):
+        raise ValueError(f"{name!r} is not a mapping.")
+
+    overlay = {
+        "model": str(profile.get("model") or "").strip() or None,
+        "provider": str(profile.get("provider") or "").strip() or None,
+        "base_url": str(profile.get("base_url") or "").strip() or None,
+        "api_key": str(profile.get("api_key") or "").strip() or None,
+        "api_mode": str(profile.get("api_mode") or "").strip().lower() or None,
+    }
+    # A non-empty pool is the only routing source; ignore global
+    # delegation.model / provider / base_url / api_key / api_mode.
+    global_route_keys = ("model", "provider", "base_url", "api_key", "api_mode")
+    merged = {key: value for key, value in cfg.items() if key not in global_route_keys}
+    for key, value in overlay.items():
+        if value:
+            merged[key] = value
+    for key in ("request_overrides", "max_output_tokens", "command", "args"):
+        if key in profile:
+            merged[key] = profile[key]
+    creds = _resolve_delegation_credentials(merged, parent_agent)
+    for key in ("request_overrides", "max_output_tokens", "command", "args"):
+        if key in profile:
+            creds[key] = profile[key]
+    if overlay["model"]:
+        creds["model"] = overlay["model"]
+    if overlay["provider"]:
+        creds["provider"] = overlay["provider"]
+    creds["fallback_chain"] = _normalize_profile_fallback_chain(
+        profile.get("fallback_chain")
+    )
+    return creds
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -4711,8 +4967,9 @@ def _build_top_level_description() -> str:
         "require a verifiable handle (URL, ID, absolute path) and verify it "
         "yourself before telling the user the operation succeeded.\n"
         + restrictions_rule +
-        "- Children inherit the parent model unless pinned via "
-        "delegation.provider / delegation.model in config.yaml."
+        "- Omitted model_profile uses standard. Unknown names and a pool "
+        "without standard fail closed; pool tiers supersede "
+        "delegation.provider/model. Results are an array, one per task."
     )
 
 
@@ -4766,6 +5023,36 @@ def _build_dynamic_schema_overrides() -> dict:
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+
+    profile_names = _available_model_profile_names()
+    profile_schema: Dict[str, Any] = {
+        "type": "string",
+        "description": (
+            "Optional named pool tier. Omitted uses standard when configured; "
+            "unknown names fail closed."
+        ),
+    }
+    if profile_names:
+        profile_schema["enum"] = profile_names
+    overrides_params["properties"]["model_profile"] = profile_schema
+
+    tasks_schema = dict(overrides_params["properties"]["tasks"])
+    task_items = dict(tasks_schema["items"])
+    task_items["properties"] = {
+        k: dict(v) for k, v in task_items["properties"].items()
+    }
+    task_profile_schema: Dict[str, Any] = {
+        "type": "string",
+        "description": (
+            "Optional named pool tier for this task; overrides the "
+            "top-level selection."
+        ),
+    }
+    if profile_names:
+        task_profile_schema["enum"] = profile_names
+    task_items["properties"]["model_profile"] = task_profile_schema
+    tasks_schema["items"] = task_items
+    overrides_params["properties"]["tasks"] = tasks_schema
 
     return {
         "description": _build_top_level_description(),
@@ -4831,6 +5118,13 @@ DELEGATE_TASK_SCHEMA = {
                                 "fields you will read."
                             ),
                         },
+                        "model_profile": {
+                            "type": "string",
+                            "description": (
+                                "Optional named pool tier for this task; "
+                                "overrides the top-level selection."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -4874,6 +5168,13 @@ DELEGATE_TASK_SCHEMA = {
                     "specific."
                 ),
             },
+            "model_profile": {
+                "type": "string",
+                "description": (
+                    "Optional named pool tier. Omitted uses standard when "
+                    "configured; unknown names fail closed."
+                ),
+            },
         },
         "required": [],
     },
@@ -4898,7 +5199,22 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    return _force_background_enabled() or not is_subagent
+
+
+def _resolve_force_background(explicit=None) -> bool:
+    """Use config by default; an explicit false opts out."""
+    if explicit is not None:
+        return is_truthy_value(explicit, default=False)
+    try:
+        return bool(_load_config().get("force_background", False))
+    except Exception:
+        return False
+
+
+def _force_background_enabled() -> bool:
+    """Return the configured no-inline guarantee for every delegation depth."""
+    return _resolve_force_background()
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
@@ -4938,6 +5254,7 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        model_profile=args.get("model_profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

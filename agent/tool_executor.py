@@ -21,7 +21,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from agent.display import (
     KawaiiSpinner,
@@ -1815,23 +1815,24 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=name,
-            tool_use_id=tool_call_id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
-        _record_persisted_path_for_stub(agent, tool_call_id, function_result)
-
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
-        if subdir_hints:
-            if _is_multimodal_tool_result(function_result):
-                # Append the hint to the text summary part so the model
-                # still sees it; don't touch the image blocks.
-                _append_subdir_hint_to_multimodal(function_result, subdir_hints)
-            else:
-                function_result += subdir_hints
+        if _is_multimodal_tool_result(function_result):
+            if subdir_hints:
+                # Append the hint to the text summary part so the model sees it;
+                # image blocks are left untouched.
+                _append_subdir_hint_to_multimodal(
+                    cast(dict, function_result), subdir_hints
+                )
+        else:
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=name,
+                tool_use_id=tool_call_id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+                history_suffix=subdir_hints or "",
+            )
+        _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
         # Unwrap _multimodal dicts to an OpenAI-style content list so any
         # vision-capable provider receives [{type:text},{type:image_url}]
@@ -2164,18 +2165,38 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 target = next_args.get("target", "memory")
                 operations = next_args.get("operations")
                 from tools.memory_tool import memory_tool as _memory_tool
-                result = _memory_tool(
-                    action=next_args.get("action"),
-                    target=target,
-                    content=next_args.get("content"),
-                    old_text=next_args.get("old_text"),
-                    operations=operations,
-                    store=agent._memory_store,
-                )
+                if getattr(agent, "_memory_provider_mode", "hybrid") == "authoritative":
+                    if agent._memory_manager:
+                        result = agent._memory_manager.authoritative_memory_write(
+                            next_args,
+                            metadata=agent._build_memory_write_metadata(
+                                task_id=effective_task_id,
+                                tool_call_id=getattr(tool_call, "id", None),
+                            ),
+                        )
+                    else:
+                        result = json.dumps({
+                            "success": False,
+                            "error": "Authoritative memory provider is unavailable.",
+                            "error_class": "provider_unavailable",
+                            "provider_mode": "authoritative",
+                        })
+                else:
+                    result = _memory_tool(
+                        action=next_args.get("action"),
+                        target=target,
+                        content=next_args.get("content"),
+                        old_text=next_args.get("old_text"),
+                        operations=operations,
+                        store=agent._memory_store,
+                    )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager
                 # interface (MemoryManager.notify_memory_tool_write).
-                if agent._memory_manager:
+                if (
+                    getattr(agent, "_memory_provider_mode", "hybrid") != "authoritative"
+                    and agent._memory_manager
+                ):
                     agent._memory_manager.notify_memory_tool_write(
                         result,
                         next_args,
@@ -2737,22 +2758,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=function_name,
-            tool_use_id=tool_call_id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
-        _record_persisted_path_for_stub(agent, tool_call_id, function_result)
-
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
-        if subdir_hints:
-            if _is_multimodal_tool_result(function_result):
-                _append_subdir_hint_to_multimodal(function_result, subdir_hints)
-            else:
-                function_result += subdir_hints
+        if _is_multimodal_tool_result(function_result):
+            if subdir_hints:
+                _append_subdir_hint_to_multimodal(
+                    cast(dict, function_result), subdir_hints
+                )
+        else:
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call_id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+                history_suffix=subdir_hints or "",
+            )
+        _record_persisted_path_for_stub(agent, tool_call_id, function_result)
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.

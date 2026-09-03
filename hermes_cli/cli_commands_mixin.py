@@ -14,6 +14,7 @@ Import discipline (mirrors gateway/slash_commands.py, PR #41886):
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -21,6 +22,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from typing import Any
 from urllib.parse import urlparse
 
 from rich import box as rich_box
@@ -28,6 +30,10 @@ from rich.markup import escape as _escape
 from rich.panel import Panel
 
 from hermes_constants import display_hermes_home, is_termux as _is_termux_environment
+from agent.memory_provider import (
+    normalize_memory_provider_mode,
+    persisted_memory_provider_mode,
+)
 from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
@@ -38,6 +44,133 @@ from hermes_cli.browser_connect import (
     local_port_in_use,
     manual_chrome_debug_command,
 )
+
+
+def _rebind_memory_provider_mode(
+    agent: Any,
+    target_mode: str,
+    messages: list | None = None,
+    *,
+    target_session_id: str | None = None,
+) -> bool:
+    """CAS-rebuild an existing agent's complete frozen memory runtime."""
+    from agent.agent_init import build_memory_subsystem
+    import model_tools
+    from model_tools import get_tool_definitions
+    from tools.memory_tool import frozen_memory_surface
+    from tools.mcp_tool import _agent_tools_lock, _reinject_post_build_tools
+    from tools.registry import registry
+
+    target_mode = normalize_memory_provider_mode(target_mode) or "hybrid"
+    target_session_id = target_session_id or getattr(agent, "session_id", "")
+    for _attempt in range(3):
+        with _agent_tools_lock:
+            old_mode = normalize_memory_provider_mode(
+                getattr(agent, "_memory_provider_mode", None)
+            ) or "hybrid"
+            if target_mode == old_mode:
+                return True
+            epoch = getattr(agent, "_tool_snapshot_generation", 0)
+            epoch = epoch if isinstance(epoch, int) else 0
+            old = {
+                "manager": getattr(agent, "_memory_manager", None),
+                "config": getattr(agent, "_memory_config", {}),
+                "init_config": getattr(agent, "_session_init_model_config", None),
+            }
+            enabled = getattr(agent, "enabled_toolsets", None)
+            disabled = getattr(agent, "disabled_toolsets", None)
+        with registry._lock:
+            registry_generation = registry._generation
+
+        new_manager = None
+        try:
+            memory_config = copy.deepcopy(old["config"])
+            state = build_memory_subsystem(
+                agent,
+                {"memory": memory_config},
+                skip_memory=bool(getattr(agent, "_skip_memory", False)),
+                provider_mode=target_mode,
+                session_id=target_session_id,
+            )
+            new_manager = state["manager"]
+            flags = (state["memory_enabled"], state["user_profile_enabled"])
+            with frozen_memory_surface(target_mode, flags):
+                new_tools = list(
+                    get_tool_definitions(
+                        enabled_toolsets=enabled,
+                        disabled_toolsets=disabled,
+                        quiet_mode=getattr(agent, "quiet_mode", False),
+                    )
+                    or []
+                )
+            new_names = {tool["function"]["name"] for tool in new_tools}
+            staged_agent = copy.copy(agent)
+            staged_agent.enabled_toolsets = enabled
+            staged_agent.disabled_toolsets = disabled
+            staged_agent._memory_manager = new_manager
+            staged_agent.tools = new_tools
+            staged_agent.valid_tool_names = new_names
+            staged_context_names = _reinject_post_build_tools(
+                staged_agent, new_tools, new_names
+            )
+            new_init_config = (
+                dict(old["init_config"])
+                if isinstance(old["init_config"], dict)
+                else {}
+            )
+            new_init_config["memory_provider_mode"] = target_mode
+
+            retirement_release = threading.Event()
+            retirement_ticket = None
+            with registry._lock:
+                with _agent_tools_lock:
+                    if (
+                        registry._generation != registry_generation
+                        or getattr(agent, "_tool_snapshot_generation", 0) != epoch
+                    ):
+                        raise LookupError("stale tool snapshot")
+                    if old["manager"] is not None and old["manager"] is not new_manager:
+                        retirement_ticket = old["manager"].commit_session_boundary_async(
+                            messages or [],
+                            new_session_id="",
+                            retire=True,
+                            release_event=retirement_release,
+                        )
+                        if retirement_ticket.done() and retirement_ticket.exception() is not None:
+                            raise RuntimeError("memory retirement admission failed")
+                    agent._memory_manager = new_manager
+                    agent._memory_store = state["store"]
+                    agent._memory_enabled, agent._user_profile_enabled = flags
+                    agent._memory_provider_mode = target_mode
+                    agent._memory_config = memory_config
+                    agent.enabled_toolsets = enabled
+                    agent.disabled_toolsets = disabled
+                    agent.tools = new_tools
+                    agent.valid_tool_names = new_names
+                    agent._context_engine_tool_names = staged_context_names
+                    agent._session_init_model_config = new_init_config
+                    agent._tool_snapshot_generation = epoch + 1
+                    model_tools._last_resolved_tool_names = sorted(new_names)
+                    agent._pending_memory_retirement = (
+                        (retirement_release, retirement_ticket, old["manager"])
+                        if old["manager"] is not None
+                        and retirement_ticket is not None
+                        else None
+                    )
+                    new_manager = None
+            return True
+        except LookupError:
+            if new_manager is not None and new_manager is not old["manager"]:
+                new_manager.shutdown_all()
+            continue
+        except Exception:
+            if new_manager is not None and new_manager is not old["manager"]:
+                try:
+                    new_manager.shutdown_all()
+                except Exception:
+                    pass
+            return False
+    return False
 
 
 class CLICommandsMixin:
@@ -1097,6 +1230,40 @@ class CLICommandsMixin:
             return
 
         old_session_id = self.session_id
+        outgoing_history = list(self.conversation_history)
+        model_history, display_history = self._session_db.get_resume_conversations(
+            target_id
+        )
+        restored = [m for m in (model_history or []) if m.get("role") != "session_meta"]
+        resume_display_history = [
+            m for m in (display_history or []) if m.get("role") != "session_meta"
+        ]
+        target_memory_mode = persisted_memory_provider_mode(session_meta)
+        _pending_retirement = None
+        try:
+            if (
+                self.agent
+                and target_memory_mode is not None
+                and not _rebind_memory_provider_mode(
+                    self.agent,
+                    target_memory_mode,
+                    outgoing_history,
+                    target_session_id=target_id,
+                )
+            ):
+                _cprint("  Could not restore the target session's memory routing; resume cancelled.")
+                return
+        finally:
+            if self.agent:
+                _pending_retirement = getattr(
+                    self.agent, "_pending_memory_retirement", None
+                )
+                if _pending_retirement is not None:
+                    self.agent._pending_memory_retirement = None
+                    _pending_retirement[0].set()
+                    _pending_retirement[2].wait_for_retirement(
+                        _pending_retirement[1]
+                    )
         # Flush un-persisted messages before ending the old session (#47202).
         if self.agent:
             try:
@@ -1129,14 +1296,8 @@ class CLICommandsMixin:
         # lineage verbatim, used by _display_resumed_history() so timeline
         # events and ancestor rows render correctly (matching the startup
         # --resume path in _preload_resumed_session).
-        model_history, display_history = self._session_db.get_resume_conversations(
-            target_id
-        )
-        restored = [m for m in (model_history or []) if m.get("role") != "session_meta"]
         self.conversation_history = restored
-        self._resume_display_history = [
-            m for m in (display_history or []) if m.get("role") != "session_meta"
-        ]
+        self._resume_display_history = resume_display_history
 
         # Re-open the target session so it's not marked as ended
         try:
@@ -1165,9 +1326,10 @@ class CLICommandsMixin:
             # subsequent writes. See #6672.
             try:
                 _mm = getattr(self.agent, "_memory_manager", None)
-                if _mm is not None:
-                    _mm.on_session_switch(
-                        target_id,
+                if _mm is not None and _pending_retirement is None:
+                    _mm.commit_session_boundary_async(
+                        outgoing_history,
+                        new_session_id=target_id,
                         parent_session_id=old_session_id or "",
                         reset=False,
                         reason="resume",
@@ -1441,6 +1603,15 @@ class CLICommandsMixin:
         # list_sessions_rich() can keep the branch visible in /resume and
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        init_config = getattr(self.agent, "_session_init_model_config", None)
+        if isinstance(init_config, dict) and "memory_provider_mode" in init_config:
+            memory_provider_mode = normalize_memory_provider_mode(
+                init_config["memory_provider_mode"]
+            ) or "hybrid"
+        else:
+            memory_provider_mode = normalize_memory_provider_mode(
+                getattr(self.agent, "_memory_provider_mode", None)
+            ) or "hybrid"
         try:
             self._session_db.create_session(
                 session_id=new_session_id,
@@ -1448,7 +1619,8 @@ class CLICommandsMixin:
                 model=self.model,
                 model_config={
                     "max_iterations": self.max_turns,
-                    "reasoning_config": self.reasoning_config,
+                    "reasoning_config": copy.deepcopy(self.reasoning_config),
+                    "memory_provider_mode": memory_provider_mode,
                     "_branched_from": parent_session_id,
                 },
                 parent_session_id=parent_session_id,
@@ -2259,7 +2431,7 @@ class CLICommandsMixin:
                     session_db=self._session_db,
                     reasoning_config=self.reasoning_config,
                     service_tier=self.service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
+                    fast_mode_overrides=turn_route.get("request_overrides"),
                     providers_allowed=self._providers_only,
                     providers_ignored=self._providers_ignore,
                     providers_order=self._providers_order,

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import logging
 import os
 import queue
@@ -22,6 +23,11 @@ from agent.secret_scope import (
     build_profile_secret_scope,
     reset_secret_scope,
     set_secret_scope,
+)
+from agent.memory_provider import normalize_memory_provider_mode
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    POST_COMPRESSION_CACHE_NOTE,
 )
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
@@ -1266,7 +1272,10 @@ def _interrupt_session_turn(
             request_hard_interrupt(session.get("agent"))
         if not run_thread_alive:
             with session["history_lock"]:
-                if session.get("running"):
+                if (
+                    session.get("running")
+                    and session.get("_manual_compression_fence") is None
+                ):
                     session["running"] = False
                     _clear_inflight_turn(session)
 
@@ -2516,6 +2525,12 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    # This is the authoritative moment a terminal turn frame leaves the
+    # gateway. Keep it on the frame (rather than a client-side Date.now()) so
+    # the TUI can distinguish a delayed delivery from an agent that just
+    # stopped. Copy rather than mutate because some callers reuse payloads.
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
     write_json(_event_frame(event, sid, payload))
 
 
@@ -2623,6 +2638,7 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
+    memory_provider_mode = _session_memory_provider_mode(session)
     return {
         "type": "turn.start",
         "sid": sid,
@@ -2638,6 +2654,7 @@ def _compute_host_turn_frame(
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
+        "memory_provider_mode_override": memory_provider_mode,
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
@@ -3220,7 +3237,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {"session_db": session_db}
+                kw: dict[str, Any] = {"session_db": session_db}
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -3248,6 +3265,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                    kw["memory_provider_mode_override"] = _session_memory_provider_mode(current)
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -3263,6 +3281,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _persist_live_session_runtime(current)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -3787,6 +3806,28 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
+def _session_memory_provider_mode(session: dict) -> str:
+    agent = session.get("agent") or {}
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict) and "memory_provider_mode" in init_config:
+        return normalize_memory_provider_mode(init_config["memory_provider_mode"]) or "hybrid"
+    mode = getattr(agent, "_memory_provider_mode", None)
+    if hasattr(agent, "_memory_provider_mode"):
+        return normalize_memory_provider_mode(mode) or "hybrid"
+    overrides = session.get("resume_runtime_overrides")
+    if isinstance(overrides, dict) and "memory_provider_mode_override" in overrides:
+        return normalize_memory_provider_mode(
+            overrides["memory_provider_mode_override"]
+        ) or "hybrid"
+    try:
+        from tools.memory_tool import get_memory_provider_mode
+
+        memory_config = _load_cfg().get("memory", {})
+        return get_memory_provider_mode(memory_config if isinstance(memory_config, dict) else {})
+    except Exception:
+        return "hybrid"
+
+
 def _ensure_session_db_row(session: dict) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
@@ -3887,6 +3928,7 @@ def _ensure_session_db_row(session: dict) -> None:
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
     parent_session_id = session.get("parent_session_id") or None
+    model_config["memory_provider_mode"] = _session_memory_provider_mode(session)
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
     # Bot-Mode room plumbing sessions are per-member scratch conversations
@@ -5423,6 +5465,11 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["service_tier_override"] = ""
     elif service_tier:
         overrides["service_tier_override"] = service_tier
+    if "memory_provider_mode" in model_config:
+        overrides["memory_provider_mode_override"] = (
+            normalize_memory_provider_mode(model_config["memory_provider_mode"])
+            or "hybrid"
+        )
 
     return overrides
 
@@ -5442,13 +5489,22 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     route the resumed chat to the wrong endpoint while the model column claimed
     the new one.
     """
-    config = dict(existing or {})
+    config = copy.deepcopy(existing) if isinstance(existing, dict) else {}
     model = str(getattr(agent, "model", "") or "").strip()
     provider = str(getattr(agent, "provider", "") or "").strip()
     base_url = str(getattr(agent, "base_url", "") or "").strip()
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict) and "memory_provider_mode" in init_config:
+        memory_provider_mode = normalize_memory_provider_mode(
+            init_config["memory_provider_mode"]
+        ) or "hybrid"
+    else:
+        memory_provider_mode = normalize_memory_provider_mode(
+            getattr(agent, "_memory_provider_mode", None)
+        ) or "hybrid"
 
     if model:
         config["model"] = model
@@ -5495,13 +5551,14 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     else:
         config.pop("api_mode", None)
     if isinstance(reasoning_config, dict):
-        config["reasoning_config"] = reasoning_config
+        config["reasoning_config"] = copy.deepcopy(reasoning_config)
     else:
         config.pop("reasoning_config", None)
     if service_tier:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+    config["memory_provider_mode"] = memory_provider_mode
 
     return config
 
@@ -6103,30 +6160,61 @@ def _persist_model_switch(result) -> None:
 
 def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
-    return {
+    from agent.agent_init import _copy_request_override_graph
+
+    snapshot = {
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
-        "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
+        "primary_runtime": getattr(agent, "_primary_runtime", None),
     }
+    if hasattr(agent, "request_overrides"):
+        snapshot["request_overrides"] = _copy_request_override_graph(
+            agent.request_overrides
+        )
+    snapshot["one_turn_fallback_state"] = {
+        name: _copy_request_override_graph(getattr(agent, name))
+        for name in (
+            "_fallback_chain",
+            "_fallback_model",
+            "_fallback_index",
+            "_consecutive_stale_streams",
+        )
+        if hasattr(agent, name)
+    }
+    return snapshot
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
         return
+    from agent.agent_init import _copy_request_override_graph
+
+    def _restore_request_overrides() -> None:
+        if "request_overrides" in snapshot:
+            agent.request_overrides = _copy_request_override_graph(
+                snapshot["request_overrides"]
+            )
+
+    def _restore_one_turn_fallback_state() -> None:
+        for name, value in snapshot.get("one_turn_fallback_state", {}).items():
+            setattr(agent, name, _copy_request_override_graph(value))
+
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
-            agent._primary_runtime = copy.deepcopy(primary)
+            agent._primary_runtime = primary
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
+                _restore_request_overrides()
+                _restore_one_turn_fallback_state()
                 return
         except Exception:
-            logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
+            logger.debug("TUI one-turn model restore via primary runtime failed")
     if hasattr(agent, "switch_model"):
         agent.switch_model(
             new_model=snapshot.get("model", ""),
@@ -6135,6 +6223,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
         )
+        _restore_request_overrides()
+        _restore_one_turn_fallback_state()
 
 
 @contextlib.contextmanager
@@ -6213,9 +6303,13 @@ def _apply_model_switch(
         is_global_flag = parsed_flags.is_global
         is_session = parsed_flags.is_session
         one_turn = parsed_flags.is_once
+        is_after_compression = parsed_flags.is_after_compression
+        reasoning = parsed_flags.reasoning
     else:
         model_input, explicit_provider, is_global_flag, _force_refresh, is_session = parsed_flags
         one_turn = False
+        is_after_compression = False
+        reasoning = ""
     # Conflict validation delegates to the shared single-owner parser; the
     # TUI surfaces it as a raised ValueError (its historical behavior)
     # using the canonical error copy.
@@ -6231,7 +6325,7 @@ def _apply_model_switch(
             explicit_provider=explicit_provider,
         )
     )
-    if not model_input:
+    if not model_input and not is_after_compression:
         raise ValueError("model value required")
 
     agent = session.get("agent")
@@ -6286,9 +6380,29 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        is_after_compression=is_after_compression,
+        reasoning=reasoning,
+        validate_live=not is_after_compression,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
+
+    if is_after_compression:
+        if agent is None:
+            raise ValueError("--after-compression requires a live session")
+        try:
+            from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+            schedule_model_switch_after_compression(agent, result)
+        except Exception as exc:
+            raise ValueError(f"Could not schedule model switch: {exc}") from exc
+        return {
+            "value": result.new_model,
+            "warning": result.warning_message or "",
+            "confirm_required": False,
+            "scope": "after_compression",
+            "deferred": True,
+        }
 
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
 
@@ -6888,6 +7002,34 @@ class CompressionLockHeld(Exception):
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
 
 
+def _begin_manual_compression_fence(session: dict) -> threading.Event:
+    """Return the generation token that owns this compression boundary."""
+    with session["history_lock"]:
+        if (
+            session.get("running")
+            or session.get("_manual_compression_fence") is not None
+        ):
+            raise RuntimeError(
+                "session busy — /interrupt the current turn before /compress"
+            )
+        fence = threading.Event()
+        session["_manual_compression_fence"] = fence
+        session["running"] = True
+        return fence
+
+
+def _finish_manual_compression_fence(
+    session: dict, fence: threading.Event | None
+) -> None:
+    """Release only the compression generation represented by ``fence``."""
+    with session["history_lock"]:
+        if fence is None or session.get("_manual_compression_fence") is not fence:
+            return
+        session["running"] = False
+        session.pop("_manual_compression_fence", None)
+    fence.set()
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
@@ -6929,6 +7071,17 @@ def _compress_session_history(
             before_messages = list(session.get("history", []))
             history_version = int(session.get("history_version", 0))
     history = before_messages
+    _replay_cache_pending_before = bool(
+        getattr(agent, "_awaiting_cache_usage_after_compression", False)
+    )
+    _replay_compressor = getattr(agent, "context_compressor", None)
+    _replay_real_usage_pending_before = bool(
+        getattr(
+            _replay_compressor,
+            "awaiting_real_usage_after_compression",
+            False,
+        )
+    )
     if len(history) < 4:
         usage = _get_usage(agent)
         return 0, usage
@@ -7004,6 +7157,15 @@ def _compress_session_history(
         if int(session.get("history_version", 0)) != history_version:
             # External mutation during compaction — drop the compressed
             # result so we don't clobber concurrent edits.
+            agent._awaiting_cache_usage_after_compression = (
+                _replay_cache_pending_before
+            )
+            if _replay_compressor is not None and hasattr(
+                _replay_compressor, "awaiting_real_usage_after_compression"
+            ):
+                _replay_compressor.awaiting_real_usage_after_compression = (
+                    _replay_real_usage_pending_before
+                )
             finalize_context_engine_compression_notification(
                 agent,
                 committed=False,
@@ -7173,6 +7335,257 @@ def _get_usage(agent) -> dict:
         except Exception:
             pass
     return usage
+
+
+def _cache_counter_snapshot(agent) -> dict[str, int | None]:
+    def count(name: str, *, optional: bool = False) -> int | None:
+        value = getattr(agent, name, None)
+        if value is None:
+            return None if optional else 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return None if optional else 0
+
+    return {
+        "calls": count("session_api_calls"),
+        "prompt_tokens": count("session_prompt_tokens"),
+        "read_tokens": count("session_cache_read_tokens", optional=True),
+        "write_tokens": count("session_cache_write_tokens", optional=True),
+    }
+
+
+def _cache_info_for_turn(agent, baseline: dict[str, int | None] | None) -> dict[str, int | str]:
+    current = _cache_counter_snapshot(agent)
+    if current["read_tokens"] is None or current["write_tokens"] is None:
+        return {"state": "unavailable", "pct": 0}
+    before = baseline or {key: 0 for key in current}
+    delta = {
+        key: max(0, int(current[key] or 0) - int(before.get(key, 0) or 0))
+        for key in current
+    }
+    prompt_tokens = delta["prompt_tokens"]
+    read_tokens = delta["read_tokens"]
+    write_tokens = delta["write_tokens"]
+    if delta["calls"] == 0 or prompt_tokens == 0:
+        return {"state": "unavailable", "pct": 0}
+    pct = round(100 * read_tokens / prompt_tokens)
+    state = "hit" if read_tokens else "cold_write" if write_tokens else "miss"
+    return {
+        "state": state,
+        "pct": pct,
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+    }
+
+
+def _cache_status_text(info: dict[str, int | str]) -> str:
+    state = str(info.get("state") or "unavailable")
+    if state == "unavailable":
+        return "cache unavailable"
+    pct = int(info.get("pct") or 0)
+    label = "<1%" if pct == 0 and int(info.get("read_tokens") or 0) > 0 else f"{pct}%"
+    counts = ""
+    if "read_tokens" in info and "prompt_tokens" in info:
+        counts = f" {int(info['read_tokens'])}/{int(info['prompt_tokens'])}"
+    if state == "cold_write":
+        text = f"cache COLD_WRITE{counts}"
+    else:
+        text = f"cache {label}{counts}"
+    if info.get("attribution") == "post_compression":
+        text += f" · {POST_COMPRESSION_CACHE_NOTE}"
+    return text
+
+
+def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
+    if not isinstance(record, dict):
+        return {"state": "unavailable", "pct": 0}
+    info: dict[str, int | str] = {
+        "state": str(record.get("state") or "unavailable"),
+        "pct": int(record.get("pct") or 0),
+    }
+    if record.get("compression_bound") is True:
+        info["compression_bound"] = True
+    for key in ("read_tokens", "prompt_tokens"):
+        if key in record:
+            try:
+                info[key] = max(0, int(record[key]))
+            except (TypeError, ValueError):
+                pass
+    if info["state"] == "no_field":
+        info["state"] = "unavailable"
+    if record.get("attribution") == "post_compression":
+        info["attribution"] = "post_compression"
+    return info
+
+
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str]:
+    if not isinstance(usage, dict):
+        return {"state": "unavailable", "pct": 0}
+    try:
+        read_tokens = max(0, int(usage.get("cache_read_tokens", 0) or 0))
+        write_tokens = max(0, int(usage.get("cache_write_tokens", 0) or 0))
+        prompt_tokens = max(0, int(usage.get("prompt_tokens", 0) or 0))
+    except (TypeError, ValueError):
+        return {"state": "unavailable", "pct": 0}
+    telemetry = usage.get("cache_telemetry")
+    if telemetry is None and (read_tokens or write_tokens):
+        telemetry = "reported"
+    if telemetry != "reported":
+        return {"state": "unavailable", "pct": 0}
+    if read_tokens:
+        state = "hit"
+        pct = round(100 * read_tokens / prompt_tokens) if prompt_tokens else 0
+    elif write_tokens:
+        state = "cold_write"
+        pct = 0
+    else:
+        state = "miss"
+        pct = 0
+    cache_info: dict[str, int | str] = {
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+        "pct": pct,
+        "state": state,
+        "level": "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info",
+    }
+    if usage.get("cache_attribution") == "post_compression":
+        cache_info["attribution"] = "post_compression"
+    return cache_info
+
+
+def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
+    session = _sessions.get(sid) or {}
+    if "cache_info" in payload:
+        record = session.get("first_provider_response")
+        cache_info = payload.get("cache_info")
+        if (
+            isinstance(cache_info, dict)
+            and isinstance(record, dict)
+            and record.get("compression_bound") is True
+        ):
+            cache_info["compression_bound"] = True
+        return
+    agent = session.get("agent")
+    info = _cache_info_from_first_call(session.get("first_provider_response"))
+    if (
+        info["state"] == "unavailable"
+        and "read_tokens" not in info
+        and "prompt_tokens" not in info
+        and agent is not None
+    ):
+        info = _cache_info_for_turn(agent, session.get("_cache_counter_baseline"))
+    session["first_provider_response"] = {
+        **info,
+        "owner": "tui_gateway",
+        "request_index": 1,
+        "timestamp": time.time(),
+        "session": hashlib.sha256(
+            f"{sid}:{getattr(agent, 'session_id', '')}".encode()
+        ).hexdigest(),
+    }
+    payload["cache_info"] = info
+    if info["state"] != "unavailable" and not session.get("_cache_status_emitted"):
+        session["_cache_status_emitted"] = True
+        _emit(
+            "status.update",
+            sid,
+            {
+                "kind": "cache_hit",
+                "text": _cache_status_text(info),
+                "cache_record": session["first_provider_response"],
+            },
+        )
+
+
+def _attach_tui_cache_callback(agent, sid: str):
+    """Publish the first provider cache response for each TUI wake."""
+    agent._tui_cache_owner_session = sid
+
+    def emit_cache_state(
+        state: str, pct: int, _read: int, _prompt: int, record: dict | None = None
+    ) -> None:
+        session = _sessions.get(sid)
+        if (
+            getattr(agent, "_tui_cache_owner_session", None) != sid
+            or not isinstance(session, dict)
+            or session.get("agent") is not agent
+        ):
+            return
+        if not getattr(agent, "_tui_first_provider_response_record_enabled", False):
+            return
+        if getattr(agent, "_tui_first_provider_response_recorded", False):
+            return
+        agent._tui_first_provider_response_recorded = True
+        cache_info = _cache_info_from_usage(
+            getattr(agent, "_first_turn_usage", None)
+        )
+        if cache_info["state"] == "unavailable":
+            cache_info = {
+                "read_tokens": _read,
+                "prompt_tokens": _prompt,
+                "pct": pct,
+                "state": state,
+                "level": "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info",
+            }
+        if getattr(
+            getattr(agent, "context_compressor", None),
+            "awaiting_real_usage_after_compression",
+            False,
+        ):
+            cache_info["compression_bound"] = True
+        if isinstance(record, dict) and record.get("attribution") == "post_compression":
+            cache_info["attribution"] = "post_compression"
+        cache_state = str(cache_info.get("state") or state)
+        cache_pct = int(cache_info.get("pct") or 0)
+        text = (
+            f"cache {cache_pct}%"
+            if cache_state == "hit"
+            else "cache unavailable"
+            if cache_state in {"no_field", "unavailable"}
+            else f"cache {cache_state.upper()}"
+        )
+        if cache_info.get("attribution") == "post_compression":
+            text += f" · {POST_COMPRESSION_CACHE_NOTE}"
+        payload: dict[str, Any] = {
+            "kind": "cache_hit",
+            "text": text,
+        }
+        if isinstance(record, dict):
+            cache_record = {key: value for key, value in record.items() if value is not None}
+            if cache_info.get("compression_bound") is True:
+                cache_record["compression_bound"] = True
+            for key, raw in (("read_tokens", _read), ("prompt_tokens", _prompt)):
+                if key in cache_record:
+                    continue
+                try:
+                    count = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if count >= 0:
+                    cache_record[key] = count
+            cache_record.update(
+                state=cache_state,
+                pct=cache_pct if cache_state == "hit" else None,
+                level=cache_info.get("level", "error"),
+                owner="tui_gateway",
+                session=hashlib.sha256(
+                    f"{sid}:{getattr(agent, 'session_id', '')}".encode()
+                ).hexdigest(),
+            )
+            if cache_info.get("attribution") == "post_compression":
+                cache_record["attribution"] = "post_compression"
+            session["first_provider_response"] = cache_record
+            session["_cache_status_emitted"] = True
+            payload["cache_record"] = cache_record
+        # No provider response means there is no status transition to show.
+        # Keep the completion payload's unavailable cache_info, but avoid a
+        # synthetic status event that changes otherwise identical turn traces.
+        if cache_state != "unavailable":
+            _emit("status.update", sid, payload)
+
+    agent._tui_cache_callback = emit_cache_state
+    return agent
 
 
 def _probe_credentials(agent) -> str:
@@ -8293,6 +8706,22 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    service_tier = getattr(agent, "service_tier", None) or _load_service_tier()
+    try:
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        fast_mode_overrides = (
+            resolve_fast_mode_overrides(str(getattr(agent, "model", "") or "")) or {}
+            if service_tier
+            else {}
+        )
+    except Exception:
+        fast_mode_overrides = {}
+    from agent.agent_init import _request_override_projections
+
+    caller_overrides, fast_mode_overrides = _request_override_projections(
+        agent, fast_mode_overrides
+    )
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
@@ -8325,8 +8754,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "session_id": task_id,
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(str(getattr(agent, "model", "") or "")),
-        "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "service_tier": service_tier,
+        "request_overrides": caller_overrides,
+        "fast_mode_overrides": fast_mode_overrides,
         "platform": "tui",
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),
@@ -8483,6 +8913,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
+    _persist_live_session_runtime(session)
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
     session["queued_prompt"] = None
@@ -8648,6 +9079,7 @@ def _make_agent(
     provider_override: str | None = None,
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
+    memory_provider_mode_override: str | None = None,
     platform_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
@@ -8657,7 +9089,7 @@ def _make_agent(
 
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
 
     from run_agent import AIAgent
 
@@ -8778,7 +9210,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -8804,6 +9236,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
+        memory_provider_mode_override=memory_provider_mode_override,
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
@@ -8825,6 +9258,7 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _init_session(
@@ -9712,6 +10146,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    on_admitted: Callable[[], None] | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -9740,6 +10175,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if on_admitted is not None:
+        queued["_on_admitted"] = [on_admitted]
     existing = session.get("queued_prompt")
     if (
         existing
@@ -9751,6 +10188,7 @@ def _enqueue_prompt(
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        existing.setdefault("_on_admitted", []).extend(queued.get("_on_admitted", []))
         return
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
@@ -10008,6 +10446,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session.pop("queued_prompts", None)
             session["running"] = False
             return True
+    admitted = False
     dispatch_failed = False
     try:
         if use_compute_host:
@@ -10031,24 +10470,27 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
+            else:
+                admitted = True
         else:
             if queued.get("image_paths"):
-                _run_prompt_submit(
+                admitted = _run_prompt_submit(
                     rid,
                     sid,
                     session,
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
-                )
+                ) is True
             else:
-                _run_prompt_submit(
+                admitted = _run_prompt_submit(
                     rid,
                     sid,
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
-                )
+                ) is True
+            dispatch_failed = not admitted
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -10058,6 +10500,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         with session["history_lock"]:
             session["running"] = False
         dispatch_failed = True
+    if admitted:
+        for callback in queued.get("_on_admitted", []):
+            callback()
     if dispatch_failed:
         with session["history_lock"]:
             drain_next = bool(session.get("queued_prompt")) and not session.get(
@@ -10167,6 +10612,12 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
+    first_usage = getattr(agent, "_first_turn_usage", None) or getattr(
+        agent, "_last_turn_usage", None
+    )
+    if first_usage:
+        payload["cache_info"] = _cache_info_from_usage(first_usage)
+    _stamp_loop_cache_info(sid, payload)
     _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
@@ -11528,6 +11979,550 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+def _session_identity_keys(sid: str, session: dict) -> set[str]:
+    current = {
+        str(sid or ""),
+        str(session.get("session_key") or ""),
+        _session_lookup_key(session, fallback=sid),
+    }
+    current.discard("")
+    return current
+
+
+def _resume_tip(key: str) -> str:
+    if not key:
+        return ""
+    try:
+        db = _get_db()
+    except Exception:
+        db = None
+    if db is None:
+        return key
+    try:
+        return str(db.resolve_resume_session_id(key) or key)
+    except Exception:
+        return key
+
+
+def _iter_live_delegate_records() -> list[dict]:
+    """In-memory live rows plus durable running/finalizing rows (process restart)."""
+    records: list[dict] = []
+    seen: set[str] = set()
+    try:
+        from tools.async_delegation import list_async_delegations
+
+        for rec in list_async_delegations():
+            if rec.get("status") not in {"running", "stalling", "finalizing"}:
+                continue
+            did = str(rec.get("delegation_id") or "")
+            records.append(rec)
+            if did:
+                seen.add(did)
+    except Exception:
+        pass
+    try:
+        from tools.async_delegation import _DB_LOCK, _transaction
+
+        with _DB_LOCK, _transaction() as conn:
+            rows = conn.execute(
+                """SELECT delegation_id, origin_session, origin_ui_session_id,
+                          parent_session_id
+                   FROM async_delegations
+                   WHERE state IN ('running', 'finalizing')"""
+            ).fetchall()
+    except Exception:
+        rows = []
+    for did, session_key, origin_ui, parent_id in rows:
+        did = str(did or "")
+        if did and did in seen:
+            continue
+        records.append(
+            {
+                "delegation_id": did,
+                "session_key": session_key,
+                "origin_ui_session_id": origin_ui,
+                "parent_session_id": parent_id,
+                "status": "running",
+            }
+        )
+    return records
+
+
+def _this_session_live_delegate_origin_keys(sid: str, session: dict) -> set[str]:
+    """Raw owner keys of live delegates belonging to this (possibly compressed) session."""
+    current = _session_identity_keys(sid, session)
+    if not current:
+        return set()
+    current_tips = {_resume_tip(k) for k in current} | current
+    current_tips.discard("")
+    origin: set[str] = set()
+    for rec in _iter_live_delegate_records():
+        rec_keys = {
+            str(rec.get("session_key") or ""),
+            str(rec.get("parent_session_id") or ""),
+            str(rec.get("origin_ui_session_id") or ""),
+        }
+        rec_keys.discard("")
+        rec_keys.discard("default")
+        if not rec_keys:
+            continue
+        if rec_keys & current or any(_resume_tip(k) in current_tips for k in rec_keys):
+            origin |= rec_keys
+    return origin
+
+
+def _is_live_delegate_child_completion(sid: str, session: dict, evt: dict) -> bool:
+    """Child terminal() tails are owned by a live delegate, not the parent session.
+
+    Production ``terminal()`` stores task_id="default" for parent and child.
+    Ownership is the registry/event session_key or parent_session_id matching
+    the live delegate's raw keys — never task_id inequality.
+    """
+    if evt.get("type") != "completion":
+        return False
+    origin = _this_session_live_delegate_origin_keys(sid, session)
+    if not origin:
+        return False
+    candidates = {str(evt.get("session_key") or "")}
+    try:
+        from tools.process_registry import process_registry
+
+        proc = process_registry.get(str(evt.get("session_id") or ""))
+    except Exception:
+        proc = None
+    if proc is not None:
+        candidates.add(str(getattr(proc, "session_key", "") or ""))
+        candidates.add(str(getattr(proc, "parent_session_id", "") or ""))
+    candidates.discard("")
+    candidates.discard("default")
+    return bool(candidates & origin)
+
+
+def _mark_completion_events_consumed(events: list) -> None:
+    from tools.process_registry import process_registry
+
+    for evt in events:
+        if evt.get("type") != "completion":
+            continue
+        sid = evt.get("session_id")
+        if sid:
+            process_registry._completion_consumed.add(sid)
+
+
+def _filter_routine_delegated_child_completions(events: list) -> list:
+    """Consume silent child successes before completion fan-in projects them."""
+    from tools.process_registry import ProcessRegistry
+
+    visible = []
+    silent = []
+    for evt in events:
+        if ProcessRegistry._is_routine_delegated_child_completion(evt):
+            silent.append(evt)
+        else:
+            visible.append(evt)
+    _mark_completion_events_consumed(silent)
+    return visible
+
+
+def _take_steered_completion_snapshot(session: dict, text: str) -> list:
+    """Make the staged completions carried by ``text`` fresh until admission."""
+    selected = []
+    with session["history_lock"]:
+        for evt in session.get("_completion_pending") or []:
+            event_sid = str(evt.get("session_id") or "")
+            if (
+                evt.get("_steer_accepted")
+                and event_sid
+                and f" {event_sid} " in f" {text} "
+            ):
+                evt.pop("_steer_accepted", None)
+                evt.pop("_steer_publication", None)
+                selected.append(evt)
+    return selected
+
+
+def _ack_steered_completion_ingest(session: dict, snapshot: list | None = None) -> None:
+    """ACK staged completions only after leftover or tool-result admission."""
+    with session["history_lock"]:
+        live = str(getattr(session.get("agent"), "_pending_steer", None) or "")
+        pending = list(session.get("_completion_pending") or [])
+        accepted = []
+        keep = []
+        snapshot_keys = (
+            {_notification_event_dedup_key(evt) for evt in snapshot}
+            if snapshot is not None
+            else None
+        )
+        for evt in pending:
+            sid = evt.get("session_id")
+            if snapshot_keys is not None:
+                if _notification_event_dedup_key(evt) in snapshot_keys:
+                    accepted.append(evt)
+                else:
+                    keep.append(evt)
+            # Still only on the live steer rail — not in this ingest snapshot.
+            elif evt.get("_steer_accepted") and sid and live and f" {sid} " in f" {live} ":
+                keep.append(evt)
+            elif evt.get("_steer_accepted"):
+                accepted.append(evt)
+            else:
+                keep.append(evt)
+        session["_completion_pending"] = keep
+    if accepted:
+        _mark_completion_events_consumed(accepted)
+
+
+def _bind_completion_steer_guards(session: dict, agent) -> None:
+    """ACK on drain (ingest); unmark on interrupt wipe so pending can replay."""
+    if agent is None or getattr(agent, "_completion_steer_guards", False):
+        return
+    orig_clear = getattr(agent, "clear_interrupt", None)
+    if callable(orig_clear):
+
+        def _clear(*args, **kwargs):
+            had = bool(getattr(agent, "_pending_steer", None))
+            result = orig_clear(*args, **kwargs)
+            if had and not getattr(agent, "_pending_steer", None):
+                with session["history_lock"]:
+                    for evt in session.get("_completion_pending") or []:
+                        evt.pop("_steer_accepted", None)
+                        evt.pop("_steer_publication", None)
+            return result
+
+        agent.clear_interrupt = _clear
+    orig_apply = getattr(agent, "_apply_pending_steer_to_tool_results", None)
+    if callable(orig_apply):
+
+        def _apply(*args, **kwargs):
+            orig_apply(*args, **kwargs)
+            if not getattr(agent, "_pending_steer", None):
+                _ack_steered_completion_ingest(session)
+
+        agent._apply_pending_steer_to_tool_results = _apply
+    agent._completion_steer_guards = True
+
+
+def _format_completion_batch(events: list) -> str:
+    """One structured summary for N completions in the same ingest window."""
+    lines = [f"{len(events)} background processes completed."]
+    for evt in events:
+        lines.append(
+            f"- {evt.get('session_id', 'unknown')} exit={evt.get('exit_code', '?')}"
+        )
+    return "[IMPORTANT: " + "\n".join(lines) + "]"
+
+
+def _notification_delivery_is_pending(evt: dict) -> bool:
+    if evt.get("type") != "async_delegation":
+        return True
+    try:
+        from tools.async_delegation import get_durable_delegation
+
+        durable = get_durable_delegation(str(evt.get("delegation_id") or ""))
+    except Exception as exc:
+        print(
+            f"[tui_gateway] completion delivery state lookup failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return True
+    return durable is None or durable.get("delivery_state") == "pending"
+
+
+def _deliver_claimed_notification_turn(
+    sid: str,
+    session: dict,
+    claimed: list[tuple[dict, str]],
+    text: str,
+    *,
+    rid: str | None = None,
+) -> list:
+    """Admit then settle a claimed batch; return only retryable members."""
+    rid = rid or f"__notif__{int(time.time() * 1000)}"
+    from tools.async_delegation import (
+        complete_completion_delivery,
+        complete_event_delivery,
+        release_event_delivery,
+    )
+
+    failed = False
+    error = None
+    try:
+        _emit("message.start", sid)
+        display_evt = claimed[0][0] if len(claimed) == 1 else None
+        if display_evt is not None and display_evt.get("type") == "async_delegation":
+            accepted = _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                display_kind="async_delegation_complete",
+                display_metadata=_async_delegation_display_metadata(display_evt),
+            )
+        else:
+            accepted = _run_prompt_submit(rid, sid, session, text)
+        if accepted is not True:
+            failed = True
+        else:
+            for evt, claim in claimed:
+                if evt.get("type") == "async_delegation":
+                    settled = complete_completion_delivery(
+                        str(evt.get("delegation_id") or ""), claim
+                    )
+                else:
+                    complete_event_delivery(evt, claim)
+                    settled = True
+                if not settled:
+                    failed = True
+    except Exception as exc:
+        failed = True
+        error = exc
+
+    if not failed:
+        return []
+
+    retry = []
+    for evt, claim in claimed:
+        if not _notification_delivery_is_pending(evt):
+            continue
+        try:
+            release_event_delivery(evt, claim)
+        except Exception as exc:
+            print(
+                f"[tui_gateway] completion delivery release failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        if _notification_delivery_is_pending(evt):
+            retry.append(evt)
+    if error is not None:
+        print(
+            f"[tui_gateway] completion notification dispatch failed: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+    with session["history_lock"]:
+        session["running"] = False
+    return retry
+
+
+def _claim_notification_events(
+    session: dict, events: list[dict], consumer: str
+) -> tuple[list[tuple[dict, str]], list[dict]]:
+    """Claim a selected batch, unwinding the whole reservation on claim error."""
+    from tools.async_delegation import claim_event_delivery, release_event_delivery
+
+    claimed: list[tuple[dict, str]] = []
+    retry: list[dict] = []
+    try:
+        for evt in events:
+            claim = claim_event_delivery(evt, consumer)
+            if claim is None:
+                if _notification_delivery_is_pending(evt):
+                    retry.append(evt)
+                continue
+            claimed.append((evt, claim))
+    except Exception as exc:
+        claims = {id(evt): claim for evt, claim in claimed}
+        retry = []
+        for evt in events:
+            claim = claims.get(id(evt))
+            if claim is not None and _notification_delivery_is_pending(evt):
+                try:
+                    release_event_delivery(evt, claim)
+                except Exception as release_exc:
+                    print(
+                        f"[tui_gateway] completion delivery release failed: "
+                        f"{type(release_exc).__name__}: {release_exc}",
+                        file=sys.stderr,
+                    )
+            if _notification_delivery_is_pending(evt):
+                retry.append(evt)
+        claimed = []
+        print(
+            f"[tui_gateway] completion delivery claim failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+    if not claimed:
+        with session["history_lock"]:
+            session["running"] = False
+    return claimed, retry
+
+
+def _submit_process_notification_turn(
+    sid: str, session: dict, evt: dict, text: str
+) -> list[dict]:
+    """Claim + deliver one notification turn; return retryable events."""
+    claimed, retry = _claim_notification_events(session, [evt], "tui-poller")
+    if claimed:
+        retry.extend(_deliver_claimed_notification_turn(sid, session, claimed, text))
+    return retry
+
+
+def _session_can_steer_completions(session: dict) -> bool:
+    """True when the live turn can ingest via AIAgent.steer (never a drop path)."""
+    if not session.get("running"):
+        return False
+    return callable(getattr(session.get("agent"), "steer", None))
+
+
+def _deliver_completions_via_steer(
+    sid: str, session: dict, events: list, emitted: set
+) -> bool:
+    """Insert one completion (or one N-event batch) into the current loop.
+
+    Uses the existing ``AIAgent.steer`` / ``_pending_steer`` rail so the
+    next tool-result or pre-API drain sees the text. Never starts a new
+    idle turn. False means the caller must keep the events (never drop).
+    """
+    if not events:
+        return False
+    steer = getattr(session.get("agent"), "steer", None)
+    if not callable(steer):
+        return False
+    from tools.process_registry import format_process_notification
+
+    text = (
+        format_process_notification(events[0])
+        if len(events) == 1
+        else _format_completion_batch(events)
+    )
+    if not text:
+        return False
+    if len(events) == 1:
+        batch_key = _notification_event_dedup_key(events[0])
+    else:
+        batch_key = ("completion-batch",) + tuple(
+            _notification_event_dedup_key(evt) for evt in events
+        )
+    if batch_key not in emitted:
+        _emit("status.update", sid, {"kind": "process", "text": text})
+        emitted.add(batch_key)
+    publication = object()
+    replaced: dict[int, dict] = {}
+    with session["history_lock"]:
+        _bind_completion_steer_guards(session, session.get("agent"))
+        pending = session.setdefault("_completion_pending", [])
+        for evt in events:
+            key = _notification_event_dedup_key(evt)
+            match = next(
+                (
+                    (index, item)
+                    for index, item in enumerate(pending)
+                    if _notification_event_dedup_key(item) == key
+                ),
+                None,
+            )
+            staged = dict(match[1] if match is not None else evt)
+            staged["_steer_accepted"] = True
+            staged["_steer_publication"] = publication
+            if match is None:
+                pending.append(staged)
+            else:
+                pending[match[0]] = staged
+                replaced[id(staged)] = match[1]
+    try:
+        accepted = bool(steer(text))
+    except Exception:
+        accepted = False
+    if not accepted:
+        with session["history_lock"]:
+            pending = session.get("_completion_pending") or []
+            session["_completion_pending"] = [
+                replaced[id(item)]
+                if item.get("_steer_publication") is publication and id(item) in replaced
+                else item
+                for item in pending
+                if item.get("_steer_publication") is not publication
+                or id(item) in replaced
+            ]
+        return False
+    # steer() True is staging only — ACK at leftover/tool-result ingest.
+    with session["history_lock"]:
+        for item in session.get("_completion_pending") or []:
+            if item.get("_steer_publication") is publication:
+                item.pop("_steer_publication", None)
+    return True
+
+
+def _deliver_completion_notifications(
+    sid: str, session: dict, events: list, emitted: set
+) -> None:
+    """Idle ingest: one item, or one batch when N>1. Never emit N updates."""
+    from tools.process_registry import format_process_notification
+
+    if not events:
+        return
+    if len(events) == 1:
+        evt = events[0]
+        text = format_process_notification(evt)
+        if not text:
+            return
+        with session["history_lock"]:
+            if session.get("running"):
+                session.setdefault("_completion_pending", []).insert(0, evt)
+                return
+            session["running"] = True
+        dedup_key = _notification_event_dedup_key(evt)
+        if dedup_key not in emitted:
+            _emit("status.update", sid, {"kind": "process", "text": text})
+            emitted.add(dedup_key)
+        if not _submit_process_notification_turn(sid, session, evt, text):
+            _mark_completion_events_consumed([evt])
+        else:
+            with session["history_lock"]:
+                session.setdefault("_completion_pending", []).insert(0, evt)
+        return
+
+    text = _format_completion_batch(events)
+    with session["history_lock"]:
+        if session.get("running"):
+            pending = session.setdefault("_completion_pending", [])
+            session["_completion_pending"] = list(events) + list(pending)
+            return
+        session["running"] = True
+    batch_key = ("completion-batch",) + tuple(
+        _notification_event_dedup_key(evt) for evt in events
+    )
+    if batch_key not in emitted:
+        _emit("status.update", sid, {"kind": "process", "text": text})
+        emitted.add(batch_key)
+    if not _submit_process_notification_turn(sid, session, events[0], text):
+        _mark_completion_events_consumed(events)
+    else:
+        with session["history_lock"]:
+            pending = session.setdefault("_completion_pending", [])
+            session["_completion_pending"] = list(events) + list(pending)
+
+
+def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) -> None:
+    with session["history_lock"]:
+        pending = list(session.get("_completion_pending") or [])
+        if not pending:
+            return
+        running = bool(session.get("running"))
+        if running and not _session_can_steer_completions(session):
+            return
+        accepted = [evt for evt in pending if evt.get("_steer_accepted")]
+        fresh = [evt for evt in pending if not evt.get("_steer_accepted")]
+        # Already staged on _pending_steer: do not re-steer or idle-dump.
+        session["_completion_pending"] = list(accepted)
+        if not fresh:
+            return
+        pending = fresh
+    pending = _filter_routine_delegated_child_completions(pending)
+    if not pending:
+        return
+    if running:
+        if not _deliver_completions_via_steer(sid, session, pending, emitted):
+            with session["history_lock"]:
+                leftover = session.setdefault("_completion_pending", [])
+                session["_completion_pending"] = list(pending) + list(leftover)
+        return
+    _deliver_completion_notifications(sid, session, pending, emitted)
+
+
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """Return the UI-emission identity for a process notification event.
 
@@ -11835,6 +12830,12 @@ def _notification_poller_loop(
     status.update (kind=process) for user visibility, then chains an
     agent turn via _run_prompt_submit if the session is idle.
 
+    Completions that arrive while session["running"] (blocked on an LLM
+    response) are buffered on the session. Idle/between-turn completions
+    share a short queue-empty window. Both paths emit one structured
+    batch at the next idle ingest — not N status.update storms, and not
+    a one-by-one dump after the loop stops.
+
     The completion_queue is process-global. In multi-session Desktop each
     poller requeues events owned by another live session and drops addressed
     events whose owner is gone; ownerless legacy notifications remain global.
@@ -11904,9 +12905,59 @@ def _notification_poller_loop(
                         with session["history_lock"]:
                             session["running"] = False
         try:
-            evt = process_registry.completion_queue.get(timeout=0.5)
+            # ponytail: reuse get() timeout as the idle fan-in window
+            # (gateway uses 0.1s); a dedicated timer if cadence must differ.
+            # After restart/compress, live-delegate child tails arrive
+            # farther apart than 0.1s — hold those only (2s) so N become
+            # one #131 ingest. Parent-owned tails keep the short window.
+            timeout = 0.5
+            with session["history_lock"]:
+                pending = list(session.get("_completion_pending") or [])
+            if pending:
+                if all(
+                    _is_live_delegate_child_completion(sid, session, item)
+                    for item in pending
+                ):
+                    timeout = 2.0  # ponytail: 2s child-hold; raise if tails space wider
+                else:
+                    timeout = 0.1
+                # In-flight LLM: hold the same 2s window so piled notifies
+                # become one steer batch, not N parent messages.
+                if _session_can_steer_completions(session):
+                    _active = getattr(
+                        session.get("agent"), "_model_request_active", None
+                    )
+                    if _active is not None and getattr(_active, "is_set", lambda: False)():
+                        timeout = 2.0
+            # A manual compression fence owns this session's queue boundary.
+            # Check before blocking, then retain any event selected by the shared
+            # queue until the terminal fence opens so FIFO cannot rotate.
+            with session["history_lock"]:
+                compression_fence = session.get("_manual_compression_fence")
+            if compression_fence is not None:
+                compression_fence.wait(timeout)
+                continue
+            evt = process_registry.get_completion_for_owner(
+                lambda candidate: not _notification_event_belongs_elsewhere(
+                    sid, session, candidate
+                ),
+                timeout=timeout,
+            )
         except Exception:
+            _flush_pending_completions_if_idle(sid, session, _emitted)
             continue
+
+        # A fence can be raised after the ownership snapshot but before the
+        # queue returns. Keep this event reserved instead of requeueing it.
+        while True:
+            with session["history_lock"]:
+                compression_fence = session.get("_manual_compression_fence")
+            if compression_fence is None:
+                break
+            if stop_event.is_set() or session.get("_finalized"):
+                process_registry.requeue_completion_front(evt)
+                return
+            compression_fence.wait(timeout)
 
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
@@ -11914,7 +12965,7 @@ def _notification_poller_loop(
         # session's poller happened to wake first (Ben's "reported in a
         # different session" bug). Leave foreign events for their owner.
         if _notification_event_belongs_elsewhere(sid, session, evt):
-            process_registry.completion_queue.put(evt)
+            process_registry.requeue_completion_front(evt)
             time.sleep(0.1)
             continue
 
@@ -11944,6 +12995,14 @@ def _notification_poller_loop(
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
 
+        # Completions that land while the session is blocked on an LLM
+        # response stay off the TUI until the next idle ingest. Buffer
+        # them here — do not emit, do not requeue/spin the shared queue.
+        if evt.get("type") == "completion":
+            with session["history_lock"]:
+                session.setdefault("_completion_pending", []).append(evt)
+            continue
+
         text = format_process_notification(evt)
         if not text:
             continue
@@ -11960,7 +13019,7 @@ def _notification_poller_loop(
         _requeued = False
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.completion_queue.put(evt)
+                process_registry.requeue_completion_front(evt)
                 _requeued = True
             else:
                 session["running"] = True
@@ -11971,36 +13030,11 @@ def _notification_poller_loop(
             time.sleep(0.25)
             continue
 
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        retry = _submit_process_notification_turn(sid, session, evt, text)
+        for retry_evt in reversed(retry):
+            process_registry.requeue_completion_front(retry_evt)
+        if retry:
+            time.sleep(0.25)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -12012,6 +13046,11 @@ def _notification_poller_loop(
             evt = process_registry.completion_queue.get_nowait()
         except Exception:
             break
+        with session["history_lock"]:
+            compression_fence = session.get("_manual_compression_fence")
+        if compression_fence is not None:
+            deferred.append(evt)
+            continue
         if _notification_event_belongs_elsewhere(sid, session, evt):
             deferred.append(evt)
             continue
@@ -12034,6 +13073,10 @@ def _notification_poller_loop(
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
+        if evt.get("type") == "completion":
+            with session["history_lock"]:
+                session.setdefault("_completion_pending", []).append(evt)
+            continue
         text = format_process_notification(evt)
         if not text:
             continue
@@ -12045,44 +13088,28 @@ def _notification_poller_loop(
 
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.completion_queue.put(evt)
+                process_registry.requeue_completion_front(evt)
                 break
             session["running"] = True
 
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        deferred.extend(_submit_process_notification_turn(sid, session, evt, text))
+
+    # One batch for any completions that arrived while busy / on drain.
+    # If the session is still running, leave them on the session so a later
+    # idle ingest (or the next poller) can deliver them — never dump N.
+    _flush_pending_completions_if_idle(sid, session, _emitted)
+    with session["history_lock"]:
+        pending = list(session.get("_completion_pending") or [])
+        leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
+        session["_completion_pending"] = [
+            evt for evt in pending if evt.get("_steer_accepted")
+        ]
+    for evt in leftover:
+        process_registry.requeue_completion_front(evt)
 
     # Hand any other sessions' events back to the shared queue.
-    for evt in deferred:
-        process_registry.completion_queue.put(evt)
+    for evt in reversed(deferred):
+        process_registry.requeue_completion_front(evt)
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -12428,6 +13455,11 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
+        session["_cache_counter_baseline"] = _cache_counter_snapshot(agent)
+        session.pop("first_provider_response", None)
+        session["_cache_status_emitted"] = False
+        agent._tui_first_provider_response_record_enabled = True
+        agent._tui_first_provider_response_recorded = False
         if hasattr(agent, "clear_interrupt"):
             try:
                 agent.clear_interrupt()
@@ -12910,6 +13942,22 @@ def _run_prompt_submit(
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
+                if result.get("partial") and result.get("error") and not (
+                    result.get("failed") or result.get("interrupted")
+                ):
+                    from gateway.run import _is_gateway_hidden_reasoning_incomplete_turn
+
+                    if _is_gateway_hidden_reasoning_incomplete_turn(result):
+                        continuation_match = re.fullmatch(
+                            r"Codex response remained incomplete after (\d+) continuation attempts",
+                            str(result.get("error")),
+                        )
+                        if continuation_match:
+                            raw = (
+                                "The model produced no visible answer after "
+                                f"{continuation_match.group(1)} continuation attempts. "
+                                "Try again, rephrase, or start a new turn with another model."
+                            )
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
                 # that error as the visible text instead of shipping an empty
@@ -12995,6 +14043,16 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
+            first_usage = getattr(agent, "_first_turn_usage", None) or getattr(
+                agent, "_last_turn_usage", None
+            )
+            if first_usage:
+                payload["cache_info"] = _cache_info_from_usage(first_usage)
+            elif not getattr(agent, "_tui_first_provider_response_recorded", False):
+                emit_cache = getattr(agent, "_tui_cache_callback", None)
+                if callable(emit_cache):
+                    emit_cache("no_field", 0, 0, 0)
+            _stamp_loop_cache_info(sid, payload)
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
@@ -13225,7 +14283,7 @@ def _run_prompt_submit(
                     _persist_live_session_runtime(session)
                     _persist_live_session_system_prompt(session)
                 except Exception:
-                    logger.debug("TUI one-turn model restore failed", exc_info=True)
+                    logger.debug("TUI one-turn model restore failed")
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -13289,8 +14347,22 @@ def _run_prompt_submit(
         # both texts.
         _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
         if isinstance(_leftover_steer, str) and _leftover_steer.strip():
+            _leftover_completion_snapshot = _take_steered_completion_snapshot(
+                session, _leftover_steer
+            )
             with session["history_lock"]:
-                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+                _enqueue_prompt(
+                    session,
+                    _leftover_steer,
+                    session.get("transport"),
+                    on_admitted=(
+                        lambda: _ack_steered_completion_ingest(
+                            session, _leftover_completion_snapshot
+                        )
+                    ) if _leftover_completion_snapshot else None,
+                )
+        else:
+            _leftover_completion_snapshot = []
         if _drain_queued_prompt(rid, sid, session):
             return
 
@@ -13340,32 +14412,47 @@ def _run_prompt_submit(
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
-            for index, (_evt, synth) in enumerate(drained):
+            visible_ids = {
+                id(evt)
+                for evt in _filter_routine_delegated_child_completions(
+                    [evt for evt, _synth in drained]
+                )
+            }
+            drained = [pair for pair in drained if id(pair[0]) in visible_ids]
+            if drained:
                 with session["history_lock"]:
                     if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
+                        for pending_evt, _pending_synth in drained:
                             process_registry.completion_queue.put(pending_evt)
-                        break
-                    session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
-                if _claim is None:
-                    continue
-                try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
-                except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
-                    print(
-                        f"[tui_gateway] completion notification dispatch failed: "
-                        f"{type(_n_exc).__name__}: {_n_exc}",
-                        file=sys.stderr,
+                        drained = []
+                    else:
+                        session["running"] = True
+                if drained:
+                    claimed, retry = _claim_notification_events(
+                        session,
+                        [pending_evt for pending_evt, _pending_synth in drained],
+                        "tui-post-turn",
                     )
-                    with session["history_lock"]:
-                        session["running"] = False
+                    if claimed:
+                        synth_by_event = {
+                            id(pending_evt): pending_synth
+                            for pending_evt, pending_synth in drained
+                        }
+                        retry.extend(
+                            _deliver_claimed_notification_turn(
+                                sid,
+                                session,
+                                claimed,
+                                "\n\n".join(
+                                    synth_by_event[id(evt)] for evt, _claim in claimed
+                                ),
+                                rid=rid,
+                            )
+                        )
+                    retry_ids = {id(pending_evt) for pending_evt in retry}
+                    for pending_evt, _pending_synth in drained:
+                        if id(pending_evt) in retry_ids:
+                            process_registry.completion_queue.put(pending_evt)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -13861,6 +14948,7 @@ def _(rid, params: dict) -> dict:
                     "confirm_required": result.get("confirm_required", False),
                     "confirm_message": result.get("confirm_message", ""),
                     "scope": result.get("scope", "session"),
+                    "deferred": result.get("deferred", False),
                 },
             )
         except Exception as e:
@@ -13924,6 +15012,27 @@ def _(rid, params: dict) -> dict:
                     "fast mode is not available for this model",
                 )
 
+        projected_overrides = None
+        target_service_tier = "priority" if nv == "fast" else None
+        if agent is not None:
+            from agent.agent_init import (
+                _RequestOverrideProjectionError,
+                _project_request_overrides,
+            )
+
+            try:
+                projected_overrides = _project_request_overrides(
+                    agent,
+                    provider=getattr(agent, "provider", ""),
+                    model=getattr(agent, "model", ""),
+                    base_url=getattr(agent, "base_url", ""),
+                    service_tier=target_service_tier,
+                    derived_overrides=overrides or {},
+                    custom_providers=getattr(agent, "_custom_providers", []),
+                )
+            except _RequestOverrideProjectionError:
+                return _err(rid, 4002, "fast mode request overrides were rejected")
+
         if session is not None:
             # Session-scoped, like `reasoning` below (global persistence is
             # `--global` / Settings → Model territory). Writing config.yaml
@@ -13939,13 +15048,8 @@ def _(rid, params: dict) -> dict:
         else:
             _write_config_key("agent.service_tier", nv)
         if agent is not None:
-            agent.service_tier = "priority" if nv == "fast" else None
-            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-            current_overrides.pop("service_tier", None)
-            current_overrides.pop("speed", None)
-            if nv == "fast":
-                current_overrides.update(overrides)
-            agent.request_overrides = current_overrides
+            agent.service_tier = target_service_tier
+            agent.request_overrides = projected_overrides
             _persist_live_session_runtime(session)
             _emit(
                 "session.info",
@@ -16008,6 +17112,13 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"
 
+    manual_compression_fence = None
+    if name == "compress":
+        try:
+            manual_compression_fence = _begin_manual_compression_fence(session)
+        except RuntimeError as exc:
+            return str(exc)
+
     try:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
@@ -16119,6 +17230,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 committed=False,
             )
         return f"live session sync failed: {e}"
+    finally:
+        if manual_compression_fence is not None:
+            _finish_manual_compression_fence(session, manual_compression_fence)
     return ""
 
 

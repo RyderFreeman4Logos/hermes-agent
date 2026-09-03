@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+import copy
 import json
 import logging
 import math
@@ -34,6 +35,11 @@ from agent.error_classifier import (
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
 )
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import (
+    StreamPayloadBoundExceeded,
+    authoritative_stream_text,
+    bounded_stream_text,
+)
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -933,6 +939,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from agent import relay_llm
+
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -963,6 +971,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
+            relay_llm.capture_transport_request(api_kwargs)
             raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
@@ -988,8 +997,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
+        relay_llm.capture_transport_request(api_kwargs)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    relay_llm.capture_transport_request(api_kwargs)
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -1869,6 +1880,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # cheap after the first call. Resolved after the anthropic/bedrock early
     # returns above, which don't use prompt_cache_key.
     _cache_scope_id = _prompt_cache_scope_for_agent(agent)
+    _cache_key_instructions = getattr(agent, "_cached_system_prompt_static", None)
+    first = api_messages[0] if api_messages else None
+    if not (
+        isinstance(_cache_key_instructions, str)
+        and isinstance(first, dict)
+        and first.get("role") in {"system", "developer"}
+        and flatten_message_text(first.get("content"), sep="").startswith(
+            _cache_key_instructions
+        )
+    ):
+        _cache_key_instructions = None
 
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
@@ -1929,6 +1951,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
+            cache_key_instructions=_cache_key_instructions,
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
@@ -2039,7 +2062,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
+            cache_key_instructions=_cache_key_instructions,
             provider_profile=_profile,
+            provider_name=getattr(agent, "requested_provider", None),
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
             provider_preferences=_prefs or None,
@@ -2072,6 +2097,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
         cache_scope_id=_cache_scope_id,
+        cache_key_instructions=_cache_key_instructions,
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
         is_nous=_is_nous,
@@ -2446,6 +2472,364 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
+_FALLBACK_RUNTIME_MISSING = object()
+_SNAPSHOT_UNSUPPORTED_VALUE = "unsupported fallback snapshot value"
+_SNAPSHOT_PLAIN_SCALARS = {type(None), str, bytes, int, float, bool, complex}
+_SNAPSHOT_CONTAINERS = {dict, list, tuple, set, frozenset}
+_CLIENT_KWARG_CAPABILITY_KEYS = frozenset({"http_client", "api_key"})
+_SNAPSHOT_CAPABILITY_MEMO = "_capability_memo"
+
+
+def _snapshot_capability_memo(agent) -> dict[int, Any]:
+    """Capture exact identities from agent-owned runtime handle positions."""
+    memo: dict[int, Any] = {}
+
+    def _retain(value: Any) -> None:
+        if (
+            value is not _FALLBACK_RUNTIME_MISSING
+            and value is not None
+            and type(value) not in _SNAPSHOT_PLAIN_SCALARS
+            and type(value) not in _SNAPSHOT_CONTAINERS
+        ):
+            memo[id(value)] = value
+
+    for name in (
+        "client",
+        "_anthropic_client",
+        "_credential_pool",
+        "context_compressor",
+        "api_key",
+        "_anthropic_api_key",
+    ):
+        _retain(getattr(agent, name, _FALLBACK_RUNTIME_MISSING))
+
+    client_kwargs = getattr(agent, "_client_kwargs", _FALLBACK_RUNTIME_MISSING)
+    if type(client_kwargs) is dict:
+        for name in _CLIENT_KWARG_CAPABILITY_KEYS:
+            if name in client_kwargs:
+                _retain(client_kwargs[name])
+
+    transport_cache = getattr(agent, "_transport_cache", _FALLBACK_RUNTIME_MISSING)
+    if type(transport_cache) is dict:
+        for value in transport_cache.values():
+            _retain(value)
+
+    compressor = getattr(agent, "context_compressor", _FALLBACK_RUNTIME_MISSING)
+    if compressor is not _FALLBACK_RUNTIME_MISSING and compressor is not None:
+        _retain(getattr(compressor, "api_key", _FALLBACK_RUNTIME_MISSING))
+    return memo
+
+
+def _is_snapshot_capability(value: Any, memo: dict[int, Any]) -> bool:
+    value_id = id(value)
+    return value_id in memo and memo[value_id] is value
+
+
+def _validate_snapshot_graph(
+    value: Any,
+    seen: set[int],
+    capability_memo: dict[int, Any],
+    capability_keys: frozenset[str] = frozenset(),
+) -> None:
+    """Validate plain snapshot data without invoking user-defined copying."""
+    if type(value) in _SNAPSHOT_PLAIN_SCALARS:
+        return
+    value_type = type(value)
+    if value_type not in _SNAPSHOT_CONTAINERS:
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+    value_id = id(value)
+    if value_id in seen:
+        return
+    seen.add(value_id)
+    if value_type is dict:
+        for key, item in value.items():
+            _validate_snapshot_graph(key, seen, capability_memo)
+            if key in capability_keys and _is_snapshot_capability(
+                item, capability_memo
+            ):
+                continue
+            _validate_snapshot_graph(item, seen, capability_memo)
+    elif value_type in {list, tuple, set, frozenset}:
+        for item in value:
+            _validate_snapshot_graph(item, seen, capability_memo)
+
+
+def _snapshot_copy(
+    value: Any,
+    capability_memo: dict[int, Any],
+    *,
+    capability_keys: frozenset[str] = frozenset(),
+) -> Any:
+    """Copy validated config while retaining snapshot-owned capabilities."""
+    _validate_snapshot_graph(value, set(), capability_memo, capability_keys)
+    try:
+        return copy.deepcopy(value, dict(capability_memo))
+    except Exception:
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE) from None
+
+
+def _prepare_snapshot_direct(value: Any, capability_memo: dict[int, Any]) -> Any:
+    if value is _FALLBACK_RUNTIME_MISSING or _is_snapshot_capability(
+        value, capability_memo
+    ):
+        return value
+    _validate_snapshot_graph(value, set(), capability_memo)
+    return value
+
+
+def _prepare_snapshot_transport_cache(
+    value: Any, capability_memo: dict[int, Any]
+) -> Any:
+    if value is _FALLBACK_RUNTIME_MISSING:
+        return value
+    if type(value) is not dict:
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+    for key, transport in value.items():
+        _validate_snapshot_graph(key, set(), capability_memo)
+        if not _is_snapshot_capability(transport, capability_memo):
+            _validate_snapshot_graph(transport, set(), capability_memo)
+    return dict(value)
+
+
+def _snapshot_fallback_candidate_runtime(agent) -> dict[str, Any]:
+    """Capture mutable runtime state before attempting a fallback candidate."""
+    capability_memo = _snapshot_capability_memo(agent)
+
+    def _value(
+        name: str,
+        *,
+        deep: bool = False,
+        capability_keys: frozenset[str] = frozenset(),
+    ):
+        value = getattr(agent, name, _FALLBACK_RUNTIME_MISSING)
+        if value is _FALLBACK_RUNTIME_MISSING:
+            return value
+        return (
+            _snapshot_copy(
+                value, capability_memo, capability_keys=capability_keys
+            )
+            if deep
+            else value
+        )
+
+    snapshot = {
+        name: _value(name)
+        for name in (
+            "model",
+            "provider",
+            "requested_provider",
+            "base_url",
+            "api_mode",
+            "api_key",
+            "client",
+            "_anthropic_client",
+            "_anthropic_api_key",
+            "_anthropic_base_url",
+            "_is_anthropic_oauth",
+            "_reasoning_echo_flag",
+            "_credential_pool",
+            "_credential_pool_entry_id",
+            "_fallback_activated",
+            "_config_context_length",
+            "_use_prompt_caching",
+            "_use_native_cache_layout",
+            "_cached_system_prompt",
+            "_pending_fallback_notice",
+        )
+    }
+    snapshot["_client_kwargs"] = _value(
+        "_client_kwargs", deep=True, capability_keys=_CLIENT_KWARG_CAPABILITY_KEYS
+    )
+    for name in ("request_overrides", "reasoning_config"):
+        snapshot[name] = _value(name, deep=True)
+
+    snapshot["_transport_cache"] = _prepare_snapshot_transport_cache(
+        _value("_transport_cache"), capability_memo
+    )
+
+    compressor = getattr(agent, "context_compressor", _FALLBACK_RUNTIME_MISSING)
+    snapshot["context_compressor"] = compressor
+    snapshot["compressor_fields"] = (
+        {
+            name: getattr(compressor, name, _FALLBACK_RUNTIME_MISSING)
+            for name in (
+                "model",
+                "context_length",
+                "base_url",
+                "api_key",
+                "provider",
+                "api_mode",
+                "threshold_tokens",
+            )
+        }
+        if compressor is not _FALLBACK_RUNTIME_MISSING and compressor is not None
+        else {}
+    )
+    snapshot[_SNAPSHOT_CAPABILITY_MEMO] = capability_memo
+    return snapshot
+
+
+def _restore_fallback_candidate_runtime(agent, snapshot: dict[str, Any]) -> None:
+    """Restore a rejected candidate without rewinding fallback-chain progress."""
+    if type(snapshot) is not dict:
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+    capability_memo = snapshot.get(_SNAPSHOT_CAPABILITY_MEMO)
+    if type(capability_memo) is not dict or any(
+        type(key) is not int or id(value) != key
+        for key, value in capability_memo.items()
+    ):
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+
+    direct_names = (
+        "model",
+        "provider",
+        "requested_provider",
+        "base_url",
+        "api_mode",
+        "api_key",
+        "client",
+        "_anthropic_client",
+        "_anthropic_api_key",
+        "_anthropic_base_url",
+        "_is_anthropic_oauth",
+        "_reasoning_echo_flag",
+        "_credential_pool",
+        "_credential_pool_entry_id",
+        "_fallback_activated",
+        "_config_context_length",
+        "_use_prompt_caching",
+        "_use_native_cache_layout",
+        "_cached_system_prompt",
+        "_pending_fallback_notice",
+    )
+    try:
+        prepared = {
+            name: _prepare_snapshot_direct(snapshot[name], capability_memo)
+            for name in direct_names
+        }
+        prepared["_client_kwargs"] = _snapshot_copy(
+            snapshot["_client_kwargs"],
+            capability_memo,
+            capability_keys=_CLIENT_KWARG_CAPABILITY_KEYS,
+        )
+        for name in ("request_overrides", "reasoning_config"):
+            prepared[name] = _snapshot_copy(snapshot[name], capability_memo)
+        prepared["_transport_cache"] = _prepare_snapshot_transport_cache(
+            snapshot["_transport_cache"], capability_memo
+        )
+        compressor = _prepare_snapshot_direct(
+            snapshot["context_compressor"], capability_memo
+        )
+        fields = snapshot["compressor_fields"]
+        if type(fields) is not dict:
+            raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE)
+        prepared_fields = {
+            name: _prepare_snapshot_direct(value, capability_memo)
+            for name, value in fields.items()
+        }
+    except (KeyError, TypeError):
+        raise TypeError(_SNAPSHOT_UNSUPPORTED_VALUE) from None
+
+    def _restore_attr(name: str) -> None:
+        value = prepared[name]
+        if value is _FALLBACK_RUNTIME_MISSING:
+            try:
+                delattr(agent, name)
+            except AttributeError:
+                pass
+            return
+        setattr(agent, name, value)
+
+    for name in direct_names:
+        _restore_attr(name)
+    for name in ("_client_kwargs", "request_overrides", "reasoning_config"):
+        _restore_attr(name)
+    _restore_attr("_transport_cache")
+
+    if compressor is _FALLBACK_RUNTIME_MISSING:
+        try:
+            delattr(agent, "context_compressor")
+        except AttributeError:
+            pass
+        return
+    agent.context_compressor = compressor
+    if compressor is None:
+        return
+
+    fields = prepared_fields
+    update_model = getattr(compressor, "update_model", None)
+    required = ("model", "context_length", "base_url", "api_key", "provider")
+    if callable(update_model) and all(
+        fields.get(name, _FALLBACK_RUNTIME_MISSING) is not _FALLBACK_RUNTIME_MISSING
+        for name in required
+    ):
+        try:
+            update_model(
+                model=fields["model"],
+                context_length=fields["context_length"],
+                base_url=fields["base_url"],
+                api_key=fields["api_key"],
+                provider=fields["provider"],
+                api_mode=fields.get("api_mode", ""),
+            )
+        except Exception:
+            logger.debug(
+                "Fallback rollback could not rebind context compressor",
+                exc_info=True,
+            )
+    for name, value in fields.items():
+        try:
+            if value is _FALLBACK_RUNTIME_MISSING:
+                delattr(compressor, name)
+            else:
+                setattr(compressor, name, value)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _close_rejected_fallback_clients(
+    agent,
+    snapshot: dict[str, Any],
+    *,
+    resolved_client: Any,
+    active_client: Any,
+    active_anthropic_client: Any,
+) -> None:
+    """Best-effort close clients created by a rejected candidate."""
+    retained = {
+        id(value)
+        for value in (snapshot["client"], snapshot["_anthropic_client"])
+        if value is not _FALLBACK_RUNTIME_MISSING and value is not None
+    }
+    seen: set[int] = set()
+    for client, is_anthropic in (
+        (resolved_client, False),
+        (active_client, False),
+        (active_anthropic_client, True),
+    ):
+        if client is None or id(client) in retained or id(client) in seen:
+            continue
+        seen.add(id(client))
+        try:
+            if not is_anthropic and callable(
+                getattr(agent, "_close_openai_client", None)
+            ):
+                agent._close_openai_client(
+                    client,
+                    reason="fallback_activation_rollback",
+                    shared=True,
+                )
+            else:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+        except Exception:
+            logger.debug(
+                "Fallback rollback could not close rejected candidate client",
+                exc_info=True,
+            )
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -2551,7 +2935,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
+    _entry_runtime = None
+    fb_client = None
     try:
+        _entry_runtime = _snapshot_fallback_candidate_runtime(agent)
         from agent.auxiliary_client import resolve_provider_client
         # Pass base_url and api_key from fallback config so custom
         # endpoints (e.g. Ollama Cloud) resolve correctly instead of
@@ -2664,6 +3051,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         old_model = agent.model
         old_provider = agent.provider
+        old_base_url = agent.base_url
+
+        from agent.agent_runtime_helpers import (
+            _project_request_overrides_for_runtime,
+        )
+
+        projected_overrides = _project_request_overrides_for_runtime(
+            agent,
+            provider=fb_provider,
+            model=fb_model,
+            base_url=fb_base_url,
+            service_tier=getattr(agent, "service_tier", None),
+        )
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
@@ -2674,6 +3074,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        agent.request_overrides = projected_overrides
         # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
         # Read from the fallback entry so the flag travels with the active
         # provider; restore_primary_runtime will revert it from the snapshot.
@@ -2867,9 +3268,38 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _reset_stale_streak(agent)
         return True
     except Exception as e:
+        _rejected_client = getattr(agent, "client", None)
+        _rejected_anthropic_client = getattr(agent, "_anthropic_client", None)
+        if _entry_runtime is not None:
+            try:
+                _restore_fallback_candidate_runtime(agent, _entry_runtime)
+            except Exception:
+                logger.error(
+                    "Fallback rollback stopped: snapshot_validation_rejected"
+                )
+                _close_rejected_fallback_clients(
+                    agent,
+                    _entry_runtime,
+                    resolved_client=fb_client,
+                    active_client=_rejected_client,
+                    active_anthropic_client=_rejected_anthropic_client,
+                )
+                return False
+            _close_rejected_fallback_clients(
+                agent,
+                _entry_runtime,
+                resolved_client=fb_client,
+                active_client=_rejected_client,
+                active_anthropic_client=_rejected_anthropic_client,
+            )
         if fb_provider == "nous":
             unavailable.add(fb_key)
-        logger.error("Failed to activate fallback %s: %s", fb_model, e)
+        from agent.agent_init import _RequestOverrideProjectionError
+
+        if isinstance(e, _RequestOverrideProjectionError):
+            logger.error("Failed to activate fallback: request_override_rejected")
+        else:
+            logger.error("Failed to activate fallback %s: %s", fb_model, e)
         return agent._try_activate_fallback(reason)  # try next in chain
 
 
@@ -2908,6 +3338,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 "api_mode": str(
                     getattr(agent, "api_mode", "") or "chat_completions"
                 ),
+                "route": str(getattr(agent, "base_url", "") or ""),
                 "api_request_id": summary_api_request_id,
                 "call_role": "iteration_summary",
                 "retry_count": retry_count,
@@ -3131,9 +3562,16 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
+
+                def _create_summary(request):
+                    from agent import relay_llm
+
+                    relay_llm.capture_transport_request(request)
+                    return summary_client.chat.completions.create(**request)
+
                 summary_response = _managed_summary_call(
                     summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
+                    _create_summary,
                     retry_count=0,
                 )
                 _summary_result = agent._get_transport().normalize_response(summary_response)
@@ -3196,9 +3634,16 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
                 )
+
+                def _create_summary_retry(request):
+                    from agent import relay_llm
+
+                    relay_llm.capture_transport_request(request)
+                    return summary_client.chat.completions.create(**request)
+
                 summary_response = _managed_summary_call(
                     summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
+                    _create_summary_retry,
                     retry_count=1,
                 )
                 _retry_result = agent._get_transport().normalize_response(summary_response)
@@ -3293,6 +3738,8 @@ def _build_partial_stream_stub(
     the conversation loop enters its continuation/retry path instead of
     silently accepting truncated output as a complete turn (#32086).
     """
+    bounded_stream_text((full_content or "") + (full_reasoning or ""))
+    full_content = full_content or None
     mock_message = SimpleNamespace(
         role=role,
         content=full_content,
@@ -3449,6 +3896,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
+                        relay_llm.capture_transport_request(final_kwargs)
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
@@ -3467,6 +3915,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
+                            relay_llm.capture_transport_request(final_kwargs)
                             return normalize_converse_response(
                                 client.converse(**final_kwargs)
                             )
@@ -3478,8 +3927,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 def _on_text(text):
                     _bedrock_response_started["yes"] = True
                     _fire_first()
-                    agent._fire_stream_delta(text)
-                    deltas_were_sent["yes"] = True
+                    deltas_were_sent["yes"] = agent._fire_stream_delta(text) or deltas_were_sent["yes"]
 
                 def _on_tool(name):
                     _bedrock_response_started["yes"] = True
@@ -3503,14 +3951,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     token = writer_token["value"]
                     return token is None or stream_writer_is_current(agent, token)
 
-                try:
-                    from agent.plugin_stream_hooks import has_reasoning_stream_observer_hooks
-
-                    plugin_reasoning_observer = has_reasoning_stream_observer_hooks()
-                except Exception:
-                    logger.debug("plugin reasoning stream observer check failed", exc_info=True)
-                    plugin_reasoning_observer = False
-
                 stream = relay_llm.stream(
                     dict(api_kwargs),
                     _open_bedrock_stream,
@@ -3527,8 +3967,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     ),
                     metadata={
                         "api_mode": "custom",
+                        "route": str(getattr(agent, "base_url", "") or ""),
                         "api_request_id": getattr(
                             agent, "_current_api_request_id", None
+                        ),
+                        "retry_count": int(
+                            getattr(agent, "_current_api_retry_count", 0) or 0
                         ),
                         "call_role": (
                             "delegated"
@@ -3542,11 +3986,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 streamed_response = stream_converse_with_callbacks(
                     {"stream": stream},
-                    on_text_delta=_on_text if agent._has_stream_consumers() else None,
+                    on_text_delta=_on_text,
                     on_tool_start=_on_tool,
-                    on_reasoning_delta=_on_reasoning
-                    if agent.reasoning_callback or agent.stream_delta_callback or plugin_reasoning_observer
-                    else None,
+                    on_reasoning_delta=_on_reasoning,
                     on_interrupt_check=lambda: agent._interrupt_requested,
                     on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
                 )
@@ -3644,6 +4086,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 raise InterruptedError("Agent interrupted during Bedrock API call (post-worker)")
             if result["error"] is not None:
+                if isinstance(result["error"], StreamPayloadBoundExceeded):
+                    raise result["error"]
+                if deltas_were_sent["yes"]:
+                    partial_text = (
+                        getattr(agent, "_current_streamed_assistant_text", "") or ""
+                    ).strip() or None
+                    partial = _build_partial_stream_stub(
+                        "assistant",
+                        partial_text,
+                        None,
+                        getattr(agent, "model", "unknown"),
+                        None,
+                    )
+                    _emit_stream_end(
+                        final_text=partial_text or "",
+                        finished=False,
+                        error=str(result["error"]),
+                    )
+                    _reset_stale_streak(agent)
+                    return partial
                 raise result["error"]
             # Success — clear the cross-turn breaker (#58962): Bedrock proved
             # responsive.  Mirrors the OpenAI/Anthropic success reset below so a
@@ -3773,7 +4235,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     first_delta_fired = {"done": False}
     deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
-    provider_tool_in_flight = {"yes": False}
+
     # Wall-clock timestamp of the last real streaming chunk.  The outer
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
@@ -3814,7 +4276,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         with stream_attempt_lock:
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
-        provider_tool_in_flight["yes"] = False
+
         return attempt_id
 
     def _cancel_current_stream_attempt(reason: str) -> None:
@@ -3875,7 +4337,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception:
                 pass
 
-    def _call_chat_completions(stream_attempt_id: int):
+    def _call_chat_completions(stream_attempt_id: int, retry_count: int):
         """Stream a chat completions response."""
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
@@ -3968,6 +4430,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
+            relay_llm.capture_transport_request(stream_kwargs)
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
@@ -3980,18 +4443,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _writer_token["value"] = claim_stream_writer(agent)
 
         def _accept_stream_chunk(_chunk: Any) -> bool:
-            # A stale-attempt fence can win while Relay is handing an
-            # already-received tool-call chunk back to Hermes. Preserve only
-            # the fact that a tool call was in flight so retry policy does not
-            # misclassify the attempt as a partial text response. The chunk
-            # itself is still rejected below and never reaches callbacks.
-            try:
-                choices = getattr(_chunk, "choices", None)
-                delta = getattr(choices[0], "delta", None) if choices else None
-                if getattr(delta, "tool_calls", None):
-                    provider_tool_in_flight["yes"] = True
-            except Exception:
-                pass
             if not _stream_attempt_is_active(stream_attempt_id):
                 return False
             token = _writer_token["value"]
@@ -4043,7 +4494,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 completed_response_predicate=lambda value: hasattr(value, "choices"),
                 metadata={
                     "api_mode": "chat_completions",
+                    "route": str(getattr(agent, "base_url", "") or ""),
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "retry_count": int(
+                        getattr(agent, "_current_api_retry_count", 0) or 0
+                    ) + retry_count,
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)
@@ -4069,16 +4524,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if not tool_calls_acc:
                 for text in pending_parts:
                     _fire_first_delta()
-                    agent._fire_stream_delta(text)
-                    deltas_were_sent["yes"] = True
+                    deltas_were_sent["yes"] = agent._fire_stream_delta(text) or deltas_were_sent["yes"]
                 return
-            if agent.stream_delta_callback:
-                for text in pending_parts:
-                    try:
-                        agent.stream_delta_callback(text)
-                        agent._record_streamed_assistant_text(text)
-                    except Exception:
-                        pass
+            for text in pending_parts:
+                deltas_were_sent["yes"] = (
+                    agent._fire_stream_delta(text) or deltas_were_sent["yes"]
+                )
 
         for chunk in _iter_provider_stream_chunks(
             stream,
@@ -4197,8 +4648,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
-                    agent._fire_stream_delta(delta_content)
-                    deltas_were_sent["yes"] = True
+                    deltas_were_sent["yes"] = (
+                        agent._fire_stream_delta(delta_content) or deltas_were_sent["yes"]
+                    )
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
                 # tool calls).  But reasoning tags embedded in suppressed
@@ -4210,12 +4662,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(delta_content)
-                        agent._record_streamed_assistant_text(delta_content)
-                    except Exception:
-                        pass
+                else:
+                    deltas_were_sent["yes"] = (
+                        agent._fire_stream_delta(delta_content)
+                        or deltas_were_sent["yes"]
+                    )
 
             # Accumulate tool call deltas — notify display on first name
             delta_tool_calls = getattr(delta, "tool_calls", None)
@@ -4447,7 +4898,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _dropped_names,
             )
             return _build_partial_stream_stub(
-                role, full_content,
+                role, authoritative_stream_text(agent),
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
                 dropped_tool_names=_dropped_names or None,
@@ -4469,7 +4920,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "with no tool calls; treating as a mid-stream drop."
             )
             return _build_partial_stream_stub(
-                role, full_content,
+                role, authoritative_stream_text(agent),
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
             )
@@ -4506,7 +4957,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             usage=usage_obj,
         )
 
-    def _call_anthropic(request_client):
+    def _call_anthropic(request_client, retry_count: int):
         """Stream an Anthropic Messages API response.
 
         Fires delta callbacks for real-time token delivery, but returns
@@ -4550,6 +5001,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            relay_llm.capture_transport_request(final_kwargs)
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()
@@ -4593,7 +5045,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 accept_chunk=_accept_anthropic_event,
                 metadata={
                     "api_mode": "anthropic_messages",
+                    "route": str(getattr(agent, "base_url", "") or ""),
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "retry_count": int(
+                        getattr(agent, "_current_api_retry_count", 0) or 0
+                    ) + retry_count,
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)
@@ -4637,8 +5093,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             text = getattr(delta, "text", "")
                             if text and not has_tool_use:
                                 _fire_first_delta()
-                                agent._fire_stream_delta(text)
-                                deltas_were_sent["yes"] = True
+                                deltas_were_sent["yes"] = agent._fire_stream_delta(text) or deltas_were_sent["yes"]
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
@@ -4757,15 +5212,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             ),
                             kind="anthropic_messages",
                         )
-                        result["response"] = _call_anthropic(request_client)
+                        result["response"] = _call_anthropic(
+                            request_client, _stream_attempt
+                        )
                     else:
-                        result["response"] = _call_chat_completions(stream_attempt_id)
+                        result["response"] = _call_chat_completions(
+                            stream_attempt_id, _stream_attempt
+                        )
                     _emit_stream_end(
                         final_text=_stream_final_text(result["response"]),
                         finished=True,
                         error=None,
                     )
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    _emit_stream_end(final_text="", finished=False, error=str(e))
+                    _close_managed_stream()
+                    result["error"] = e
+                    return
                 except Exception as e:
                     _emit_stream_end(final_text="", finished=False, error=str(e))
                     _close_managed_stream()
@@ -4793,111 +5257,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
 
-                    # If the stream died AFTER some tokens were delivered:
-                    # normally we don't retry (the user already saw text,
-                    # retrying would duplicate it).  BUT: if a tool call
-                    # was in-flight when the stream died, silently aborting
-                    # discards the tool call entirely.  In that case we
-                    # prefer to retry — the user sees a brief
-                    # "reconnecting" marker + duplicated preamble text,
-                    # which is strictly better than a failed action with
-                    # a "retry manually" message.  Limit this to transient
-                    # connection errors (Clawdbot-style narrow gate): no
-                    # tool has executed yet within this API call, so
-                    # silent retry is safe wrt side-effects.
+                    # Any successful display/TTS write commits this physical
+                    # attempt. Replaying after delivery duplicates billed and
+                    # visible work, including partial tool-call preambles.
                     if deltas_were_sent["yes"]:
-                        _partial_tool_in_flight = bool(
-                            result.get("partial_tool_names")
-                        ) or provider_tool_in_flight["yes"]
-                        _is_sse_conn_err_preview = False
-                        if not _is_timeout and not _is_conn_err:
-                            from openai import APIError as _APIError
-                            if isinstance(e, _APIError) and not getattr(e, "status_code", None):
-                                _err_lower_preview = str(e).lower()
-                                _SSE_PREVIEW_PHRASES = (
-                                    "connection lost",
-                                    "connection reset",
-                                    "connection closed",
-                                    "connection terminated",
-                                    "network error",
-                                    "network connection",
-                                    "terminated",
-                                    "peer closed",
-                                    "broken pipe",
-                                    "upstream connect error",
-                                )
-                                _is_sse_conn_err_preview = any(
-                                    phrase in _err_lower_preview
-                                    for phrase in _SSE_PREVIEW_PHRASES
-                                )
-                        _is_transient = (
-                            _is_timeout
-                            or _is_conn_err
-                            or _is_sse_conn_err_preview
-                            or _is_stream_parse_err
+                        logger.warning(
+                            "Streaming failed after partial delivery, not retrying: %s", e
                         )
-                        _can_silent_retry = (
-                            _partial_tool_in_flight
-                            and _is_transient
-                            and _stream_attempt < _max_stream_retries
-                        )
-                        if not _can_silent_retry:
-                            # Either no tool call was in-flight (so the
-                            # turn was a pure text response — current
-                            # stub-with-recovered-text behaviour is
-                            # correct), or retries are exhausted, or the
-                            # error isn't transient.  Fall through to the
-                            # stub path.
-                            logger.warning(
-                                "Streaming failed after partial delivery, not retrying: %s", e
-                            )
-                            result["error"] = e
-                            return
-                        # Tool call was in-flight AND error is transient:
-                        # retry silently.  Clear per-attempt state so the
-                        # next stream starts clean.  Fire a "reconnecting"
-                        # marker so the user sees why the preamble is
-                        # about to be re-streamed.  Structured WARNING is
-                        # emitted by ``_emit_stream_drop`` below; no
-                        # additional INFO line needed.
-                        try:
-                            agent._fire_stream_delta(
-                                "\n\n⚠ Connection dropped mid tool-call; "
-                                "reconnecting…\n\n"
-                            )
-                        except Exception:
-                            pass
-                        # Reset the streamed-text buffer so the retry's
-                        # fresh preamble doesn't get double-recorded in
-                        # _current_streamed_assistant_text (which would
-                        # pollute the interim-visible-text comparison).
-                        try:
-                            agent._reset_stream_delivery_tracking()
-                        except Exception:
-                            pass
-                        # Reset in-memory accumulators so the next
-                        # attempt's chunks don't concat onto the dead
-                        # stream's partial JSON.
-                        result["partial_tool_names"] = []
-                        deltas_were_sent["yes"] = False
-                        first_delta_fired["done"] = False
-                        agent._emit_stream_drop(
-                            error=e,
-                            attempt=_stream_attempt + 2,
-                            max_attempts=_max_stream_retries + 1,
-                            mid_tool_call=True,
-                            diag=request_client_holder.get("diag"),
-                        )
-                        _cancel_current_stream_attempt("stream_mid_tool_retry_cleanup")
-                        _close_request_client_once("stream_mid_tool_retry_cleanup")
-                        # #67142: anthropic streams on a request-local client,
-                        # already worker-owned-closed by _close_request_client_once
-                        # above; the next attempt builds a fresh one. The shared
-                        # _anthropic_client is never closed from inside a request.
-                        # #70773: same FD-recycle corruption vector for OpenAI.
-                        # The shared client will be replaced lazily by
-                        # _ensure_primary_openai_client on the next attempt.
-                        continue
+                        result["error"] = e
+                        return
 
                     # SSE error events from proxies (e.g. OpenRouter sends
                     # {"error":{"message":"Network connection lost."}}) are
@@ -4949,15 +5317,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # Close the stale request client before retry
                             _cancel_current_stream_attempt("stream_retry_cleanup")
                             _close_request_client_once("stream_retry_cleanup")
-                            # Also rebuild the primary client to purge any dead
-                            # connections from the pool. #67142: anthropic uses a
-                            # request-local client (already worker-owned-closed
-                            # above; next attempt builds fresh), so the shared
-                            # _anthropic_client is never closed from inside a
-                            # request — only the OpenAI-wire primary is refreshed.
-                            # #70773: same FD-recycle corruption vector for OpenAI.
-                            # The shared client will be replaced lazily by
-                            # _ensure_primary_openai_client on the next attempt.
+                            # Discard failed-attempt scrubber, delivery, and byte
+                            # state; never flush its held tail into the retry.
+                            agent._reset_stream_delivery_tracking(flush=False)
+                            result["partial_tool_names"] = []
+                            first_delta_fired["done"] = False
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
@@ -5272,13 +5636,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
+        if isinstance(result["error"], StreamPayloadBoundExceeded):
+            raise result["error"]
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
             # Return a partial response stub with finish_reason="length"
             # so the conversation loop's continuation machinery fires.
             # tool_calls=None prevents auto-execution of incomplete calls.
-            _partial_text = (
+            _partial_text = bounded_stream_text(
                 getattr(agent, "_current_streamed_assistant_text", "") or ""
             ).strip() or None
 
@@ -5294,12 +5660,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     f"({_name_str}); the action was not executed. "
                     f"Ask me to retry if you want to continue."
                 )
-                _partial_text = (_partial_text or "") + _warn
-                # Fire as streaming delta so the user sees it immediately.
-                try:
-                    agent._fire_stream_delta(_warn)
-                except Exception:
-                    pass
+                # Admit and emit before adding generated text to the partial.
+                # A bound crossing is terminal and never reaches a sink.
+                agent._fire_stream_delta(_warn)
+                _partial_text = bounded_stream_text((_partial_text or "") + _warn)
                 logger.warning(
                     "Partial stream dropped tool call(s) %s after %s chars "
                     "of text; surfaced warning to user: %s",

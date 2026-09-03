@@ -141,6 +141,183 @@ async def test_async_execution_uses_canonical_relay_operation_name(
     assert observed_names == ["openai.responses"]
 
 
+def test_managed_current_sends_remember_once_and_retain_distinct_fingerprints(
+    relay_turn, monkeypatch, tmp_path
+):
+    from agent import cache_lowhit_request_dump as dump
+    from agent import cache_request_capture as capture
+    from agent.usage_pricing import CanonicalUsage
+
+    monkeypatch.setattr(capture, "_settings", lambda: {"enabled": True})
+
+    dump.reset_for_tests()
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    remembered = []
+    original_remember = dump.remember_sent_request
+
+    def remember(request, *, api_mode):
+        remembered.append((request, api_mode))
+        original_remember(request, api_mode=api_mode)
+
+    monkeypatch.setattr(dump, "remember_sent_request", remember)
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+
+    request_a = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "managed-a"}],
+    }
+    request_b = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "managed-b"}],
+    }
+
+    relay_llm.execute_current(
+        request_a,
+        lambda _request: {"content": "done-a"},
+        name="custom",
+        model_name="test-model",
+        metadata={"api_mode": "chat_completions"},
+    )
+
+    async def provider(_request):
+        return {"content": "done-b"}
+
+    asyncio.run(
+        relay_llm.execute_current_async(
+            request_b,
+            provider,
+            name="custom",
+            model_name="test-model",
+            metadata={"api_mode": "chat_completions"},
+        )
+    )
+
+    assert len(remembered) == 2
+    assert [request["messages"][0]["content"] for request, _mode in remembered] == [
+        "managed-a",
+        "managed-b",
+    ]
+
+    dump.maybe_dump_on_usage(
+        CanonicalUsage(
+            cache_read_tokens=0,
+            input_tokens=10_000,
+            cache_telemetry="reported",
+        )
+    )
+    files = list((tmp_path / "observability" / "cache_lowhit").glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    fingerprints = [request["fingerprint"] for request in payload["requests"]]
+    assert len(fingerprints) == 2
+    assert len(set(fingerprints)) == 2
+
+
+def test_physical_attempt_unwraps_pre_wrapped_callback_once(relay_turn, monkeypatch):
+    from agent import cache_lowhit_request_dump as dump
+
+    remembered = []
+    monkeypatch.setattr(
+        dump,
+        "remember_sent_request",
+        lambda request, *, api_mode: remembered.append((request, api_mode)),
+    )
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+
+    def provider(request):
+        return {"content": request["messages"][0]["content"]}
+
+    for content in ("physical-a", "physical-b"):
+        result = relay_llm._execute_with_physical_attempt(
+            {"model": "test-model", "messages": [{"role": "user", "content": content}]},
+            relay_llm._RememberingSend(provider, "chat_completions"),
+            session_id="session-1",
+            name="custom",
+            model_name="test-model",
+            metadata={"api_mode": "chat_completions"},
+        )
+        assert result == {"content": content}
+
+    assert len(remembered) == 2
+    assert [request["messages"][0]["content"] for request, _mode in remembered] == [
+        "physical-a",
+        "physical-b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_async_physical_attempt_unwraps_pre_wrapped_callback_once(
+    relay_turn, monkeypatch
+):
+    from agent import cache_lowhit_request_dump as dump
+
+    remembered = []
+    monkeypatch.setattr(
+        dump,
+        "remember_sent_request",
+        lambda request, *, api_mode: remembered.append((request, api_mode)),
+    )
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+
+    async def provider(request):
+        return {"content": request["messages"][0]["content"]}
+
+    for content in ("async-physical-a", "async-physical-b"):
+        result = await relay_llm._execute_async_with_physical_attempt(
+            {"model": "test-model", "messages": [{"role": "user", "content": content}]},
+            relay_llm._RememberingSend(provider, "chat_completions"),
+            session_id="session-1",
+            name="custom",
+            model_name="test-model",
+            metadata={"api_mode": "chat_completions"},
+        )
+        assert result == {"content": content}
+
+    assert len(remembered) == 2
+    assert [request["messages"][0]["content"] for request, _mode in remembered] == [
+        "async-physical-a",
+        "async-physical-b",
+    ]
+
+
+def test_stream_physical_attempt_unwraps_pre_wrapped_factory_once(
+    relay_turn, monkeypatch
+):
+    from agent import cache_lowhit_request_dump as dump
+
+    remembered = []
+    monkeypatch.setattr(
+        dump,
+        "remember_sent_request",
+        lambda request, *, api_mode: remembered.append((request, api_mode)),
+    )
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+
+    def stream_factory(request):
+        return iter([{"delta": request["messages"][0]["content"]}])
+
+    for content in ("stream-physical-a", "stream-physical-b"):
+        stream = relay_llm._stream_with_physical_attempt(
+            {"model": "test-model", "messages": [{"role": "user", "content": content}]},
+            relay_llm._RememberingSend(stream_factory, "chat_completions"),
+            session_id="session-1",
+            name="custom",
+            model_name="test-model",
+            finalizer=lambda: {"content": content},
+            metadata={"api_mode": "chat_completions"},
+        )
+        try:
+            assert list(stream) == [{"delta": content}]
+        finally:
+            stream.close()
+
+    assert len(remembered) == 2
+    assert [request["messages"][0]["content"] for request, _mode in remembered] == [
+        "stream-physical-a",
+        "stream-physical-b",
+    ]
+
+
 def test_stream_execution_uses_canonical_relay_operation_name(relay_turn, monkeypatch):
     relay, _turn = relay_turn
     observed_names = []
@@ -651,6 +828,146 @@ def test_non_stream_defers_logical_success_and_reuses_scope_for_retry(relay_turn
     relay_llm.complete_logical_call("request-retry", outcome="success")
 
     assert turn.logical_llm_calls == {}
+
+
+def test_cache_scope_envelope_is_digested_then_removed_before_relay_and_provider(
+    relay_turn, monkeypatch, tmp_path
+):
+    relay, _turn = relay_turn
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    sentinel = "ISSUE108-PRIVATE-CACHE-SCOPE"
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: {
+        "observability": {"physical_attempt_digests": {"enabled": True}}
+    })
+    diagnostics._LAST_ATTEMPT.clear()
+    prepared = []
+    scope_digests = iter(("scope-one", "scope-two"))
+
+    def prepare_cache_scope(scope):
+        prepared.append(scope)
+        return {"digest": next(scope_digests)}
+
+    monkeypatch.setattr(diagnostics, "prepare_cache_scope", prepare_cache_scope)
+    relay_requests = []
+    provider_requests = []
+
+    def inspect_relay_request(name, request, annotated):
+        del name
+        relay_requests.append(request.content)
+        return relay.LLMRequestInterceptOutcome(request, annotated)
+
+    relay.intercepts.register_llm_request(
+        "hermes-test-cache-scope-envelope", 1, False, inspect_relay_request
+    )
+    try:
+        for loop, cache_key in ((1, f"{sentinel}-one"), (2, f"{sentinel}-two")):
+            relay_llm.execute(
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "system", "content": "fixed"}],
+                    "prompt_cache_key": cache_key,
+                },
+                lambda request: provider_requests.append(request) or {"ok": True},
+                session_id="session-1",
+                name="test-provider",
+                model_name="test-model",
+                metadata={
+                    "api_mode": "chat_completions",
+                    "api_request_id": f"cache-scope:api:{loop}",
+                },
+            )
+    finally:
+        relay.intercepts.deregister_llm_request("hermes-test-cache-scope-envelope")
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "profile" / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text().splitlines()
+    ]
+    attempts = [record for record in records if record["phase"] == "attempt"]
+    assert prepared == [f"{sentinel}-one", f"{sentinel}-two"]
+    assert attempts[0]["digests"]["cache_scope"] != attempts[1]["digests"]["cache_scope"]
+    assert all("_hermes_physical_attempt_cache_scope" not in request for request in relay_requests)
+    assert all("_hermes_physical_attempt_cache_scope" not in request for request in provider_requests)
+    serialized = json.dumps(records, sort_keys=True)
+    assert sentinel + "-one" in serialized
+    assert sentinel + "-two" in serialized
+    assert "_hermes_physical_attempt_cache_scope" not in serialized
+
+
+def test_real_config_records_codex_input_history_through_relay(relay_turn, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    sentinel = "ISSUE170-PRIVATE-CODEX-HISTORY"
+    profile = tmp_path / "profile"
+    profile.mkdir(exist_ok=True)
+    (profile / "config.yaml").write_text(
+        "observability:\n  physical_attempt_digests:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    diagnostics._LAST_ATTEMPT.clear()
+    provider_requests = []
+
+    for loop, text in ((1, f"{sentinel}-old"), (2, f"{sentinel}-new")):
+        relay_llm.execute(
+            {
+                "model": "test-model",
+                "instructions": "fixed",
+                "input": [{"role": "user", "content": text}],
+                "tools": [],
+                "prompt_cache_key": "fixed",
+            },
+            lambda request: provider_requests.append(request) or {
+                "id": f"response-{loop}",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "test-model",
+                "output": [],
+            },
+            session_id="session-1",
+            name="openai-codex",
+            model_name="test-model",
+            metadata={
+                "api_mode": "codex_responses",
+                "api_request_id": f"real-config:api:{loop}",
+            },
+        )
+
+    records = [
+        json.loads(line)
+        for line in (
+            profile / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    pair = next(record for record in records if record["phase"] == "pair")
+    assert len(provider_requests) == 2
+    assert pair["first_differing_segment"] == "later_history"
+    assert pair["equal"] == {
+        "cache_scope": True,
+        "later_history": False,
+        "prefix": True,
+        "tools": True,
+    }
+    serialized = json.dumps(records, sort_keys=True)
+    assert sentinel + "-old" in serialized
+    assert sentinel + "-new" in serialized
+
+
+def test_unrelated_extra_body_keeps_session_cache_scope_fallback(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(
+        relay_llm.physical_attempt_diagnostics,
+        "prepare_cache_scope",
+        lambda scope: prepared.append(scope) or None,
+    )
+
+    request = {"extra_body": {"temperature": 0}}
+    assert relay_llm._request_with_cache_scope(request, "session-1") is request
+    assert prepared == ["session-1"]
 
 
 def test_non_stream_result_survives_logical_scope_close_failure(

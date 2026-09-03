@@ -10,6 +10,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent.conversation_loop import _is_xai_bad_credentials_403
 
 
 @pytest.fixture(autouse=True)
@@ -1315,6 +1316,30 @@ def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
     )
 
 
+def test_xai_prompt_cache_key_ignores_trailing_loop_timing(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    stable_messages = [
+        {"role": "system", "content": "Stable instructions"},
+        {"role": "user", "content": "Ping"},
+    ]
+
+    def build(timing_text):
+        return agent._build_api_kwargs(
+            [*stable_messages, {"role": "system", "content": timing_text}]
+        )
+
+    first = build(
+        "[Agent loop timing]\nCurrent loop start: 2026-08-22T11:28:03-07:00"
+    )
+    second = build(
+        "[Agent loop timing]\nCurrent loop start: 2026-08-22T11:28:05-07:00"
+    )
+
+    assert first["extra_body"]["prompt_cache_key"] == second["extra_body"]["prompt_cache_key"]
+    assert first["instructions"] == second["instructions"] == "Stable instructions"
+    assert "[Agent loop timing]" not in first["instructions"]
+    assert "[Agent loop timing]" in str(first["input"])
+    assert "[Agent loop timing]" in str(second["input"])
 
 
 def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
@@ -1823,6 +1848,104 @@ def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"
         status="in_progress",
         model="gpt-5-codex",
     )
+
+
+def _codex_unreplayable_reasoning_response(text: str):
+    """Incomplete reasoning without opaque or message-item replay state."""
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                id="rs_unreplayable",
+                summary=[SimpleNamespace(text=text)],
+                status="completed",
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
+        status="in_progress",
+        model="gpt-5-codex",
+    )
+
+
+def test_codex_incomplete_budget_issues_three_continuations(monkeypatch):
+    """Three declared continuations produce three physical follow-up calls."""
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_unreplayable_reasoning_response(f"Thinking {index}")
+        for index in range(4)
+    ]
+    calls = []
+    notices = []
+
+    def _fake_api_call(api_kwargs):
+        calls.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(agent, "_emit_wait_notice", notices.append)
+
+    result = agent.run_conversation("test continuation budget")
+
+    assert len(calls) == 4  # initial request + three continuations
+    assert [notice.rsplit(" ", 1)[-1] for notice in notices] == [
+        "(1/3)",
+        "(2/3)",
+        "(3/3)",
+    ]
+    assert result["api_calls"] == 4
+    assert result["final_response"] == (
+        "Codex response remained incomplete after 3 continuation attempts"
+    )
+    assert result["error"] == result["final_response"]
+    assert getattr(agent, "_codex_incomplete_retries") == 0
+
+    nudge_count = sum(
+        1
+        for message in result["messages"]
+        if message.get("role") == "user"
+        and str(message.get("content", "")).startswith(
+            "[System: Your previous response contained only internal reasoning"
+        )
+    )
+    assert nudge_count == 3
+    roles = [message.get("role") for message in result["messages"]]
+    assert all(
+        pair not in (("user", "user"), ("tool", "user"))
+        for pair in zip(roles, roles[1:])
+    )
+
+
+def test_codex_incomplete_counter_resets_after_completion_and_new_turn(monkeypatch):
+    """Completed continuations and a fresh turn both restart at 1/3."""
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_with_reasoning("First partial", "rs_first"),
+        _codex_message_response("First complete"),
+        _codex_incomplete_with_reasoning("Second partial", "rs_second"),
+        _codex_message_response("Second complete"),
+    ]
+    notices = []
+    monkeypatch.setattr(
+        agent, "_interruptible_api_call", lambda _kwargs: responses.pop(0)
+    )
+    monkeypatch.setattr(agent, "_emit_wait_notice", notices.append)
+
+    first = agent.run_conversation("first turn")
+    assert first["completed"] is True
+    assert first["final_response"] == "First complete"
+    assert getattr(agent, "_codex_incomplete_retries") == 0
+
+    # Seed stale state to prove build_turn_context owns the new-turn reset.
+    setattr(agent, "_codex_incomplete_retries", 2)
+    second = agent.run_conversation("second turn")
+
+    assert second["completed"] is True
+    assert second["final_response"] == "Second complete"
+    assert [notice.rsplit(" ", 1)[-1] for notice in notices] == [
+        "(1/3)",
+        "(1/3)",
+    ]
+    assert getattr(agent, "_codex_incomplete_retries") == 0
 
 
 def test_codex_incomplete_visible_dedup_suppresses_duplicate_interims(monkeypatch):
@@ -2407,3 +2530,125 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
     )
 
     assert "".join(reasoning_streamed) == "Need to inspect files."
+
+
+class _XaiForbidden403(Exception):
+    status_code = 403
+
+    def __init__(self, body, text="Error code: 403"):
+        self.body = body
+        super().__init__(text)
+
+
+class _Unauthorized401(Exception):
+    status_code = 401
+
+
+@pytest.mark.parametrize(
+    ("body", "text", "expected"),
+    [
+        ({"code": "unauthenticated:bad-credentials"}, "Error code: 403", True),
+        (
+            {"error": "bad-credentials is not the cause"},
+            "HTTP 403: bad-credentials is not the cause",
+            False,
+        ),
+        ({"code": "unauthenticated:bad-credentials-extra"}, "Error code: 403", False),
+        (
+            {"code": "other", "message": "OAuth2 access token could not be validated"},
+            "Error code: 403",
+            True,
+        ),
+        (
+            {"code": "other", "message": "not OAuth2 access token could be validated"},
+            "Error code: 403",
+            False,
+        ),
+    ],
+)
+def test_xai_403_marker_matching_is_structured_and_exact(body, text, expected):
+    assert _is_xai_bad_credentials_403(
+        "xai-oauth", 403, _XaiForbidden403(body, text)
+    ) is expected
+
+
+def test_run_conversation_xai_403_body_only_refreshes_and_retries(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403(
+                {
+                    "code": "unauthenticated:bad-credentials",
+                    "message": "OAuth2 access token could not be validated",
+                }
+            )
+        return _codex_message_response("OK")
+
+    refreshes = {"count": 0}
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        assert force is True
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 1
+    assert calls["api"] == 2
+    assert result["completed"] is True
+    assert result["final_response"] == "OK"
+
+
+def test_run_conversation_xai_403_shares_one_shot_budget_with_401(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+    refreshes = {"count": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403({"code": "unauthenticated:bad-credentials"})
+        raise _Unauthorized401("HTTP 401: unauthorized")
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 1
+    assert result.get("completed") is not True
+
+
+@pytest.mark.parametrize(
+    ("builder", "body"),
+    [
+        (_build_xai_oauth_agent, {"code": "personal-team-blocked:spending-limit"}),
+        (_build_xai_oauth_agent, {"error": "forbidden by policy"}),
+        (_build_agent, {"code": "unauthenticated:bad-credentials"}),
+    ],
+)
+def test_run_conversation_unrelated_403_does_not_refresh(monkeypatch, builder, body):
+    agent = builder(monkeypatch)
+    refreshes = {"count": 0}
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    def _api_call(_api_kwargs):
+        raise _XaiForbidden403(body)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 0
+    assert result.get("completed") is not True

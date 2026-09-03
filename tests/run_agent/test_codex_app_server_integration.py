@@ -137,6 +137,8 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.context_length == 200000
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
+        from tui_gateway import server as tui_server
+
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
                 final_text="done",
@@ -146,8 +148,8 @@ class TestRunConversationCodexPath:
                 compacted=True,
                 token_usage_last={
                     "totalTokens": 300_000,
-                    "inputTokens": 300_000,
-                    "cachedInputTokens": 0,
+                    "inputTokens": 15_000,
+                    "cachedInputTokens": 285_000,
                     "outputTokens": 0,
                     "reasoningOutputTokens": 0,
                 },
@@ -158,9 +160,22 @@ class TestRunConversationCodexPath:
             CodexAppServerSession, "ensure_started", lambda self: "thread-compact-1"
         )
         events = []
+        gateway_events = []
         agent = _make_codex_agent(event_callback=lambda name, payload: events.append((name, payload)))
+        setattr(agent, "_tui_first_provider_response_record_enabled", True)
+        monkeypatch.setitem(tui_server._sessions, "codex-cache-sid", {"agent": agent})
+        tui_server._attach_tui_cache_callback(agent, "codex-cache-sid")
 
-        with patch.object(agent, "_spawn_background_review", return_value=None):
+        with (
+            patch.object(agent, "_spawn_background_review", return_value=None),
+            patch.object(
+                tui_server,
+                "_emit",
+                side_effect=lambda event, sid, payload: gateway_events.append(
+                    (event, sid, payload)
+                ),
+            ),
+        ):
             result = agent.run_conversation("hello")
 
         assert result["completed"] is True
@@ -170,6 +185,24 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_prompt_tokens == 300_000
         assert agent.context_compressor.awaiting_real_usage_after_compression is False
         assert agent.context_compressor._ineffective_compression_count == 1
+        assert gateway_events[0][:2] == ("status.update", "codex-cache-sid")
+        assert gateway_events[0][2]["kind"] == "cache_hit"
+        assert gateway_events[0][2]["text"] == (
+            "cache 95% · post-compression cold prefix (expected)"
+        )
+        assert gateway_events[0][2]["cache_record"]["state"] == "hit"
+        assert gateway_events[0][2]["cache_record"]["attribution"] == "post_compression"
+        assert tui_server._cache_info_from_usage(
+            getattr(agent, "_first_turn_usage")
+        ) == {
+            "attribution": "post_compression",
+            "read_tokens": 285_000,
+            "prompt_tokens": 300_000,
+            "pct": 95,
+            "state": "hit",
+            "level": "info",
+        }
+        assert getattr(agent, "_awaiting_cache_usage_after_compression") is False
         assert events == [
             (
                 "session:compress",
@@ -185,6 +218,91 @@ class TestRunConversationCodexPath:
                 },
             )
         ]
+
+    def test_explicit_compact_usage_waits_for_next_useful_turn_attribution(self):
+        class FakeSession:
+            def __init__(self):
+                self.turns = iter(
+                    [
+                        TurnResult(
+                            final_text="first",
+                            projected_messages=[{"role": "assistant", "content": "first"}],
+                            thread_id="thread-compact-1",
+                            turn_id="turn-useful-1",
+                            token_usage_last={
+                                "totalTokens": 130,
+                                "inputTokens": 80,
+                                "cachedInputTokens": 20,
+                                "outputTokens": 25,
+                                "reasoningOutputTokens": 5,
+                            },
+                        ),
+                        TurnResult(
+                            final_text="second",
+                            projected_messages=[{"role": "assistant", "content": "second"}],
+                            thread_id="thread-compact-1",
+                            turn_id="turn-useful-2",
+                            token_usage_last={
+                                "totalTokens": 130,
+                                "inputTokens": 80,
+                                "cachedInputTokens": 20,
+                                "outputTokens": 25,
+                                "reasoningOutputTokens": 5,
+                            },
+                        ),
+                    ]
+                )
+
+            def compact_thread(self):
+                return TurnResult(
+                    thread_id="thread-compact-1",
+                    turn_id="turn-compact-1",
+                    token_usage_last={
+                        "totalTokens": 300_000,
+                        "inputTokens": 15_000,
+                        "cachedInputTokens": 285_000,
+                        "outputTokens": 0,
+                        "reasoningOutputTokens": 0,
+                    },
+                )
+
+            def run_turn(self, *, user_input, **_kwargs):
+                return next(self.turns)
+
+        agent = _make_codex_agent()
+        agent._codex_session = FakeSession()
+
+        agent._compress_context([], "system", force=True)
+
+        assert agent.session_api_calls == 1
+        assert agent.session_total_tokens == 300_000
+        assert agent.context_compressor._ineffective_compression_count == 1
+        assert agent._awaiting_cache_usage_after_compression is True
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("first useful turn")
+        assert agent._first_turn_usage["cache_attribution"] == "post_compression"
+        assert agent._awaiting_cache_usage_after_compression is False
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("following turn")
+        assert "cache_attribution" not in agent._first_turn_usage
+
+    def test_explicit_compact_without_usage_clears_cache_attribution(self):
+        class FakeSession:
+            def compact_thread(self):
+                return TurnResult(
+                    thread_id="thread-compact-1",
+                    turn_id="turn-compact-no-usage",
+                )
+
+        agent = _make_codex_agent()
+        agent._codex_session = FakeSession()
+
+        agent._compress_context([], "system", force=True)
+
+        assert agent.context_compressor.awaiting_real_usage_after_compression is False
+        assert agent._awaiting_cache_usage_after_compression is False
 
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()
@@ -753,6 +871,39 @@ class TestCodexToolProgressBridge:
         on_event({"method": "item/completed", "params": {}})
         on_event({})
         assert events == []
+
+    @pytest.mark.parametrize(
+        ("method", "callback_attr"),
+        [
+            ("item/agentMessage/delta", "_fire_stream_delta"),
+            ("item/reasoning/delta", "_fire_reasoning_delta"),
+        ],
+    )
+    def test_bridge_propagates_stream_payload_bound_exceeded(
+        self, method, callback_attr
+    ):
+        from agent.codex_runtime import make_codex_app_server_event_bridge
+        from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+        overflow = StreamPayloadBoundExceeded(256 * 1024 + 1)
+
+        def raise_overflow(_text):
+            raise overflow
+
+        agent = SimpleNamespace(
+            tool_progress_callback=None,
+            _fire_stream_delta=None,
+            _fire_reasoning_delta=None,
+            _emit_interim_assistant_message=None,
+        )
+        setattr(agent, callback_attr, raise_overflow)
+
+        with pytest.raises(StreamPayloadBoundExceeded) as caught:
+            make_codex_app_server_event_bridge(agent)(
+                {"method": method, "params": {"delta": "overflow"}}
+            )
+
+        assert caught.value is overflow
 
     def test_session_wired_with_on_event_that_fires_tool_progress(self, monkeypatch):
         """The session is constructed with an on_event hook that, when fed an

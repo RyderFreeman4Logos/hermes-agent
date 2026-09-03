@@ -11100,9 +11100,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
-            "agent_primary_runtime": copy.deepcopy(
+            "agent_primary_runtime": (
                 getattr(agent, "_primary_runtime", None)
-            ) if agent is not None else None,
+                if agent is not None
+                else None
+            ),
         }
 
     def _restore_model_runtime_snapshot(self, snapshot: dict | None) -> None:
@@ -11129,13 +11131,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         primary = snapshot.get("agent_primary_runtime")
         if primary and hasattr(agent, "_restore_primary_runtime"):
             try:
-                agent._primary_runtime = copy.deepcopy(primary)
+                agent._primary_runtime = primary
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():
                     return
             except Exception:
-                logger.debug("CLI one-turn model restore via primary runtime failed", exc_info=True)
+                logger.debug("CLI one-turn model restore via primary runtime failed")
 
         if hasattr(agent, "switch_model"):
             try:
@@ -11146,8 +11148,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
                 )
-            except Exception as exc:
-                logger.warning("CLI one-turn model restore failed: %s", exc)
+            except Exception:
+                logger.warning("CLI one-turn model restore failed")
 
     @staticmethod
     def _filter_model_picker_entries(entries: list, query: str) -> list:
@@ -11539,7 +11541,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         custom_provs = ctx.custom_providers if ctx is not None else None
 
         # No args at all: open prompt_toolkit-native picker modal
-        if not model_input and not explicit_provider:
+        if (
+            not model_input
+            and not explicit_provider
+            and not request.is_after_compression
+        ):
             model_display = self.model or "unknown"
             provider_display = get_label(self.provider) if self.provider else "unknown"
 
@@ -11584,10 +11590,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            is_after_compression=request.is_after_compression,
+            reasoning=request.reasoning,
+            validate_live=not request.is_after_compression,
         )
 
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
+            return
+        result.is_after_compression = request.is_after_compression
+
+        if request.is_after_compression:
+            agent = getattr(self, "agent", None)
+            if agent is None:
+                _cprint("  ✗ --after-compression requires a live session.")
+                return
+            try:
+                from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+                schedule_model_switch_after_compression(agent, result)
+            except Exception as exc:
+                _cprint(f"  ✗ Could not schedule model switch: {exc}")
+                return
+            _cprint(f"  ✓ Model switch scheduled after compression: {result.new_model}")
             return
 
         if self.agent is not None:

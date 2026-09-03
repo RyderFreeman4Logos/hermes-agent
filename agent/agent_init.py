@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import copy as _copy
 import logging
 import os
 import re
@@ -49,10 +50,9 @@ from agent.tool_guardrails import (
     ToolGuardrailDecision,
 )
 from hermes_cli.config import cfg_get
-from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
-from utils import base_url_host_matches, is_truthy_value
+from utils import base_url_host_matches, is_truthy_value, normalize_route_base_url
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
 # capture our warnings.  (run_agent.py also does
@@ -76,23 +76,117 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     no memory and no diagnostic. A common trigger is systemd/gateway services
     not inheriting ``~/.hermes/.env``. See NousResearch/hermes-agent#2765.
 
-    ``reason`` is the provider's ``unavailable_reason()`` — a provider-specific,
-    actionable hint (e.g. which package to install). Because an unavailable
-    provider is never initialized, this is the only place such a hint can reach
-    the user, so it is appended to the warning when present (#7718).
+    Provider names and reasons are not logged because plugin-controlled text may
+    contain request, credential, or response data. The arguments remain for the
+    compatibility and once-per-provider deduplication contract.
     """
     if name in _warned_unavailable_providers:
         return
     _warned_unavailable_providers.add(name)
     logger.warning(
-        "Memory provider %r is selected but reports unavailable — external memory "
+        "Selected memory provider reports unavailable — external memory "
         "is disabled for this session (built-in memory still works). Check the "
         "provider's credentials/config with 'hermes memory status'. Note: "
         "systemd/gateway services do not inherit ~/.hermes/.env automatically; set "
-        "any required variables in the service environment.%s",
-        name,
-        f" {reason}" if reason else "",
+        "any required variables in the service environment. "
+        "Status: provider_unavailable."
     )
+
+
+def build_memory_subsystem(
+    agent: Any,
+    config: Dict[str, Any],
+    *,
+    skip_memory: bool,
+    provider_mode: str,
+    session_id: str,
+) -> Dict[str, Any]:
+    """Construct and initialize the external provider off to the side."""
+    from tools.memory_tool import get_builtin_memory_config
+
+    enabled = bool(getattr(agent, "_memory_enabled", False))
+    profile_enabled = bool(getattr(agent, "_user_profile_enabled", False))
+    store = getattr(agent, "_memory_store", None)
+    manager = None
+    mem_config: Dict[str, Any] = (
+        get_builtin_memory_config(config)
+        if not skip_memory
+        else dict(getattr(agent, "_memory_config", {}) or {})
+    )
+
+    if not skip_memory:
+        provider_name = str(mem_config.get("provider", "") or "").strip()
+        if provider_name or provider_mode == "authoritative":
+            from agent.memory_manager import MemoryManager
+            from plugins.memory import load_memory_provider
+
+            manager = MemoryManager(provider_mode=provider_mode)
+            provider = None
+            try:
+                provider = load_memory_provider(provider_name) if provider_name else None
+                if provider and provider.is_available():
+                    manager.add_provider(provider)
+                elif provider is not None:
+                    _warn_memory_provider_unavailable(provider_name)
+                if manager.providers:
+                    init_kwargs = {
+                        "session_id": session_id,
+                        "platform": getattr(agent, "platform", None) or "cli",
+                        "hermes_home": str(get_hermes_home()),
+                        "agent_context": "primary",
+                    }
+                    if init_kwargs["platform"] == "cli":
+                        init_kwargs["warning_callback"] = agent._emit_warning
+                        init_kwargs["status_callback"] = agent._emit_status
+                    session_db = getattr(agent, "_session_db", None)
+                    if session_db:
+                        try:
+                            title = session_db.get_session_title(session_id)
+                            if title:
+                                init_kwargs["session_title"] = title
+                        except Exception:
+                            pass
+                    for attr, key in (
+                        ("_user_id", "user_id"),
+                        ("_user_id_alt", "user_id_alt"),
+                        ("_user_name", "user_name"),
+                        ("_chat_id", "chat_id"),
+                        ("_chat_name", "chat_name"),
+                        ("_chat_type", "chat_type"),
+                        ("_thread_id", "thread_id"),
+                        ("_gateway_session_key", "gateway_session_key"),
+                    ):
+                        value = getattr(agent, attr, None)
+                        if value:
+                            init_kwargs[key] = value
+                    try:
+                        from hermes_cli.profiles import get_active_profile_name
+
+                        init_kwargs["agent_identity"] = get_active_profile_name()
+                        init_kwargs["agent_workspace"] = "hermes"
+                    except Exception:
+                        pass
+                    manager.initialize_all(**init_kwargs)
+                    _ra().logger.info("Memory provider '%s' activated", provider_name)
+                elif provider_mode != "authoritative":
+                    manager = None
+            except BaseException:
+                if provider is not None and provider not in manager.providers:
+                    try:
+                        provider.shutdown()
+                    except Exception:
+                        pass
+                manager.shutdown_all()
+                raise
+
+    return {
+        "config": mem_config,
+        "memory_enabled": enabled,
+        "user_profile_enabled": profile_enabled,
+        "store": store,
+        "manager": manager,
+        "provider_mode": provider_mode,
+    }
 
 
 def _ra():
@@ -398,9 +492,67 @@ def _record_codex_gpt55_autoraise_notice(autoraise: Dict[str, Any]) -> None:
 
 
 def _normalized_custom_base_url(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return value.strip().rstrip("/")
+    return normalize_route_base_url(value)
+
+
+_REQUEST_OVERRIDE_REJECTION = "request override projection rejected"
+_REQUEST_OVERRIDE_UNSET = object()
+
+
+class _RequestOverrideProjectionError(TypeError):
+    """A target request mapping could not be safely projected."""
+
+
+def _validate_request_override_graph(value: Any) -> None:
+    seen: set[int] = set()
+
+    def _validate(item: Any) -> None:
+        item_type = type(item)
+        if item_type in {type(None), str, bytes, int, float, bool}:
+            return
+        if item_type not in {dict, list, tuple}:
+            raise _RequestOverrideProjectionError(
+                _REQUEST_OVERRIDE_REJECTION
+            ) from None
+        item_id = id(item)
+        if item_id in seen:
+            return
+        seen.add(item_id)
+        values = item.items() if item_type is dict else enumerate(item)
+        for key, nested in values:
+            _validate(key)
+            _validate(nested)
+
+    _validate(value)
+
+
+def _copy_validated_request_override_graph(value: Any) -> Any:
+    try:
+        return _copy.deepcopy(value)
+    except Exception:
+        raise _RequestOverrideProjectionError(_REQUEST_OVERRIDE_REJECTION) from None
+
+
+def _copy_request_override_graph(value: Any) -> Any:
+    """Validate and detach one exact-plain request/runtime graph."""
+    _validate_request_override_graph(value)
+    return _copy_validated_request_override_graph(value)
+
+
+def _request_override_projections(
+    agent, derived_overrides: Optional[Dict[str, Any]] = None
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return independent caller-owned and derived runtime projections."""
+    try:
+        owned = object.__getattribute__(agent, "__dict__")
+    except (AttributeError, TypeError):
+        owned = {}
+    except Exception:
+        raise _RequestOverrideProjectionError(_REQUEST_OVERRIDE_REJECTION) from None
+    caller = owned.get("_caller_request_overrides", {}) if type(owned) is dict else {}
+    return _copy_request_override_graph(caller or {}), _copy_request_override_graph(
+        derived_overrides or {}
+    )
 
 
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
@@ -433,6 +585,27 @@ def _custom_provider_extra_body_for_agent(
     base_url: str,
     custom_providers: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
+    selected = _select_custom_provider_extra_body(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        custom_providers=custom_providers,
+    )
+    if selected is None:
+        return None
+    _validate_request_override_graph({"extra_body": selected})
+    return _copy_validated_request_override_graph({"extra_body": selected})[
+        "extra_body"
+    ]
+
+
+def _select_custom_provider_extra_body(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    custom_providers: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
     provider_norm = (provider or "").strip().lower()
     if provider_norm == "custom":
         provider_key_filter = ""
@@ -447,7 +620,7 @@ def _custom_provider_extra_body_for_agent(
 
     fallback: Optional[Dict[str, Any]] = None
     for entry in custom_providers or []:
-        if not isinstance(entry, dict):
+        if type(entry) is not dict:
             continue
         if provider_key_filter:
             entry_keys = {
@@ -459,35 +632,105 @@ def _custom_provider_extra_body_for_agent(
         if _normalized_custom_base_url(entry.get("base_url")) != target_url:
             continue
         extra_body = entry.get("extra_body")
-        if not isinstance(extra_body, dict) or not extra_body:
+        if type(extra_body) is not dict or not extra_body:
             continue
         provider_model = str(entry.get("model", "") or "").strip()
         if provider_model:
             if _custom_provider_model_matches(model, entry):
-                return dict(extra_body)
+                return extra_body
         elif fallback is None:
-            fallback = dict(extra_body)
+            fallback = extra_body
 
     return fallback
 
 
-def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
-    extra_body = _custom_provider_extra_body_for_agent(
-        provider=agent.provider,
-        model=agent.model,
-        base_url=agent.base_url,
+def _project_request_overrides(
+    agent,
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    service_tier: Optional[str],
+    derived_overrides: Optional[Dict[str, Any]] = None,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    caller_overrides: Any = _REQUEST_OVERRIDE_UNSET,
+) -> Dict[str, Any]:
+    """Return one detached target-runtime mapping without publishing it."""
+    del service_tier  # The caller supplies the tier-derived target layer explicitly.
+    if caller_overrides is _REQUEST_OVERRIDE_UNSET:
+        if hasattr(agent, "_caller_request_overrides"):
+            caller_source = getattr(agent, "_caller_request_overrides")
+        else:
+            current = getattr(agent, "request_overrides", {})
+            caller_source = (
+                {
+                    key: value
+                    for key, value in current.items()
+                    if key not in {"service_tier", "speed"}
+                }
+                if type(current) is dict
+                else current
+            )
+    else:
+        caller_source = caller_overrides
+    caller_source = {} if caller_source is None else caller_source
+    derived_source = {} if derived_overrides is None else derived_overrides
+    custom_source = _select_custom_provider_extra_body(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        custom_providers=custom_providers or [],
+    )
+
+    if type(caller_source) is not dict or type(derived_source) is not dict:
+        raise _RequestOverrideProjectionError(_REQUEST_OVERRIDE_REJECTION) from None
+    _validate_request_override_graph(caller_source)
+    _validate_request_override_graph(derived_source)
+    if custom_source is not None:
+        _validate_request_override_graph({"extra_body": custom_source})
+
+    caller = _copy_validated_request_override_graph(caller_source)
+    derived = _copy_validated_request_override_graph(derived_source)
+    custom = (
+        _copy_validated_request_override_graph({"extra_body": custom_source})[
+            "extra_body"
+        ]
+        if custom_source is not None
+        else None
+    )
+
+    composed: Dict[str, Any] = {}
+    if custom is not None:
+        composed["extra_body"] = custom
+    derived_extra = derived.get("extra_body")
+    if type(derived_extra) is dict and type(composed.get("extra_body")) is dict:
+        composed["extra_body"].update(derived_extra)
+        derived = {key: value for key, value in derived.items() if key != "extra_body"}
+    composed.update(derived)
+    caller_extra = caller.get("extra_body")
+    if type(caller_extra) is dict and type(composed.get("extra_body")) is dict:
+        composed["extra_body"].update(caller_extra)
+        caller = {key: value for key, value in caller.items() if key != "extra_body"}
+    composed.update(caller)
+    return composed
+
+
+def _compose_request_overrides(
+    agent,
+    derived_overrides: Optional[Dict[str, Any]] = None,
+    *,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Project and publish one constructor/cached-turn request mapping."""
+    agent.request_overrides = _project_request_overrides(
+        agent,
+        provider=getattr(agent, "provider", ""),
+        model=getattr(agent, "model", ""),
+        base_url=getattr(agent, "base_url", ""),
+        service_tier=getattr(agent, "service_tier", None),
+        derived_overrides=derived_overrides,
         custom_providers=custom_providers,
     )
-    if not extra_body:
-        return
-
-    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
-    existing_extra_body = overrides.get("extra_body")
-    if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
-    agent.request_overrides = overrides
 
 
 def _normalize_run_budget_seconds(value) -> Optional[float]:
@@ -587,6 +830,7 @@ def init_agent(
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
+    fast_mode_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
     user_id: str = None,
@@ -613,6 +857,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    memory_provider_mode_override: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -963,7 +1208,9 @@ def init_agent(
     # keep it in sync with the active provider.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
     agent.service_tier = service_tier
-    agent.request_overrides = dict(request_overrides or {})
+    agent._caller_request_overrides = _copy_request_override_graph(
+        request_overrides or {}
+    )
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     
@@ -1112,6 +1359,7 @@ def init_agent(
     # commentary when the provider later returns it as a completed interim
     # assistant message.
     agent._current_streamed_assistant_text = ""
+    agent._current_streamed_payload_bytes = 0
     # Completed interim messages delivered during the current user turn.
     # Unlike token-stream tracking, this spans Codex continuation/tool calls so
     # repeated commentary is not re-sent before normalization can deduplicate it.
@@ -1605,11 +1853,33 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
+    from agent.memory_provider import normalize_memory_provider_mode
+    from tools.memory_tool import (
+        frozen_memory_surface,
+        get_builtin_memory_config,
+        get_builtin_memory_store_flags,
+        get_memory_provider_mode,
     )
+
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _memory_schema_agent_cfg = load_config_readonly()
+    except Exception:
+        _memory_schema_agent_cfg = {}
+    _memory_schema_config = get_builtin_memory_config(_memory_schema_agent_cfg)
+    _memory_schema_mode = get_memory_provider_mode(_memory_schema_config)
+    if memory_provider_mode_override is not None:
+        _memory_schema_mode = (
+            normalize_memory_provider_mode(memory_provider_mode_override) or "hybrid"
+        )
+    _memory_schema_flags = get_builtin_memory_store_flags(_memory_schema_agent_cfg)
+    with frozen_memory_surface(_memory_schema_mode, _memory_schema_flags):
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1851,6 +2121,7 @@ def init_agent(
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
+    agent._memory_provider_mode = "hybrid"
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
@@ -1866,20 +2137,34 @@ def init_agent(
     _memory_toolset_requested = (
         "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
     )
+    mem_config = {}
+    agent._memory_config = mem_config
     if not skip_memory or _memory_toolset_requested:
         try:
+            from agent.memory_provider import normalize_memory_provider_mode
             from tools.memory_tool import (
                 get_builtin_memory_config,
                 get_builtin_memory_store_flags,
+                get_memory_provider_mode,
             )
 
             mem_config = get_builtin_memory_config(_agent_cfg)
+            agent._memory_config = mem_config
             agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
                 _agent_cfg
+            )
+            agent._memory_provider_mode = get_memory_provider_mode(mem_config)
+            if memory_provider_mode_override is not None:
+                agent._memory_provider_mode = normalize_memory_provider_mode(
+                    memory_provider_mode_override
+                ) or "hybrid"
+            agent._session_init_model_config["memory_provider_mode"] = (
+                agent._memory_provider_mode
             )
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
+
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
@@ -1889,92 +2174,25 @@ def init_agent(
                 agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init
-    
 
 
-    # Memory provider plugin (external — one at a time, alongside built-in)
-    # Reads memory.provider from config to select which plugin to activate.
+    # Build only the external provider here; built-in store gating is upstream.
     agent._memory_manager = None
-    if not skip_memory:
-        try:
-            _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-
-            if _mem_provider_name and _mem_provider_name.strip():
-                from agent.memory_manager import MemoryManager as _MemoryManager
-                from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
-                    agent._memory_manager.add_provider(_mp)
-                elif _mp is not None:
-                    # Skip the (potentially expensive) unavailable_reason() call
-                    # if we've already warned for this provider — the gateway
-                    # builds a fresh AIAgent per message, so without this guard
-                    # unavailable_reason() (which reads config from disk and may
-                    # probe importlib) runs on every turn.
-                    if _mem_provider_name not in _warned_unavailable_providers:
-                        try:
-                            _unavailable_reason = _mp.unavailable_reason()
-                        except Exception:
-                            _unavailable_reason = ""
-                        _warn_memory_provider_unavailable(_mem_provider_name, _unavailable_reason)
-                if agent._memory_manager.providers:
-                    _init_kwargs = {
-                        "session_id": agent.session_id,
-                        "platform": platform or "cli",
-                        "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
-                    }
-                    if _init_kwargs["platform"] == "cli":
-                        _init_kwargs["warning_callback"] = agent._emit_warning
-                        _init_kwargs["status_callback"] = agent._emit_status
-                    # Thread session title for memory provider scoping
-                    # (e.g. honcho uses this to derive chat-scoped session keys)
-                    if agent._session_db:
-                        try:
-                            _st = agent._session_db.get_session_title(agent.session_id)
-                            if _st:
-                                _init_kwargs["session_title"] = _st
-                        except Exception:
-                            pass
-                    # Thread gateway user identity for per-user memory scoping
-                    if agent._user_id:
-                        _init_kwargs["user_id"] = agent._user_id
-                    if agent._user_id_alt:
-                        _init_kwargs["user_id_alt"] = agent._user_id_alt
-                    if agent._user_name:
-                        _init_kwargs["user_name"] = agent._user_name
-                    if agent._chat_id:
-                        _init_kwargs["chat_id"] = agent._chat_id
-                    if agent._chat_name:
-                        _init_kwargs["chat_name"] = agent._chat_name
-                    if agent._chat_type:
-                        _init_kwargs["chat_type"] = agent._chat_type
-                    if agent._thread_id:
-                        _init_kwargs["thread_id"] = agent._thread_id
-                    # Thread gateway session key for stable per-chat Honcho session isolation
-                    if agent._gateway_session_key:
-                        _init_kwargs["gateway_session_key"] = agent._gateway_session_key
-                    # Profile identity for per-profile provider scoping
-                    try:
-                        from hermes_cli.profiles import get_active_profile_name
-                        _profile = get_active_profile_name()
-                        _init_kwargs["agent_identity"] = _profile
-                        _init_kwargs["agent_workspace"] = "hermes"
-                    except Exception:
-                        pass
-                    # NOTE: status_callback (for the deterministic retain
-                    # indicator) is wired above, CLI-only — gateway status is
-                    # delivered on a different path (see the platform=="cli"
-                    # block), and the indicator no-ops when it's absent.
-                    agent._memory_manager.initialize_all(**_init_kwargs)
-                    _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
-                else:
-                    _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
-                    agent._memory_manager = None
-        except Exception as _mpe:
-            _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
-            agent._memory_manager = None
+    try:
+        _memory_state = build_memory_subsystem(
+            agent,
+            _agent_cfg,
+            skip_memory=skip_memory,
+            provider_mode=agent._memory_provider_mode,
+            session_id=agent.session_id,
+        )
+        agent._memory_config = _memory_state["config"]
+        agent._memory_enabled = _memory_state["memory_enabled"]
+        agent._user_profile_enabled = _memory_state["user_profile_enabled"]
+        agent._memory_store = _memory_state["store"]
+        agent._memory_manager = _memory_state["manager"]
+    except Exception:
+        _ra().logger.warning("Memory provider plugin initialization failed (provider_error)")
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
@@ -2603,7 +2821,9 @@ def init_agent(
     # Store for reuse by _check_compression_model_feasibility (auxiliary
     # compression model context-length detection needs the same list).
     agent._custom_providers = _custom_providers
-    _merge_custom_provider_extra_body(agent, _custom_providers)
+    _compose_request_overrides(
+        agent, fast_mode_overrides, custom_providers=_custom_providers
+    )
 
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:
@@ -2972,6 +3192,7 @@ def init_agent(
     agent.session_estimated_cost_usd = 0.0
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
+    agent._awaiting_cache_usage_after_compression = False
     
     # ── Ollama num_ctx injection ──
     # Ollama defaults to 2048 context regardless of the model's capabilities.
@@ -3100,6 +3321,7 @@ def init_agent(
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": _copy_request_override_graph(agent.request_overrides),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
@@ -3119,6 +3341,13 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
+
+    try:
+        from hermes_cli.model_switch import restore_model_switch_after_compression
+
+        restore_model_switch_after_compression(agent)
+    except Exception:
+        logger.debug("deferred model-switch restore skipped", exc_info=True)
 
 
 

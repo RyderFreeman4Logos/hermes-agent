@@ -141,3 +141,31 @@ class TestUnknownTopLevelKeys:
         assert any("base_url" in i.message for i in misplaced)
         assert any("api_key" in i.message for i in misplaced)
 
+
+class TestModelPoolRequiresStandard:
+    def test_nonempty_pool_without_standard_is_error(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "model_pool": {
+                    "fast": {"provider": "custom", "model": "tiny"},
+                }
+            }
+        })
+        errors = [i for i in issues if i.severity == "error"]
+        assert any("standard" in i.message for i in errors)
+
+    def test_nonempty_pool_with_standard_is_valid(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "model_pool": {
+                    "standard": {"provider": "custom", "model": "tiny"},
+                }
+            }
+        })
+        assert not any("delegation.model_pool" in i.message for i in issues)
+
+    def test_empty_or_absent_pool_is_valid(self):
+        for delegation in ({}, {"model_pool": {}}):
+            issues = validate_config_structure({"delegation": delegation})
+            assert not any("delegation.model_pool" in i.message for i in issues)
+

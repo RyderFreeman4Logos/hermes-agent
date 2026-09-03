@@ -42,6 +42,12 @@ DEFAULT_CONFIG = {
         # behavior everywhere.
         "terminal_continue": True,
     },
+    "debug": {
+        "cache_requests": {
+            "enabled": False,
+            "strict_write": False,
+        },
+    },
     "agent": {
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a
@@ -54,6 +60,8 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Include previous/current loop timestamps in the API-only context.
+        "loop_timing_context": True,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -400,6 +408,11 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # FEATURE not bug (issue #191): omitted timeout auto-promotes even
+        # when this stock default 180 is below the threshold. Do not change
+        # this to "omitted timeout stays foreground" unless a user explicitly
+        # reverses the feature.
+        "auto_background_timeout_threshold": 200,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -3900,6 +3913,8 @@ DEFAULT_CONFIG = {
     # Config schema version - bump this when adding new required fields
     "_config_version": 39,
 }
+
+DEFAULT_CONFIG.setdefault("observability", {})["physical_attempt_digests"] = {"enabled": False}
 
 # Optional environment variables that enhance functionality
 OPTIONAL_ENV_VARS = {

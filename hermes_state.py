@@ -104,6 +104,8 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
 
 logger = logging.getLogger(__name__)
 
+_BILLING_MODE_UNSET = object()
+
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
 
@@ -2062,6 +2064,179 @@ def _cross_process_repair_lock(db_path: Path):
             handle.close()
 
 
+_ADVISORY_LOCK_CONTENTION_ERRNOS = {
+    errno.EACCES,
+    errno.EAGAIN,
+    errno.EDEADLK,
+}
+_ADVISORY_LOCK_UNSUPPORTED_ERRNOS = {
+    errno.ENOLCK,
+    errno.ENOSYS,
+    errno.ENOTSUP,
+    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+}
+_WINDOWS_LOCK_CONTENTION_ERRORS = {32, 33}
+_WINDOWS_LOCK_UNSUPPORTED_ERRORS = {1, 50}
+
+
+def session_db_write_lock_path(db_path: Path) -> Path:
+    """Return the cross-process advisory writer lock for *db_path*."""
+    return Path(str(db_path) + ".write.lock")
+
+
+def _is_advisory_lock_contention(exc: OSError) -> bool:
+    return (
+        exc.errno in _ADVISORY_LOCK_CONTENTION_ERRNOS
+        or getattr(exc, "winerror", None) in _WINDOWS_LOCK_CONTENTION_ERRORS
+    )
+
+
+def _is_advisory_lock_unsupported(exc: OSError) -> bool:
+    return (
+        exc.errno in _ADVISORY_LOCK_UNSUPPORTED_ERRNOS
+        or getattr(exc, "winerror", None) in _WINDOWS_LOCK_UNSUPPORTED_ERRORS
+    )
+
+
+def _seed_windows_lock_file(handle) -> None:
+    """Seed an empty sidecar at offset zero, never by append."""
+    handle.seek(0)
+    if handle.write(b"\0") != 1:
+        raise OSError("could not initialize the Windows advisory lock file")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _open_windows_advisory_lock_handle(lock_path: Path):
+    """Open and atomically initialize one byte for a Windows lock sidecar."""
+    path = os.fspath(lock_path)
+    while True:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except FileNotFoundError:
+                continue
+            handle = os.fdopen(fd, "r+b", buffering=0)
+            try:
+                if os.fstat(fd).st_size == 0:
+                    _seed_windows_lock_file(handle)
+                return handle
+            except BaseException:
+                handle.close()
+                raise
+        else:
+            handle = os.fdopen(fd, "r+b", buffering=0)
+            try:
+                _seed_windows_lock_file(handle)
+                return handle
+            except BaseException:
+                handle.close()
+                raise
+
+
+def _open_session_db_advisory_lock_handle(lock_path: Path):
+    """Open a writer sidecar at the platform's lock-file boundary."""
+    import platform
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if platform.system() == "Windows":
+        return _open_windows_advisory_lock_handle(lock_path)
+    return lock_path.open("a+b")
+
+
+def _try_acquire_exclusive_file_lock(handle) -> bool:
+    """Try to acquire an exclusive advisory lock without blocking."""
+    import platform
+
+    if platform.system() == "Windows":
+        import msvcrt
+
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            if _is_advisory_lock_contention(exc):
+                return False
+            raise
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        if _is_advisory_lock_contention(exc):
+            return False
+        raise
+
+
+def _release_exclusive_file_lock(handle) -> None:
+    """Release an advisory lock, best-effort."""
+    import platform
+
+    try:
+        if platform.system() == "Windows":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+
+
+@contextmanager
+def _session_db_advisory_write_lock(
+    db_path: Path,
+    *,
+    deadline: float,
+    patience_s: float,
+    allow_unsupported: bool,
+):
+    """Hold the per-database writer lock, or safely use DELETE-mode locking."""
+    handle = _open_session_db_advisory_lock_handle(session_db_write_lock_path(db_path))
+    acquired = False
+    started = deadline - patience_s
+    try:
+        while True:
+            try:
+                acquired = _try_acquire_exclusive_file_lock(handle)
+            except OSError as exc:
+                if allow_unsupported and _is_advisory_lock_unsupported(exc):
+                    yield False
+                    return
+                raise
+            if acquired:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                raise sqlite3.OperationalError(
+                    "database is locked (another Hermes process held the "
+                    f"state.db write lock for over {patience_s:.0f}s — "
+                    "likely a long maintenance operation such as VACUUM, "
+                    "a large WAL checkpoint, or an older pre-update process; "
+                    "the database itself is healthy)"
+                )
+            elapsed = now - started
+            delay = (
+                random.uniform(0.250, 1.000)
+                if elapsed >= 2.0
+                else random.uniform(0.020, 0.150)
+            )
+            time.sleep(min(delay, max(deadline - now, 0.001)))
+        yield True
+    finally:
+        if acquired:
+            _release_exclusive_file_lock(handle)
+        handle.close()
+
+
 def _bump_schema_cookie(conn: sqlite3.Connection) -> None:
     """Increment the schema cookie after direct ``sqlite_master`` surgery.
 
@@ -3007,7 +3182,7 @@ def _copy_database_snapshot(
             source.close()
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly_locked(db_path: Path) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
@@ -3187,7 +3362,49 @@ def _live_writer_holds_db(db_path: Path) -> bool:
                 pass
 
 
+def _uses_delete_journal_on_disk(db_path: Path) -> bool:
+    """Return true only when an existing SQLite header declares DELETE mode."""
+    try:
+        with db_path.open("rb") as handle:
+            header = handle.read(20)
+    except OSError:
+        return False
+    return (
+        len(header) >= 20
+        and header.startswith(b"SQLite format 3\x00")
+        and header[18] == 1
+    )
+
+
+def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+    """Run the state write probe under cross-process writer coordination."""
+    db_path = Path(db_path)
+    patience_s = SessionDB._WRITE_PATIENCE_S
+    with _session_db_advisory_write_lock(
+        db_path,
+        deadline=time.monotonic() + patience_s,
+        patience_s=patience_s,
+        allow_unsupported=_uses_delete_journal_on_disk(db_path),
+    ):
+        return _db_opens_cleanly_locked(db_path)
+
+
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+    """Repair state.db while excluding every other Hermes state writer."""
+    db_path = Path(db_path)
+    patience_s = SessionDB._WRITE_PATIENCE_S
+    with _session_db_advisory_write_lock(
+        db_path,
+        deadline=time.monotonic() + patience_s,
+        patience_s=patience_s,
+        allow_unsupported=_uses_delete_journal_on_disk(db_path),
+    ):
+        return _repair_state_db_schema_with_repair_lock(db_path, backup=backup)
+
+
+def _repair_state_db_schema_with_repair_lock(
+    db_path: Path, *, backup: bool = True
+) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -3251,7 +3468,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             # Another process is still inside its critical section. It may
             # nonetheless have healed the file already (long VACUUM after a
             # successful strategy), so re-probe before reporting failure.
-            if _db_opens_cleanly(db_path) is None:
+            if _db_opens_cleanly_locked(db_path) is None:
                 report["repaired"] = True
                 report["strategy"] = "repaired_by_other_process"
             else:
@@ -3426,7 +3643,7 @@ def _repair_state_db_schema_locked(
     # repaired the file, in which case redoing the surgery would undo its
     # work on a now-healthy DB (the repair/re-corrupt cascade this lock
     # exists to break).
-    if _db_opens_cleanly(db_path) is None:
+    if _db_opens_cleanly_locked(db_path) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
@@ -3606,7 +3823,7 @@ def _run_repair_strategies(
                     continue
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly_locked(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
             logger.warning(
@@ -3633,7 +3850,7 @@ def _run_repair_strategies(
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly_locked(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
             logger.warning(
@@ -3664,7 +3881,7 @@ def _run_repair_strategies(
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly_locked(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
@@ -3698,7 +3915,7 @@ def _run_repair_strategies(
             conn.execute("VACUUM")
         finally:
             conn.close()
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly_locked(db_path)
         if reason is None:
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
@@ -4435,6 +4652,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # refused rather than allowed to land a stale turn in a session whose
     # compression is genuinely long-running or wedged.
     _COMPRESSION_BUSY_WAIT_S = 5.0
+    _COMPRESSION_LOCK_ACQUIRE_PATIENCE_S = 1.0
+    _COMPRESSION_LOCK_MAX_RETRIES = 15
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
@@ -4520,6 +4739,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        # Writers wait on the cross-process sidecar without blocking readers.
+        self._writer_lock = threading.Lock()
+        self._write_lock_owner = None
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
         # behind writer flushes on self._lock. See _read_ctx().
@@ -4694,7 +4916,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
 
-            def _connect_and_init():
+            def _connect_and_init(deadline: float):
                 self._conn = _connect_tracked_db(
                     str(self.db_path),
                     check_same_thread=False,
@@ -4708,13 +4930,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                self._wal_active = (
-                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
-                )
-                apply_database_pragmas(self._conn, db_label="state.db")
-                self._conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema()
+                current_mode = _on_disk_journal_mode(self._conn)
+                with self._write_guard(
+                    deadline=deadline,
+                    allow_unsupported=current_mode == "delete",
+                ) as acquired:
+                    if acquired:
+                        self._wal_active = (
+                            apply_wal_with_fallback(self._conn, db_label="state.db")
+                            == "wal"
+                        )
+                    else:
+                        self._wal_active = False
+                    apply_database_pragmas(self._conn, db_label="state.db")
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+                    self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                    self._init_schema()
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -4730,7 +4961,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 deadline = time.monotonic() + self._WRITE_PATIENCE_S
                 while True:
                     try:
-                        _connect_and_init()
+                        _connect_and_init(deadline)
                         return
                     except sqlite3.OperationalError as exc:
                         err = str(exc).lower()
@@ -5012,6 +5243,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── Core write helper ──
 
+    @contextmanager
+    def _write_guard(
+        self,
+        *,
+        patience_s: Optional[float] = None,
+        deadline: Optional[float] = None,
+        allow_unsupported: Optional[bool] = None,
+    ):
+        """Serialize one state mutation across threads and processes."""
+        owner = threading.get_ident()
+        if self._write_lock_owner == owner:
+            yield True
+            return
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+        if deadline is None:
+            deadline = time.monotonic() + patience_s
+        if allow_unsupported is None:
+            allow_unsupported = not self._wal_active
+        with self._writer_lock:
+            with _session_db_advisory_write_lock(
+                self.db_path,
+                deadline=deadline,
+                patience_s=patience_s,
+                allow_unsupported=allow_unsupported,
+            ) as acquired:
+                with self._lock:
+                    self._write_lock_owner = owner
+                    try:
+                        yield acquired
+                    finally:
+                        self._write_lock_owner = None
+
     @staticmethod
     def _is_fts5_unavailable_error(exc: sqlite3.OperationalError) -> bool:
         err = str(exc).lower()
@@ -5253,6 +5517,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        *,
+        recover_fts_errors: bool = True,
+        max_retries: Optional[int] = None,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -5276,10 +5543,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         millisecond contention and backs off to 250ms-1s once the lock has
         been held longer than ``_WRITE_RETRY_SLOW_AFTER_S``.
 
+        The remaining budget caps SQLite's busy handler on each attempt, so a
+        single ``BEGIN IMMEDIATE`` cannot overrun the wall-time deadline.
+        ``recover_fts_errors=False`` disables the generic derived-index repair
+        path for latency-sensitive writes such as compression-lock acquire.
+        ``max_retries`` optionally caps the total number of attempts, including
+        the initial attempt.
+
         Returns whatever *fn* returns.
         """
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
+        retry_limit = None if max_retries is None else max(1, max_retries)
         deadline = time.monotonic() + patience_s
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
@@ -5295,19 +5570,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        retry_count = 0
         while True:
+            retry_count += 1
             try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                with self._write_guard(patience_s=patience_s, deadline=deadline):
+                    assert self._conn is not None
+                    previous_busy_timeout_ms = int(
+                        self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                    )
+                    remaining_ms = max(
+                        0, int((deadline - time.monotonic()) * 1000)
+                    )
+                    self._conn.execute(
+                        f"PRAGMA busy_timeout={min(previous_busy_timeout_ms, remaining_ms)}"
+                    )
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                    finally:
+                        try:
+                            self._conn.execute(
+                                f"PRAGMA busy_timeout={previous_busy_timeout_ms}"
+                            )
+                        except sqlite3.Error:
+                            logger.debug(
+                                "failed to restore SQLite busy timeout",
+                                exc_info=True,
+                            )
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -5339,7 +5637,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
-                    if self._sleep_before_write_retry(deadline, patience_s):
+                    if (
+                        (retry_limit is None or retry_count < retry_limit)
+                        and self._sleep_before_write_retry(deadline, patience_s)
+                    ):
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
@@ -5350,12 +5651,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     ) from exc
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if (
+                    recover_fts_errors
+                    and _is_no_more_rows(exc)
+                    and (retry_limit is None or retry_count < retry_limit)
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
                     continue
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if (
+                    recover_fts_errors
+                    and _is_no_more_rows(exc)
+                    and (retry_limit is None or retry_count < retry_limit)
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
                     continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
@@ -5364,9 +5675,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # same guarantee. First try the cheap in-place repair. If that
                 # one-shot path is unavailable or corruption recurs, detach the
                 # derived indexes and retry against the canonical tables.
-                if self._try_runtime_fts_rebuild(exc):
+                if recover_fts_errors and self._try_runtime_fts_rebuild(exc):
                     continue
-                if self._enter_fts_fail_open(exc):
+                if recover_fts_errors and self._enter_fts_fail_open(exc):
                     continue
                 raise
             except sqlite3.Error as exc:
@@ -5375,7 +5686,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # subclass) or another sqlite3.Error class outside the two
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if (
+                    recover_fts_errors
+                    and _is_no_more_rows(exc)
+                    and (retry_limit is None or retry_count < retry_limit)
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
                     continue
                 raise
 
@@ -5667,7 +5983,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         try:
-            with self._lock:
+            with self._write_guard():
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._conn.execute(
@@ -5731,7 +6047,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from checkpointing thousands of frames at once (issue #45383).
         """
         try:
-            with self._lock:
+            with self._write_guard(patience_s=0.0):
                 result = self._conn.execute(
                     "PRAGMA wal_checkpoint(PASSIVE)"
                 ).fetchone()
@@ -5806,23 +6122,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except queue.Empty:
                 break
             self._close_read_conn(conn)
-        with self._lock:
-            if self._conn:
-                if not self.read_only:
-                    # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
-                    # transient SessionDB, so a TRUNCATE here fires a full WAL
-                    # reset many times/hour, racing the gateway's long-lived
-                    # writer on large WAL databases and tearing hot B-tree
-                    # pages -- the #45383 corruption this class's own periodic
-                    # checkpoint was already made PASSIVE to avoid. TRUNCATE
-                    # belongs only on a sole-opener/quiescent connection.
-                    try:
+        if self._conn:
+            if not self.read_only:
+                # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
+                # transient SessionDB, so a TRUNCATE here fires a full WAL
+                # reset many times/hour, racing the gateway's long-lived
+                # writer on large WAL databases and tearing hot B-tree
+                # pages -- the #45383 corruption this class's own periodic
+                # checkpoint was already made PASSIVE to avoid. TRUNCATE
+                # belongs only on a sole-opener/quiescent connection.
+                try:
+                    with self._write_guard(patience_s=0.0):
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except Exception as exc:
-                        logger.debug(
-                            "WAL checkpoint (PASSIVE) at close failed: %s",
-                            exc,
-                        )
+                except Exception as exc:
+                    logger.debug(
+                        "WAL checkpoint (PASSIVE) at close failed: %s",
+                        exc,
+                    )
+            with self._lock:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
 
@@ -7047,6 +7364,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         require_compression_lease: bool = True,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        source_ids: Optional[List[int]] = None,
+        source_signature: Optional[str] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -7069,6 +7388,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The caller captures ``MAX(id)`` immediately BEFORE that flush; only
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
+
+        When *source_signature* is supplied, it must match the complete active
+        pre-watermark durable source; a rewritten source aborts instead of
+        letting a stale summary publish over it. ``source_ids`` remains a
+        narrower compatibility check for direct callers.
         """
         def _do(conn):
             lock_row = conn.execute(
@@ -7084,6 +7408,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
+            self._assert_pre_watermark_source_unchanged(
+                conn,
+                parent_session_id,
+                watermark,
+                source_ids,
+                source_signature,
+            )
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
@@ -7790,10 +8121,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Try to atomically acquire the compression lock for ``session_id``.
 
         Returns ``True`` on success (caller now owns the lock and must
-        release via :meth:`release_compression_lock`).  Returns ``False``
-        if another holder already owns a non-expired lock — the caller
-        MUST NOT proceed with compression in that case (its rotation would
-        race against the holder's, splitting the session lineage).
+        release via :meth:`release_compression_lock`). Returns ``False``
+        if another holder owns a live lock or SQLite remains ``locked``/``busy``
+        through the lock-specific wall-time budget. Other SQLite failures
+        propagate so callers do not mistake corruption or schema errors for
+        transient contention.
 
         Expired locks (``expires_at < now``) are reclaimed transparently.
         Structured holders whose local ``pid=`` no longer exists are reclaimed
@@ -7851,7 +8183,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return acquired, reclaimed_holder
 
         try:
-            acquired, reclaimed_holder = self._execute_write(_do)
+            acquired, reclaimed_holder = self._execute_write(
+                _do,
+                patience_s=self._COMPRESSION_LOCK_ACQUIRE_PATIENCE_S,
+                recover_fts_errors=False,
+                max_retries=self._COMPRESSION_LOCK_MAX_RETRIES,
+            )
             if reclaimed_holder:
                 logger.warning(
                     "Reclaimed stale compression lock for session=%s "
@@ -7860,13 +8197,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reclaimed_holder,
                 )
             return bool(acquired)
-        except sqlite3.Error as exc:
-            logger.warning(
-                "try_acquire_compression_lock(%s) failed: %s",
-                session_id, exc,
+        except sqlite3.OperationalError as exc:
+            err_msg = str(exc).lower()
+            if "locked" not in err_msg and "busy" not in err_msg:
+                raise
+            logger.debug(
+                "try_acquire_compression_lock(%s) hit transient SQLite contention: %s",
+                session_id,
+                exc,
             )
-            # Fail open: returning False makes the caller skip compression,
-            # which is the safe behaviour when the lock subsystem is broken.
             return False
 
     def release_compression_lock(self, session_id: str, holder: str) -> None:
@@ -8562,13 +8901,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         provider: str,
         base_url: str,
-        billing_mode: Optional[str] = None,
+        billing_mode: Any = _BILLING_MODE_UNSET,
     ) -> None:
         """Unconditionally update the billing provider/base_url for a session.
 
         Unlike ``update_token_counts`` which uses ``COALESCE(billing_provider, ?)``
         (only filling in NULL), this unconditionally sets the billing fields so
         that the dashboard reflects the user's latest /model switch.
+
+        ``billing_mode`` is omitted by default so callers can leave it unchanged;
+        passing ``None`` explicitly clears it for rollback to a NULL preimage.
 
         Also nulls ``system_prompt`` so the cached snapshot (which embeds a
         stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
@@ -8578,15 +8920,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.flush_token_counts()
 
         def _do(conn):
+            billing_mode_clause = (
+                ", billing_mode = ?"
+                if billing_mode is not _BILLING_MODE_UNSET
+                else ""
+            )
+            params = (
+                (provider, base_url, billing_mode, session_id)
+                if billing_mode is not _BILLING_MODE_UNSET
+                else (provider, base_url, session_id)
+            )
             conn.execute(
-                """UPDATE sessions SET
+                f"""UPDATE sessions SET
                    billing_provider = ?,
-                   billing_base_url = ?,
-                   billing_mode = COALESCE(?, billing_mode),
+                   billing_base_url = ?{billing_mode_clause},
                    system_prompt = NULL,
                    system_prompt_hash = NULL
                    WHERE id = ?""",
-                (provider, base_url, billing_mode, session_id),
+                params,
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
@@ -11736,6 +12087,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def get_active_message_source_snapshot(self, session_id: str) -> Tuple[int, str]:
+        """Atomically capture a compression watermark and durable source digest.
+
+        The single statement binds the ``MAX(id)`` watermark to every active
+        pre-watermark row it hashes, so a source rewrite cannot be admitted as
+        part of a later baseline. Rows appended after the watermark are excluded
+        when the digest is checked at publication.
+        """
+        if not session_id:
+            return 0, self._message_source_signature(())
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT messages.*, MAX(id) OVER () AS _compression_watermark "
+                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        if not rows:
+            return 0, self._message_source_signature(())
+        return (
+            int(rows[-1]["_compression_watermark"]),
+            self._message_source_signature(rows, skip_column="_compression_watermark"),
+        )
+
     def get_active_message_watermark(self, session_id: str) -> int:
         """MAX(id) of the session's active rows — the compression watermark.
 
@@ -11761,6 +12135,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        source_ids: Optional[List[int]] = None,
+        source_signature: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -11794,6 +12170,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``watermark=None`` preserves the historical archive-everything
         behavior.
 
+        When *source_signature* is supplied, it must match the complete active
+        pre-watermark durable source; a rewritten source aborts instead of
+        letting a stale summary publish over it. ``source_ids`` remains a
+        narrower compatibility check for direct callers.
+
         Commit-fence safety: when *lock_holder* is provided, the commit
         verifies INSIDE the transaction that the compression lock is still
         held by that holder and unexpired — a compression whose lease was
@@ -11822,6 +12203,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         f"Compression lease for {session_id!r} lost before "
                         "commit; refusing to publish a stale compaction"
                     )
+
+            self._assert_pre_watermark_source_unchanged(
+                conn,
+                session_id,
+                watermark,
+                source_ids,
+                source_signature,
+            )
 
             patched_model_config = None
             if model_config_patch is not None:
@@ -11905,6 +12294,69 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         return self._execute_write(_do)
+
+    def _assert_pre_watermark_source_unchanged(
+        self,
+        conn,
+        session_id: str,
+        watermark: Optional[int],
+        source_ids: Optional[List[int]],
+        source_signature: Optional[str],
+    ) -> None:
+        if watermark is None:
+            return
+        if source_ids is not None:
+            current_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                    "AND id <= ? ORDER BY id",
+                    (session_id, int(watermark)),
+                ).fetchall()
+            ]
+            if current_ids != source_ids:
+                raise SessionCompressionInProgressError(
+                    f"Compression source changed before publication: {session_id}"
+                )
+        if source_signature is not None and (
+            self._pre_watermark_source_signature(conn, session_id, watermark)
+            != source_signature
+        ):
+            raise SessionCompressionInProgressError(
+                f"Compression source changed before publication: {session_id}"
+            )
+
+    @staticmethod
+    def _message_source_signature(rows, skip_column: Optional[str] = None) -> str:
+        """Hash every durable message field with an unambiguous type boundary."""
+        digest = hashlib.sha256()
+        for row in rows:
+            for column in row.keys():
+                if column == skip_column:
+                    continue
+                value = row[column]
+                if isinstance(value, bytes):
+                    encoded = value
+                elif value is None:
+                    encoded = b""
+                else:
+                    encoded = str(value).encode("utf-8", "surrogatepass")
+                digest.update(column.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(type(value).__name__.encode("ascii"))
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        return digest.hexdigest()
+
+    def _pre_watermark_source_signature(
+        self, conn, session_id: str, watermark: int
+    ) -> str:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? AND active = 1 "
+            "AND id <= ? ORDER BY id",
+            (session_id, int(watermark)),
+        ).fetchall()
+        return self._message_source_signature(rows)
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""
@@ -14943,7 +15395,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
-        with self._lock:
+        with self._write_guard():
             # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
             # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
             # CLI process, and a TRUNCATE reset here would race a live gateway

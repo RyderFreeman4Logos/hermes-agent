@@ -497,6 +497,7 @@ class AIAgent:
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
+        fast_mode_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
@@ -523,6 +524,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        memory_provider_mode_override: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -588,6 +590,7 @@ class AIAgent:
             reasoning_config=reasoning_config,
             service_tier=service_tier,
             request_overrides=request_overrides,
+            fast_mode_overrides=fast_mode_overrides,
             prefill_messages=prefill_messages,
             platform=platform,
             user_id=user_id,
@@ -613,6 +616,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            memory_provider_mode_override=memory_provider_mode_override,
         )
 
     def _get_session_db_for_recall(self):
@@ -798,6 +802,7 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self._awaiting_cache_usage_after_compression = False
 
         # Session boundary: the usage anchor describes the OLD session's
         # transcript — a fresh/branched/resumed session must fall back to
@@ -3946,6 +3951,13 @@ class AIAgent:
                 + "the request was interrupted mid-call before a reply was "
                 "received. Send `continue` to retry."
             )
+        if reason == "stream_payload_bound_exceeded":
+            return (
+                prefix
+                + "the streamed assistant payload exceeded the declared size "
+                "bound. The turn was aborted. Send `continue` or start a new "
+                "turn rather than waiting on a silent think."
+            )
         if reason == "budget_exhausted":
             return (
                 prefix
@@ -4435,8 +4447,8 @@ class AIAgent:
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
+            except Exception:
+                logger.warning("Memory provider shutdown hook failed (provider_error)")
             try:
                 self._memory_manager.shutdown_all()
             except Exception:
@@ -6574,59 +6586,45 @@ class AIAgent:
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
-    def _reset_stream_delivery_tracking(self) -> None:
-        """Reset tracking for text delivered during the current model response."""
-        # Flush any benign partial-tag tail held by the think scrubber
-        # first (#17924): an innocent '<' at the end of the stream that
-        # turned out not to be a tag prefix should reach the UI.  Then
-        # flush the context scrubber.  Order matters — the think
-        # scrubber's output feeds into the context scrubber's state.
+    def _reset_stream_delivery_tracking(self, *, flush: bool = True) -> None:
+        """Finish or discard one attempt, then clear its delivery state."""
         think_scrubber = getattr(self, "_stream_think_scrubber", None)
-        if think_scrubber is not None:
-            think_tail = think_scrubber.flush()
+        context_scrubber = getattr(self, "_stream_context_scrubber", None)
+        if flush:
+            think_tail = think_scrubber.flush() if think_scrubber is not None else ""
+            if think_tail and context_scrubber is not None:
+                think_tail = context_scrubber.feed(think_tail)
             if think_tail:
-                # Route the tail through the context scrubber too so a
-                # memory-context span straddling the final boundary is
-                # still caught.
-                ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
-                if ctx_scrubber is not None:
-                    think_tail = ctx_scrubber.feed(think_tail)
-                if think_tail:
-                    callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                    for cb in callbacks:
-                        try:
-                            cb(think_tail)
-                        except Exception:
-                            pass
-                    self._record_streamed_assistant_text(think_tail)
-        # Flush any benign partial-tag tail held by the context scrubber so it
-        # reaches the UI before we clear state for the next model call.  If
-        # the scrubber is mid-span, flush() drops the orphaned content.
-        scrubber = getattr(self, "_stream_context_scrubber", None)
-        if scrubber is not None:
-            tail = scrubber.flush()
-            if tail:
-                callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-                for cb in callbacks:
-                    try:
-                        cb(tail)
-                    except Exception:
-                        pass
-                self._record_streamed_assistant_text(tail)
+                self._emit_admitted_stream_text(think_tail)
+            context_tail = (
+                context_scrubber.flush() if context_scrubber is not None else ""
+            )
+            if context_tail:
+                self._emit_admitted_stream_text(context_tail)
+        else:
+            if think_scrubber is not None:
+                think_scrubber.reset()
+            if context_scrubber is not None:
+                context_scrubber.reset()
         self._current_streamed_assistant_text = ""
+        self._current_streamed_payload_bytes = 0
 
-    def _record_streamed_assistant_text(self, text: str) -> None:
-        """Accumulate visible assistant text emitted through stream callbacks."""
-        # Single-writer guard (#65991): a superseded stream must not pollute the
-        # turn's accumulated text (which also feeds the interim-visible-text
-        # de-dup comparison), even when a caller reaches this directly (the
-        # tool-suppressed content path) rather than through _fire_stream_delta.
+    def _record_streamed_assistant_text(
+        self, text: str, *, admitted: bool = False
+    ) -> None:
+        """Accumulate assistant text only after display or TTS accepted it."""
         if self._stream_writer_superseded():
             return
         if isinstance(text, str) and text:
-            self._current_streamed_assistant_text = (
-                getattr(self, "_current_streamed_assistant_text", "") + text
+            from agent.stream_payload_bound import (
+                accumulate_stream_text,
+                admit_stream_payload,
             )
+
+            if not admitted:
+                admit_stream_payload(self, text)
+            existing = getattr(self, "_current_streamed_assistant_text", "") or ""
+            self._current_streamed_assistant_text = accumulate_stream_text(existing, text)
 
     @staticmethod
     def _normalize_interim_visible_text(text: str) -> str:
@@ -6743,35 +6741,21 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
-        cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(text, str):
+        if not isinstance(text, str):
             return
-        visible = self._strip_think_blocks(text).strip()
-        if visible:
-            visible = redact_sensitive_text(visible)
-        if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
-            return
-        try:
-            cb(visible, already_streamed=False)
-            self._record_delivered_interim_text(visible)
-        except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+        visible = redact_sensitive_text(self._strip_think_blocks(text).strip())
+        if visible and visible != "(empty)":
+            self._emit_interim_assistant_message({"role": "assistant", "content": visible})
 
     def _emit_interim_assistant_message(
-        self, assistant_msg: Dict[str, Any]
-    ) -> None:
+        self, assistant_msg: Dict[str, Any], *, admitted: bool = False
+    ) -> bool:
         """Surface a real mid-turn assistant commentary message to the UI layer.
 
-        Does NOT set ``_response_was_previewed`` — that flag means "the final
-        response was already shown to the user," but this helper is called for
-        ordinary tool-call narration, intermediate acknowledgements, and
-        verification candidates alike. Setting it here would cause the CLI to
-        suppress a *different* final summary (e.g. from ``_handle_max_iterations``)
-        when the only streamed text was unrelated mid-turn commentary. (#65919
-        review: response-loss blocker)
+        This does not mark the possibly different final response as previewed.
         """
         if not isinstance(assistant_msg, dict):
-            return
+            return False
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         undelivered_parts: List[str] = []
         pending_keys: set[str] = set()
@@ -6790,41 +6774,51 @@ class AIAgent:
             if commentary_parts
             else self._interim_assistant_visible_text(assistant_msg)
         )
-        if (
-            not visible
-            or visible == "(empty)"
-            or self._interim_text_was_delivered(visible)
+        if not visible or visible == "(empty)" or self._interim_text_was_delivered(
+            visible
         ):
-            return
+            return False
         already_streamed = self._interim_content_was_streamed(visible)
-        try:
-            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+        if not admitted:
+            from agent.stream_payload_bound import admit_stream_payload, authoritative_stream_text
 
-            enqueue_plugin_stream_hook(
-                "on_interim_message",
-                turn_id=getattr(self, "_current_turn_id", "") or "",
-                iteration=int(getattr(self, "_api_call_count", 0) or 0),
-                session_id=self.session_id or "",
-                model=self.model or "",
-                provider=self.provider or "",
-                surface=self.platform or "cli",
-                text=visible,
-                already_streamed=already_streamed,
-            )
-        except Exception:
-            logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
+            streamed = authoritative_stream_text(self)
+            unseen = visible[len(streamed) :] if visible.startswith(streamed) else visible
+            admit_stream_payload(self, unseen)
+        hook_key = self._normalize_interim_visible_text(visible)
+        queued = getattr(self, "_queued_interim_texts", set())
+        if hook_key not in queued:
+            try:
+                from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+                enqueue_plugin_stream_hook(
+                    "on_interim_message",
+                    turn_id=getattr(self, "_current_turn_id", "") or "",
+                    iteration=int(getattr(self, "_api_call_count", 0) or 0),
+                    session_id=self.session_id or "",
+                    model=self.model or "",
+                    provider=self.provider or "",
+                    surface=self.platform or "cli",
+                    text=visible,
+                    already_streamed=already_streamed,
+                )
+                queued.add(hook_key)
+                self._queued_interim_texts = queued
+            except Exception:
+                logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
-            return
+            return False
         try:
             cb(visible, already_streamed=already_streamed)
-            if undelivered_parts:
-                for part in undelivered_parts:
-                    self._record_delivered_interim_text(part)
-            else:
-                self._record_delivered_interim_text(visible)
+            if not already_streamed:
+                self._record_streamed_assistant_text(visible, admitted=True)
+            for part in undelivered_parts or [visible]:
+                self._record_delivered_interim_text(part)
+            return True
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+            return False
 
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the single-writer guard fields (#65991).
@@ -6933,13 +6927,48 @@ class AIAgent:
         except Exception:
             logger.debug("on_stream_end plugin hook enqueue failed", exc_info=True)
 
-    def _fire_stream_delta(self, text: str) -> None:
-        """Fire all registered stream delta callbacks (display + TTS)."""
+    def _emit_admitted_stream_text(self, text: str, *, interim: bool = False) -> bool:
+        """Admit once, then fan visible text out to every stream consumer."""
+        from agent.stream_payload_bound import admit_stream_payload
+
+        admit_stream_payload(self, text)
+        callbacks = [
+            cb
+            for cb in (self.stream_delta_callback, self._stream_callback)
+            if cb is not None
+        ]
+        delivered = False
+        for cb in callbacks:
+            try:
+                cb(text)
+                delivered = True
+            except Exception:
+                pass
+        if delivered:
+            self._record_streamed_assistant_text(text, admitted=True)
+        if interim:
+            message = {"role": "assistant", "content": text}
+            delivered = self._emit_interim_assistant_message(message, admitted=True) or delivered
+        try:
+            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+            enqueue_plugin_stream_hook(
+                "on_stream_delta",
+                **self._stream_hook_base_payload(),
+                delta=text,
+                kind="text",
+            )
+        except Exception:
+            logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
+        return delivered
+
+    def _fire_stream_delta(self, text: str, *, interim: bool = False) -> bool:
+        """Fire display/TTS callbacks and report physical delivery."""
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_stream_delta")
-            return
+            return False
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -6979,28 +7008,8 @@ class AIAgent:
             ):
                 text = text.lstrip("\n")
         if not text:
-            return
-        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
-        try:
-            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
-
-            enqueue_plugin_stream_hook(
-                "on_stream_delta",
-                **self._stream_hook_base_payload(),
-                delta=text,
-                kind="text",
-            )
-        except Exception:
-            logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
-        if delivered:
-            self._record_streamed_assistant_text(text)
+            return False
+        return self._emit_admitted_stream_text(text, interim=interim)
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
@@ -7009,6 +7018,10 @@ class AIAgent:
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
+        if isinstance(text, str) and text:
+            from agent.stream_payload_bound import admit_stream_payload
+
+            admit_stream_payload(self, text)
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -7067,6 +7080,21 @@ class AIAgent:
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
+
+        if getattr(self, "_delegate_model_profile", None) == "standard":
+            if getattr(self, "_delegate_has_successful_llm_request", False):
+                return False
+            if reason not in {
+                FailoverReason.rate_limit,
+                FailoverReason.upstream_rate_limit,
+            }:
+                return False
+            cooldown = getattr(self, "_rate_limited_until", 0)
+            backoff_count = getattr(self, "_rate_limit_backoff_count", 0)
+            activated = try_activate_fallback(self, reason)
+            self._rate_limited_until = cooldown
+            self._rate_limit_backoff_count = backoff_count
+            return activated
         return try_activate_fallback(self, reason)
 
     def _has_pending_fallback(self) -> bool:
@@ -8100,30 +8128,19 @@ class AIAgent:
                     # caller's live transcript. Plugin/legacy context engines are
                     # allowed to mutate their input list in place; after a host
                     # timeout the worker stays alive, so a shared list would let
-                    # a late engine rewrite the live conversation (roles,
-                    # ordering, persisted content) behind the caller's back.
-                    # Deep-snapshot here, on the worker thread, so the caller's
-                    # list object is never touched by pooled code. Results are
-                    # published to caller-visible state only via the returned
-                    # value of an ADMITTED commit (the host discards results on
-                    # timeout/cancel); durable SessionDB mutation is already
-                    # gated behind the commit fence inside compress_context.
+                    # a late engine rewrite the live conversation behind the
+                    # caller's back.
                     snapshot = copy.deepcopy(messages)
                     result_msgs, result_prompt = _run(
                         fence, target_messages=snapshot
                     )
                     if result_msgs is snapshot:
-                        # No-op/abort path returned the snapshot unchanged: hand
-                        # back the caller's ORIGINAL list so identity-based
-                        # semantics (len/identity no-op detection, flush dedup
-                        # by id()) keep working.
+                        # Preserve identity-based no-op semantics for callers.
                         return messages, result_prompt
                     return result_msgs, result_prompt
 
-                # Resolve the fallback prompt lazily on timeout only. Eager
-                # rebuild here would raise before compress_context runs whenever
-                # _cached_system_prompt is unset and _build_system_prompt fails
-                # (lock-refresher / noop-exception tests rely on that path).
+                # Resolve only on timeout; eager rebuild would turn a normal
+                # compression call into a system-prompt failure path.
                 def _fallback_prompt():
                     cached = getattr(self, "_cached_system_prompt", None)
                     if cached:
@@ -8139,14 +8156,69 @@ class AIAgent:
                         return system_message or ""
 
                 def _on_timeout(idle, waited, since_progress):
-                    logger.warning(
-                        "Context compression made no progress for %.1fs "
-                        "(total wait %.1fs, ceiling %.1fs); continuing without "
-                        "compression",
-                        since_progress,
+                    from agent.auxiliary_client import classify_compression_watchdog
+
+                    reason = classify_compression_watchdog(
+                        idle,
                         waited,
                         total_ceiling,
+                        since_progress,
+                        getattr(active_fence, "had_meaningful_progress", False),
                     )
+                    if reason == "total_ceiling":
+                        logger.warning(
+                            "Context compression hit the total ceiling after %.1fs "
+                            "(last meaningful progress %.1fs ago, ceiling %.1fs); "
+                            "continuing without compression",
+                            waited,
+                            since_progress,
+                            total_ceiling,
+                        )
+                        timeout_label = "host compress_context timeout (total ceiling)"
+                        emit_msg = (
+                            "⚠ Context compression hit the total time ceiling "
+                            f"after {waited:.1f}s. No messages were dropped — "
+                            "continuing without compression. Run /compress to "
+                            "retry, /new for a clean session, or check "
+                            "auxiliary.compression."
+                        )
+                    elif reason == "candidate_fallback":
+                        logger.warning(
+                            "Context compression cancelled after fallback "
+                            "progression (waited %.1fs, last meaningful progress "
+                            "%.1fs ago); continuing without compression",
+                            waited,
+                            since_progress,
+                        )
+                        timeout_label = (
+                            "host compress_context timeout (cancelled/fallback)"
+                        )
+                        emit_msg = (
+                            "⚠ Context compression stopped after trying "
+                            "configured fallbacks. No messages were dropped — "
+                            "continuing without compression. Run /compress to "
+                            "retry, /new for a clean session, or check "
+                            "auxiliary.compression."
+                        )
+                    else:
+                        logger.warning(
+                            "Context compression made no progress for %.1fs "
+                            "(total wait %.1fs, ceiling %.1fs); continuing without "
+                            "compression",
+                            since_progress,
+                            waited,
+                            total_ceiling,
+                        )
+                        timeout_label = (
+                            "host compress_context timeout (no summary progress)"
+                        )
+                        emit_msg = (
+                            "⚠ Context compression timed out "
+                            f"after {idle:.1f}s with no output from the summary "
+                            "model. No messages were dropped — continuing without "
+                            "compression. Run /compress to retry, /new for a clean "
+                            "session, or check auxiliary.compression."
+                        )
                     touch = getattr(self, "_touch_activity", None)
                     if callable(touch):
                         try:
@@ -8159,38 +8231,24 @@ class AIAgent:
                                 "compress_context timeout activity touch failed",
                                 exc_info=True,
                             )
-                    # Same timeout cooldown ladder as summary-LLM timeouts
-                    # (#62452): avoid re-burning the full idle budget every turn.
                     compressor = getattr(self, "context_compressor", None)
                     if compressor is not None:
                         record = getattr(compressor, "record_timeout_failure", None)
                         if callable(record):
                             try:
-                                record(
-                                    "host compress_context timeout "
-                                    "(no summary progress)"
-                                )
+                                record(timeout_label)
                             except Exception:
                                 logger.debug(
-                                    "failed to record compress_context timeout "
-                                    "cooldown",
+                                    "failed to record compress_context timeout cooldown",
                                     exc_info=True,
                                 )
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
-                        emit(
-                            "⚠ Context compression timed out "
-                            f"after {idle:.1f}s with no output from the summary "
-                            "model. No messages were dropped — continuing without "
-                            "compression. Run /compress to retry, /new for a clean "
-                            "session, or check auxiliary.compression."
-                        )
+                        emit(emit_msg)
 
                 def _on_commit_overrun(waited, ceiling):
-                    # Commit-phase ceiling breach: the SessionDB mutation is in
-                    # flight and must complete (abandoning it mid-commit would
-                    # diverge live messages from durable session state), so this
-                    # only surfaces the overrun — it never cancels the commit.
+                    # Never cancel an in-flight SessionDB mutation: doing so can
+                    # diverge the live transcript from durable session state.
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
                         emit(
@@ -8201,11 +8259,8 @@ class AIAgent:
                         )
 
                 def _publish_new_fence():
-                    # The stall-fallback retry (#78981) needs a fence the aborted
-                    # attempt cannot veto. Publish it on the same serialized slot
-                    # hard_interrupt() reads, so a /stop during the retry admits
-                    # against the attempt that is actually running. The finally
-                    # below restores whatever the caller had either way.
+                    # hard_interrupt() must target the retry, not the aborted
+                    # attempt. Publication is serialized with begin_commit().
                     retry_fence = CompressionCommitFence()
                     with fence_registration_lock:
                         self._active_compression_commit_fence = retry_fence
@@ -8471,6 +8526,7 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
+            _load_config as _load_delegation_config,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
@@ -8486,16 +8542,19 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        _force_background = bool(_load_delegation_config().get("force_background", False))
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=(True if _force_background else (not _is_subagent)),
+            force_background=_force_background,
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
+            model_profile=function_args.get("model_profile"),
             parent_agent=self,
         )
 
@@ -8617,7 +8676,7 @@ class AIAgent:
             set_accounting_context,
         )
         from agent import relay_runtime
-        from agent.conversation_loop import run_conversation
+        from agent.conversation_loop import _loop_timing_context, run_conversation
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
@@ -8653,6 +8712,7 @@ class AIAgent:
         durable_turn_lease_interrupt_message = None
         token = None
         acct_token = None
+        heartbeat_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -8952,13 +9012,16 @@ class AIAgent:
                 getattr(self, "session_id", None),
             )
             from agent.auxiliary_client import scoped_runtime_main
+            from tools.runtime_heartbeat import bind_agent_provider
 
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
+            heartbeat_token = bind_agent_provider(self)
             with bind_subagent_parent(self), scoped_runtime_main({}):
                 try:
+                    self._loop_timing_context_text = _loop_timing_context(self) or ""
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:
                             durable_turn_lease_turn_active = True
@@ -8977,6 +9040,8 @@ class AIAgent:
                         moa_config=moa_config,
                     )
                 finally:
+                    _loop_timing_context(self, stop=True)
+                    self._loop_timing_context_text = ""
                     # The lease remains held through relay/task finalization, but
                     # those post-loop steps must not receive a late refresh
                     # interrupt that poisons the next turn on a cached agent.
@@ -9017,6 +9082,10 @@ class AIAgent:
             raise
         finally:
             try:
+                if heartbeat_token is not None:
+                    from tools.runtime_heartbeat import reset_current_provider
+
+                    reset_current_provider(heartbeat_token)
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(
                         relay_turn,

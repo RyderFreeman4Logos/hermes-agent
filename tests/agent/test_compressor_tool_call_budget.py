@@ -48,6 +48,24 @@ def _args_only_estimate(msg: dict) -> int:
 
 
 class TestToolCallEnvelopeEstimate:
+    @pytest.mark.parametrize(
+        ("message", "wire_content"),
+        [
+            (
+                {"role": "user", "content": "short", "api_content": "wire" * 2_000},
+                "wire" * 2_000,
+            ),
+            (
+                {"role": "assistant", "content": "same", "api_content": "same"},
+                "same",
+            ),
+            ({"role": "user", "content": "plain"}, "plain"),
+        ],
+    )
+    def test_api_content_budget_matches_wire_content(self, message, wire_content):
+        expected = {"role": message["role"], "content": wire_content}
+        assert _estimate_msg_budget_tokens(message) == _estimate_msg_budget_tokens(expected)
+
     def test_envelope_counted_not_just_arguments(self):
         msg = _assistant_with_tool_calls(4)
         new = _estimate_msg_budget_tokens(msg)

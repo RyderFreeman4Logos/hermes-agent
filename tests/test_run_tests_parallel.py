@@ -5,14 +5,11 @@ Setup
 A test in this file spawns a long-lived Python grandchild that writes
 its PID + a nonce to a tempfile, then exits without cleaning up.
 With the old ``subprocess.run`` runner, that grandchild would orphan
-and outlive the test (and the whole runner). With the current Popen +
-``start_new_session`` + ``_kill_tree`` runner, the grandchild gets
-SIGKILL'd via process-group kill when its file's pytest exits.
-
-The leaker test always passes — its only job is to spawn a grandchild
-and walk away. The verifier runs the runner over the leaker file in a
-subprocess, then waits for the grandchild PID to disappear from the
-kernel's process table.
+and outlive the test (and the whole runner). On Linux the runner now puts
+that subprocess in a transient user-systemd service with a task budget and
+``KillMode=control-group``; other POSIX platforms use the captured process
+group. The verifier runs the runner over the leaker file in a subprocess,
+then waits for the grandchild PID to vanish from the kernel's process table.
 
 POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 ``taskkill /F /T`` semantics). Marked accordingly.
@@ -20,15 +17,32 @@ POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import select
+import shutil
+import signal
 import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
+from types import ModuleType
+from typing import NamedTuple
 
 import pytest
+
+
+def _load_runner_module() -> ModuleType:
+    """Load the runner for a direct lifecycle seam test."""
+    runner = Path(__file__).resolve().parent.parent / "scripts" / "run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location("runner_lifecycle_test", runner)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 # Both tests share the same handoff file: the leaker writes here, the
@@ -61,6 +75,395 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+class _ProcessIdentity(NamedTuple):
+    pid: int
+    start_time: int
+    pidfd: int
+
+
+def _proc_start_time(pid: int) -> int | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return int(stat[stat.rfind(")") + 2:].split()[19])
+    except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+        return None
+
+
+def _open_process_identity(pid: int, expected_start: int | None) -> _ProcessIdentity:
+    if expected_start is None or _proc_start_time(pid) != expected_start:
+        raise RuntimeError(f"fixture process {pid} no longer has its recorded identity")
+    pidfd = os.pidfd_open(pid)
+    if _proc_start_time(pid) != expected_start:
+        os.close(pidfd)
+        raise RuntimeError(f"fixture process {pid} changed identity while opening pidfd")
+    return _ProcessIdentity(pid, expected_start, pidfd)
+
+
+def _process_identity_alive(identity: _ProcessIdentity) -> bool:
+    poller = select.poll()
+    poller.register(identity.pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    return not poller.poll(0)
+
+
+def _signal_process_identity(identity: _ProcessIdentity, sig: int) -> bool:
+    if not _process_identity_alive(identity):
+        return False
+    try:
+        signal.pidfd_send_signal(identity.pidfd, sig)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux pidfd identity")
+def test_stale_process_identity_is_not_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exited fixture identity cannot target a reused numeric PID."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    )
+    identity = _open_process_identity(proc.pid, _proc_start_time(proc.pid))
+    assert proc.stdin is not None
+    proc.stdin.close()
+    proc.wait(timeout=10)
+    calls = []
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        lambda *args: calls.append(args),
+    )
+    try:
+        assert not _signal_process_identity(identity, signal.SIGKILL)
+        assert calls == []
+    finally:
+        os.close(identity.pidfd)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux systemd completion")
+def test_linux_normal_completion_never_signals_stale_process_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A reaped systemd-run client cannot authorize numeric-PGID cleanup."""
+    runner = _load_runner_module()
+    killpg_calls: list[tuple[int, int]] = []
+
+    class ReapedClient:
+        pid = 4242
+        returncode = 0
+        kill_calls = 0
+
+        def communicate(self, timeout: float) -> tuple[str, None]:
+            return "", None
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    client = ReapedClient()
+    monkeypatch.setattr(runner, "_spawn_test_process", lambda *args: (client, None))
+    monkeypatch.setattr(runner, "_read_linux_completion", lambda *args: (0, True, ""))
+    monkeypatch.setattr(runner.os, "getpgid", lambda pid: 4242)
+    monkeypatch.setattr(
+        runner.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+
+    result = runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 1)
+
+    assert result.returncode == 0
+    assert killpg_calls == []
+    assert client.kill_calls == 0
+
+
+@pytest.mark.parametrize("prefill_pipe", [False, True])
+def test_environment_pipe_backpressure_is_bounded_and_private(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prefill_pipe: bool,
+) -> None:
+    """A retained nonreading supervisor pipe cannot block or expose its environment."""
+    runner = _load_runner_module()
+    secret = "watch-pipe-backpressure-sentinel-" + "x" * (1024 * 1024)
+    writes: list[int] = []
+    commands: list[list[str]] = []
+    launcher_envs: list[dict[str, str]] = []
+    original_pipe = runner.os.pipe
+    original_write = runner.os.write
+
+    class NonreadingClient:
+        def __init__(self, stdin_fd: int) -> None:
+            self.read_fd = os.dup(stdin_fd)
+            self.kill_calls = 0
+            self.communicate_timeouts: list[float] = []
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def communicate(self, timeout: float) -> tuple[str, None]:
+            self.communicate_timeouts.append(timeout)
+            return "", None
+
+    client: NonreadingClient | None = None
+
+    def pipe() -> tuple[int, int]:
+        read_fd, write_fd = original_pipe()
+        if prefill_pipe:
+            os.set_blocking(write_fd, False)
+            while True:
+                try:
+                    original_write(write_fd, b"x" * 65536)
+                except BlockingIOError:
+                    return read_fd, write_fd
+        return read_fd, write_fd
+
+    def write(fd: int, payload: bytes) -> int:
+        count = original_write(fd, payload)
+        writes.append(count)
+        return count
+
+    def popen(*args: object, **kwargs: object) -> NonreadingClient:
+        nonlocal client
+        command = args[0]
+        stdin_fd = kwargs["stdin"]
+        launcher_env = kwargs["env"]
+        assert isinstance(command, list)
+        assert isinstance(stdin_fd, int)
+        assert isinstance(launcher_env, dict)
+        commands.append(command)
+        launcher_envs.append(launcher_env)
+        client = NonreadingClient(stdin_fd)
+        return client
+
+    monkeypatch.setenv("WATCH_PIPE_BACKPRESSURE_SECRET", secret)
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/env")
+    monkeypatch.setattr(runner.os, "pipe", pipe)
+    monkeypatch.setattr(runner.os, "write", write)
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="environment pipe write timed out") as exc_info:
+            runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 0.1)
+    finally:
+        if client is not None:
+            os.close(client.read_fd)
+
+    assert time.monotonic() - started < 2
+    assert client is not None
+    assert client.kill_calls == 1
+    assert client.communicate_timeouts
+    assert secret not in str(exc_info.value)
+    assert len(commands) == len(launcher_envs) == 1
+    assert secret not in " ".join(commands[0])
+    assert secret not in launcher_envs[0].values()
+    if prefill_pipe:
+        assert writes == []
+    else:
+        assert writes and writes[0] < len(secret)
+
+
+def test_environment_pipe_write_failure_removes_secret_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A failed supervisor-pipe write leaves neither root nor live client."""
+    runner = _load_runner_module()
+    root = tmp_path / "attempt-root"
+
+    class SpawnedClient:
+        def __init__(self) -> None:
+            self.kill_calls = 0
+            self.communicate_calls = 0
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def communicate(self, timeout: float) -> tuple[str, None]:
+            self.communicate_calls += 1
+            return "", None
+
+    client = SpawnedClient()
+
+    def make_root(*args: object, **kwargs: object) -> str:
+        root.mkdir()
+        return str(root)
+
+    monkeypatch.setattr(runner.tempfile, "mkdtemp", make_root)
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/env")
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: client)
+    monkeypatch.setattr(runner.os, "write", lambda *args: (_ for _ in ()).throw(OSError("pipe failed")))
+
+    with pytest.raises(OSError, match="pipe failed"):
+        runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 1)
+
+    assert client.kill_calls == 1
+    assert client.communicate_calls == 1
+    assert not root.exists()
+
+
+def test_runner_sigkill_before_spawn_leaves_no_secret_transport(tmp_path: Path) -> None:
+    """A killed runner cannot leave a pre-spawn environment file behind."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner_path = repo_root / "scripts" / "run_tests_parallel.py"
+    root = tmp_path / "attempts"
+    root.mkdir()
+    ready = tmp_path / "pre-spawn-ready"
+    secret = "pre-spawn-secret-sentinel"
+    child_code = textwrap.dedent(
+        f"""
+        import importlib.util
+        import sys
+        import time
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location("runner_probe", {str(runner_path)!r})
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+
+        def stop_before_spawn(*args):
+            Path({str(ready)!r}).write_text("ready", encoding="utf-8")
+            time.sleep(600)
+
+        runner._spawn_test_process = stop_before_spawn
+        runner._run_one_file_once(Path("test_probe.py"), [], Path({str(repo_root)!r}), 1)
+        """
+    )
+    env = os.environ.copy()
+    env["TMPDIR"] = str(root)
+    env["PARENT_LOSS_SECRET"] = secret
+    proc = subprocess.Popen([sys.executable, "-c", child_code], env=env)
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "runner did not reach the pre-spawn boundary"
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        transport_files = list(root.rglob("environment.json"))
+        retained = b"".join(path.read_bytes() for path in root.rglob("*") if path.is_file())
+        assert transport_files == []
+        assert secret.encode() not in retained
+    finally:
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_supervisor_exits_after_watch_parent_loss(tmp_path: Path) -> None:
+    """The scope-side supervisor exits without exposing its pipe environment."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    secret = "parent-loss-secret-sentinel"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(runner),
+            "--_hermes-supervise",
+            str(repo_root),
+            str(tmp_path / "completion.json"),
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.2)",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps({"PARENT_LOSS_SECRET": secret}) + "\n")
+    proc.stdin.close()
+    assert proc.wait(timeout=10) == 137
+    assert proc.stdout is not None
+    assert secret not in proc.stdout.read()
+
+
+def test_linux_descendant_reap_has_an_absolute_deadline(tmp_path: Path) -> None:
+    """An unreapable adopted child cannot block the supervisor forever."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner_path = repo_root / "scripts" / "run_tests_parallel.py"
+    child_code = textwrap.dedent(
+        f"""
+        import importlib.util
+        import sys
+
+        spec = importlib.util.spec_from_file_location("runner_probe", {str(runner_path)!r})
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+        runner.os.waitpid = lambda *args: (0, 0)
+        runner.os.kill = lambda *args: None
+        runner.Path.read_text = lambda *args, **kwargs: "123"
+        assert runner._linux_terminate_and_reap_descendants() == 1
+        """
+    )
+    proc = subprocess.Popen([sys.executable, "-c", child_code])
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        pytest.fail("descendant cleanup blocked in waitpid")
+    assert proc.returncode == 0
+
+
+def test_linux_cleanup_consumes_watch_close_before_reap_deadline(tmp_path: Path) -> None:
+    """Watch-parent loss interrupts a cleanup that cannot reap immediately."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner_path = repo_root / "scripts" / "run_tests_parallel.py"
+    ready = tmp_path / "cleanup-ready"
+    child_code = textwrap.dedent(
+        f"""
+        import importlib.util
+        import json
+        import sys
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location("runner_probe", {str(runner_path)!r})
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+
+        class FinishedChild:
+            returncode = 0
+            def poll(self):
+                return 0
+
+        runner._linux_enable_subreaper = lambda: True
+        runner._read_linux_resource_events = lambda: {{
+            "pids.events": 0, "memory.events": 0, "memory.events.oom": 0,
+            "memory.events.oom_kill": 0,
+        }}
+        runner.subprocess.Popen = lambda *args, **kwargs: FinishedChild()
+        runner.os.waitpid = lambda *args: (0, 0)
+        runner.os.kill = lambda *args: None
+        def children(*args, **kwargs):
+            Path({str(ready)!r}).write_text("ready", encoding="utf-8")
+            return "123"
+        runner.Path.read_text = children
+        raise SystemExit(runner._linux_supervise({str(repo_root)!r}, {str(tmp_path / 'completion.json')!r}, []))
+        """
+    )
+    proc = subprocess.Popen([sys.executable, "-c", child_code], stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps({"SAFE": "value"}).encode() + b"\n")
+    proc.stdin.flush()
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "supervisor did not enter descendant cleanup"
+        proc.stdin.close()
+        assert proc.wait(timeout=1) == 137
+    except subprocess.TimeoutExpired:
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        pytest.fail("watch close did not interrupt descendant cleanup")
+    finally:
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
 
 
 def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> None:
@@ -228,6 +631,132 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
+@pytest.mark.live_system_guard_bypass
+def test_runner_sigkill_contains_descendant_tree(tmp_path: Path) -> None:
+    """A SIGKILL'd runner must not orphan a bounded descendant tree."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = repo_root / f".runner-sigkill-probe-{os.getpid()}"
+    probe_dir.mkdir()
+    handoff = tmp_path / "tree.json"
+    release = tmp_path / "release"
+    output_path = tmp_path / "runner.out"
+    probe = probe_dir / "test_probe_tree.py"
+    leaf_code = textwrap.dedent(
+        f"""
+        import json, os, subprocess, sys, time
+        from pathlib import Path
+
+        def start_time(pid):
+            stat = Path(f"/proc/{{pid}}/stat").read_text()
+            return int(stat[stat.rfind(")") + 2:].split()[19])
+
+        leaf = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        Path({str(handoff)!r}).write_text(json.dumps({{
+            "tree": os.getpid(),
+            "tree_start": start_time(os.getpid()),
+            "leaf": leaf.pid,
+            "leaf_start": start_time(leaf.pid),
+        }}))
+        time.sleep(600)
+        """
+    )
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            import os, subprocess, sys, time
+            from pathlib import Path
+
+            HANDOFF = Path({str(handoff)!r})
+            RELEASE = Path({str(release)!r})
+
+            def test_tree_waits_for_runner():
+                subprocess.Popen(
+                    [sys.executable, "-c", {leaf_code!r}],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                deadline = time.monotonic() + 10
+                while not HANDOFF.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert HANDOFF.exists(), "descendant tree never started"
+                while not RELEASE.exists():
+                    time.sleep(0.01)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with output_path.open("wb") as output:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(runner),
+                "--paths",
+                str(probe),
+                "--file-retries",
+                "0",
+                "-j",
+                "1",
+                "--file-timeout",
+                "30",
+                "-q",
+                f"--rootdir={repo_root}",
+            ],
+            cwd=repo_root,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        identities: list[_ProcessIdentity] = []
+        try:
+            deadline = time.monotonic() + 10
+            while not handoff.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert handoff.exists(), "runner did not start the synthetic tree"
+            data = json.loads(handoff.read_text(encoding="utf-8"))
+            identities.append(_open_process_identity(data["tree"], data["tree_start"]))
+            identities.append(_open_process_identity(data["leaf"], data["leaf_start"]))
+            os.kill(proc.pid, 9)
+            proc.wait(timeout=10)
+            assert proc.returncode in (-9, 137)
+            assert "=== Summary:" not in output_path.read_text(encoding="utf-8")
+            deadline = time.monotonic() + 5
+            while (
+                any(_process_identity_alive(identity) for identity in identities)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+            assert not any(
+                _process_identity_alive(identity) for identity in identities
+            ), f"descendants survived: {[identity.pid for identity in identities]}"
+        finally:
+            if proc.poll() is None:
+                os.kill(proc.pid, 9)
+                proc.wait(timeout=10)
+            try:
+                for identity in identities:
+                    _signal_process_identity(identity, signal.SIGKILL)
+                deadline = time.monotonic() + 5
+                while (
+                    any(_process_identity_alive(identity) for identity in identities)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.05)
+            finally:
+                for identity in identities:
+                    os.close(identity.pidfd)
+            probe.unlink(missing_ok=True)
+            shutil.rmtree(probe_dir, ignore_errors=True)
+
+
 # ── Bare pytest-flag passthrough ─────────────────────────────────────────────
 #
 # The runner routes any token starting with ``-`` that isn't one of its own
@@ -360,6 +889,308 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
     assert "retry output" in proc.stdout
 
 
+def _fake_systemd_run(
+    tmp_path: Path, tasksmax_event: bool = False, late_descendant_event: bool = False,
+) -> Path:
+    """Create a non-unit launcher with an optional fake cgroup event reader."""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    launcher = fake_bin / "systemd-run"
+    launcher.write_text(
+        textwrap.dedent(
+            """
+            #!/usr/bin/python3
+            import json
+            import os
+            import subprocess
+            import sys
+            import time
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            cmd = args[args.index("--") + 1:]
+            flag = cmd.index("--_hermes-supervise")
+            completion = Path(cmd[flag + 2])
+            transport = sys.stdin.buffer.readline()
+            try:
+                private_env = json.loads(transport)
+            except (OSError, ValueError):
+                private_env = os.environ
+            state = Path(private_env["FAKE_SYSTEMD_STATE"])
+            attempt = int(state.read_text()) + 1 if state.exists() else 1
+            state.write_text(str(attempt))
+            mode = private_env["FAKE_SYSTEMD_MODE"]
+            if attempt == 1 and mode == "fatal-137":
+                print("service killed by resource containment", flush=True)
+                raise SystemExit(137)
+            if attempt == 1 and mode == "startup":
+                print("Failed to start transient service unit", flush=True)
+                raise SystemExit(125)
+            if attempt == 1 and mode == "missing-status":
+                print("1 failed in 0.01s", flush=True)
+                raise SystemExit(1)
+            if attempt == 1 and mode == "malformed-status":
+                completion.write_text("not json")
+                raise SystemExit(1)
+            if attempt == 1 and mode == "mismatched-status":
+                completion.write_text(json.dumps({
+                    "kind": "pytest", "returncode": 0,
+                    "resource_events": {
+                        "pids.events": 0,
+                        "memory.events": 0,
+                        "memory.events.oom": 0,
+                        "memory.events.oom_kill": 0,
+                    },
+                }))
+                raise SystemExit(1)
+            if attempt == 1 and mode == "timeout":
+                time.sleep(2)
+                raise SystemExit(1)
+            if attempt == 1 and mode == "typed-exit4":
+                completion.write_text(json.dumps({
+                    "kind": "pytest",
+                    "returncode": 4,
+                    "resource_events": {
+                        "pids.events": 0,
+                        "memory.events": 0,
+                        "memory.events.oom": 0,
+                        "memory.events.oom_kill": 0,
+                    },
+                }))
+                print("ERROR: file or directory not found", flush=True)
+                raise SystemExit(4)
+            record = private_env.get("FAKE_SYSTEMD_ARGV_RECORD")
+            if record:
+                Path(record).write_text(json.dumps(sys.argv))
+            child = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            child.stdin.write(transport)
+            child.stdin.flush()
+            status = child.wait()
+            child.stdin.close()
+            raise SystemExit(status)
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    if tasksmax_event or late_descendant_event:
+        site_dir = tmp_path / "fake-site"
+        site_dir.mkdir()
+        (site_dir / "sitecustomize.py").write_text(
+            textwrap.dedent(
+                f"""
+                    import pathlib
+                    import subprocess
+                    import sys
+
+                    _read_text = pathlib.Path.read_text
+                    _pids_events_reads = 0
+
+                    def _fake_cgroup_read_text(self, *args, **kwargs):
+                        global _pids_events_reads
+                        if str(self) == "/proc/self/cgroup":
+                            return "0::/fake\\n"
+                        if str(self) == "/sys/fs/cgroup/fake/pids.events":
+                            _pids_events_reads += 1
+                            if _pids_events_reads == 2 and {late_descendant_event!r}:
+                                subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.5)"])
+                                return "max 0\\n"
+                            return f"max {{_pids_events_reads - 1}}\\n"
+                        if str(self) == "/sys/fs/cgroup/fake/memory.events":
+                            return "max 0\\noom 0\\noom_kill 0\\n"
+                        return _read_text(self, *args, **kwargs)
+
+                    pathlib.Path.read_text = _fake_cgroup_read_text
+                    """
+                ).lstrip(),
+            encoding="utf-8",
+        )
+        env_binary = fake_bin / "env"
+        env_binary.write_text(
+            "#!/bin/sh\nshift\nexec /usr/bin/env -i PYTHONPATH=" + str(site_dir) + " \"$@\"\n",
+            encoding="utf-8",
+        )
+        env_binary.chmod(0o755)
+    return fake_bin
+
+
+def _run_fake_systemd_retry(
+    tmp_path: Path,
+    mode: str,
+    probe_source: str = "def test_probe():\n    assert True\n",
+    *,
+    file_timeout: float = 30,
+    tasksmax_event: bool = False,
+    late_descendant_event: bool = False,
+    secret: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    repo_root = Path(__file__).resolve().parent.parent
+    probe_dir = repo_root / f".runner-retry-probe-{os.getpid()}-{tmp_path.name}"
+    probe_dir.mkdir()
+    probe = probe_dir / "test_retry_boundary.py"
+    probe.write_text(probe_source, encoding="utf-8")
+    state = tmp_path / "attempts"
+    env = os.environ.copy()
+    env["FAKE_SYSTEMD_MODE"] = mode
+    env["FAKE_SYSTEMD_STATE"] = str(state)
+    if secret is not None:
+        env["DIRECT_RUNNER_SECRET"] = secret
+        env["FAKE_SYSTEMD_ARGV_RECORD"] = str(tmp_path / "launcher-argv.json")
+    env["PATH"] = os.pathsep.join((
+        str(_fake_systemd_run(tmp_path, tasksmax_event, late_descendant_event)), "/usr/bin", "/bin",
+    ))
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "run_tests_parallel.py"),
+                "--files",
+                str(probe),
+                "--file-retries",
+                "1",
+                "--file-timeout",
+                str(file_timeout),
+                "-j",
+                "1",
+                "-q",
+                f"--rootdir={repo_root}",
+            ],
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    return proc, int(state.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("mode", ("fatal-137", "startup", "missing-status"))
+def test_non_pytest_attempt_cannot_retry_to_green(tmp_path: Path, mode: str) -> None:
+    """A fatal systemd-boundary result is terminal even if retry would pass."""
+    proc, attempts = _run_fake_systemd_retry(tmp_path, mode)
+
+    assert proc.returncode == 1, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert "1 file failed" in proc.stdout
+    assert "FLAKY" not in proc.stdout
+
+
+def test_typed_pytest_failure_can_retry_to_green(tmp_path: Path) -> None:
+    """A real pytest assertion failure remains explicitly retry-eligible."""
+    marker = tmp_path / "failed-once"
+    proc, attempts = _run_fake_systemd_retry(
+        tmp_path,
+        "pytest",
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_probe():
+                marker = Path({str(marker)!r})
+                if not marker.exists():
+                    marker.write_text("failed")
+                    assert False, "retry-eligible pytest failure"
+            """
+        ),
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert attempts == 2, proc.stdout
+    assert "FLAKY file" in proc.stdout
+    assert "retry-eligible pytest failure" in proc.stdout
+
+
+def test_tasksmax_event_cannot_retry_to_green(tmp_path: Path) -> None:
+    """A pids-controller denial is terminal even when its pytest retry passes."""
+    marker = tmp_path / "failed-once"
+    proc, attempts = _run_fake_systemd_retry(
+        tmp_path,
+        "pytest",
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_probe():
+                marker = Path({str(marker)!r})
+                if not marker.exists():
+                    marker.write_text("failed")
+                    assert False, "simulated TasksMax EAGAIN"
+            """
+        ),
+        tasksmax_event=True,
+    )
+
+    assert proc.returncode == 1, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert "fatal cgroup resource event" in proc.stdout
+    assert "FLAKY" not in proc.stdout
+
+
+def test_post_sample_descendant_event_cannot_retry_to_green(tmp_path: Path) -> None:
+    """A descendant created after the final counter sample is terminal."""
+    marker = tmp_path / "failed-once"
+    proc, attempts = _run_fake_systemd_retry(
+        tmp_path,
+        "pytest",
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+            import subprocess
+            import sys
+
+            def test_probe():
+                marker = Path({str(marker)!r})
+                if not marker.exists():
+                    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.5)"])
+                    marker.write_text("failed")
+                    assert False, "late cgroup event must be terminal"
+            """
+        ),
+        late_descendant_event=True,
+    )
+
+    assert proc.returncode == 1, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert "FLAKY" not in proc.stdout
+
+
+@pytest.mark.parametrize("mode", ("malformed-status", "mismatched-status", "timeout"))
+def test_non_authoritative_attempt_siblings_cannot_retry_to_green(
+    tmp_path: Path, mode: str,
+) -> None:
+    """Malformed, mismatched, and timeout boundaries stay terminal."""
+    proc, attempts = _run_fake_systemd_retry(
+        tmp_path, mode, file_timeout=0.1 if mode == "timeout" else 30,
+    )
+
+    assert proc.returncode == 1, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert "FLAKY" not in proc.stdout
+
+
+def test_direct_linux_runner_keeps_secrets_out_of_launcher_argv(tmp_path: Path) -> None:
+    """The direct Python entrypoint never places inherited secrets in argv."""
+    secret = "direct-runner-secret-sentinel"
+    proc, attempts = _run_fake_systemd_retry(tmp_path, "pytest", secret=secret)
+    argv = (tmp_path / "launcher-argv.json").read_text(encoding="utf-8")
+
+    assert proc.returncode == 0, proc.stdout
+    assert attempts == 1, proc.stdout
+    assert secret not in argv
+    assert secret not in proc.stdout
+
+
+def test_typed_exit4_for_existing_file_can_retry_to_green(tmp_path: Path) -> None:
+    """Preserve the intentional loaded-runner exit-4 retry contract."""
+    proc, attempts = _run_fake_systemd_retry(tmp_path, "typed-exit4")
+
+    assert proc.returncode == 0, proc.stdout
+    assert attempts == 2, proc.stdout
+    assert "FLAKY file" in proc.stdout
+    assert "file or directory not found" in proc.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -460,3 +1291,239 @@ def test_drive_letter_colon_is_not_a_path_separator(tmp_path: Path) -> None:
         f"drive letter split off as a phantom root:\n{proc.stdout}"
     )
     assert "Discovered 1 test files" in proc.stdout, proc.stdout
+
+
+def test_huge_requested_worker_count_is_capped(tmp_path: Path) -> None:
+    """A caller cannot turn the file runner into an unbounded process fanout."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    probe = probe_dir / "test_worker_cap.py"
+    probe.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+
+    repo_root = Path(__file__).resolve().parent.parent
+    env = os.environ.copy()
+    env.pop("HERMES_TEST_MAX_WORKERS", None)
+    env.pop("HERMES_TEST_WORKERS", None)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "run_tests_parallel.py"),
+            "--files",
+            str(probe),
+            "-j",
+            "40",
+            "--file-retries",
+            "0",
+            "-q",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    expected = min(os.cpu_count() or 1, 8)
+    assert proc.returncode == 0, proc.stdout
+    assert f"with -j {expected}" in proc.stdout, proc.stdout
+
+
+def test_worker_path_excludes_mise_tool_shims(tmp_path: Path) -> None:
+    """A normal worker cannot resolve or execute mise's Rust-tool shims."""
+    repo_root = Path(__file__).resolve().parent.parent
+    probe_dir = repo_root / f".runner-mise-probe-{os.getpid()}"
+    probe_dir.mkdir()
+    capture = tmp_path / "worker-env.json"
+    executions = tmp_path / "mise-tool-executions"
+    mise_shims = tmp_path / "mise" / "shims"
+    mise_executable = tmp_path / "mise-runtime" / "mise"
+    safe_bin = tmp_path / "safe-bin"
+    mise_shims.mkdir(parents=True)
+    mise_executable.parent.mkdir()
+    safe_bin.mkdir()
+    mise_executable.write_text(
+        "#!/bin/sh" + chr(10) + f"echo \"$0\" >> {executions!s}" + chr(10),
+        encoding="utf-8",
+    )
+    mise_executable.chmod(0o755)
+    exposed_bins = []
+    for tool in ("rustup", "cargo", "rustc"):
+        exposed = tmp_path / f"mise-exposing-{tool}"
+        exposed.mkdir()
+        (exposed / tool).symlink_to(mise_executable)
+        (safe_bin / tool).write_text("#!/bin/sh" + chr(10) + "exit 0" + chr(10), encoding="utf-8")
+        (safe_bin / tool).chmod(0o755)
+        exposed_bins.append(exposed)
+
+    aliased_bins = []
+    suffix_bins = []
+    for tool in ("rustup", "cargo", "rustc"):
+        real_mise = tmp_path / f"regular-{tool}" / "mise"
+        real_shims = real_mise / "shims"
+        real_shims.mkdir(parents=True)
+        regular_shim = real_shims / tool
+        regular_shim.write_text(
+            "#!/bin/sh" + chr(10) + f"echo \"$0\" >> {executions!s}" + chr(10),
+            encoding="utf-8",
+        )
+        regular_shim.chmod(0o755)
+        alias = tmp_path / f"aliased-{tool}"
+        alias.symlink_to(real_mise, target_is_directory=True)
+        aliased_bins.append(alias / "shims")
+
+        suffix_bin = tmp_path / f"suffix-{tool}"
+        suffix_bin.mkdir()
+        (suffix_bin / f"{tool}.exe").symlink_to(mise_executable)
+        suffix_bins.append(suffix_bin)
+
+    uncertain_bin = tmp_path / "uncertain-bin"
+    uncertain_bin.mkdir()
+    (uncertain_bin / "cargo").symlink_to(tmp_path / "missing-mise-target")
+
+    probe = probe_dir / "test_worker_path.py"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import os
+            import shutil
+            from pathlib import Path
+
+            def test_worker_path_is_sanitized():
+                Path({str(capture)!r}).write_text(json.dumps({{
+                    "path": os.environ.get("PATH", ""),
+                    "tools": {{tool: shutil.which(tool) for tool in ("rustup", "cargo", "rustc")}},
+                }}))
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join(
+        (
+            str(mise_shims),
+            *(str(path) for path in exposed_bins),
+            *(str(path) for path in aliased_bins),
+            *(str(path) for path in suffix_bins),
+            str(uncertain_bin),
+            str(safe_bin),
+            "/usr/bin",
+            "/bin",
+        )
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "run_tests_parallel.py"),
+            "--files",
+            str(probe),
+            "-j",
+            "1",
+            "--file-retries",
+            "0",
+            "-q",
+            f"--rootdir={repo_root}",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    data = json.loads(capture.read_text(encoding="utf-8"))
+    path_entries = data["path"].split(os.pathsep)
+    assert not any(Path(entry).as_posix().rstrip("/").endswith("/mise/shims") for entry in path_entries)
+    assert not any(str(path) in path_entries for path in exposed_bins)
+    assert not any(str(path) in path_entries for path in aliased_bins)
+    assert not any(str(path) in path_entries for path in suffix_bins)
+    assert str(uncertain_bin) not in path_entries
+    assert data["tools"] == {tool: str(safe_bin / tool) for tool in ("rustup", "cargo", "rustc")}
+    assert not executions.exists(), "ordinary worker executed a mise Rust-tool shim"
+    shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+def test_direct_runner_resolves_empty_and_relative_path_at_repo_root(tmp_path: Path) -> None:
+    """Direct invocation filters empty and dot PATH entries using the child CWD."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = repo_root / f".runner-relative-mise-probe-{os.getpid()}-{tmp_path.name}"
+    parent_cwd = tmp_path / "safe-parent"
+    capture = tmp_path / "worker-env.json"
+    executions = tmp_path / "mise-tool-executions"
+    safe_bin = tmp_path / "safe-bin"
+    mise = tmp_path / "mise"
+    root_tools = [repo_root / tool for tool in ("rustup", "cargo", "rustc")]
+    probe_dir.mkdir()
+    parent_cwd.mkdir()
+    safe_bin.mkdir()
+    try:
+        assert not any(path.exists() or path.is_symlink() for path in root_tools)
+        mise.write_text(
+            "#!/bin/sh\n" + f"echo \"$0\" >> {executions!s}\n",
+            encoding="utf-8",
+        )
+        mise.chmod(0o755)
+        for tool, root_tool in zip(("rustup", "cargo", "rustc"), root_tools):
+            root_tool.symlink_to(mise)
+            safe_tool = safe_bin / tool
+            safe_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            safe_tool.chmod(0o755)
+        probe = probe_dir / "test_worker_path.py"
+        probe.write_text(
+            textwrap.dedent(
+                f"""
+                import json
+                import os
+                import shutil
+                from pathlib import Path
+
+                def test_worker_path_is_sanitized():
+                    Path({str(capture)!r}).write_text(json.dumps({{
+                        "path": os.environ["PATH"],
+                        "tools": {{tool: shutil.which(tool) for tool in ("rustup", "cargo", "rustc")}},
+                    }}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["PATH"] = os.pathsep.join(("", str(safe_bin), ".", "/usr/bin", "/bin"))
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(runner),
+                "--files",
+                str(probe),
+                "--file-retries",
+                "0",
+                "-j",
+                "1",
+                "-q",
+                f"--rootdir={repo_root}",
+            ],
+            cwd=parent_cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+        assert proc.returncode == 0, proc.stdout
+        data = json.loads(capture.read_text(encoding="utf-8"))
+        assert "" not in data["path"].split(os.pathsep)
+        assert "." not in data["path"].split(os.pathsep)
+        assert data["tools"] == {tool: str(safe_bin / tool) for tool in ("rustup", "cargo", "rustc")}
+        assert not executions.exists(), "ordinary worker executed a mise Rust-tool shim"
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        for root_tool in root_tools:
+            root_tool.unlink(missing_ok=True)

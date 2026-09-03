@@ -24,6 +24,7 @@ import re
 import ssl
 import sys
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -37,9 +38,13 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
-from agent.display import KawaiiSpinner
+from agent.display import KawaiiSpinner, _RED, _RESET
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.stream_payload_bound import (
+    StreamPayloadBoundExceeded,
+    persist_interrupted_stream_partial,
+)
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
@@ -100,14 +105,189 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    POST_COMPRESSION_CACHE_NOTE,
+    cache_hit_percent,
+    estimate_usage_cost,
+    normalize_usage,
+)
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
-from utils import base_url_host_matches, env_var_enabled
+from utils import base_url_host_matches, env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+def _loop_timing_context(
+    agent: Any,
+    *,
+    now: Optional[datetime] = None,
+    stop: bool = False,
+) -> Optional[str]:
+    """Record a loop boundary or return its API-only timing context."""
+    current = now or datetime.now().astimezone()
+    if stop:
+        agent._loop_timing_last_stop = current
+        return None
+
+    previous_start = getattr(agent, "_loop_timing_last_start", None)
+    previous_stop = getattr(agent, "_loop_timing_last_stop", None)
+    agent._loop_timing_last_start = current
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
+        enabled = is_truthy_value(
+            agent_config.get("loop_timing_context")
+            if isinstance(agent_config, dict)
+            else None,
+            default=True,
+        )
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+
+    lines = ["[Agent loop timing]"]
+    if previous_start is not None:
+        lines.append(f"Previous loop start: {previous_start.isoformat(timespec='seconds')}")
+    if previous_stop is not None:
+        lines.append(f"Previous loop stop: {previous_stop.isoformat(timespec='seconds')}")
+    lines.append(f"Current loop start: {current.isoformat(timespec='seconds')}")
+    return "\n".join(lines)
+
+
+def _drop_redundant_previous_loop_start(text: str, history) -> str:
+    """Drop Previous loop start when history already has that Current stamp."""
+    if not text or not history:
+        return text
+    lines = text.splitlines()
+    previous = next(
+        (line for line in lines if line.startswith("Previous loop start: ")), None
+    )
+    if previous is None:
+        return text
+    needle = f"Current loop start: {previous[len('Previous loop start: '):]}"
+    if any(
+        isinstance(message, dict)
+        and "[Agent loop timing]" in str(message.get("content", ""))
+        and needle in str(message.get("content", ""))
+        for message in history
+    ):
+        return "\n".join(line for line in lines if line != previous)
+    return text
+
+
+def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -> bool:
+    """Store one real usage reading and consume pending cache attribution."""
+    agent._last_turn_usage = dict(usage)
+    post_compression = bool(
+        getattr(agent, "_awaiting_cache_usage_after_compression", False)
+    )
+    if not (first_call or post_compression):
+        return post_compression
+    cache_usage = dict(usage)
+    if post_compression:
+        cache_usage["cache_attribution"] = "post_compression"
+        agent._awaiting_cache_usage_after_compression = False
+    agent._first_turn_usage = cache_usage
+
+    cache_callback = getattr(agent, "_tui_cache_callback", None)
+    if callable(cache_callback):
+        cache_read = usage.get("cache_read_tokens", 0) or 0
+        cache_write = usage.get("cache_write_tokens", 0) or 0
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        if cache_read:
+            cache_state = "hit"
+            cache_pct = cache_hit_percent(cache_read, prompt_tokens)
+        elif cache_write:
+            cache_state, cache_pct = "cold_write", 0
+        elif usage.get("cache_telemetry") == "unavailable":
+            cache_state, cache_pct = "no_field", 0
+        else:
+            cache_state, cache_pct = "miss", 0
+        response_index = int(getattr(agent, "_tui_provider_response_index", 0)) + 1
+        agent._tui_provider_response_index = response_index
+        try:
+            cache_callback(
+                cache_state,
+                cache_pct,
+                cache_read,
+                prompt_tokens,
+                {
+                    "request_index": response_index,
+                    "state": cache_state,
+                    "pct": cache_pct if cache_state == "hit" else None,
+                    "timestamp": time.monotonic(),
+                    "turn_origin": getattr(agent, "_cache_turn_origin", "user"),
+                    **(
+                        {"attribution": "post_compression"}
+                        if post_compression
+                        else {}
+                    ),
+                },
+            )
+        except TypeError:
+            try:
+                cache_callback(cache_state, cache_pct, cache_read, prompt_tokens)
+            except Exception:
+                logger.debug("TUI cache callback failed", exc_info=True)
+        except Exception:
+            logger.debug("TUI cache callback failed", exc_info=True)
+    return post_compression
+
+
+def _is_standard_profile_child(agent) -> bool:
+    return getattr(agent, "_delegate_model_profile", None) == "standard"
+
+
+def _standard_child_has_successful_llm_request(agent) -> bool:
+    return bool(getattr(agent, "_delegate_has_successful_llm_request", False))
+
+
+def _standard_child_can_fallback(
+    agent, *, rate_limited: bool = False, terminal_quota: bool = False, billing: bool = False
+) -> bool:
+    """Permit pre-success 429 or billing fallback for standard children."""
+    if not _is_standard_profile_child(agent):
+        return True
+    return (
+        (rate_limited or terminal_quota or billing)
+        and not _standard_child_has_successful_llm_request(agent)
+    )
+
+
+def _standard_child_fallback_reason(agent, reason, *, terminal_quota: bool = False):
+    """Map standard-child billing/quota failures to the shared rate-limit gate."""
+    if _is_standard_profile_child(agent) and (
+        terminal_quota or reason == FailoverReason.billing
+    ):
+        return FailoverReason.rate_limit
+    return reason
+
+
+def _response_error_code(response) -> Optional[int]:
+    error = getattr(response, "error", None) if response is not None else None
+    code = getattr(error, "code", None)
+    if code is None and isinstance(error, dict):
+        code = error.get("code")
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _standard_child_can_fallback_invalid_response(agent, response) -> bool:
+    if not _is_standard_profile_child(agent):
+        return True
+    return (
+        not _standard_child_has_successful_llm_request(agent)
+        and _response_error_code(response) == 429
+    )
 
 
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
@@ -471,6 +651,41 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
 
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
+
+
+def _is_xai_bad_credentials_403(
+    provider: str,
+    status_code: Any,
+    api_error: Any,
+    error_context: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """xAI reports an expired or invalid OAuth access token as HTTP 403 with
+    body code ``unauthenticated:bad-credentials`` rather than 401, so the
+    401-only refresh trigger never fires and a long-lived worker keeps its
+    dead in-memory token (#82052). Scoped to xai-oauth: other providers'
+    403s remain non-retryable authorization failures.
+    """
+    if provider != "xai-oauth" or status_code != 403:
+        return False
+    if error_context is None:
+        from agent.agent_runtime_helpers import extract_api_error_context
+
+        error_context = extract_api_error_context(api_error)
+    reason = str((error_context or {}).get("reason") or "").strip().casefold()
+    if reason == "unauthenticated:bad-credentials":
+        return True
+    exact_messages = {
+        "oauth2 access token could not be validated",
+        "the oauth2 access token could not be validated",
+    }
+    for value in (
+        (error_context or {}).get("message"),
+        getattr(api_error, "message", None),
+    ):
+        message = str(value or "").strip().casefold().removesuffix(".")
+        if message in exact_messages:
+            return True
+    return False
 
 
 def _is_copilot_provider(agent: Any) -> bool:
@@ -1223,6 +1438,8 @@ _CODEX_INCOMPLETE_NUDGE = (
     "Produce your final answer as plain text now (or make the tool call "
     "you were planning).]"
 )
+# The retry counter includes the initial incomplete response, not just follow-ups.
+_CODEX_INCOMPLETE_CONTINUATION_LIMIT = 3
 
 
 # Re-prompt sent after a Codex/Responses turn ends with an acknowledgment-only
@@ -1938,6 +2155,7 @@ def run_conversation(
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
+    agent._queued_interim_texts = set()
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
@@ -1973,6 +2191,7 @@ def run_conversation(
     # objects without the attribute (older pickles / minimal stubs).
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
+    _skip_preflight_after_output_cap_compression = False
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
@@ -1990,6 +2209,7 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    loop_timing_persisted_text = ""
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -2004,6 +2224,8 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    agent._first_turn_usage = None
+    agent._tui_provider_response_index = 0
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -2011,6 +2233,7 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        agent._reset_stream_delivery_tracking(flush=False)
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -2117,44 +2340,7 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
-        if _pre_api_steer:
-            _injected = False
-            for _si in range(len(messages) - 1, -1, -1):
-                _sm = messages[_si]
-                if isinstance(_sm, dict) and _sm.get("role") == "tool":
-                    from agent.prompt_builder import format_steer_marker
-                    marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
-                    if isinstance(existing, str):
-                        _sm["content"] = existing + marker
-                    else:
-                        # Multimodal content blocks — append text block
-                        try:
-                            blocks = list(existing) if existing else []
-                            blocks.append({"type": "text", "text": marker})
-                            _sm["content"] = blocks
-                        except Exception:
-                            pass
-                    _injected = True
-                    logger.debug(
-                        "Pre-API-call steer drain: injected into tool msg at index %d",
-                        _si,
-                    )
-                    break
-            if not _injected:
-                # No tool message to inject into — put it back so
-                # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
-                else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+        agent._apply_pending_steer_to_tool_results(messages, len(messages))
 
         # ── Wall-clock run-budget wrap-up notice ───────────────────────
         # One-shot: when a run budget (agent.run_budget_seconds /
@@ -2563,6 +2749,32 @@ def run_conversation(
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools
 
+        # Timing is hidden system metadata. Append after cache planning so the
+        # new block never receives a breakpoint, then persist it for the next
+        # cycle's stable historical prefix. The exact normalized-text sentinel
+        # spans inner continuations but resets for each outer run_conversation.
+        _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
+        if _loop_timing_text:
+            if not loop_timing_persisted_text:
+                loop_timing_persisted_text = _drop_redundant_previous_loop_start(
+                    _loop_timing_text, messages
+                )
+            if not any(
+                message.get("role") == "system"
+                and message.get("content") == loop_timing_persisted_text
+                for message in messages
+            ):
+                api_messages.append(
+                    {"role": "system", "content": loop_timing_persisted_text}
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": loop_timing_persisted_text,
+                        "display_kind": "hidden",
+                    }
+                )
+
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
         # is deliberately ephemeral and therefore absent from ``messages``.
@@ -2690,12 +2902,20 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        # The output-cap handler's restart rebuilds API-only timing. Skip this
+        # one re-entry because that handler already owns its compression pass.
+        _skip_preflight = _skip_preflight_after_output_cap_compression
+        _skip_preflight_after_output_cap_compression = False
         if (
             agent.compression_enabled
             and not _review_fork_first_request_pending(agent)
-            and len(messages) > 1
+            # A freshly appended timing row is metadata, not enough history to
+            # justify compaction before the first provider request. It remains
+            # in this outer-run guard, so tool continuations still compact.
+            and len(messages) > 1 + int(bool(loop_timing_persisted_text))
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
+            and not _skip_preflight
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
@@ -2903,12 +3123,16 @@ def run_conversation(
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            agent._current_api_retry_count = retry_count
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
             # (including SDK-level retries) counts against RPH and
             # deepens the rate limit hole.
-            if agent.provider == "nous":
+            if agent.provider == "nous" and not (
+                _is_standard_profile_child(agent)
+                and _standard_child_has_successful_llm_request(agent)
+            ):
                 try:
                     from agent.nous_rate_guard import (
                         nous_rate_limit_remaining,
@@ -2924,7 +3148,16 @@ def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if (
+                            _standard_child_can_fallback(agent, rate_limited=True)
+                            and agent._try_activate_fallback(
+                                reason=(
+                                    FailoverReason.rate_limit
+                                    if _is_standard_profile_child(agent)
+                                    else None
+                                )
+                            )
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -3411,7 +3644,16 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
+                    if (
+                        _standard_child_can_fallback_invalid_response(agent, response)
+                        and agent._try_activate_fallback(
+                            reason=(
+                                FailoverReason.rate_limit
+                                if _is_standard_profile_child(agent)
+                                else None
+                            )
+                        )
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3485,7 +3727,16 @@ def run_conversation(
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
+                        if (
+                            _standard_child_can_fallback_invalid_response(agent, response)
+                            and agent._try_activate_fallback(
+                                reason=(
+                                    FailoverReason.rate_limit
+                                    if _is_standard_profile_child(agent)
+                                    else None
+                                )
+                            )
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -3555,6 +3806,28 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                if _is_standard_profile_child(agent):
+                    agent._delegate_has_successful_llm_request = True
+
+                if api_call_count == 1:
+                    _first_response_usage = getattr(response, "usage", None)
+                    if _first_response_usage:
+                        _first_canonical_usage = normalize_usage(
+                            _first_response_usage,
+                            provider=agent.provider,
+                            api_mode=agent.api_mode,
+                        )
+                        agent._first_turn_usage = {
+                            "prompt_tokens": _first_canonical_usage.prompt_tokens,
+                            "completion_tokens": _first_canonical_usage.output_tokens,
+                            "total_tokens": _first_canonical_usage.total_tokens,
+                            "input_tokens": _first_canonical_usage.input_tokens,
+                            "output_tokens": _first_canonical_usage.output_tokens,
+                            "cache_read_tokens": _first_canonical_usage.cache_read_tokens,
+                            "cache_write_tokens": _first_canonical_usage.cache_write_tokens,
+                            "cache_telemetry": _first_canonical_usage.cache_telemetry,
+                            "reasoning_tokens": _first_canonical_usage.reasoning_tokens,
+                        }
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -3659,11 +3932,11 @@ def run_conversation(
                     # Deterministic for the unchanged prompt — never retry.
                     # Try a configured fallback once (a different model may not
                     # refuse); otherwise surface the refusal terminally.
-                    if agent._has_pending_fallback():
+                    if agent._has_pending_fallback() and _standard_child_can_fallback(agent):
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if _standard_child_can_fallback(agent) and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3878,6 +4151,7 @@ def run_conversation(
                         if (
                             _cf_terminated
                             and agent._fallback_index < len(agent._fallback_chain)
+                            and _standard_child_can_fallback(agent)
                         ):
                             agent._vprint(
                                 f"{agent.log_prefix}🛡️  Content filter terminated "
@@ -4185,8 +4459,12 @@ def run_conversation(
                         "output_tokens": canonical_usage.output_tokens,
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
+                        "cache_telemetry": canonical_usage.cache_telemetry,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    post_compression_cache = _ingest_successful_provider_usage(
+                        agent, usage_dict, first_call=api_call_count == 1
+                    )
                     # Capture the boundary latch before update_from_response()
                     # consumes it. Only a real provider prompt count for the
                     # request immediately following a completed compaction can
@@ -4251,13 +4529,6 @@ def run_conversation(
                         _preflight_compression_blocked = False
                         _last_preflight_pressure = None
 
-                    # Stash this response's canonical usage so the post-turn
-                    # on_turn_complete() observation hook can forward it (the
-                    # same dict shape passed to update_from_response). A turn
-                    # may make several API calls; the engine's per-turn signal
-                    # of interest is the cost/size of the latest assembled
-                    # request, so we keep the most recent call's usage.
-                    agent._last_turn_usage = dict(usage_dict)
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",
@@ -4416,11 +4687,19 @@ def run_conversation(
                     written = canonical_usage.cache_write_tokens
                     prompt = usage_dict["prompt_tokens"]
                     if (cached or written) and not agent.quiet_mode:
-                        hit_pct = (cached / prompt * 100) if prompt > 0 else 0
+                        hit_pct = cache_hit_percent(cached, prompt)
+                        hit_text = f"{hit_pct}%"
+                        if hit_pct < CACHE_HIT_ERROR_THRESHOLD:
+                            hit_text = f"{_RED}{hit_text}{_RESET}"
+                        cache_note = (
+                            f" · {POST_COMPRESSION_CACHE_NOTE}"
+                            if post_compression_cache
+                            else ""
+                        )
                         agent._vprint(
                             f"{agent.log_prefix}   💾 Cache: "
                             f"{cached:,}/{prompt:,} tokens "
-                            f"({hit_pct:.0f}% hit, {written:,} written)"
+                            f"({hit_text} hit, {written:,} written){cache_note}"
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success
@@ -4470,14 +4749,31 @@ def run_conversation(
                 # record of the half-finished reply on screen, so the next turn
                 # the model "forgets" what it just said — exactly what users hit
                 # when they stop to redirect mid-response.
-                _partial = agent._strip_think_blocks(
-                    getattr(agent, "_current_streamed_assistant_text", "") or ""
-                ).strip()
-                if _partial:
-                    append_message(messages, {"role": "assistant", "content": _partial})
-                    final_response = _partial
-                else:
-                    final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
+                # Oversize thinking/stream payloads must not stay as the last
+                # assistant row when the user mashes interrupt (#119).
+                final_response = persist_interrupted_stream_partial(
+                    agent, messages, elapsed=api_elapsed
+                )
+                agent._persist_session(messages, conversation_history)
+                break
+
+            except StreamPayloadBoundExceeded as api_error:
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+                interrupted = True
+                _turn_exit_reason = "stream_payload_bound_exceeded"
+                final_response = persist_interrupted_stream_partial(
+                    agent,
+                    messages,
+                    elapsed=time.time() - api_start_time,
+                    exceeded=True,
+                    size=getattr(api_error, "size", 0),
+                    bound=getattr(api_error, "bound", None),
+                )
+                agent._vprint(f"{agent.log_prefix}⚠ {final_response}", force=True)
                 agent._persist_session(messages, conversation_history)
                 break
 
@@ -4777,6 +5073,10 @@ def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
+                _terminal_quota_429 = (
+                    status_code == 429
+                    and classified.reason == FailoverReason.billing
+                )
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
                     turn_id=turn_id,
@@ -4799,6 +5099,10 @@ def run_conversation(
                         getattr(agent, "provider", "") or "",
                         getattr(agent, "base_url", "") or "",
                     )
+                    and not _standard_child_can_fallback(
+                        agent,
+                        terminal_quota=_terminal_quota_429,
+                    )
                     and not _retry.nous_paid_entitlement_refresh_attempted
                 ):
                     _retry.nous_paid_entitlement_refresh_attempted = True
@@ -4810,13 +5114,16 @@ def run_conversation(
                         )
                         continue
 
-                recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-                    status_code=status_code,
-                    has_retried_429=_retry.has_retried_429,
-                    classified_reason=classified.reason,
-                    error_context=error_context,
-                    billing_unverified=classified.billing_unverified,
-                )
+                if _is_standard_profile_child(agent):
+                    recovered_with_pool = False
+                else:
+                    recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
+                        status_code=status_code,
+                        has_retried_429=_retry.has_retried_429,
+                        classified_reason=classified.reason,
+                        error_context=error_context,
+                        billing_unverified=classified.billing_unverified,
+                    )
                 if recovered_with_pool:
                     continue
 
@@ -4936,13 +5243,18 @@ def run_conversation(
                 if (
                     agent.api_mode == "codex_responses"
                     and agent.provider in {"openai-codex", "xai-oauth"}
-                    and status_code == 401
+                    and (
+                        status_code == 401
+                        or _is_xai_bad_credentials_403(
+                            agent.provider, status_code, api_error, error_context
+                        )
+                    )
                     and not _retry.codex_auth_retry_attempted
                 ):
                     _retry.codex_auth_retry_attempted = True
                     if agent._try_refresh_codex_client_credentials(force=True):
                         _label = "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
-                        agent._buffer_vprint(f"🔐 {_label} auth refreshed after 401. Retrying request...")
+                        agent._buffer_vprint(f"🔐 {_label} auth refreshed after {status_code}. Retrying request...")
                         continue
                 if (
                     agent.api_mode == "chat_completions"
@@ -5479,7 +5791,20 @@ def run_conversation(
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
                 )
-                if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
+                if (
+                    _should_fallback
+                    and _standard_child_can_fallback(
+                        agent,
+                        rate_limited=classified.reason
+                        in {
+                            FailoverReason.rate_limit,
+                            FailoverReason.upstream_rate_limit,
+                        },
+                        terminal_quota=_terminal_quota_429,
+                        billing=classified.reason == FailoverReason.billing,
+                    )
+                    and agent._fallback_index < len(agent._fallback_chain)
+                ):
                     # Don't eagerly fallback if credential pool rotation may
                     # still recover.  See _pool_may_recover_from_rate_limit
                     # for the single-credential-pool exception.  Fixes #11314.
@@ -5490,7 +5815,7 @@ def run_conversation(
                     # different model regardless of pool state.
                     _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
                     pool_may_recover = (
-                        False if _is_upstream
+                        False if _is_upstream or _terminal_quota_429
                         else _ra()._pool_may_recover_from_rate_limit(
                             agent._credential_pool,
                         )
@@ -5522,7 +5847,13 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        if agent._try_activate_fallback(
+                            reason=_standard_child_fallback_reason(
+                                agent,
+                                classified.reason,
+                                terminal_quota=_terminal_quota_429,
+                            ),
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -5530,6 +5861,23 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             _retry.restart_with_rebuilt_messages = True
                             break
+
+                # Standard children never retry a 429 on the same route when
+                # no configured fallback could be activated.
+                if (
+                    _is_standard_profile_child(agent)
+                    and _standard_child_can_fallback(
+                        agent,
+                        rate_limited=classified.reason
+                        in {
+                            FailoverReason.rate_limit,
+                            FailoverReason.upstream_rate_limit,
+                        },
+                        terminal_quota=_terminal_quota_429,
+                        billing=classified.reason == FailoverReason.billing,
+                    )
+                ):
+                    retry_count = max_retries
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
@@ -5548,6 +5896,7 @@ def run_conversation(
                 # + provider-specific troubleshooting guidance unchanged.
                 if (
                     classified.is_auth
+                    and _standard_child_can_fallback(agent)
                     and not _retry.auth_failover_attempted
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):
@@ -5587,6 +5936,7 @@ def run_conversation(
                 # successful response.
                 if (
                     is_rate_limited
+                    and not _is_standard_profile_child(agent)
                     and agent.provider == "nous"
                     and classified.reason == FailoverReason.rate_limit
                     and not recovered_with_pool
@@ -5878,7 +6228,9 @@ def run_conversation(
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
                             )
+                            _skip_preflight_after_output_cap_compression = True
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
+                                _skip_preflight_after_output_cap_compression = False
                                 compression_attempts -= 1
                                 agent._persist_session(messages, conversation_history)
                                 return _compression_deferred_result(
@@ -6153,7 +6505,13 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
-                if is_client_error:
+                if is_client_error and (
+                    not _is_standard_profile_child(agent)
+                    or (
+                        classified.reason == FailoverReason.billing
+                        and _standard_child_can_fallback(agent, billing=True)
+                    )
+                ):
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /
@@ -6193,7 +6551,19 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if (
+                        _standard_child_can_fallback(
+                            agent,
+                            billing=classified.reason == FailoverReason.billing,
+                        )
+                        and agent._try_activate_fallback(
+                            reason=_standard_child_fallback_reason(
+                                agent,
+                                classified.reason,
+                                terminal_quota=_terminal_quota_429,
+                            )
+                        )
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6391,8 +6761,12 @@ def run_conversation(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+                    if (
+                        not _is_standard_profile_child(agent)
+                        and not _retry.primary_recovery_attempted
+                        and agent._try_recover_primary_transport(
                         api_error, retry_count=retry_count, max_retries=max_retries,
+                        )
                     ):
                         _retry.primary_recovery_attempted = True
                         retry_count = 0
@@ -6407,7 +6781,29 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if (
+                        _standard_child_can_fallback(
+                            agent,
+                            rate_limited=classified.reason
+                            in {
+                                FailoverReason.rate_limit,
+                                FailoverReason.upstream_rate_limit,
+                            },
+                            terminal_quota=_terminal_quota_429,
+                            billing=classified.reason == FailoverReason.billing,
+                        )
+                        and agent._try_activate_fallback(
+                            reason=_standard_child_fallback_reason(
+                                agent,
+                                (
+                                    classified.reason
+                                    if _is_standard_profile_child(agent)
+                                    else None
+                                ),
+                                terminal_quota=_terminal_quota_429,
+                            ),
+                        )
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6714,7 +7110,8 @@ def run_conversation(
 
         # If the API call was interrupted, skip response processing
         if interrupted:
-            _turn_exit_reason = "interrupted_during_api_call"
+            if _turn_exit_reason != "stream_payload_bound_exceeded":
+                _turn_exit_reason = "interrupted_during_api_call"
             break
 
         if _retry.restart_with_compressed_messages:
@@ -7012,7 +7409,7 @@ def run_conversation(
                         append_message(messages, interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
 
-                if agent._codex_incomplete_retries < 3:
+                if agent._codex_incomplete_retries <= _CODEX_INCOMPLETE_CONTINUATION_LIMIT:
                     # When the interim message has nothing the Responses
                     # input converter will replay (no visible content, no
                     # encrypted reasoning items, no replayable message
@@ -7052,7 +7449,7 @@ def run_conversation(
                                 "content": _CODEX_INCOMPLETE_NUDGE,
                             })
                     if not agent.quiet_mode:
-                        agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
+                        agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})")
                     # Surface the continuation on the live spinner/status line
                     # (CLI/TUI/Desktop) and gateway heartbeat: each of these
                     # retries can spend minutes waiting on the provider, and
@@ -7061,20 +7458,25 @@ def run_conversation(
                     agent._emit_wait_notice(
                         f"↻ model returned reasoning with no final answer — "
                         f"asking it to continue "
-                        f"({agent._codex_incomplete_retries}/3)"
+                        f"({agent._codex_incomplete_retries}/{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})"
                     )
                     agent._session_messages = messages
                     continue
 
+                continuation_attempts = agent._codex_incomplete_retries - 1
+                continuation_error = (
+                    f"Codex response remained incomplete after "
+                    f"{continuation_attempts} continuation attempts"
+                )
                 agent._codex_incomplete_retries = 0
                 agent._persist_session(messages, conversation_history)
                 return {
-                    "final_response": "Codex response remained incomplete after 3 continuation attempts",
+                    "final_response": continuation_error,
                     "messages": messages,
                     "api_calls": api_call_count,
                     "completed": False,
                     "partial": True,
-                    "error": "Codex response remained incomplete after 3 continuation attempts",
+                    "error": continuation_error,
                 }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
@@ -8001,7 +8403,11 @@ def run_conversation(
                     # chain.  This covers the case where a model
                     # (e.g. GLM-4.5-Air) consistently returns empty
                     # due to context degradation or provider issues.
-                    if _truly_empty and agent._fallback_chain:
+                    if (
+                        _truly_empty
+                        and agent._fallback_chain
+                        and _standard_child_can_fallback(agent)
+                    ):
                         logger.warning(
                             "Empty response after %d retries — "
                             "attempting fallback (model=%s, provider=%s)",

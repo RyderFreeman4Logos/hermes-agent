@@ -1851,7 +1851,11 @@ class GatewaySlashCommandsMixin:
             current_api_key = override.get("api_key", current_api_key)
 
         # No args: show interactive picker (Telegram/Discord) or text list
-        if not model_input and not explicit_provider:
+        if (
+            not model_input
+            and not explicit_provider
+            and not request.is_after_compression
+        ):
             # Try interactive picker if the platform supports it
             adapter = getattr(self, "_adapter_for_source")(source)
             has_picker = (
@@ -2220,10 +2224,14 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            is_after_compression=request.is_after_compression,
+            reasoning=request.reasoning,
+            validate_live=not request.is_after_compression,
         )
 
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
+        result.is_after_compression = request.is_after_compression
 
         try:
             from hermes_cli.context_switch_guard import (
@@ -2254,6 +2262,30 @@ class GatewaySlashCommandsMixin:
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
+
+            if result.is_after_compression:
+                if not cached_entry or cached_entry[0] is None:
+                    return t(
+                        "gateway.model.error_prefix",
+                        error="--after-compression requires a live session.",
+                    )
+                state = self._session_state(session_key)
+                replaced = state.conversation.after_compression_model_switch
+                state.conversation.after_compression_model_switch = result
+                self._attach_model_switch_after_compression(
+                    session_key,
+                    cached_entry[0],
+                )
+                lines = [
+                    "Deferred model switch scheduled after compression "
+                    f"(the next successful compression): `{result.new_model}`",
+                    f"Provider: {result.provider_label or result.target_provider}",
+                ]
+                if replaced is not None:
+                    lines.append(
+                        "_(replaced the previously scheduled model switch)_"
+                    )
+                return "\n".join(lines)
 
             if cached_entry and cached_entry[0] is not None:
                 try:

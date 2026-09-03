@@ -2863,7 +2863,7 @@ def convert_messages_to_anthropic(
                     # must contain non-whitespace text"), and a blank block
                     # carrying a cache_control breakpoint cannot simply be
                     # dropped (#70909).
-                    system = []
+                    system_entry = []
                     for p in content:
                         if not isinstance(p, dict):
                             continue
@@ -2874,13 +2874,25 @@ def convert_messages_to_anthropic(
                         ):
                             p = dict(p)
                             p["text"] = _EMPTY_TEXT_PLACEHOLDER
-                        system.append(p)
+                        system_entry.append(p)
                 else:
-                    system = "\n".join(
+                    system_entry = "\n".join(
                         p["text"] for p in content if p.get("type") == "text"
                     )
             else:
-                system = content
+                system_entry = content
+
+            if system is None:
+                system = system_entry
+            elif isinstance(system, list):
+                if isinstance(system_entry, list):
+                    system.extend(system_entry)
+                else:
+                    system.append({"type": "text", "text": system_entry})
+            elif isinstance(system_entry, list):
+                system = [{"type": "text", "text": system}, *system_entry]
+            else:
+                system = f"{system}\n\n{system_entry}"
             continue
 
         if role == "assistant":
@@ -3239,6 +3251,8 @@ def create_anthropic_message(
     in particular. Only fires on the streaming path, which is the one the main
     turn loop takes.
     """
+    from agent import relay_llm
+
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
 
     messages_api = getattr(client, "messages", None)
@@ -3247,6 +3261,7 @@ def create_anthropic_message(
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
         try:
+            relay_llm.capture_transport_request(stream_kwargs)
             with stream_fn(**stream_kwargs) as stream:
                 if callable(on_response):
                     try:
@@ -3281,4 +3296,5 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
+    relay_llm.capture_transport_request(create_kwargs)
     return messages_api.create(**create_kwargs)

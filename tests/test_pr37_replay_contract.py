@@ -61,11 +61,19 @@ def test_compression_lock_uses_bounded_non_fts_write(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / "state.db")
     calls = []
 
-    def execute_write(_fn, *, patience_s=None, recover_fts_errors=True):
-        calls.append((patience_s, recover_fts_errors))
+    def execute_write(
+        _fn, *, patience_s=None, recover_fts_errors=True, max_retries=None
+    ):
+        calls.append((patience_s, recover_fts_errors, max_retries))
         return False, None
 
     monkeypatch.setattr(db, "_execute_write", execute_write)
     assert db.try_acquire_compression_lock("replay-session", "holder") is False
-    assert calls == [(db._COMPRESSION_LOCK_ACQUIRE_PATIENCE_S, False)]
+    assert calls == [
+        (
+            db._COMPRESSION_LOCK_ACQUIRE_PATIENCE_S,
+            False,
+            db._COMPRESSION_LOCK_MAX_RETRIES,
+        )
+    ]
     db.close()

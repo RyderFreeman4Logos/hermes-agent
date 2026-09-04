@@ -670,3 +670,122 @@ def test_bedrock_stream_fallback_captures_each_final_opener(monkeypatch, tmp_pat
 
     assert result == {"response": "ok"}
     assert captured == opened
+
+
+def test_codex_app_server_turn_start_and_steer_capture_once(monkeypatch):
+    from agent import relay_llm
+    from agent.transports.codex_app_server import CodexAppServerError
+    from agent.transports.codex_app_server_session import CodexAppServerSession
+
+    events = []
+
+    class Client:
+        def request(self, method, params, timeout=None):
+            events.append(("open", method, dict(params)))
+            raise CodexAppServerError(code=-1, message="opener failed")
+
+        def stderr_tail(self, _count):
+            return []
+
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: events.append(("capture", dict(request))),
+    )
+    session = CodexAppServerSession()
+    session._client = cast(Any, Client())
+    session._thread_id = "thread-1"
+
+    result = session.run_turn("start")
+    session._active_turn_id = "turn-1"
+    assert session.request_steer("steer") is False
+
+    assert result.error is not None
+    assert [event[:2] for event in events] == [
+        ("capture", {"threadId": "thread-1", "input": [{"type": "text", "text": "start"}]}),
+        ("open", "turn/start"),
+        (
+            "capture",
+            {
+                "threadId": "thread-1",
+                "input": [{"type": "text", "text": "steer"}],
+                "expectedTurnId": "turn-1",
+            },
+        ),
+        ("open", "turn/steer"),
+    ]
+    assert events[0][1] == events[1][2]
+    assert events[2][1] == events[3][2]
+
+
+def test_native_gemini_sync_and_stream_capture_once(monkeypatch):
+    from agent import relay_llm
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    events = []
+
+    class HTTP:
+        def post(self, _url, *, json, headers, timeout):
+            events.append(("open", dict(json)))
+            raise RuntimeError("sync opener failed")
+
+        def stream(self, _method, _url, *, json, headers, timeout):
+            events.append(("open", dict(json)))
+            raise RuntimeError("stream opener failed")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: events.append(("capture", dict(request))),
+    )
+    client = GeminiNativeClient(api_key="test", http_client=cast(Any, HTTP()))
+    kwargs = {
+        "model": "gemini-test",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    with pytest.raises(RuntimeError, match="sync opener failed"):
+        client.chat.completions.create(**kwargs)
+    stream = client.chat.completions.create(**kwargs, stream=True)
+    assert [kind for kind, _request in events] == ["capture", "open"]
+    with pytest.raises(RuntimeError, match="stream opener failed"):
+        next(stream)
+
+    assert [kind for kind, _request in events] == ["capture", "open"] * 2
+    assert events[0][1] == events[1][1]
+    assert events[2][1] == events[3][1]
+
+
+def test_auxiliary_direct_and_deadline_capture_before_failure(monkeypatch):
+    from agent import auxiliary_client as auxiliary, relay_llm
+
+    events = []
+
+    class Completions:
+        def create(self, **kwargs):
+            events.append(("open", dict(kwargs)))
+            raise RuntimeError("opener failed")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: events.append(("capture", dict(request))),
+    )
+
+    direct = {"model": "direct", "messages": []}
+    with pytest.raises(RuntimeError, match="opener failed"):
+        auxiliary._create_with_progress(client, direct)
+
+    deadline = {"model": "deadline", "messages": [], "timeout": 1}
+    with auxiliary.aux_host_candidate_deadline(1):
+        with pytest.raises(RuntimeError, match="opener failed"):
+            auxiliary._create_with_progress(client, deadline)
+
+    assert [kind for kind, _request in events] == ["capture", "open"] * 2
+    assert events[0][1] == events[1][1] == direct
+    assert events[2][1] == events[3][1]
+    assert events[2][1]["model"] == "deadline"

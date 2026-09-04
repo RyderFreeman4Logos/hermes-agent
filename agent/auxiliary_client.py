@@ -10694,10 +10694,12 @@ def _create_with_progress(
     # only when no host candidate budget is active.
     if not _aux_progress_active() and not force_stream:
         if not _aux_candidate_deadline_active():
-            response = client.chat.completions.create(**kwargs)
             if not _client_streams_internally(client):
                 from agent import relay_llm
+
                 relay_llm.capture_transport_request(kwargs)
+            response = client.chat.completions.create(**kwargs)
+            if not _client_streams_internally(client):
                 _notify_aux_provider_response(response)
             return response
         wait = _aux_next_wait(kwargs.get("timeout"))
@@ -10705,8 +10707,16 @@ def _create_with_progress(
             raise _aux_timeout_error(wait)
         request = dict(kwargs)
         request["timeout"] = wait
+
+        def _create() -> Any:
+            if not _client_streams_internally(client):
+                from agent import relay_llm
+
+                relay_llm.capture_transport_request(request)
+            return client.chat.completions.create(**request)
+
         response = _create_bounded(
-            lambda: client.chat.completions.create(**request), wait
+            _create, wait
         )
         _notify_aux_provider_response(response)
         return response
@@ -11634,35 +11644,6 @@ def _call_llm_impl_unscoped(
         kwargs["stream"] = True
         if stream_options:
             kwargs["stream_options"] = stream_options
-        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
-            # CodexAuxiliaryClient (openai-codex, xai-oauth, and any other
-            # Responses-shim provider) consumes the provider stream internally
-            # and returns a completed response object. Routing that nested
-            # MoA stream through Relay's generic managed stream makes the
-            # manager iterate the completed SimpleNamespace itself (#55933).
-            # Return the provider call directly; the MoA facade converts a
-            # completed response into a one-chunk delta iterator at its
-            # boundary. Keep the physical opener inside Relay's request-local
-            # capture context without routing the completed response through
-            # generic stream management.
-            direct_route = _relay_auxiliary_metadata(
-                provider=request_provider,
-                api_mode=resolved_api_mode,
-                model=kwargs.get("model"),
-                route=str(getattr(client, "base_url", "") or ""),
-            )
-            if direct_route is None:
-                return client.chat.completions.create(**kwargs)
-            provider_name, fallback_model, metadata = direct_route
-            from agent import relay_llm
-
-            return relay_llm._execute_attempt(
-                kwargs,
-                lambda request: client.chat.completions.create(**request),
-                name=provider_name,
-                model_name=str(kwargs.get("model") or fallback_model),
-                metadata=metadata,
-            )
         return _relay_sync_stream(
             client,
             kwargs,

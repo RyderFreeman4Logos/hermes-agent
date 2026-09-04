@@ -4475,8 +4475,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "Stream ended with no finish_reason after delivering text "
                 "with no tool calls; treating as a mid-stream drop."
             )
+            from agent.memory_manager import sanitize_context
+
+            partial_content = sanitize_context(
+                agent._strip_think_blocks(full_content or "")
+            )
             return _build_partial_stream_stub(
-                role, full_content,
+                role, partial_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
             )

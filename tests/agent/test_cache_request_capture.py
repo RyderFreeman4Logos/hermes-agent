@@ -488,6 +488,40 @@ def test_anthropic_capture_matches_stream_and_fallback_kwargs(monkeypatch):
     ]
 
 
+def test_codex_moa_and_streaming_bounded_sends_keep_capture_context(
+    monkeypatch, tmp_path
+):
+    from agent import auxiliary_client as auxiliary, relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    request = {"model": "m", "messages": [{"role": "user", "content": "x"}]}
+
+    for provider, api_mode in (
+        ("openai-codex", "codex_responses"),
+        ("moa", "chat_completions"),
+        ("streaming", "chat_completions"),
+    ):
+        with relay_llm._transport_capture_context(
+            name=provider,
+            model_name="m",
+            metadata={
+                "api_mode": api_mode,
+                "route": "https://provider.example.test/v1",
+            },
+        ):
+            auxiliary._create_bounded(
+                lambda: relay_llm.capture_transport_request(request), 1
+            )
+
+    captures = _captures(tmp_path)
+    assert [item["request"] for item in captures] == [request] * 3
+    assert [item["route"]["provider"] for item in captures] == [
+        "openai-codex",
+        "moa",
+        "streaming",
+    ]
+
 
 def test_codex_direct_auxiliary_stream_captures_once(monkeypatch, tmp_path):
     from agent import auxiliary_client as auxiliary

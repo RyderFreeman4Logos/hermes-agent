@@ -10627,7 +10627,9 @@ def _create_bounded(create_fn, timeout_s: float) -> Any:
     executor = DaemonThreadPoolExecutor(
         max_workers=1, thread_name_prefix="hermes-aux-attempt-deadline"
     )
-    future = executor.submit(_run)
+    from tools.thread_context import propagate_context_to_thread
+
+    future = executor.submit(propagate_context_to_thread(_run))
 
     def _shutdown(_future=None) -> None:
         executor.shutdown(wait=False, cancel_futures=True)

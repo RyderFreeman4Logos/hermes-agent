@@ -258,8 +258,13 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
     """Return True when ``msg`` is internal recovery scaffolding that must never
     be persisted to the durable transcript (SQLite session store or JSON log)."""
-    return isinstance(msg, dict) and any(
-        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
+    return isinstance(msg, dict) and (
+        any(msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS)
+        or (
+            msg.get("role") == "system"
+            and msg.get("display_kind") == "hidden"
+            and str(msg.get("content", "")).startswith("[Agent loop timing]")
+        )
     )
 
 

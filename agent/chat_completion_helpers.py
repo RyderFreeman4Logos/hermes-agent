@@ -40,7 +40,6 @@ from agent.error_classifier import (
 from agent.errors import EmptyStreamError
 from agent.stream_payload_bound import (
     StreamPayloadBoundExceeded,
-    authoritative_stream_text,
     bounded_stream_text,
 )
 from agent.turn_context import substitute_api_content
@@ -4455,7 +4454,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _dropped_names,
             )
             return _build_partial_stream_stub(
-                role, authoritative_stream_text(agent),
+                role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
                 dropped_tool_names=_dropped_names or None,
@@ -4477,7 +4476,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "with no tool calls; treating as a mid-stream drop."
             )
             return _build_partial_stream_stub(
-                role, authoritative_stream_text(agent),
+                role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
             )

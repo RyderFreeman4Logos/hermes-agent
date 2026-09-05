@@ -31,7 +31,7 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
 )
-from hermes_state import SessionDB
+from hermes_state import SessionDB, _default_db_path
 
 
 def _make_mock_parent(depth=0):
@@ -418,8 +418,18 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
-                self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                # acquire() resolves; SessionDB stores the given path. Same FILE,
+                # not lexical str() equality (TMPDIR may be a symlink).
+                child_path = Path(child_db.db_path).resolve()
+                parent_path = Path(parent_db.db_path).resolve()
+                self.assertTrue(
+                    child_path.samefile(parent_path),
+                    f"child {child_db.db_path} is not the same file as parent {parent_db.db_path}",
+                )
+                self.assertNotEqual(
+                    child_path,
+                    Path(_default_db_path()).resolve(),
+                    "child dedicated handle must not target the launch-profile default state.db",
                 )
             finally:
                 if child_db is not None:

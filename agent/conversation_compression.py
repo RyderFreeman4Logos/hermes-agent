@@ -4087,6 +4087,8 @@ def compress_context(
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
                     )
+                    # The transcript is durable now; later bookkeeping cannot undo it.
+                    agent._awaiting_cache_usage_after_compression = True
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -4231,6 +4233,7 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
+                    agent._awaiting_cache_usage_after_compression = True
                     # For the `already_present` outcome the live-dict stamping is
                     # handled by the run_agent _compress_context wrapper's
                     # _sync_persisted_markers (it mirrors the handoff stamps back
@@ -4626,6 +4629,10 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
+        # Durable modes arm at publication, before fallible bookkeeping.
+        # With no DB, reaching this point publishes the semantic rewrite in memory.
+        if not agent._session_db:
+            agent._awaiting_cache_usage_after_compression = True
         # Compaction rewrote the transcript, so the usage anchor's base
         # message-list snapshot no longer describes what will be sent —
         # invalidate it. Context checks fall back to full estimation until
@@ -4804,12 +4811,12 @@ def _compress_context_via_codex_app_server(
             approx_tokens=approx_tokens,
             force=True,
         )
-        # An empty usage report must consume the pending post-compaction verdict
-        # rather than leaving preflight deferral armed until some unrelated later
-        # Codex turn supplies usage. Minimal external test engines may not expose
-        # the ContextEngine update hook; preserve their existing bookkeeping.
+        # Compact RPC usage is bookkeeping: account it, but do not spend the
+        # post-compression latch. The next useful Codex response consumes it.
         if hasattr(agent.context_compressor, "update_from_response"):
-            _record_codex_app_server_usage(agent, result)
+            _record_codex_app_server_usage(
+                agent, result, consume_compression_bound=False
+            )
     except Exception:
         logger.debug("codex compaction bookkeeping failed", exc_info=True)
 

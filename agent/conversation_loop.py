@@ -100,7 +100,11 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    cache_hit_percent,
+    estimate_usage_cost,
+    normalize_usage,
+)
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -124,6 +128,56 @@ RUN_BUDGET_WRAPUP_NOTICE = (
     "now. Produce the required final deliverable (answer/JSON/summary) from "
     "the state you already have, completing only mandatory writes."
 )
+
+
+def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -> bool:
+    """Store real usage and consume pending post-compression attribution."""
+    agent._last_turn_usage = dict(usage)
+    post_compression = bool(
+        getattr(agent, "_awaiting_cache_usage_after_compression", False)
+    )
+    if not (first_call or post_compression):
+        return post_compression
+    cache_usage = dict(usage)
+    if post_compression:
+        cache_usage["cache_attribution"] = "post_compression"
+        agent._awaiting_cache_usage_after_compression = False
+    agent._first_turn_usage = cache_usage
+    callback = getattr(agent, "_tui_cache_callback", None)
+    if not callable(callback):
+        return post_compression
+    read = usage.get("cache_read_tokens", 0) or 0
+    write = usage.get("cache_write_tokens", 0) or 0
+    prompt = usage.get("prompt_tokens", 0) or 0
+    if read:
+        state, pct = "hit", cache_hit_percent(read, prompt)
+    elif write:
+        state, pct = "cold_write", 0
+    elif usage.get("cache_telemetry") == "unavailable":
+        state, pct = "no_field", 0
+    else:
+        state, pct = "miss", 0
+    index = int(getattr(agent, "_tui_provider_response_index", 0)) + 1
+    agent._tui_provider_response_index = index
+    record = {
+        "request_index": index,
+        "state": state,
+        "pct": pct if state == "hit" else None,
+        "timestamp": time.monotonic(),
+        "turn_origin": getattr(agent, "_cache_turn_origin", "user"),
+    }
+    if post_compression:
+        record["attribution"] = "post_compression"
+    try:
+        callback(state, pct, read, prompt, record)
+    except TypeError:
+        try:
+            callback(state, pct, read, prompt)
+        except Exception:
+            logger.debug("TUI cache callback failed", exc_info=True)
+    except Exception:
+        logger.debug("TUI cache callback failed", exc_info=True)
+    return post_compression
 
 
 def _review_input_budget_exhausted(agent: Any) -> bool:
@@ -2004,6 +2058,8 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    agent._first_turn_usage = None
+    agent._tui_provider_response_index = 0
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -4185,8 +4241,25 @@ def run_conversation(
                         "output_tokens": canonical_usage.output_tokens,
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
+                        "cache_telemetry": canonical_usage.cache_telemetry,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    _ingest_successful_provider_usage(
+                        agent,
+                        # Cache provenance belongs to this response, not advisor spend.
+                        {
+                            "prompt_tokens": aggregator_usage.prompt_tokens,
+                            "completion_tokens": aggregator_usage.output_tokens,
+                            "total_tokens": aggregator_usage.total_tokens,
+                            "input_tokens": aggregator_usage.input_tokens,
+                            "output_tokens": aggregator_usage.output_tokens,
+                            "cache_read_tokens": aggregator_usage.cache_read_tokens,
+                            "cache_write_tokens": aggregator_usage.cache_write_tokens,
+                            "cache_telemetry": aggregator_usage.cache_telemetry,
+                            "reasoning_tokens": aggregator_usage.reasoning_tokens,
+                        },
+                        first_call=api_call_count == 1,
+                    )
                     # Capture the boundary latch before update_from_response()
                     # consumes it. Only a real provider prompt count for the
                     # request immediately following a completed compaction can
@@ -4269,6 +4342,7 @@ def run_conversation(
                     # charged to that old compaction, and so preflight deferral
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
+                    agent._awaiting_cache_usage_after_compression = False
 
                 if hasattr(response, 'usage') and response.usage:
                     # Cache discovered context length after successful call.

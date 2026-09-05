@@ -356,6 +356,93 @@ def test_same_wake_post_compression_usage_publishes_compression_bound(
     assert agent._awaiting_cache_usage_after_compression is False
 
 
+@pytest.mark.parametrize(
+    "aggregator_read,advisor_read,expected_state,expected_pct",
+    [(None, None, "unavailable", 0), (None, 760, "unavailable", 0),
+     (0, 760, "miss", 0), (400, 760, "hit", 50),
+     (400, None, "hit", 50), (400, "absent", "hit", 50)],
+)
+@pytest.mark.parametrize("pending", [False, True])
+def test_normal_loop_cache_origin_seam(
+    frames, turn_env, aggregator_read, advisor_read, expected_state, expected_pct, pending
+):
+    """Execute the production normalization/fold/selection seam, not a full turn."""
+    import ast
+    import logging
+    from pathlib import Path
+
+    import agent.conversation_loop as loop
+    from agent.usage_pricing import normalize_usage
+
+    path = Path(__file__).resolve().parents[2] / "agent/conversation_loop.py"
+    assert Path(loop.__file__).resolve() == path
+    tree = ast.parse(path.read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == "run_conversation")
+    # Take the contiguous real usage block through ingest, including the actual
+    # aggregator capture and advisor fold. No parallel mapping or line-number pin.
+    block = next(n for n in ast.walk(function) if isinstance(n, ast.If)
+                 and n.body and isinstance(n.body[0], ast.Assign)
+                 and ast.unparse(n.body[0].targets[0]) == "canonical_usage")
+    end = next(i for i, n in enumerate(block.body) if isinstance(n, ast.Expr)
+               and isinstance(n.value, ast.Call)
+               and ast.unparse(n.value.func) == "_ingest_successful_provider_usage")
+    seam = compile(ast.Module(body=block.body[:end + 1], type_ignores=[]), str(path), "exec")
+    raw = {"prompt_tokens": 800, "completion_tokens": 20,
+           "prompt_tokens_details": {"cached_tokens": aggregator_read}}
+    advisor = None if advisor_read == "absent" else normalize_usage(
+        {"prompt_tokens": 800, "completion_tokens": 10,
+         "prompt_tokens_details": {"cached_tokens": advisor_read}},
+        provider="openai", api_mode="chat_completions",
+    )
+
+    class Agent:
+        def __init__(self):
+            self.__dict__.update(_real_shaped_counters().__dict__)
+            self.provider, self.api_mode = "openai", "chat_completions"
+            self.client = types.SimpleNamespace(consume_reference_usage=lambda: (advisor, None))
+
+        def run_conversation(self, _prompt, **kwargs):
+            self._awaiting_cache_usage_after_compression = pending
+            scope = {"agent": self, "response": types.SimpleNamespace(usage=raw),
+                     "api_call_count": 1, "normalize_usage": normalize_usage,
+                     "logger": logging.getLogger(__name__),
+                     "_ingest_successful_provider_usage": loop._ingest_successful_provider_usage}
+            exec(seam, scope)
+            self.accounted_usage = scope["usage_dict"]
+            return {"final_response": "synthetic", "messages": []}
+
+        def clear_interrupt(self):
+            pass
+
+    agent = Agent()
+    sid = "synthetic-cache-origin"
+    session = _session(agent=agent, running=True)
+    server._sessions[sid] = session
+    try:
+        server._attach_tui_cache_callback(agent, sid)
+        server._run_prompt_submit("synthetic", sid, session, "synthetic")
+        # Keep accounting assertions outside the host's exception handler.
+        usage = agent.accounted_usage
+        assert usage["prompt_tokens"] == (800 if advisor is None else 1600)
+        assert usage["completion_tokens"] == (20 if advisor is None else 30)
+        assert usage["cache_read_tokens"] == (aggregator_read or 0) + (
+            advisor_read if isinstance(advisor_read, int) else 0)
+        info = _complete_payloads(frames)[0]["cache_info"]
+        assert info["state"] == expected_state
+        assert info["pct"] == expected_pct
+        assert (info.get("compression_bound") is True) == pending
+        assert ("read_tokens" in info) == (aggregator_read is not None)
+        if aggregator_read is not None:
+            assert info["read_tokens"] == aggregator_read
+            assert info["prompt_tokens"] == 800
+        else:
+            assert "prompt_tokens" not in info
+        assert agent._awaiting_cache_usage_after_compression is False
+    finally:
+        server._sessions.pop(sid, None)
+
+
 @pytest.mark.parametrize("source", ["ingest", "callback", "record", "usage"])
 @pytest.mark.parametrize("state", ["hit", "cold_write", "miss", "no_field", "unavailable"])
 @pytest.mark.parametrize("epoch", ["ordinary", "before-first", "same-wake", "repeated"])

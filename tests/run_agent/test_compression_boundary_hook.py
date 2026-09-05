@@ -291,7 +291,7 @@ _BOUNDARY_CASES = [
     for outcome in (
         "success", "success-without-progress-flag", "summary-error", "abort",
         "noop-copy", "noop-identity", "empty", "fence-cancel",
-        *(("persist-error", "growth") if not mode.startswith("memory") else ()),
+        *(("persist-error", "growth", "notify-error") if not mode.startswith("memory") else ()),
         *(("prompt-error",) if mode == "in-place" else ()),
     )
 ]
@@ -362,30 +362,56 @@ def test_public_compression_boundary_outcome_matrix(tmp_path, monkeypatch, mode,
                 persist.side_effect = RuntimeError("synthetic persist failure")
             if outcome == "prompt-error":
                 stack.enter_context(patch.object(db, "update_system_prompt", side_effect=RuntimeError("synthetic prompt failure")))
+        before_contents = [row["content"] for row in messages]
+        returned = messages
+        boundary_seen = []
+        if outcome == "notify-error":
+            def fail_notification(*args, **kwargs):
+                if kwargs.get("boundary_reason") == "compression":
+                    boundary_seen.append(agent._awaiting_cache_usage_after_compression)
+                    raise RuntimeError("synthetic notification failure")
+            compressor.on_session_start.side_effect = fail_notification
         if outcome == "summary-error":
             with pytest.raises(RuntimeError, match="synthetic summary failure"):
                 agent._compress_context(messages, "sys", approx_tokens=1000, commit_fence=fence)
         else:
-            agent._compress_context(messages, "sys", approx_tokens=1000, commit_fence=fence)
-        success = outcome.startswith("success")
-        assert agent._awaiting_cache_usage_after_compression is (pending or success)
+            returned, _ = agent._compress_context(messages, "sys", approx_tokens=1000, commit_fence=fence)
         assert compressor.compress.call_count == 1
         if persist is not None:
-            assert persist.call_count == int(success or outcome in {"persist-error", "prompt-error"})
-            if success:
-                assert db.get_messages(agent.session_id) != before_rows
+            import sqlite3
+
+            # Read committed rows through a different connection, including
+            # prompt-update failure after the archive transaction succeeded.
+            with sqlite3.connect(tmp_path / "boundary.db") as reader:
+                active = reader.execute(
+                    "SELECT content FROM messages WHERE session_id=? AND active=1 ORDER BY id",
+                    (agent.session_id,),
+                ).fetchall()
+                archived = reader.execute(
+                    "SELECT count(*) FROM messages WHERE session_id=? AND active=0 AND compacted=1",
+                    (original_sid,),
+                ).fetchone()[0]
+            published = active == [("summary",)]
+            assert persist.call_count == int(published or outcome == "persist-error")
+            if published:
+                assert [row["content"] for row in returned] == ["summary"]
                 assert (agent.session_id != original_sid) == (not in_place)
                 assert agent._last_compaction_in_place is in_place
-            elif outcome != "prompt-error":
-                # Prompt-update failure is after archive committed: this test
-                # claims only latch admission, not a new transcript rollback.
+                assert archived == int(in_place)
+            else:
+                assert [row[0] for row in active] == before_contents
                 assert db.get_messages(original_sid) == before_rows
         else:
             assert agent._session_db is None
             assert agent.session_id == original_sid
+            published = [row["content"] for row in returned] != before_contents
+        assert agent._awaiting_cache_usage_after_compression is (pending or published)
+        if outcome == "notify-error":
+            assert boundary_seen == [True]
         notifications = [c for c in compressor.on_session_start.call_args_list
                          if c.kwargs.get("boundary_reason") == "compression"]
-        assert len(notifications) == int(success and not memory_only)
+        # Notification requires prompt bookkeeping too; cache attribution does not.
+        assert len(notifications) == int(published and not memory_only and outcome != "prompt-error")
 
 
 class TestSessionCompressEvent:

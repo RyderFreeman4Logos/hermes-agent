@@ -4087,6 +4087,8 @@ def compress_context(
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
                     )
+                    # The transcript is durable now; later bookkeeping cannot undo it.
+                    agent._awaiting_cache_usage_after_compression = True
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -4231,6 +4233,7 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                     )
+                    agent._awaiting_cache_usage_after_compression = True
                     # For the `already_present` outcome the live-dict stamping is
                     # handled by the run_agent _compress_context wrapper's
                     # _sync_persisted_markers (it mirrors the handoff stamps back
@@ -4626,9 +4629,9 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
-        # Reuse the durable boundary verdict, not the summary's progress hint.
+        # Durable modes arm at publication, before fallible bookkeeping.
         # With no DB, reaching this point publishes the semantic rewrite in memory.
-        if _context_engine_boundary_committed or not agent._session_db:
+        if not agent._session_db:
             agent._awaiting_cache_usage_after_compression = True
         # Compaction rewrote the transcript, so the usage anchor's base
         # message-list snapshot no longer describes what will be sent —

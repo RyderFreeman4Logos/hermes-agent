@@ -19,7 +19,7 @@ immutable = false
 historical_frozen_v11 = "hermes-final-manifest-20260906-frozen-v11.toml"
 historical_frozen_v11_sha256 = "afb1c561b5968db19251638d608535ddc18b739d9c183f6164f5681b7183850a"
 product_prs = 26
-owned_unique_commits = 40
+owned_unique_commits = 44
 stacked_deps = 5
 head_overlay_prs = []
 unpublished_heads_adopted = false
@@ -243,32 +243,34 @@ pr = 162
 name = "feat-memory-carry-authoritative-external-provid"
 title = "feat(memory): carry authoritative external provider backend"
 branch = "topic/143-auth-mem-live-20260820"
-head = "13db93cfce20363a8fdc97dca7fca717976a4274"
-tree = "10adc9c330884315507cb85f419b97c800234055"
+head = "23a7005febecde13b3da97de0f3e15a025349971"
+tree = "3c8e2750371a907299fbb3de8400e93c9ef85b36"
 base_ref = "pin/official-main-83467c28-20260906"
 base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
-parent = "cd2c84a7269f4dcc8e5b29d861831b469fbac92d"
+parent = "13db93cfce20363a8fdc97dca7fca717976a4274"
 depends_on = []
 required = true
 supersedes = []
 overlay = false
 unique_on_pin = true
-unique_count = 2
-vs_pin_count = 2
+unique_count = 3
+vs_pin_count = 3
 stacked_prereq_count = 0
-owned_diffsha_vs_base = "a61f46d042d79a9c4c7c1cab0b6b98816170bf00918b5318a0311a881032d753"
-owned_diff_bytes_vs_base = 76750
-full_diffsha_vs_pin = "a61f46d042d79a9c4c7c1cab0b6b98816170bf00918b5318a0311a881032d753"
-full_diff_bytes_vs_pin = 76750
+owned_diffsha_vs_base = "83e6692492a180d8f2fda8d2da27387b3672f43a03400826e9925df0f9804b07"
+owned_diff_bytes_vs_base = 80056
+full_diffsha_vs_pin = "83e6692492a180d8f2fda8d2da27387b3672f43a03400826e9925df0f9804b07"
+full_diff_bytes_vs_pin = 80056
 owned_commits = [
   "cd2c84a7269f4dcc8e5b29d861831b469fbac92d",
   "13db93cfce20363a8fdc97dca7fca717976a4274",
+  "23a7005febecde13b3da97de0f3e15a025349971",
 ]
 owned_subjects = [
   "fix(memory): persist authoritative provider mode across sessions",
   "fix(cli): freeze memory_provider_mode on resume rebuild",
+  "test(tui): expect hybrid memory_provider_mode on session rows",
 ]
-notes = "unique-on-pin 2; CLI resume retains frozen memory mode; official memory split reused"
+notes = "unique-on-pin 3; CLI resume retains frozen memory mode; official memory split reused; tests-only successor 23a7005f; independent GREEN 6; campaign_green=false"
 
 [[patch]]
 order = 8
@@ -338,30 +340,32 @@ pr = 160
 name = "fix-auxiliary-preserve-configured-fallback-dest"
 title = "fix(auxiliary): preserve configured fallback destinations"
 branch = "topic/159-aux-codex-dest-live-20260820"
-head = "efc415a3f8d21705a68395bad53a83063038ee94"
-tree = "653cecc846b78a3f315bb9f7d48d31df62f09b52"
+head = "04f85351ab04b5cb99004c57549a9eb25d4e6a90"
+tree = "058fa4756fb90aefac0d506197695a5f767599de"
 base_ref = "topic/163-aux-concurrency-20260821"
 base_sha = "38d1c2fcae06fffd11c7fb5b0074b10e9413ace5"
-parent = "38d1c2fcae06fffd11c7fb5b0074b10e9413ace5"
+parent = "efc415a3f8d21705a68395bad53a83063038ee94"
 depends_on = [165]
 required = true
 supersedes = []
 overlay = false
 unique_on_pin = false
-unique_count = 1
-vs_pin_count = 2
+unique_count = 2
+vs_pin_count = 3
 stacked_prereq_count = 1
-owned_diffsha_vs_base = "153a0d3b9fc68c4f475fddea200e081a863bf33959143ce3fa31f6a102a27abe"
-owned_diff_bytes_vs_base = 28536
-full_diffsha_vs_pin = "3dafc919346738b4806c356fa148842e021202c95dbc5e39522722bff18ef259"
-full_diff_bytes_vs_pin = 59749
+owned_diffsha_vs_base = "15f162ede80fef839021d3442ff0faf87f4bdc425c2b23e7f9702b24c841f660"
+owned_diff_bytes_vs_base = 36927
+full_diffsha_vs_pin = "0f7bf149c6a6f1ba41cb4681b1b960d4af55423f2899ff4187b8c8574f6fe8f4"
+full_diff_bytes_vs_pin = 68140
 owned_commits = [
   "efc415a3f8d21705a68395bad53a83063038ee94",
+  "04f85351ab04b5cb99004c57549a9eb25d4e6a90",
 ]
 owned_subjects = [
   "fix(auxiliary): keep configured fallback destinations on Codex",
+  "test(auxiliary): align Codex-only fail-closed aux contracts",
 ]
-notes = "stacked on #165; owned 1 excludes #165 prefix; keep configured fallback destinations on Codex"
+notes = "stacked on #165; owned 2 excludes #165 prefix; keep configured fallback destinations on Codex; tests-only successor 04f85351; independent GREEN 20; campaign_green=false; pin residual #276 FAIL not this owner"
 
 [[patch]]
 order = 11
@@ -402,34 +406,36 @@ pr = 180
 name = "fix-tui-repair-cache-telemetry-on-f293"
 title = "fix(tui): repair cache telemetry on f293"
 branch = "topic/upgrade-pr13-07-tui-cache-completion-20260821"
-head = "b435c6a2d7e5ff1ed55e48a5ee7482eef74ec6b0"
-tree = "bd0d9a21e140ac25ad56162877a0aaad2bfef2f3"
+head = "97d89c2d3530159bc194a9f567b4d701dd63e5ea"
+tree = "734e0bb0001b578dcdca5c1e58c43079d8b2b306"
 base_ref = "fix/runtime-heartbeat-managed-targets"
 base_sha = "9d16bdab80a2933be39f3d6a8aa164e4967f51fb"
-parent = "db76f8fb190e53434a630effcb811457ddb558c7"
+parent = "b435c6a2d7e5ff1ed55e48a5ee7482eef74ec6b0"
 depends_on = [42]
 required = true
 supersedes = []
 overlay = false
 unique_on_pin = false
-unique_count = 3
-vs_pin_count = 4
+unique_count = 4
+vs_pin_count = 5
 stacked_prereq_count = 1
-owned_diffsha_vs_base = "9317a7c531bbbbadbd45bd091079f9f87c4bca01f22ed3790f3834ed80688b67"
-owned_diff_bytes_vs_base = 68905
-full_diffsha_vs_pin = "fd8faa6dad4b4392b76b6936864e31754076bf23e9bac09a12926b230d70825f"
-full_diff_bytes_vs_pin = 77570
+owned_diffsha_vs_base = "0c584027a0fed7fe8c169409b8b2f0c288bea7d144d836d1d7f009b0af269d4b"
+owned_diff_bytes_vs_base = 69826
+full_diffsha_vs_pin = "cf0a9cda8468e44cbf2b528ce64658e4a0b6172184897281b079c382077e3976"
+full_diff_bytes_vs_pin = 78491
 owned_commits = [
   "74c4d45b91892738ec96cc6f0bf6ab31a09fa63c",
   "db76f8fb190e53434a630effcb811457ddb558c7",
   "b435c6a2d7e5ff1ed55e48a5ee7482eef74ec6b0",
+  "97d89c2d3530159bc194a9f567b4d701dd63e5ea",
 ]
 owned_subjects = [
   "feat(tui): stamp cache-warm telemetry on official split seams",
   "fix(codex): keep cache telemetry off session usage accounting",
   "fix(tui): restore miss vs no_field and error-complete cache stamps",
+  "test(tui): accept explicit turn_origin on notification fake",
 ]
-notes = "stacked on #42; owned 3 excludes #42 prefix; CanonUsage cache_telemetry field integrates separately from #227 HMAC dump; miss vs no_field + error-complete stamps"
+notes = "stacked on #42; owned 4 excludes #42 prefix; CanonUsage cache_telemetry field integrates separately from #227 HMAC dump; miss vs no_field + error-complete stamps; tests-only successor 97d89c2d; independent GREEN 4; campaign_green=false"
 
 [[patch]]
 order = 13
@@ -470,30 +476,32 @@ pr = 185
 name = "fix-delegate-require-standard-model-pool-profil"
 title = "fix(delegate): require standard model pool profile"
 branch = "topic/upgrade-pr13-04-lineage-cache-delegate-20260821"
-head = "5e627f7d39f5daf013658f6094ef33bfe0f41228"
-tree = "2e020f4cef307095dc5e012475ca04d01bbb3b3d"
+head = "a2893025feb9845180a1db9db1cc395c921391a9"
+tree = "9519bc85a38947180b4de6ac988529d29b632f4b"
 base_ref = "pin/official-main-83467c28-20260906"
 base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
-parent = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "5e627f7d39f5daf013658f6094ef33bfe0f41228"
 depends_on = []
 required = true
 supersedes = []
 overlay = false
 unique_on_pin = true
-unique_count = 1
-vs_pin_count = 1
+unique_count = 2
+vs_pin_count = 2
 stacked_prereq_count = 0
-owned_diffsha_vs_base = "f6cc25ab12c14215a41b7d8767223226a3daadfdcbc19b0bf0f13c2f009aefc5"
-owned_diff_bytes_vs_base = 38760
-full_diffsha_vs_pin = "f6cc25ab12c14215a41b7d8767223226a3daadfdcbc19b0bf0f13c2f009aefc5"
-full_diff_bytes_vs_pin = 38760
+owned_diffsha_vs_base = "54aaa687199574b86cbc0a4300045d54e8dfc4285aa3f3d8f3598da5114601b3"
+owned_diff_bytes_vs_base = 40063
+full_diffsha_vs_pin = "54aaa687199574b86cbc0a4300045d54e8dfc4285aa3f3d8f3598da5114601b3"
+full_diff_bytes_vs_pin = 40063
 owned_commits = [
   "5e627f7d39f5daf013658f6094ef33bfe0f41228",
+  "a2893025feb9845180a1db9db1cc395c921391a9",
 ]
 owned_subjects = [
   "fix(delegate): require standard model pool profile",
+  "test(delegate): assert model_pool standard fail-closed description",
 ]
-notes = "unique-on-pin 1; replay-safe successor; non-empty delegation.model_pool requires explicit standard; prefix 19+1 not full 43 green"
+notes = "unique-on-pin 2; replay-safe successor; non-empty delegation.model_pool requires explicit standard; tests-only successor a2893025; independent GREEN 4; pin residual #276 FAIL not this owner; campaign_green=false"
 
 [[patch]]
 order = 15

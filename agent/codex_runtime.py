@@ -23,8 +23,10 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
-from agent.stream_payload_bound import StreamPayloadBoundExceeded
-
+from agent.stream_payload_bound import (
+    StreamPayloadBoundExceeded,
+    authoritative_stream_text,
+)
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
@@ -776,6 +778,13 @@ def run_codex_app_server_turn(
 
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
+    except StreamPayloadBoundExceeded:
+        try:
+            agent._codex_session.close()
+        except Exception:
+            pass
+        agent._codex_session = None
+        raise
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -840,6 +849,23 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
+
+    if turn.interrupted or turn.error is not None:
+        partial_text = authoritative_stream_text(agent)
+        turn.final_text = partial_text
+        turn.projected_messages = [
+            message
+            for message in turn.projected_messages
+            if not (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and not message.get("tool_calls")
+            )
+        ]
+        if partial_text:
+            turn.projected_messages.append(
+                {"role": "assistant", "content": partial_text}
+            )
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
@@ -1756,7 +1782,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if deltas_were_sent["yes"]:
-                    partial_text = "".join(agent._codex_streamed_text_parts)
+                    partial_text = authoritative_stream_text(agent)
                     return SimpleNamespace(
                         output=[SimpleNamespace(
                             type="message",
@@ -1780,6 +1806,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._client_log_context(), exc,
                     )
                     agent._codex_streamed_text_parts.clear()
+                    agent._reset_stream_delivery_tracking(flush=False)
                     continue
                 _log_codex_request_failure(
                     agent,

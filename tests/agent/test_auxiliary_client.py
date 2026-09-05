@@ -338,8 +338,7 @@ class TestMoaAggregatorSharedResolution:
 
 
     def test_main_agent_fallback_uses_aggregator_for_moa_main(self, tmp_path, monkeypatch):
-        """_try_main_agent_model_fallback with a moa main resolves the
-        aggregator instead of asking for a literal "moa" client."""
+        """MoA unwraps to the aggregator, then Codex-only last-resort fails closed."""
         from agent.auxiliary_client import _try_main_agent_model_fallback
 
         self._write_moa_config(tmp_path, monkeypatch)
@@ -347,16 +346,12 @@ class TestMoaAggregatorSharedResolution:
              patch("agent.auxiliary_client._read_main_model", return_value="opus-gpt"), \
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
              patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
-            mock_client = MagicMock()
-            mock_resolve.return_value = (mock_client, "anthropic/claude-opus-4.8")
+            mock_resolve.return_value = (MagicMock(), "anthropic/claude-opus-4.8")
 
             client, model, label = _try_main_agent_model_fallback("anthropic", task="compression")
 
-        assert client is mock_client
-        assert model == "anthropic/claude-opus-4.8"
-        assert label == "main-agent(openrouter)"
-        assert mock_resolve.call_args.kwargs["provider"] == "openrouter"
-        assert mock_resolve.call_args.kwargs["model"] == "anthropic/claude-opus-4.8"
+        assert client is None and model is None and label == ""
+        mock_resolve.assert_not_called()
 
 
 class TestBuildCallKwargsMaxTokens:
@@ -863,9 +858,10 @@ class TestResolveProviderClientUniversalModelFallback:
 class TestExpiredCodexFallback:
     """Test that expired Codex tokens don't block the auto chain."""
 
-    def test_expired_codex_falls_through_to_next(self, tmp_path, monkeypatch):
-        """When Codex token is expired, auto chain should skip it and try next provider."""
+    def test_expired_codex_falls_through_to_next(self, tmp_path, monkeypatch, caplog):
+        """Expired Codex does not restore Anthropic/OpenRouter discovery."""
         import base64
+        import logging
         import time as _time
 
         # Expired Codex JWT
@@ -886,19 +882,22 @@ class TestExpiredCodexFallback:
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-        # Set up Anthropic as fallback
-        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-test-fallback")
-        with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-expired-codex-test")
+        with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+             caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
             mock_build.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto_route
-            client, model, _provider = _resolve_auto_route()
-            # Should NOT be Codex, should be Anthropic (or another available provider)
-            assert not isinstance(client, type(None)), "Should find a provider after expired Codex"
+            client, model, provider = _resolve_auto_route()
+
+        assert client is None and model is None and provider == ""
+        mock_build.assert_not_called()
+        assert any("openrouter (non-Codex destination)" in r.message for r in caplog.records)
 
 
-    def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch):
-        """With expired Codex + OpenRouter key, OpenRouter should win (1st in chain)."""
+    def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch, caplog):
+        """OPENROUTER_API_KEY does not win Codex-only discovery."""
         import base64
+        import logging
         import time as _time
 
         # Belt-and-suspenders: _try_openrouter marks openrouter unhealthy
@@ -930,13 +929,15 @@ class TestExpiredCodexFallback:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
 
-        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai, \
+             caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto_route
-            client, model, _provider = _resolve_auto_route()
-            assert client is not None
-            # OpenRouter is 1st in chain, should win
-            mock_openai.assert_called()
+            client, model, provider = _resolve_auto_route()
+
+        assert client is None and model is None and provider == ""
+        mock_openai.assert_not_called()
+        assert any("openrouter (non-Codex destination)" in r.message for r in caplog.records)
 
 
 
@@ -1932,6 +1933,7 @@ class TestAuxiliaryFallbackLayering:
             "compression",
             "ollama-cloud",
             reason="provider unavailable",
+            route_info=None,
         )
 
 
@@ -1966,7 +1968,7 @@ class TestAuxiliaryFallbackLayering:
 
 
 class TestTryMainAgentModelFallback:
-    """_try_main_agent_model_fallback resolves the user's main provider+model as a safety net."""
+    """_try_main_agent_model_fallback is Codex-only last-resort (#160)."""
 
     def test_returns_none_when_main_provider_is_auto(self):
         from agent.auxiliary_client import _try_main_agent_model_fallback
@@ -1979,15 +1981,16 @@ class TestTryMainAgentModelFallback:
     def test_resolves_main_provider_client(self):
         from agent.auxiliary_client import _try_main_agent_model_fallback
         fake_client = MagicMock()
-        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
-             patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4"), \
+        with patch("agent.auxiliary_client._read_main_provider", return_value="openai-codex"), \
+             patch("agent.auxiliary_client._read_main_model", return_value="gpt-5.4"), \
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
              patch("agent.auxiliary_client.resolve_provider_client",
-                   return_value=(fake_client, "anthropic/claude-sonnet-4")):
+                   return_value=(fake_client, "gpt-5.4")) as mock_resolve:
             client, model, label = _try_main_agent_model_fallback("glm", task="vision")
         assert client is fake_client
-        assert model == "anthropic/claude-sonnet-4"
-        assert label == "main-agent(openrouter)"
+        assert model == "gpt-5.4"
+        assert label == "main-agent(openai-codex)"
+        assert mock_resolve.call_args.kwargs["provider"] == "openai-codex"
 
 
 
@@ -3336,8 +3339,8 @@ class TestVisionAutoSkipsKimiCoding:
     """
 
     def test_kimi_coding_skipped_falls_through_to_openrouter(self, monkeypatch):
-        """kimi-coding as main + vision auto → OpenRouter (not kimi)."""
-        fake_or_client = MagicMock(name="openrouter_client")
+        """kimi-coding as main + vision auto → openai-codex, not OpenRouter."""
+        fake_codex_client = MagicMock(name="codex_client")
 
         monkeypatch.setattr(
             "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding",
@@ -3356,10 +3359,8 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         def fake_strict(provider, model=None):
-            if provider == "openrouter":
-                return fake_or_client, "google/gemini-3-flash-preview"
-            if provider == "nous":
-                return None, None
+            if provider == "openai-codex":
+                return fake_codex_client, "gpt-5.4"
             raise AssertionError(
                 f"strict vision backend should not be called for {provider!r} "
                 "when main provider is kimi-coding"
@@ -3370,9 +3371,9 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         provider, client, model = resolve_vision_provider_client()
-        assert provider == "openrouter"
-        assert client is fake_or_client
-        assert model == "google/gemini-3-flash-preview"
+        assert provider == "openai-codex"
+        assert client is fake_codex_client
+        assert model == "gpt-5.4"
 
 
 

@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import select
 import shlex
 import signal
 import subprocess
@@ -43,6 +44,7 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
+_PTSNAME_LOCK = threading.Lock()
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -429,6 +431,10 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _stdin_closed: bool = field(default=False, repr=False)
+    _pty_eof_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _pty_eof_cancel: Optional[threading.Event] = field(default=None, repr=False)
+    _pty_eof_start: Optional[threading.Event] = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -512,6 +518,81 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    @staticmethod
+    def _open_pty_slave(master_fd: int) -> int:
+        """Open the slave peer so canonical-input readiness can be observed."""
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        ptsname = libc.ptsname
+        ptsname.argtypes = [ctypes.c_int]
+        ptsname.restype = ctypes.c_char_p
+        with _PTSNAME_LOCK:
+            name = ptsname(master_fd)
+            if not name:
+                raise OSError("Could not resolve PTY slave")
+            path = os.fsdecode(name)
+        return os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+
+    @staticmethod
+    def _pty_eof_after_record(
+        session: ProcessSession,
+        eof: bytes,
+        slave_fd: int,
+        start: threading.Event,
+        cancel: threading.Event,
+        poller,
+    ) -> None:
+        """Send a second VEOF only after the first canonical record is read."""
+        try:
+            start.wait()
+            if cancel.is_set():
+                return
+            while True:
+                if cancel.is_set():
+                    return
+                if not _IS_WINDOWS and session.pid:
+                    try:
+                        if os.waitid(
+                            os.P_PID,
+                            session.pid,
+                            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+                        ) is not None:
+                            return
+                    except ChildProcessError:
+                        return
+                events = dict(poller.poll(0))
+                slave_events = events.get(slave_fd, 0)
+                if slave_events & (select.POLLERR | select.POLLHUP):
+                    return
+                if not slave_events & select.POLLIN:
+                    with session._lock:
+                        if not session.exited:
+                            session._pty.write(eof)
+                    return
+                os.sched_yield()
+        except (EOFError, OSError):
+            return
+        finally:
+            os.close(slave_fd)
+
+    @staticmethod
+    def _stop_pty_eof_helper(session: ProcessSession) -> None:
+        """Cancel and join a session's owned canonical-EOF helper."""
+        with session._lock:
+            thread = session._pty_eof_thread
+            cancel = session._pty_eof_cancel
+            start = session._pty_eof_start
+            if cancel is not None:
+                cancel.set()
+            if start is not None:
+                start.set()
+            session._pty_eof_thread = None
+            session._pty_eof_cancel = None
+            session._pty_eof_start = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -1030,6 +1111,22 @@ class ProcessRegistry:
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return "/tmp"
 
+    def _rollback_failed_launch(self, session: ProcessSession) -> None:
+        """Remove a failed post-registration launch without emitting completion."""
+        with self._lock:
+            if self._running.get(session.id) is session:
+                self._running.pop(session.id, None)
+        session.notify_on_complete = False
+        session.exited = True
+        session.exit_code = -1
+        session.completion_reason = "failed_start"
+        session.termination_source = "failed_start"
+        session._completion_event.set()
+        try:
+            self._write_checkpoint()
+        except Exception:
+            logger.exception("Could not persist failed launch cleanup for %s", session.id)
+
     def spawn_local(
         self,
         command: str,
@@ -1038,6 +1135,8 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notify_on_complete: bool = False,
+        watcher_metadata: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1065,6 +1164,8 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            notify_on_complete=notify_on_complete,
+            **(watcher_metadata or {}),
         )
 
         pty_scope_attempted = False
@@ -1120,6 +1221,10 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+
                 # PTY reader thread
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
@@ -1130,10 +1235,6 @@ class ProcessRegistry:
                 session._reader_thread = reader
                 reader.start()
 
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
                 self._write_checkpoint()
                 return session
 
@@ -1141,6 +1242,19 @@ class ProcessRegistry:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if session._pty is not None:
+                    session.notify_on_complete = False
+                    try:
+                        session._pty.terminate(force=True)
+                    except Exception:
+                        if session.pid:
+                            self._terminate_host_pid(session.pid, session.host_start_time)
+                    try:
+                        session._pty.wait()
+                    except Exception:
+                        pass
+                    self._rollback_failed_launch(session)
+                    raise
                 if pty_scope_attempted and session.systemd_unit:
                     if not _stop_systemd_unit(session.systemd_unit):
                         raise RuntimeError(
@@ -1226,6 +1340,10 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+
             # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
@@ -1235,10 +1353,6 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
             reader.start()
-
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
 
             self._write_checkpoint()
         except Exception:
@@ -1269,6 +1383,7 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            self._rollback_failed_launch(session)
             raise
 
         return session
@@ -1281,6 +1396,8 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notify_on_complete: bool = False,
+        watcher_metadata: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1302,6 +1419,8 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
+            **(watcher_metadata or {}),
         )
 
         # Run the command in the sandbox with output capture
@@ -1353,23 +1472,30 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
 
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
-            reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
-                daemon=True,
-                name=f"proc-poller-{session.id}",
-            )
-            session._reader_thread = reader
-            reader.start()
+            try:
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
 
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
-
-        if not session.exited:
-            self._write_checkpoint()
+                reader = threading.Thread(
+                    target=self._env_poller_loop,
+                    args=(session, env, log_path, pid_path, exit_path),
+                    daemon=True,
+                    name=f"proc-poller-{session.id}",
+                )
+                session._reader_thread = reader
+                reader.start()
+                self._write_checkpoint()
+            except Exception:
+                session.notify_on_complete = False
+                session.exited = True
+                if session.env_ref and session.pid:
+                    try:
+                        session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                    except Exception:
+                        logger.debug("Could not terminate failed environment launch %s", session.id, exc_info=True)
+                self._rollback_failed_launch(session)
+                raise
 
         return session
 
@@ -1582,7 +1708,7 @@ class ProcessRegistry:
             self._emit_output(session, text)
 
         try:
-            while pty.isalive():
+            while _IS_WINDOWS and pty.isalive() or not _IS_WINDOWS:
                 try:
                     chunk = pty.read(4096)
                     if chunk:
@@ -1605,11 +1731,23 @@ class ProcessRegistry:
         except Exception:
             pass
 
-        # Process exited
+        self._stop_pty_eof_helper(session)
+        reaped = False
         try:
             pty.wait()
+            reaped = True
         except Exception as e:
             logger.debug("PTY wait timed out or failed: %s", e)
+        if reaped:
+            try:
+                if not _IS_WINDOWS and hasattr(pty, "fileobj"):
+                    pty.fileobj.close()
+                    pty.fd = -1
+                    pty.closed = True
+                elif hasattr(pty, "close"):
+                    pty.close()
+            except Exception as e:
+                logger.debug("PTY handle close failed: %s", e)
         session.exited = True
         if session.completion_reason != "killed":
             session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
@@ -1640,6 +1778,8 @@ class ProcessRegistry:
                 "session_id": session.id,
                 "session_key": session.session_key,
                 "task_id": session.task_id,
+                "platform": session.watcher_platform,
+                "parent_session_id": session.parent_session_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -2433,35 +2573,29 @@ class ProcessRegistry:
             return {"status": "error", "error": str(e)}
 
     def write_stdin(self, session_id: str, data: str) -> dict:
-        """Send raw data to a running process's stdin (no newline appended)."""
+        """Write data to a running process's stdin without a trailing newline."""
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
         if session.exited:
             return {"status": "already_exited", "error": "Process has already finished"}
 
-        # PTY mode -- write through pty handle.
-        if hasattr(session, '_pty') and session._pty:
-            try:
-                # pywinpty expects str on Windows; ptyprocess expects bytes on POSIX.
-                if _IS_WINDOWS:
-                    pty_data = data.decode("utf-8") if isinstance(data, bytes) else str(data)
-                else:
-                    # surrogateescape: a PTY is a byte stream — round-trip the
-                    # original bytes instead of crashing on surrogate content.
-                    pty_data = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
-                session._pty.write(pty_data)
-                return {"status": "ok", "bytes_written": len(data)}
-            except Exception as e:
-                return {"status": "error", "error": str(e)}
-
-        # Popen mode -- write through stdin pipe
-        if not session.process or not session.process.stdin:
-            return {"status": "error", "error": "Process stdin not available (non-local backend or stdin closed)"}
         try:
-            session.process.stdin.write(data)
-            session.process.stdin.flush()
-            return {"status": "ok", "bytes_written": len(data)}
+            with session._lock:
+                if session._stdin_closed:
+                    return {"status": "error", "error": "Process stdin is closed"}
+                if hasattr(session, "_pty") and session._pty:
+                    if _IS_WINDOWS:
+                        pty_data = data.decode("utf-8") if isinstance(data, bytes) else str(data)
+                    else:
+                        pty_data = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
+                    session._pty.write(pty_data)
+                    return {"status": "ok", "bytes_written": len(data)}
+                if not session.process or not session.process.stdin:
+                    return {"status": "error", "error": "Process stdin not available (non-local backend or stdin closed)"}
+                session.process.stdin.write(data)
+                session.process.stdin.flush()
+                return {"status": "ok", "bytes_written": len(data)}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -2526,19 +2660,74 @@ class ProcessRegistry:
         if session.exited:
             return {"status": "already_exited", "error": "Process has already finished"}
 
-        if hasattr(session, '_pty') and session._pty:
-            try:
-                session._pty.sendeof()
-                return {"status": "ok", "message": "EOF sent"}
-            except Exception as e:
-                return {"status": "error", "error": str(e)}
-
-        if not session.process or not session.process.stdin:
-            return {"status": "error", "error": "Process stdin not available (non-local backend or stdin closed)"}
+        reraise_pty_setup_error = False
         try:
-            session.process.stdin.close()
-            return {"status": "ok", "message": "stdin closed"}
+            with session._lock:
+                if session._stdin_closed:
+                    return {"status": "already_closed", "message": "stdin already closed"}
+                if hasattr(session, "_pty") and session._pty:
+                    if _IS_WINDOWS:
+                        session._pty.sendeof()
+                    else:
+                        import termios
+
+                        eof = termios.tcgetattr(session._pty.fd)[6][termios.VEOF]
+                        eof = bytes([eof]) if isinstance(eof, int) else eof
+                        slave_fd = self._open_pty_slave(session._pty.fd)
+                        reraise_pty_setup_error = True
+                        start = cancel = helper = None
+                        try:
+                            start = threading.Event()
+                            cancel = threading.Event()
+                            poller = select.poll()
+                            poller.register(slave_fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+                            helper = threading.Thread(
+                                target=self._pty_eof_after_record,
+                                args=(session, eof, slave_fd, start, cancel, poller),
+                                daemon=True,
+                                name=f"proc-pty-eof-{session.id}",
+                            )
+                            helper.start()
+                            session._pty_eof_thread = helper
+                            session._pty_eof_cancel = cancel
+                            session._pty_eof_start = start
+                            session._pty.write(eof)
+                            session._stdin_closed = True
+                            start.set()
+                            reraise_pty_setup_error = False
+                        except BaseException:
+                            for event in (cancel, start):
+                                if event is not None:
+                                    try:
+                                        event.set()
+                                    except BaseException:
+                                        pass
+                            session._pty_eof_thread = None
+                            session._pty_eof_cancel = None
+                            session._pty_eof_start = None
+                            session._stdin_closed = False
+                            if helper is not None and helper.ident is not None:
+                                if helper is not threading.current_thread():
+                                    try:
+                                        helper.join()
+                                    except BaseException:
+                                        pass
+                            else:
+                                try:
+                                    os.close(slave_fd)
+                                except OSError:
+                                    pass
+                            raise
+                    session._stdin_closed = True
+                    return {"status": "ok", "message": "EOF sent"}
+                if not session.process or not session.process.stdin:
+                    return {"status": "error", "error": "Process stdin not available (non-local backend or stdin closed)"}
+                session.process.stdin.close()
+                session._stdin_closed = True
+                return {"status": "ok", "message": "stdin closed"}
         except Exception as e:
+            if reraise_pty_setup_error:
+                raise
             return {"status": "error", "error": str(e)}
 
     def count_running(self) -> int:

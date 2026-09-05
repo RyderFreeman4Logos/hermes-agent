@@ -97,6 +97,7 @@ class TestCompressionBoundaryHook:
             assert call.kwargs.get("old_session_id") == original_sid, \
                 f"Expected old_session_id={original_sid!r}, got {call.kwargs!r}"
             assert len(comp_calls) == 1
+            assert agent._awaiting_cache_usage_after_compression is True
 
     def test_automatic_notification_follows_core_persistence(self):
         from hermes_state import SessionDB

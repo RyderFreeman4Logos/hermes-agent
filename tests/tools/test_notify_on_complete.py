@@ -130,6 +130,46 @@ class TestCompletionQueue:
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
+    def test_immediate_reader_completion_keeps_notification(self, registry, monkeypatch):
+        """Register notification state before a synchronous reader can finish."""
+        import tools.process_registry as process_registry_module
+
+        def finish(session):
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+
+        monkeypatch.setattr(
+            process_registry_module.subprocess, "Popen", lambda *_args, **_kwargs: MagicMock(pid=123)
+        )
+        monkeypatch.setattr(
+            process_registry_module.threading,
+            "Thread",
+            lambda **kwargs: type("ImmediateThread", (), {"start": lambda self: kwargs["target"](*kwargs["args"])})(),
+        )
+        monkeypatch.setattr(registry, "_reader_loop", finish)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: None)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        session = registry.spawn_local(
+            "true",
+            cwd="/tmp",
+            task_id="task-immediate",
+            session_key="key-immediate",
+            notify_on_complete=True,
+            watcher_metadata={"watcher_platform": "telegram", "parent_session_id": "parent-immediate"},
+        )
+
+        completion = registry.completion_queue.get_nowait()
+        assert registry.completion_queue.empty()
+        assert (
+            completion["platform"],
+            completion["parent_session_id"],
+            completion["session_key"],
+            completion["task_id"],
+        ) == ("telegram", "parent-immediate", "key-immediate", "task-immediate")
+        assert completion["session_id"] == session.id
+
 
 # =========================================================================
 # Checkpoint persistence
@@ -374,6 +414,48 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
         f"Correct usage must not emit a hint, got: {result.get('hint')!r}"
     )
     assert result.get("notify_on_complete") is True
+
+
+def test_notify_is_registered_before_spawn(monkeypatch, tmp_path):
+    """An immediate reader observes notify state and routing metadata at launch."""
+    from types import SimpleNamespace
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    captured = {}
+
+    def capture_spawn(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            id="proc_launch_test", pid=1, watcher_platform="", watcher_interval=0
+        )
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.spawn_local", capture_spawn
+    )
+    try:
+        result = json.loads(
+            tt.terminal_tool("true", background=True, notify_on_complete=True)
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["notify_on_complete"] is True
+    assert captured["notify_on_complete"] is True
+    assert "watcher_metadata" in captured
+
+
+def test_omitted_timeout_auto_promotes_to_notified_background(monkeypatch, tmp_path):
+    """Issue #191: omitted timeout and background is intentionally managed."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    try:
+        result = json.loads(tt.terminal_tool("true"))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["session_id"] == "proc_silent_test"
+    assert result["notify_on_complete"] is True
 
 
 def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):

@@ -24,6 +24,7 @@ import re
 import ssl
 import sys
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -105,9 +106,70 @@ from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
-from utils import base_url_host_matches, env_var_enabled
+from utils import base_url_host_matches, env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+def _loop_timing_context(
+    agent: Any,
+    *,
+    now: Optional[datetime] = None,
+    stop: bool = False,
+) -> Optional[str]:
+    """Record a loop boundary or return its API-only timing context."""
+    current = now or datetime.now().astimezone()
+    if stop:
+        agent._loop_timing_last_stop = current
+        return None
+
+    previous_start = getattr(agent, "_loop_timing_last_start", None)
+    previous_stop = getattr(agent, "_loop_timing_last_stop", None)
+    agent._loop_timing_last_start = current
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
+        enabled = is_truthy_value(
+            agent_config.get("loop_timing_context")
+            if isinstance(agent_config, dict)
+            else None,
+            default=True,
+        )
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+
+    lines = ["[Agent loop timing]"]
+    if previous_start is not None:
+        lines.append(f"Previous loop start: {previous_start.isoformat(timespec='seconds')}")
+    if previous_stop is not None:
+        lines.append(f"Previous loop stop: {previous_stop.isoformat(timespec='seconds')}")
+    lines.append(f"Current loop start: {current.isoformat(timespec='seconds')}")
+    return "\n".join(lines)
+
+
+def _drop_redundant_previous_loop_start(text: str, history) -> str:
+    """Drop Previous loop start when history already has that Current stamp."""
+    if not text or not history:
+        return text
+    lines = text.splitlines()
+    previous = next(
+        (line for line in lines if line.startswith("Previous loop start: ")), None
+    )
+    if previous is None:
+        return text
+    needle = f"Current loop start: {previous[len('Previous loop start: '):]}"
+    if any(
+        isinstance(message, dict)
+        and "[Agent loop timing]" in str(message.get("content", ""))
+        and needle in str(message.get("content", ""))
+        for message in history
+    ):
+        return "\n".join(line for line in lines if line != previous)
+    return text
 
 
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
@@ -1990,6 +2052,7 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    loop_timing_persisted_text = ""
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -2563,6 +2626,32 @@ def run_conversation(
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools
 
+        # Timing is hidden system metadata. Append after cache planning so the
+        # new block never receives a breakpoint, then persist it for the next
+        # cycle's stable historical prefix. The exact normalized-text sentinel
+        # spans inner continuations but resets for each outer run_conversation.
+        _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
+        if _loop_timing_text:
+            if not loop_timing_persisted_text:
+                loop_timing_persisted_text = _drop_redundant_previous_loop_start(
+                    _loop_timing_text, messages
+                )
+            if not any(
+                message.get("role") == "system"
+                and message.get("content") == loop_timing_persisted_text
+                for message in messages
+            ):
+                api_messages.append(
+                    {"role": "system", "content": loop_timing_persisted_text}
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": loop_timing_persisted_text,
+                        "display_kind": "hidden",
+                    }
+                )
+
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
         # is deliberately ephemeral and therefore absent from ``messages``.
@@ -2693,7 +2782,10 @@ def run_conversation(
         if (
             agent.compression_enabled
             and not _review_fork_first_request_pending(agent)
-            and len(messages) > 1
+            # A freshly appended timing row is metadata, not enough history to
+            # justify compaction before the first provider request. It remains
+            # in this outer-run guard, so tool continuations still compact.
+            and len(messages) > 1 + int(bool(loop_timing_persisted_text))
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)

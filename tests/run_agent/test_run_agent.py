@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -3054,6 +3057,7 @@ class TestRunConversation:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
         ):
             result = agent.run_conversation("hello")
 
@@ -3072,6 +3076,9 @@ class TestRunConversation:
                 "cache_control": {"type": "ephemeral"},
             },
         ]
+        timing = agent.client.chat.completions.create.call_args.kwargs["messages"][-1]
+        assert timing["content"].startswith("[Agent loop timing]\nCurrent loop start:")
+        assert "cache_control" not in timing
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)
@@ -3908,7 +3915,14 @@ class TestRunConversation:
         assert result["final_response"] == "Using Postgres instead."
         assert len(requests) == 2
 
-        replay = requests[1]["messages"]
+        replay = [
+            message
+            for message in requests[1]["messages"]
+            if not (
+                message.get("role") == "system"
+                and "[Agent loop timing]" in str(message.get("content", ""))
+            )
+        ]
         assert [m["role"] for m in replay[-3:]] == [
             "user",
             "assistant",
@@ -4144,6 +4158,9 @@ class TestRunConversation:
             )
             result = agent.run_conversation("search something")
         mock_compress.assert_called_once()
+        assert any(
+            message["role"] == "tool" for message in mock_compress.call_args.args[0]
+        )
         assert result["final_response"] == "All done"
         assert result["completed"] is True
 
@@ -4915,7 +4932,14 @@ class TestRunConversation:
         # prompt), not the original multi-message window. Without this, the
         # output-cap retry would call the compressor but re-transmit the same
         # oversized request forever.
-        second_messages = second_call.get("messages", [])
+        second_messages = [
+            message
+            for message in second_call.get("messages", [])
+            if not (
+                message.get("role") == "system"
+                and "[Agent loop timing]" in str(message.get("content", ""))
+            )
+        ]
         assert second_messages[-1].get("content") == "hello"
         assert len(second_messages) == 2
         assert second_messages[0]["role"] == "system"

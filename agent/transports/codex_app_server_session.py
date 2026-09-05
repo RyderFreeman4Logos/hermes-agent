@@ -410,14 +410,18 @@ class CodexAppServerSession:
             client = self._client
         if not turn_id or not thread_id or client is None:
             return False
+        request = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": cleaned}],
+            "expectedTurnId": turn_id,
+        }
         try:
+            from agent import relay_llm
+
+            relay_llm.capture_transport_request(request)
             response = client.request(
                 "turn/steer",
-                {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": cleaned}],
-                    "expectedTurnId": turn_id,
-                },
+                request,
                 timeout=10,
             )
         except (CodexAppServerError, TimeoutError):
@@ -518,13 +522,17 @@ class CodexAppServerSession:
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
+        request = {
+            "threadId": self._thread_id,
+            "input": [{"type": "text", "text": user_input_text}],
+        }
         try:
+            from agent import relay_llm
+
+            relay_llm.capture_transport_request(request)
             ts = self._client.request(
                 "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
+                request,
                 timeout=10,
             )
         except CodexAppServerError as exc:

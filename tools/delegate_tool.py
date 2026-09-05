@@ -1372,7 +1372,6 @@ def _build_child_progress_callback(
     subagent_id: Optional[str] = None,
     parent_id: Optional[str] = None,
     depth: Optional[int] = None,
-    model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
 ) -> Optional[callable]:
@@ -1383,8 +1382,8 @@ def _build_child_progress_callback(
       Gateway: batches tool names and relays to parent's progress callback
 
     The identity kwargs (``subagent_id``, ``parent_id``, ``depth``, ``model``,
-    ``toolsets``) are threaded into every relayed event so the TUI can
-    reconstruct the live spawn tree and route per-branch controls (kill,
+    ``provider``, ``toolsets``) are threaded into relayed events after the child
+    has a successful runtime identity, so the TUI can reconstruct the live
     pause) back by ``subagent_id``.  All are optional for backward compat —
     older callers that ignore them still produce a flat list on the TUI.
 
@@ -1418,8 +1417,14 @@ def _build_child_progress_callback(
             kw["parent_id"] = parent_id
         if depth is not None:
             kw["depth"] = depth
-        if model is not None:
-            kw["model"] = model
+        child = session_ref.get("child") if session_ref else None
+        if getattr(child, "_delegate_has_successful_llm_request", False):
+            runtime_model = getattr(child, "model", None)
+            runtime_provider = getattr(child, "provider", None)
+            if isinstance(runtime_model, str) and runtime_model:
+                kw["model"] = runtime_model
+            if isinstance(runtime_provider, str) and runtime_provider:
+                kw["provider"] = runtime_provider
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
         # The child's own session id — filled into the shared ref once the
@@ -1622,6 +1627,8 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Resolved delegation model-pool profile, used by child-runtime policy.
+    model_profile: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1741,9 +1748,6 @@ def _build_child_agent(
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
         parent_api_key = parent_agent._client_kwargs.get("api_key")
 
-    # Resolve the child's effective model early so it can ride on every event.
-    effective_model_for_cb = model or getattr(parent_agent, "model", None)
-
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.
@@ -1756,7 +1760,6 @@ def _build_child_agent(
         subagent_id=subagent_id,
         parent_id=parent_subagent_id,
         depth=tui_depth,
-        model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
     )
@@ -2021,9 +2024,13 @@ def _build_child_agent(
         child._owns_session_db = True
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
+    child_session_ref["child"] = child
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
+    # Preserve the resolved model-pool tier for child-runtime retry policy.
+    child._delegate_model_profile = model_profile
+    child._delegate_has_successful_llm_request = False
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
@@ -3107,6 +3114,7 @@ def _run_single_child(
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
+        _provider = getattr(child, "provider", None)
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -3114,7 +3122,6 @@ def _run_single_child(
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
-            "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
             # Explicit, parent-visible truncation flag. A subagent that
             # exhausts its per-child iteration budget still returns a summary,
@@ -3150,6 +3157,13 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if result.get("completed", False) or getattr(
+            child, "_delegate_has_successful_llm_request", False
+        ):
+            if isinstance(_model, str) and _model:
+                entry["model"] = _model
+            if isinstance(_provider, str) and _provider:
+                entry["provider"] = _provider
         # Per-delegation spend, serialized back to the model alongside
         # tokens/api_calls so the parent can see what each delegation cost.
         # Mirrors _child_cost_usd (which is stripped pre-serialization and
@@ -3879,6 +3893,7 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        task_profile = str(t.get("model_profile") or "").strip() or None
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -3899,6 +3914,7 @@ def delegate_task(
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
+                model_profile=task_profile,
                 role=effective_role,
             )
         except ValueError as exc:

@@ -150,6 +150,15 @@ def test_gateway_store_read_failure_cannot_fall_back(config_boundary, monkeypatc
         obj._resolve_session_agent_runtime(session_key="route", user_config={})
 
 
+def test_cli_resume_preserves_explicit_session_api_mode(config_boundary):
+    obj = cli_agent("custom:lab")
+    obj._restore_session_model({"model": MODEL, "model_config": json.dumps({
+        "provider": "custom:lab", "api_mode": "anthropic_messages",
+    })})
+    assert obj.api_mode == "anthropic_messages"
+    assert obj.base_url == PRIVATE and obj.api_key == "route-key"
+
+
 def test_catalog_route_real_resolution(config_boundary, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-route-key")
     public = "https://openrouter.ai/api/v1"

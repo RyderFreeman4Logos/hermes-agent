@@ -204,6 +204,19 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.auth
         assert result.should_fallback is True
 
+    def test_xai_spending_limit_403_marks_xai_specific_billing(self):
+        e = MockAPIError(
+            "HTTP 403: spending limit",
+            status_code=403,
+            body={"code": "personal-team-blocked:spending-limit"},
+        )
+        result = classify_api_error(e, provider="xai-oauth", model="grok-4.6")
+        assert result.reason == FailoverReason.billing
+        assert result.error_context == {
+            "billing_unverified": True,
+            "xai_spending_limit": True,
+        }
+
 
 
 

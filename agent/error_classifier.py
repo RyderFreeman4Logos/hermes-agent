@@ -1272,11 +1272,12 @@ def _classify_by_status(
     if status_code == 403:
         # OpenRouter 403 "key limit exceeded" is actually billing. Other
         # providers also use 403 for account-plan or credit exhaustion.
+        xai_spending_limit = provider == "xai-oauth" and (
+            error_code.lower() == _XAI_SPENDING_LIMIT_ERROR_CODE
+            or _XAI_SPENDING_LIMIT_ERROR_CODE in error_msg
+        )
         if (
-            (
-                provider == "xai-oauth"
-                and error_code.lower() == _XAI_SPENDING_LIMIT_ERROR_CODE
-            )
+            xai_spending_limit
             or "key limit exceeded" in error_msg
             or "spending limit" in error_msg
             or any(p in error_msg for p in _BILLING_PATTERNS)
@@ -1286,6 +1287,16 @@ def _classify_by_status(
                 retryable=False,
                 should_rotate_credential=True,
                 should_fallback=True,
+                # A same-session xAI OAuth Grok success can follow this exact
+                # 403 (#209), so it is not proof that the credential is spent.
+                error_context=(
+                    {
+                        "billing_unverified": True,
+                        "xai_spending_limit": True,
+                    }
+                    if xai_spending_limit
+                    else {}
+                ),
             )
         return result_fn(
             FailoverReason.auth,

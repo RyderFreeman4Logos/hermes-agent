@@ -2217,9 +2217,12 @@ def _queue_context_engine_compression_notification(agent: Any, *, new_session_id
         raise RuntimeError("a compression notification is already pending")
 
     def _notify() -> bool:
-        return _notify_context_engine_compression_complete(
+        from hermes_cli.model_switch import apply_model_switch_after_compression
+        applied = apply_model_switch_after_compression(agent) == "applied"
+        observed = _notify_context_engine_compression_complete(
             agent, new_session_id=new_session_id, old_session_id=old_session_id
         )
+        return applied or observed
 
     setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, _notify)
 
@@ -3059,12 +3062,14 @@ def _finish_compaction_boundary(
     # Plugin engines use boundary_reason="compression" to keep lineage/checkpoint
     # state. Fires in BOTH modes: in-place passes the same id, the boundary is real.
     if session_commit_succeeded and (bool(_old_sid) or compacted_in_place):
-        notify = (
-            _queue_context_engine_compression_notification
-            if defer_context_engine_notification
-            else _notify_context_engine_compression_complete
-        )
-        notify(agent, new_session_id=agent.session_id or "", old_session_id=_boundary_parent)
+        if defer_context_engine_notification:
+            _queue_context_engine_compression_notification(
+                agent, new_session_id=agent.session_id or "", old_session_id=_boundary_parent)
+        else:
+            from hermes_cli.model_switch import apply_model_switch_after_compression
+            apply_model_switch_after_compression(agent)
+            _notify_context_engine_compression_complete(
+                agent, new_session_id=agent.session_id or "", old_session_id=_boundary_parent)
 
     # Providers refresh cached per-session state; reset=False, conversation goes on.
     # Fires in BOTH modes so buffers don't double-count dropped turns in-place.

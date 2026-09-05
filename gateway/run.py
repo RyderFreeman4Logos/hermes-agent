@@ -27358,32 +27358,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not persisted:
             return
+        from hermes_cli.runtime_provider import resolve_persisted_model_route
+
+        runtime = resolve_persisted_model_route(persisted)
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
-            "provider": persisted.get("provider"),
-            "base_url": persisted.get("base_url"),
+            "provider": runtime["provider"],
+            "base_url": runtime["base_url"],
+            "api_key": runtime.get("api_key") or "",
+            "api_mode": runtime.get("api_mode") or "",
+            "credential_pool": runtime.get("credential_pool"),
         }
         if isinstance(persisted.get("reasoning_config"), dict):
             override["reasoning_config"] = dict(persisted["reasoning_config"])
-        provider = persisted.get("provider")
-        if provider:
-            # Re-resolve credentials for the persisted provider. On failure
-            # (e.g. credentials were removed since the switch) keep the
-            # credential-less override — _resolve_session_agent_runtime falls
-            # back to env-based resolution and applies model/provider on top.
-            try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
-                override["api_key"] = runtime.get("api_key")
-                override["api_mode"] = runtime.get("api_mode")
-                override["credential_pool"] = runtime.get("credential_pool")
-                if not override.get("base_url"):
-                    override["base_url"] = runtime.get("base_url")
-            except Exception:
-                logger.debug(
-                    "Credential re-resolution failed for persisted override "
-                    "(provider=%s); using credential-less override",
-                    provider, exc_info=True,
-                )
+        provider = runtime["provider"]
         self._session_state(session_key).conversation.model_override = override
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
@@ -27398,8 +27386,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         The gateway /model command stores per-session overrides in
         ``_session_model_overrides``.  These must take precedence over
         config.yaml defaults so the switched model is actually used for
-        subsequent messages.  Fields with ``None`` values are skipped so
-        partial overrides don't clobber valid config defaults.
+        subsequent messages. Missing fields preserve partial overrides;
+        explicit empty values clear stale ambient credentials and pools.
         """
         _apply_state = self._peek_session_state(session_key)
         override = _apply_state.conversation.model_override if _apply_state else None
@@ -27407,9 +27395,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return model, runtime_kwargs
         model = override.get("model", model)
         for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
-            val = override.get(key)
-            if val is not None:
-                runtime_kwargs[key] = val
+            if key in override:
+                runtime_kwargs[key] = override[key]
         if (
             runtime_kwargs.get("api_key")
             and runtime_kwargs.get("credential_pool") is None

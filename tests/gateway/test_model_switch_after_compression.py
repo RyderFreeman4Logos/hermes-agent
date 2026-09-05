@@ -133,13 +133,7 @@ async def test_gateway_deferred_reasoning_survives_fresh_session_reconstruction(
     fresh_runner = object.__new__(GatewayRunner)
     fresh_runner._sessions = {}
     fresh_runner.session_store = store2
-    monkeypatch.setattr(
-        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
-        lambda _provider: {
-            "api_key": "[REDACTED]",
-            "api_mode": "chat_completions",
-        },
-    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-openrouter-key")
     fresh_runner._rehydrate_session_model_override(session_key)
 
     assert fresh_runner._resolve_session_reasoning_config(

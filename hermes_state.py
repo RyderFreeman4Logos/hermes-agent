@@ -8598,7 +8598,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
-        persisted_base_url = sanitize_persisted_base_url(base_url) or ""
+        route = sanitize_persisted_model_config({"provider": provider, "base_url": base_url or None})
+        provider = route.get("provider") or "unresolved"
+        persisted_base_url = route.get("base_url") or ""
 
         def _do(conn):
             conn.execute(

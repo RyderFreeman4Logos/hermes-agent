@@ -121,3 +121,90 @@ def test_next_cycle_keeps_prior_timing_in_historical_prefix():
     assert "Current loop start: 2026-08-26T00:01:00-07:00" in second_timing[-1]["content"]
     assert "Previous loop start: 2026-08-26T00:00:00-07:00" not in second_timing[-1]["content"]
     assert all("cache_control" not in message for message in second_timing)
+
+
+def test_inner_tool_continuation_persists_one_timing_row():
+    start = datetime(2026, 8, 26, 0, 0, 0, tzinfo=UTC_MINUS_7)
+    stop = start + timedelta(seconds=3)
+    stamps = iter([start, stop])
+    real_timing = conversation_loop._loop_timing_context
+
+    def timing(agent, *args, now=None, stop=False, **kwargs):
+        return real_timing(agent, *args, now=next(stamps), stop=stop, **kwargs)
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    tool_call = SimpleNamespace(
+        id="call-1",
+        type="function",
+        function=SimpleNamespace(name="test_tool", arguments="{}"),
+    )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=None, tool_calls=[tool_call]),
+                    finish_reason="tool_calls",
+                )
+            ],
+            model="test/model",
+            usage=None,
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="done", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            model="test/model",
+            usage=None,
+        ),
+    ]
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent._fallback_chain = []
+    agent.valid_tool_names = {"test_tool"}
+
+    def execute_tool_call(assistant_message, messages, *_args):
+        messages.append(
+            {
+                "role": "tool",
+                "name": "test_tool",
+                "tool_call_id": "call-1",
+                "content": "ok",
+            }
+        )
+
+    with (
+        patch("agent.conversation_loop._loop_timing_context", side_effect=timing),
+        patch.object(agent, "_execute_tool_calls", side_effect=execute_tool_call),
+        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["final_response"] == "done"
+    assert agent.client.chat.completions.create.call_count == 2
+    timing_rows = [
+        message
+        for message in result["messages"]
+        if "[Agent loop timing]" in str(message.get("content", ""))
+    ]
+    assert len(timing_rows) == 1
+    assert "Current loop start: 2026-08-26T00:00:00-07:00" in timing_rows[0]["content"]

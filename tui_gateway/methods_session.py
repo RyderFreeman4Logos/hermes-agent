@@ -3165,6 +3165,7 @@ def _(rid, params: dict) -> dict:
         new_key = _new_session_key()
         new_sid = uuid.uuid4().hex[:8]
         source = _session_source(session)
+        memory_provider_mode = _session_memory_provider_mode(session)
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         branch_name = params.get("name", "")
         try:
@@ -3186,7 +3187,10 @@ def _(rid, params: dict) -> dict:
                 # the parent live (no end_reason='branched'), so the legacy
                 # end_reason heuristic never matches it — the marker is the only
                 # thing that surfaces TUI branches. See issue #20856.
-                model_config={"_branched_from": old_key},
+                model_config={
+                    "memory_provider_mode": memory_provider_mode,
+                    "_branched_from": old_key,
+                },
                 parent_session_id=old_key,
                 cwd=_session_cwd(session),
                 # The branch stays on its parent's profile. Explicit stamp (not
@@ -3275,6 +3279,7 @@ def _(rid, params: dict) -> dict:
                     session_id=new_key,
                     session_db=branch_db,
                     platform_override=source,
+                    memory_provider_mode_override=memory_provider_mode,
                 )
             finally:
                 _clear_session_context(tokens)
@@ -3296,6 +3301,7 @@ def _(rid, params: dict) -> dict:
             # handle, so the finally must not close it.
             _transfer_db_to_agent(agent, branch_db)
             branch_owns_db = False
+            _persist_live_session_runtime(_sessions.get(new_sid))
         finally:
             if secret_token is not None:
                 reset_secret_scope(secret_token)

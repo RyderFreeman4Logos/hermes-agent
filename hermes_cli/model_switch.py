@@ -883,6 +883,7 @@ def schedule_model_switch_after_compression(
         config[_AFTER_COMPRESSION_CONFIG_KEY] = {
             "model": result.new_model,
             "provider": result.target_provider,
+            "base_url": result.base_url,
             "api_mode": result.api_mode,
         }
         if result.reasoning_config is not None:
@@ -909,32 +910,28 @@ def restore_model_switch_after_compression(agent: Any) -> Optional[ModelSwitchRe
     provider = str(descriptor.get("provider") or "").strip()
     if not model or not provider:
         return None
-    user_providers = None
-    custom_providers = None
     try:
-        from hermes_cli.config import (
-            get_compatible_custom_providers,
-            load_config_readonly,
-        )
+        from hermes_cli.runtime_provider import resolve_persisted_model_route
+        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
 
+        runtime = resolve_persisted_model_route(descriptor)
         config = load_config_readonly()
-        user_providers = config.get("providers")
-        custom_providers = get_compatible_custom_providers(config)
     except Exception:
-        pass
+        logger.warning("Could not restore deferred model route; select a configured provider again")
+        return None
     result = switch_model(
         raw_input=model,
-        current_provider=str(getattr(agent, "provider", "") or ""),
+        current_provider=runtime["provider"],
         current_model=str(getattr(agent, "model", "") or ""),
-        current_base_url=str(getattr(agent, "base_url", "") or ""),
-        current_api_key=getattr(agent, "api_key", "") or "",
-        explicit_provider=provider,
-        user_providers=user_providers,
-        custom_providers=custom_providers,
+        current_base_url=runtime["base_url"],
+        current_api_key=runtime.get("api_key") or "",
+        explicit_provider=runtime["provider"],
+        user_providers=config.get("providers"),
+        custom_providers=get_compatible_custom_providers(config),
         validate_live=False,
     )
-    if not result.success:
-        logger.warning("Could not restore deferred model switch: %s", result.error_message)
+    if not result.success or result.base_url.rstrip("/") != runtime["base_url"].rstrip("/"):
+        logger.warning("Could not restore deferred model route; select a configured provider again")
         return None
     result.api_mode = str(descriptor.get("api_mode") or result.api_mode or "")
     if isinstance(descriptor.get("reasoning_config"), dict):

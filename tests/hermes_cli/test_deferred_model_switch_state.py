@@ -115,7 +115,7 @@ def test_scheduling_persists_secret_free_descriptor():
     stored = json.loads(agent._session_db.row["model_config"])
     assert stored["pending_model_switch_after_compression"] == {
         "model": "new-model",
-        "provider": "new-provider",
+        "provider": "unresolved",
         "api_mode": "responses",
     }
     assert "new-key" not in json.dumps(stored)
@@ -220,14 +220,18 @@ def test_restore_rehydrates_persisted_pending_intent(monkeypatch):
         }
     )
 
-    restored_result = _result("restored-model", "restored-provider")
-    restored_result.reasoning_config = {"enabled": True, "effort": "low"}
-    monkeypatch.setattr(
-        "hermes_cli.model_switch.switch_model",
-        lambda **_kwargs: restored_result,
-    )
-
-    assert restore_model_switch_after_compression(agent) is restored_result
+    import hermes_cli.config as cfg
+    import hermes_cli.runtime_provider as rp
+    config = {"providers": {"restored-provider": {
+        "api": "https://restored.example.test/v1", "api_key": "restored-key",
+    }}}
+    monkeypatch.setattr(cfg, "load_config", lambda: config)
+    monkeypatch.setattr(cfg, "load_config_readonly", lambda: config)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+    restored_result = restore_model_switch_after_compression(agent)
+    assert restored_result is not None
+    assert restored_result.base_url == "https://restored.example.test/v1"
+    assert restored_result.api_key == "restored-key"
     assert get_model_switch_after_compression(agent) is restored_result
     assert restored_result.reasoning_config == {"enabled": True, "effort": "low"}
 
@@ -247,15 +251,13 @@ def test_restore_rehydrates_configured_custom_provider_without_mocking_switch(
             }
         }
     )
-    (tmp_path / "config.yaml").write_text(
-        "custom_providers:\n"
-        "  - name: team\n"
-        "    base_url: https://team.example/v1\n"
-        "    api_key: test-key\n"
-        "    model: team-model\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import hermes_cli.config as cfg
+    import hermes_cli.runtime_provider as rp
+    config = {"custom_providers": [{"name": "team", "base_url": "https://team.example/v1",
+                                    "api_key": "test-key", "model": "team-model"}]}
+    monkeypatch.setattr(cfg, "load_config", lambda: config)
+    monkeypatch.setattr(cfg, "load_config_readonly", lambda: config)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
 
     restored_result = restore_model_switch_after_compression(agent)
 
@@ -263,4 +265,6 @@ def test_restore_rehydrates_configured_custom_provider_without_mocking_switch(
     assert restored_result.success is True
     assert restored_result.new_model == "team-model"
     assert restored_result.target_provider == "custom:team"
+    assert restored_result.base_url == "https://team.example/v1"
+    assert restored_result.api_key == "test-key"
     assert get_model_switch_after_compression(agent) is restored_result

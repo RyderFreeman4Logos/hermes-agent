@@ -14,6 +14,24 @@ import cli as cli_mod
 from hermes_state import SessionDB
 
 
+@pytest.fixture(autouse=True)
+def configured_routes(monkeypatch):
+    # Resume must use actual config identity resolution, never a fake resolver.
+    import hermes_cli.config as cfg
+    import hermes_cli.runtime_provider as rp
+
+    config = {"providers": {
+        "feather": {"api": "https://f/v1", "api_key": "feather-key"},
+        "opencode-zen": {"api": "https://oz/v1", "api_key": "zen-key"},
+        "myendpoint": {"api": "https://my-endpoint/v1", "api_key": "endpoint-key"},
+    }}
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    monkeypatch.setattr(cfg, "load_config", lambda: config)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+    monkeypatch.setenv("MINIMAX_API_KEY", "synthetic-minimax-key")
+    yield config
+
+
 def _make_stub(**overrides):
     """Bare HermesCLI the way resume paths see it (no __init__)."""
     stub = object.__new__(cli_mod.HermesCLI)
@@ -259,34 +277,28 @@ def test_persist_model_switch_heals_bare_custom(monkeypatch):
         api_mode = ""
 
     import hermes_cli.runtime_provider as rp
-    monkeypatch.setattr(rp, "canonical_custom_identity",
-                        lambda base_url=None, model=None: "custom:myendpoint")
     stub = _make_stub(_session_db=_DB(), session_id="s1")
     stub._persist_model_switch_to_session(_BareResult())
     assert written["patch"]["provider"] == "custom:myendpoint"
 
-    # Healing fails -> provider dropped (explicit None deletes any stale
-    # persisted provider), never persisted bare.
-    monkeypatch.setattr(rp, "canonical_custom_identity",
-                        lambda base_url=None, model=None: None)
+    # Removed config cannot become an ambient fallback.
+    monkeypatch.setattr(rp, "load_config", lambda: {})
     written.clear()
     stub._persist_model_switch_to_session(_BareResult())
-    assert written["patch"]["provider"] is None
-    assert written["patch"]["gateway_runtime"]["provider"] is None
+    assert written["patch"]["provider"] == "unresolved"
+    assert written["patch"]["gateway_runtime"]["provider"] == "unresolved"
 
 
 def test_restore_session_model_heals_bare_custom_stored_rows(monkeypatch):
-    """Rows persisted by older builds may carry bare 'custom' — heal or drop."""
-    import hermes_cli.runtime_provider as rp
-    monkeypatch.setattr(rp, "canonical_custom_identity",
-                        lambda base_url=None, model=None: None)
+    """Bare legacy custom without route authority must reject resume."""
     stub = _make_stub()
-    stub._restore_session_model(_row(model_config={
-        "gateway_runtime": {"provider": "custom"},
-    }))
-    # Provider dropped -> model restored but provider stays ambient.
-    assert stub.model == "glm-4.7"
-    assert stub.provider == "openrouter"
+    with pytest.raises(ValueError, match="restore.*route"):
+        stub._restore_session_model(_row(model_config={
+            "gateway_runtime": {"provider": "custom"},
+        }))
+    assert stub.model == "ambient-model"
+    assert stub.provider == "unresolved"
+    assert not stub.api_key and not stub.base_url
 
 
 # ── round trip: persist → get_session shape → restore ───────────────
@@ -306,7 +318,8 @@ def test_round_trip_persist_then_restore(tmp_path, monkeypatch):
     assert restored.model == "deepseek-v4-flash-free"
     assert restored.provider == "custom:opencode-zen"
     assert "oz/v1" not in json.dumps(dict(meta))
-    assert restored.base_url != "https://oz/v1"
+    assert restored.base_url == "https://oz/v1"
+    assert restored.api_key == "zen-key"
 
 
 # ── update_session_model provider persistence (#79536) ──────────────

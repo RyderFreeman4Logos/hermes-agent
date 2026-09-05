@@ -943,6 +943,7 @@ def _sanitize_persisted_route_url(container: dict, url_key: str) -> None:
         return
     if not isinstance(raw, str) or not raw.strip() or _persisted_url_has_secrets(raw):
         container.pop(url_key, None)
+        container["provider"] = "unresolved"
         return
     safe = sanitize_persisted_base_url(raw)
     if safe is not None:
@@ -950,27 +951,43 @@ def _sanitize_persisted_route_url(container: dict, url_key: str) -> None:
         return
     alias = _route_alias_for_url(raw)
     container.pop(url_key, None)
-    provider = str(container.get("provider") or "").strip().lower()
-    if alias and provider in _BARE_ROUTE_PROVIDERS:
-        container["provider"] = alias
+    # Omission alone would let resume inherit a different ambient route.
+    if container.get("provider") != "unresolved":
+        container["provider"] = alias or "unresolved"
 
 
 def sanitize_persisted_model_config(config: Any) -> dict:
     """Persist aliases / catalog URLs only; drop private endpoints."""
     if not isinstance(config, dict):
         return {}
+    from hermes_cli.runtime_provider import (
+        is_safe_route_alias, validated_custom_provider_identity,
+    )
+
     cleaned = dict(config)
     for key in _PERSISTED_ROUTE_SECRET_KEYS:
         cleaned.pop(key, None)
-    _sanitize_persisted_route_url(cleaned, "base_url")
-    runtime = cleaned.get("gateway_runtime")
-    if isinstance(runtime, dict):
-        runtime = dict(runtime)
-        for key in _PERSISTED_ROUTE_SECRET_KEYS:
-            runtime.pop(key, None)
-        for url_key in ("base_url", "billing_base_url"):
-            _sanitize_persisted_route_url(runtime, url_key)
-        cleaned["gateway_runtime"] = runtime
+    provider = cleaned.get("provider")
+    if provider and not is_safe_route_alias(provider):
+        cleaned["provider"] = "unresolved"
+    for url_key in ("base_url", "billing_base_url"):
+        _sanitize_persisted_route_url(cleaned, url_key)
+    provider = cleaned.get("provider")
+    if provider and provider != "unresolved":
+        from hermes_cli.auth import AuthError, resolve_provider
+
+        try:
+            if provider in _BARE_ROUTE_PROVIDERS or provider.startswith("custom:"):
+                raise AuthError("custom identity requires configuration")
+            resolve_provider(provider)
+        except AuthError:
+            from hermes_cli.providers import get_provider
+
+            if provider.startswith("custom:") or not get_provider(provider, allow_network=False):
+                cleaned["provider"] = validated_custom_provider_identity(provider) or "unresolved"
+    for key in ("gateway_runtime", "pending_model_switch_after_compression"):
+        if isinstance(cleaned.get(key), dict):
+            cleaned[key] = sanitize_persisted_model_config(cleaned[key])
     return cleaned
 
 

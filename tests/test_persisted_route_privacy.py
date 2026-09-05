@@ -29,7 +29,10 @@ def _patch_config(monkeypatch, config=None):
     import hermes_cli.runtime_provider as rp
 
     payload = _lab_config() if config is None else config
+    import hermes_cli.config as cfg
     monkeypatch.setattr(rp, "load_config", lambda: payload)
+    monkeypatch.setattr(cfg, "load_config", lambda: payload)
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
 
 
 def test_catalog_url_may_persist(monkeypatch):
@@ -69,7 +72,7 @@ def test_public_looking_unknown_url_is_not_kept(monkeypatch):
         "base_url": "https://api.example/v1?api-version=2024-01-01&region=us",
     }
     cleaned = sanitize_model_override(override)
-    assert cleaned == {"model": "gpt-5o", "provider": "openai"}
+    assert cleaned == {"model": "gpt-5o", "provider": "unresolved"}
     assert "api.example" not in json.dumps(cleaned)
 
 
@@ -122,19 +125,9 @@ def test_session_and_billing_persist_alias_roundtrip(tmp_path, monkeypatch):
 
 def test_cli_persist_restore_uses_config_url_not_disk(tmp_path, monkeypatch):
     import cli as cli_mod
-    import hermes_cli.runtime_provider as rp
 
     _patch_config(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    monkeypatch.setattr(
-        rp,
-        "resolve_runtime_provider",
-        lambda requested=None, **_k: {
-            "provider": requested,
-            "base_url": RESOLVABLE_URL,
-            "api_key": "resolved-key",
-        },
-    )
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session(session_id="rt-alias", source="cli", model="ambient-model")
 

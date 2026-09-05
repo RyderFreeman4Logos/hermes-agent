@@ -7001,8 +7001,6 @@ class AIAgent:
             )
         except Exception:
             logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
-        if delivered:
-            self._record_streamed_assistant_text(text)
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""

@@ -4074,11 +4074,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 return
             if agent.stream_delta_callback:
                 for text in pending_parts:
-                    try:
-                        agent.stream_delta_callback(text)
-                        agent._record_streamed_assistant_text(text)
-                    except Exception:
-                        pass
+                    agent._fire_stream_delta(text)
 
         for chunk in _iter_provider_stream_chunks(
             stream,
@@ -4211,11 +4207,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(delta_content)
-                        agent._record_streamed_assistant_text(delta_content)
-                    except Exception:
-                        pass
+                    agent._fire_stream_delta(delta_content)
 
             # Accumulate tool call deltas — notify display on first name
             delta_tool_calls = getattr(delta, "tool_calls", None)

@@ -29,6 +29,91 @@ const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
+type CacheInfo = {
+  compression_bound?: boolean
+  pct?: number
+  prompt_tokens?: number
+  read_tokens?: number
+  state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
+}
+
+const compressionReason = (cacheInfo: CacheInfo): string => {
+  if (!cacheInfo.compression_bound) {
+    return ''
+  }
+
+  return cacheInfo.state === 'miss' ||
+    (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50)
+    ? ' because of compression'
+    : ''
+}
+
+const cacheFootnote = (cacheInfo?: CacheInfo): null | string => {
+  if (!cacheInfo) {
+    return null
+  }
+
+  if (cacheInfo.state === 'hit') {
+    const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
+    const pair = hasCounts ? ` ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : ''
+
+    return hasCounts && cacheInfo.read_tokens! * 100 < cacheInfo.prompt_tokens!
+      ? `cache <1%${pair}${compressionReason(cacheInfo)}`
+      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}${compressionReason(cacheInfo)}`
+  }
+
+  if (cacheInfo.state === 'miss') {
+    const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
+
+    return hasCounts
+      ? `cache miss ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}${compressionReason(cacheInfo)}`
+      : `cache miss${compressionReason(cacheInfo)}`
+  }
+
+  return cacheInfo.state === 'cold_write' ? 'cache COLD_WRITE' : `cache ${cacheInfo.state}`
+}
+
+const isLowCacheHit = (cacheInfo?: CacheInfo): boolean => {
+  if (!cacheInfo) {
+    return false
+  }
+
+  return (
+    cacheInfo.state === 'miss' || (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50)
+  )
+}
+
+const completionFootnote = (completedAt?: number): null | string => {
+  if (!Number.isFinite(completedAt)) {
+    return null
+  }
+
+  const time = new Date(completedAt! * 1_000).toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    hour12: false,
+    minute: '2-digit',
+    second: '2-digit'
+  })
+
+  return `agent loop stop at ${time}`
+}
+
+const turnCompletionLine = (payload: { cache_info?: CacheInfo; completed_at?: number }): Msg | null => {
+  const completion = completionFootnote(payload.completed_at)
+  const cache = cacheFootnote(payload.cache_info)
+
+  if (!completion && !cache) {
+    return null
+  }
+
+  return {
+    kind: 'event',
+    role: 'system',
+    text: [completion, cache].filter(Boolean).join('  '),
+    ...(isLowCacheHit(payload.cache_info) ? { eventTone: 'warn' as const } : {})
+  }
+}
+
 // Extracts the raw patch from a diff-only segment produced by
 // pushInlineDiffSegment. Used at message.complete to dedupe against final
 // assistant text that narrates the same patch. Returns null for anything
@@ -565,6 +650,8 @@ class TurnController {
   }
 
   recordMessageComplete(payload: {
+    cache_info?: CacheInfo
+    completed_at?: number
     rendered?: string
     reasoning?: string
     response_previewed?: boolean
@@ -642,6 +729,15 @@ class TurnController {
 
     if (finalText) {
       finalMessages.push({ role: 'assistant', text: finalText })
+    }
+
+    const footnote = turnCompletionLine(payload)
+
+    if (
+      footnote &&
+      (Number.isFinite(payload.completed_at) || finalMessages.some(message => message.role === 'assistant'))
+    ) {
+      finalMessages.push(footnote)
     }
 
     const wasInterrupted = this.interrupted

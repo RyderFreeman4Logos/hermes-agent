@@ -350,6 +350,68 @@ class TestStreamingCallbacks:
 
         assert deltas == ["a", "b", "c"]
 
+    @pytest.mark.parametrize(
+        ("pending", "with_tts"),
+        [
+            pytest.param(False, False, id="suppressed-direct-no-delivery"),
+            pytest.param(False, True, id="suppressed-direct-tts-delivery"),
+            pytest.param(True, False, id="suppressed-pending-no-delivery"),
+            pytest.param(True, True, id="suppressed-pending-tts-delivery"),
+        ],
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_suppressed_tool_text_records_only_after_callback_delivery(
+        self, mock_close, mock_create, pending, with_tts, monkeypatch,
+    ):
+        """Suppressed tool text inherits shared display/TTS delivery provenance."""
+        from run_agent import AIAgent
+
+        text = "suppressed text"
+        if pending:
+            monkeypatch.setattr(
+                "agent.chat_completion_helpers._provider_stream_text_may_be_sse",
+                lambda _text: True,
+            )
+        tool_chunk = _make_stream_chunk(tool_calls=[
+            _make_tool_call_delta(index=0, tc_id="call_1", name="terminal"),
+        ])
+        chunks = (
+            [_make_stream_chunk(content=text), tool_chunk]
+            if pending
+            else [tool_chunk, _make_stream_chunk(content=text)]
+        )
+        chunks.append(_make_stream_chunk(finish_reason="tool_calls"))
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        display = []
+
+        def _raising_display(delta):
+            display.append(delta)
+            raise RuntimeError("display failed")
+
+        tts = []
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=_raising_display,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._stream_callback = tts.append if with_tts else None
+
+        agent._interruptible_streaming_api_call({})
+
+        assert display == [text]
+        assert tts == ([text] if with_tts else [])
+        assert agent._current_streamed_assistant_text == (text if with_tts else "")
+
 
 
 

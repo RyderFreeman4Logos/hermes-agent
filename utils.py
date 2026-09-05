@@ -853,54 +853,123 @@ _PERSISTED_ROUTE_SECRET_KEYS = frozenset({
 })
 
 
-def sanitize_persisted_base_url(value: Any) -> str | None:
-    """Return a base URL only when it carries no credential material."""
-    if not isinstance(value, str):
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+_BARE_ROUTE_PROVIDERS = frozenset({"", "custom", "auto"})
+
+
+def _url_host_path(raw: str) -> tuple[str, str] | None:
+    try:
+        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+    except (TypeError, ValueError):
         return None
-    raw = value.strip()
-    if not raw:
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
         return None
+    return host, (parsed.path or "").rstrip("/").lower()
+
+
+def _persisted_url_has_secrets(raw: str) -> bool:
     try:
         parsed = urlsplit(raw if "://" in raw else f"//{raw}")
         if parsed.username or parsed.password or parsed.fragment:
-            return None
+            return True
         for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
             normalized = key.strip().lower().replace("-", "_")
             if (
                 normalized in _PERSISTED_ROUTE_SECRET_KEYS
                 or normalized.endswith(("_key", "_token", "_secret", "_password"))
             ):
-                return None
+                return True
     except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _is_catalog_public_base_url(raw: str) -> bool:
+    """True only for built-in public provider endpoints (existing registry)."""
+    target = _url_host_path(raw)
+    if target is None or target[0] in _LOOPBACK_HOSTS:
+        return False
+    urls = []
+    try:
+        from hermes_constants import OPENROUTER_BASE_URL
+
+        urls.append(OPENROUTER_BASE_URL)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        for entry in PROVIDER_REGISTRY.values():
+            urls.append(getattr(entry, "inference_base_url", "") or "")
+            urls.append(getattr(entry, "portal_base_url", "") or "")
+    except Exception:
+        pass
+    return any(_url_host_path(url) == target for url in urls if url)
+
+
+def _route_alias_for_url(raw: str) -> str | None:
+    """Map a URL to an existing config/provider alias. Never invent identity."""
+    try:
+        from hermes_cli.runtime_provider import find_custom_provider_identity
+
+        alias = find_custom_provider_identity(raw)
+    except Exception:
         return None
-    return raw
+    if not isinstance(alias, str):
+        return None
+    alias = alias.strip()
+    return alias or None
+
+
+def sanitize_persisted_base_url(value: Any) -> str | None:
+    """Persist a URL only when it is a credential-free catalog public route."""
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or _persisted_url_has_secrets(raw):
+        return None
+    if _is_catalog_public_base_url(raw):
+        return raw
+    return None
+
+
+def _sanitize_persisted_route_url(container: dict, url_key: str) -> None:
+    if url_key not in container:
+        return
+    raw = container[url_key]
+    if raw is None:
+        container.pop(url_key, None)
+        return
+    if not isinstance(raw, str) or not raw.strip() or _persisted_url_has_secrets(raw):
+        container.pop(url_key, None)
+        return
+    safe = sanitize_persisted_base_url(raw)
+    if safe is not None:
+        container[url_key] = safe
+        return
+    alias = _route_alias_for_url(raw)
+    container.pop(url_key, None)
+    provider = str(container.get("provider") or "").strip().lower()
+    if alias and provider in _BARE_ROUTE_PROVIDERS:
+        container["provider"] = alias
 
 
 def sanitize_persisted_model_config(config: Any) -> dict:
-    """Strip credential-bearing route values at the durable model boundary."""
+    """Persist aliases / catalog URLs only; drop private endpoints."""
     if not isinstance(config, dict):
         return {}
     cleaned = dict(config)
     for key in _PERSISTED_ROUTE_SECRET_KEYS:
         cleaned.pop(key, None)
-    if "base_url" in cleaned:
-        base_url = sanitize_persisted_base_url(cleaned["base_url"])
-        if base_url is None:
-            cleaned.pop("base_url", None)
-        else:
-            cleaned["base_url"] = base_url
+    _sanitize_persisted_route_url(cleaned, "base_url")
     runtime = cleaned.get("gateway_runtime")
     if isinstance(runtime, dict):
         runtime = dict(runtime)
         for key in _PERSISTED_ROUTE_SECRET_KEYS:
             runtime.pop(key, None)
         for url_key in ("base_url", "billing_base_url"):
-            if url_key in runtime:
-                base_url = sanitize_persisted_base_url(runtime[url_key])
-                if base_url is None:
-                    runtime.pop(url_key, None)
-                else:
-                    runtime[url_key] = base_url
+            _sanitize_persisted_route_url(runtime, url_key)
         cleaned["gateway_runtime"] = runtime
     return cleaned
 

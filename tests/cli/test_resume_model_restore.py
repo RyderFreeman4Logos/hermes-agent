@@ -146,7 +146,8 @@ def test_persist_model_switch_writes_model_and_both_route_shapes():
     assert patch["gateway_runtime"]["provider"] == "custom:opencode-zen"
     # ...and top-level for the TUI gateway's _stored_session_runtime_overrides.
     assert patch["provider"] == "custom:opencode-zen"
-    assert patch["base_url"] == "https://oz/v1"
+    assert patch["base_url"] is None
+    assert "oz/v1" not in json.dumps(patch)
     # Both shapes use or-None so stale keys are deleted (not merely omitted)
     # in BOTH gateway_runtime and top-level — the asymmetry that caused the
     # original stale-key bug.
@@ -304,7 +305,8 @@ def test_round_trip_persist_then_restore(tmp_path, monkeypatch):
     restored._restore_session_model(meta)
     assert restored.model == "deepseek-v4-flash-free"
     assert restored.provider == "custom:opencode-zen"
-    assert restored.base_url == "https://oz/v1"
+    assert "oz/v1" not in json.dumps(dict(meta))
+    assert restored.base_url != "https://oz/v1"
 
 
 # ── update_session_model provider persistence (#79536) ──────────────

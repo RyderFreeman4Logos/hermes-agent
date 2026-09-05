@@ -700,19 +700,12 @@ def _persist_session_model_config(
 ) -> None:
     """Persist a secret-free route descriptor through existing DB seams."""
     config = sanitize_persisted_model_config(config)
-    persisted_base_url = sanitize_persisted_base_url(
-        result.base_url if result is not None else config.get("base_url")
-    )
-    if persisted_base_url is None and "base_url" in config:
-        config.pop("base_url", None)
-    elif persisted_base_url is not None:
-        config["base_url"] = persisted_base_url
-    runtime = config.get("gateway_runtime")
-    if isinstance(runtime, dict):
-        if persisted_base_url is None:
-            runtime.pop("base_url", None)
-        else:
-            runtime["base_url"] = persisted_base_url
+    persisted_base_url = sanitize_persisted_base_url(config.get("base_url"))
+    billing_provider = ""
+    if result is not None:
+        billing_provider = (
+            str(config.get("provider") or result.target_provider or "")
+        )
     db = getattr(agent, "_session_db", None)
     sid = getattr(agent, "session_id", None)
     if db is not None and sid:
@@ -728,7 +721,7 @@ def _persist_session_model_config(
             if callable(update_route):
                 update_route(
                     sid,
-                    provider=result.target_provider,
+                    provider=billing_provider,
                     base_url=persisted_base_url,
                     billing_mode=result.api_mode or None,
                 )

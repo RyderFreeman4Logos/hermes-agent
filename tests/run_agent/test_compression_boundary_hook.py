@@ -157,6 +157,36 @@ class TestCompressionBoundaryHook:
                 )
 
             compressor.on_session_start.assert_not_called()
+            assert agent._awaiting_cache_usage_after_compression is False
+
+    def test_failed_persist_does_not_arm_cache_bound_latch(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [
+                {"role": "user", "content": "summary"}
+            ]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            compressor._last_compression_made_progress = True
+            agent.context_compressor = compressor
+
+            with patch.object(
+                db, "publish_compression_child", side_effect=RuntimeError("persist failed")
+            ):
+                agent._compress_context(
+                    [{"role": "user", "content": "m" * 400}],
+                    "sys",
+                    approx_tokens=100,
+                )
+
+            assert agent._awaiting_cache_usage_after_compression is False
 
 
     def test_no_progress_does_not_notify(self):
@@ -179,6 +209,7 @@ class TestCompressionBoundaryHook:
 
             assert returned is messages
             compressor.on_session_start.assert_not_called()
+            assert agent._awaiting_cache_usage_after_compression is False
 
 
     def test_no_hook_when_no_session_db(self):

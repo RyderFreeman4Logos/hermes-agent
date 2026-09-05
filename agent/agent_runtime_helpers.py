@@ -2842,7 +2842,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode='', *, credential_pool=...):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2855,6 +2855,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     client-swap logic but also updates ``_primary_runtime`` so the
     change persists across turns (unlike fallback which is
     turn-scoped).
+
+    An explicit ``credential_pool`` (including None) replaces recovery
+    authority in the same rollback boundary. Omission keeps reload behavior.
     """
     from hermes_cli.model_switch import _inject_deferred_model_switch_fault
     from hermes_cli.providers import determine_api_mode
@@ -2985,17 +2988,21 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         if _is_deferred_boundary_switch:
             _inject_deferred_model_switch_fault(agent, "provider_resolve")
 
-        # ── Reload credential pool for the new provider (issue #52727) ──
+        # ── Adopt the resolved pool, or reload if omitted (issue #52727) ──
         # Without this, ``recover_with_credential_pool`` sees a
         # ``pool.provider != agent.provider`` mismatch and short-circuits,
         # leaving the new provider with no rotation/recovery on 401/429 and
-        # burning the original pool's entries. Only reload when the provider
+        # burning the original pool's entries. Without an explicit pool,
+        # only reload when the provider
         # actually changed (or the pool was missing) — re-selecting the same
         # provider must not churn the pool reference. A reload failure is
         # logged + swallowed: the switch itself must still complete.
         old_norm = (old_provider or "").strip().lower()
         new_norm = (new_provider or "").strip().lower()
-        if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
+        if credential_pool is not ...:
+            agent._credential_pool = credential_pool
+            agent._credential_pool_entry_id = None
+        elif old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
             # A pool bound to the old provider is worse than no pool: the
             # recovery guard rejects it and every later 401/429 skips rotation.
             agent._credential_pool = None
@@ -3339,7 +3346,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 _apply_model_switch = switch_model
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode='', *, credential_pool=...):
     """Serialize a live swap and cancel superseded deferred intent."""
     from hermes_cli.model_switch import (
         _emit_deferred_model_switch_status,
@@ -3349,7 +3356,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     with model_switch_transaction_lock(agent):
         result = _apply_model_switch(
-            agent, new_model, new_provider, api_key, base_url, api_mode
+            agent, new_model, new_provider, api_key, base_url, api_mode,
+            credential_pool=credential_pool,
         )
         if not getattr(agent, "_applying_model_switch_after_compression", False):
             cancelled = clear_model_switch_after_compression(agent)

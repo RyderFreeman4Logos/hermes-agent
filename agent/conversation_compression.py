@@ -4626,10 +4626,9 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
-        # Arm the post-compression cache latch only after a committed rewrite.
-        # Failed persist rolls _compression_made_progress back to False and
-        # must not over-arm an unrelated later usage.
-        if _compression_made_progress:
+        # Reuse the durable boundary verdict, not the summary's progress hint.
+        # With no DB, reaching this point publishes the semantic rewrite in memory.
+        if _context_engine_boundary_committed or not agent._session_db:
             agent._awaiting_cache_usage_after_compression = True
         # Compaction rewrote the transcript, so the usage anchor's base
         # message-list snapshot no longer describes what will be sent —

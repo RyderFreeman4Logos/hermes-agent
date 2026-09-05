@@ -354,3 +354,111 @@ def test_same_wake_post_compression_usage_publishes_compression_bound(
     assert payload["cache_info"]["attribution"] == "post_compression"
     assert payload["cache_info"]["state"] == "cold_write"
     assert agent._awaiting_cache_usage_after_compression is False
+
+
+@pytest.mark.parametrize("source", ["ingest", "callback", "record", "usage"])
+@pytest.mark.parametrize("state", ["hit", "cold_write", "miss", "no_field", "unavailable"])
+@pytest.mark.parametrize("epoch", ["ordinary", "before-first", "same-wake", "repeated"])
+def test_public_completion_projection_matrix(frames, turn_env, source, state, epoch):
+    """Unknown numeric telemetry cannot erase an authoritative boundary record."""
+    from pathlib import Path
+
+    from agent.conversation_loop import _ingest_successful_provider_usage as ingest
+
+    root = Path(__file__).resolve().parents[2]
+    assert Path(server.__file__).resolve() == root / "tui_gateway/server.py"
+    assert Path(ingest.__code__.co_filename).resolve() == root / "agent/conversation_loop.py"
+    known = state not in {"no_field", "unavailable"}
+    bound = epoch != "ordinary"
+    expected_state = state if known else "unavailable"
+    read = 760 if state == "hit" else 0
+    usage = {
+        "prompt_tokens": 800,
+        "cache_read_tokens": read,
+        "cache_write_tokens": 25 if state == "cold_write" else 0,
+        "cache_telemetry": "reported" if known else "unavailable",
+    }
+
+    class Agent:
+        def __init__(self):
+            self.__dict__.update(_real_shaped_counters().__dict__)
+            self.wake = 0
+
+        def run_conversation(self, _prompt, **_kwargs):
+            self.wake += 1
+            # Match run_conversation's per-wake usage reset; session-record
+            # reset itself is exercised in the real _run_prompt_submit.
+            self._first_turn_usage = None
+            self._last_turn_usage = None
+            self._tui_provider_response_index = 0
+            if self.wake == 2:
+                return {"final_response": "reply", "messages": []}
+            if epoch in {"same-wake", "repeated"}:
+                ingest(self, {**usage, "cache_telemetry": "reported",
+                              "cache_read_tokens": 0, "cache_write_tokens": 0}, first_call=True)
+            if epoch == "repeated":
+                self._awaiting_cache_usage_after_compression = True
+                ingest(self, {**usage, "cache_telemetry": "reported",
+                              "cache_read_tokens": 400}, first_call=False)
+            self._awaiting_cache_usage_after_compression = bound
+            if source == "usage":
+                self._tui_cache_callback = None
+                session.pop("first_provider_response", None)
+            if source in {"ingest", "usage"}:
+                ingest(self, usage, first_call=epoch in {"ordinary", "before-first"})
+            else:
+                record = {"state": state, "pct": 95 if read else 0}
+                if bound:
+                    record["attribution"] = "post_compression"
+                if known:
+                    record.update(read_tokens=read, prompt_tokens=800)
+                if source == "record":
+                    session["first_provider_response"] = record
+                    # An older fallback must not replace an authoritative
+                    # unknown record, even when that fallback has numbers.
+                    self._first_turn_usage = {**usage, "cache_telemetry": "reported"}
+                else:
+                    self._first_turn_usage = None
+                    self._tui_cache_callback(state, record["pct"], read, 800, record)
+                self._awaiting_cache_usage_after_compression = False
+            # Ordinary later usage must not replace the first/boundary response.
+            ingest(self, {**usage, "cache_telemetry": "reported",
+                          "cache_read_tokens": 123}, first_call=False)
+            return {"final_response": "reply", "messages": []}
+
+        def clear_interrupt(self):
+            pass
+
+    agent = Agent()
+    sid = "projection-matrix"
+    session = _session(agent=agent, running=True)
+    server._sessions[sid] = session
+    try:
+        server._attach_tui_cache_callback(agent, sid)
+        server._run_prompt_submit("first", sid, session, "synthetic")
+        info = _complete_payloads(frames)[0]["cache_info"]
+        assert info["state"] == expected_state
+        assert (info.get("compression_bound") is True) == bound
+        assert info.get("attribution") == ("post_compression" if bound else None)
+        assert ("read_tokens" in info) == known
+        assert ("prompt_tokens" in info) == known
+        if known:
+            assert info["read_tokens"] == read
+            assert info["prompt_tokens"] == 800
+            assert info["pct"] == (95 if read else 0)
+        for key, value in info.items():
+            assert session["first_provider_response"][key] == value
+        assert agent._awaiting_cache_usage_after_compression is False
+        if source in {"ingest", "callback"}:
+            statuses = [f["params"]["payload"]["cache_record"] for f in frames
+                        if f.get("params", {}).get("type") == "status.update"
+                        and "cache_record" in f["params"]["payload"]]
+            if known:
+                assert statuses[-1]["state"] == info["state"]
+                assert statuses[-1].get("compression_bound", False) == bound
+            else:
+                assert not any(r.get("state") in {"no_field", "unavailable"} for r in statuses)
+        server._run_prompt_submit("second", sid, session, "synthetic")
+        assert _complete_payloads(frames)[1]["cache_info"] == {"state": "unavailable", "pct": 0}
+    finally:
+        server._sessions.pop(sid, None)

@@ -208,6 +208,39 @@ def _on_applied(agent):
     return _sync
 
 
+def test_frontend_failure_restores_all_deferred_route_state(monkeypatch):
+    agent, db, _old_client = _make_agent(monkeypatch)
+    agent._reasoning_echo_flag = True
+    agent._transport_cache = {"old-transport": "old-value"}
+    agent._use_prompt_caching = True
+    agent._use_native_cache_layout = True
+    agent._provider_fallback_active = True
+    agent._provider_fallback_route = ("old-fallback-model", "old-fallback-provider")
+    before = {
+        "reasoning_echo": agent._reasoning_echo_flag,
+        "transport": dict(agent._transport_cache),
+        "prompt": agent._use_prompt_caching,
+        "native": agent._use_native_cache_layout,
+        "fallback_active": agent._provider_fallback_active,
+        "fallback_route": agent._provider_fallback_route,
+    }
+    transport_cache = agent._transport_cache
+    schedule_model_switch_after_compression(agent, _result())
+    agent._deferred_model_switch_fault_after = "frontend"
+
+    assert apply_model_switch_after_compression(agent) == "failed"
+
+    assert {
+        "reasoning_echo": agent._reasoning_echo_flag,
+        "transport": dict(agent._transport_cache),
+        "prompt": agent._use_prompt_caching,
+        "native": agent._use_native_cache_layout,
+        "fallback_active": agent._provider_fallback_active,
+        "fallback_route": agent._provider_fallback_route,
+    } == before
+    assert agent._transport_cache is transport_cache
+
+
 @pytest.mark.parametrize("stage", STAGES)
 def test_injected_failure_after_each_stage_restores_one_route(monkeypatch, stage):
     agent, db, _old_client = _make_agent(monkeypatch)

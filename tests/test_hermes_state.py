@@ -456,6 +456,19 @@ class TestSessionLifecycle:
 
 
 
+    def test_billing_route_rejects_credential_bearing_base_url(self, db):
+        db.create_session(session_id="unsafe-route", source="cli", model="primary")
+        db.update_session_billing_route(
+            "unsafe-route",
+            provider="private-provider",
+            base_url="https://user:route-marker@private.example/v1?token=query-marker",
+        )
+        row = db.get_session("unsafe-route")
+        assert row["billing_base_url"] in (None, "")
+        assert "route-marker" not in json.dumps(dict(row))
+        assert "query-marker" not in json.dumps(dict(row))
+
+
     def test_first_accounted_route_replaces_all_route_fields_atomically(self, db):
         db.create_session(session_id="route", source="cli", model="primary")
         db.update_session_billing_route(

@@ -154,6 +154,33 @@ def test_persist_model_switch_writes_model_and_both_route_shapes():
     assert patch["api_mode"] is None
 
 
+
+
+def test_persist_model_switch_rejects_credential_bearing_base_url():
+    written = {}
+
+    class _DB:
+        def update_session_model(self, sid, model):
+            written["model"] = (sid, model)
+
+        def patch_session_model_config(self, sid, patch):
+            written["patch"] = (sid, patch)
+
+    class _UnsafeResult:
+        new_model = "gpt-5.4"
+        target_provider = "custom:private"
+        base_url = "https://user:route-marker@private.example/v1?token=query-marker"
+        api_mode = ""
+
+    stub = _make_stub(_session_db=_DB(), session_id="s1")
+    stub._persist_model_switch_to_session(_UnsafeResult())
+    patch = written["patch"][1]
+    assert patch["base_url"] is None
+    assert patch["gateway_runtime"]["base_url"] is None
+    assert "route-marker" not in json.dumps(patch)
+    assert "query-marker" not in json.dumps(patch)
+
+
 def test_persist_model_switch_clears_stale_route_keys(tmp_path, monkeypatch):
     """A later switch must not inherit the previous switch's api_mode/base_url.
 

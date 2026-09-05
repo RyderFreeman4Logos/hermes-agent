@@ -226,7 +226,12 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import base_url_host_matches, base_url_hostname, fast_safe_load
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    fast_safe_load,
+    sanitize_persisted_base_url,
+)
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -8784,9 +8789,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Deriving the top-level from **route guarantees the two shapes
         # can never diverge — the asymmetry that caused the original
         # stale-key bug (#85261 simplify-code review).
+        persisted_base_url = sanitize_persisted_base_url(result.base_url)
         route = {
             "provider": provider or None,
-            "base_url": result.base_url or None,
+            "base_url": persisted_base_url,
             "api_mode": result.api_mode or None,
         }
         try:

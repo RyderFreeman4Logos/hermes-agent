@@ -133,3 +133,27 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+
+
+def test_sanitize_model_override_rejects_credential_bearing_urls():
+    unsafe = {
+        "model": "gpt-5o",
+        "provider": "openai",
+        "base_url": "https://user:route-marker@api.example/v1?api_key=query-marker",
+    }
+
+    cleaned = sanitize_model_override(unsafe)
+
+    assert cleaned == {"model": "gpt-5o", "provider": "openai"}
+    assert "route-marker" not in json.dumps(cleaned)
+    assert "query-marker" not in json.dumps(cleaned)
+
+
+def test_sanitize_model_override_keeps_benign_route_query():
+    override = {
+        "model": "gpt-5o",
+        "provider": "openai",
+        "base_url": "https://api.example/v1?api-version=2024-01-01&region=us",
+    }
+
+    assert sanitize_model_override(override) == override

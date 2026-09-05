@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Union
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlsplit
 
 import yaml
 
@@ -843,6 +843,66 @@ def normalize_proxy_env_vars() -> None:
         normalized = normalize_proxy_url(value)
         if normalized and normalized != value:
             os.environ[key] = normalized
+
+
+# Query names that are credentials rather than routing metadata.  A route may
+# legitimately use benign query parameters (for example, api-version).
+_PERSISTED_ROUTE_SECRET_KEYS = frozenset({
+    "api_key", "apikey", "access_token", "refresh_token", "client_secret", "password",
+    "passwd", "secret", "authorization", "auth", "credential", "credentials", "token",
+})
+
+
+def sanitize_persisted_base_url(value: Any) -> str | None:
+    """Return a base URL only when it carries no credential material."""
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+        if parsed.username or parsed.password or parsed.fragment:
+            return None
+        for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+            normalized = key.strip().lower().replace("-", "_")
+            if (
+                normalized in _PERSISTED_ROUTE_SECRET_KEYS
+                or normalized.endswith(("_key", "_token", "_secret", "_password"))
+            ):
+                return None
+    except (TypeError, ValueError):
+        return None
+    return raw
+
+
+def sanitize_persisted_model_config(config: Any) -> dict:
+    """Strip credential-bearing route values at the durable model boundary."""
+    if not isinstance(config, dict):
+        return {}
+    cleaned = dict(config)
+    for key in _PERSISTED_ROUTE_SECRET_KEYS:
+        cleaned.pop(key, None)
+    if "base_url" in cleaned:
+        base_url = sanitize_persisted_base_url(cleaned["base_url"])
+        if base_url is None:
+            cleaned.pop("base_url", None)
+        else:
+            cleaned["base_url"] = base_url
+    runtime = cleaned.get("gateway_runtime")
+    if isinstance(runtime, dict):
+        runtime = dict(runtime)
+        for key in _PERSISTED_ROUTE_SECRET_KEYS:
+            runtime.pop(key, None)
+        for url_key in ("base_url", "billing_base_url"):
+            if url_key in runtime:
+                base_url = sanitize_persisted_base_url(runtime[url_key])
+                if base_url is None:
+                    runtime.pop(url_key, None)
+                else:
+                    runtime[url_key] = base_url
+        cleaned["gateway_runtime"] = runtime
+    return cleaned
 
 
 # ─── URL Parsing Helpers ──────────────────────────────────────────────────────

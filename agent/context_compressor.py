@@ -4792,6 +4792,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     call_kwargs.update(route)
                 elif route_info is not None:
                     call_kwargs["route_info"] = route_info
+                else:
+                    call_kwargs.update(attempt_summary_route_kwargs())
                 resp = call_llm(**call_kwargs)
                 body = (
                     resp.choices[0].message.content

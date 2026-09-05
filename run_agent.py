@@ -6637,6 +6637,7 @@ class AIAgent:
             if context_scrubber is not None:
                 context_scrubber.reset()
         self._current_streamed_assistant_text = ""
+        self._current_streamed_payload_bytes = 0
 
     def _record_streamed_assistant_text(
         self, text: str, *, admitted: bool = False

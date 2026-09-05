@@ -776,6 +776,7 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    agent._reset_stream_delivery_tracking(flush=False)
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except StreamPayloadBoundExceeded:

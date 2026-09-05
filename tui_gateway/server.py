@@ -12996,11 +12996,14 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                agent.clear_interrupt()
-            except Exception:
-                pass
+    # clear_interrupt() can be wrapped by completion-steer bookkeeping.  Keep
+    # it outside history_lock: the wrapper may need that same non-reentrant
+    # lock to roll back a pending steer.
+    if hasattr(agent, "clear_interrupt"):
+        try:
+            agent.clear_interrupt()
+        except Exception:
+            pass
     # Desktop/TUI observability (#86647): this is the ONE INFO record proving
     # a Desktop/TUI prompt was accepted by THIS process, and it ties together
     # every id a rotation-mute trace needs — the UI session id, the gateway

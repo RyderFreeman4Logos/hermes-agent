@@ -78,6 +78,60 @@ def _process_status(emitted: list) -> list:
     return [args for args in emitted if args and args[0] == "status.update"]
 
 
+def test_admitted_completion_steer_does_not_deadlock_next_turn(monkeypatch):
+    """A completion accepted by steer must not wedge the next admission."""
+    from run_agent import AIAgent
+
+    class _NotStartedThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._pending_steer = None
+    setattr(agent, "_pending_steer_lock", threading.Lock())
+    agent._pending_redirect = None
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._tool_interrupt_reason = None
+    agent._interrupt_thread_signal_pending = False
+    setattr(agent, "_execution_thread_id", None)
+    session = _session(agent=agent, running=True)
+    event = _completion("proc-next-turn-deadlock", 0, "echo done")
+    emitted = []
+
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    assert server._deliver_completions_via_steer("sid-next-turn", session, [event], set())
+    assert agent._pending_steer
+
+    with session["history_lock"]:
+        session["running"] = False
+
+    real_thread = threading.Thread
+    monkeypatch.setattr(server.threading, "Thread", _NotStartedThread)
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda *args, **kwargs: (threading.Event(), types.SimpleNamespace(join=lambda: None)),
+    )
+    result = {}
+
+    def admit_next_turn():
+        result["accepted"] = server._run_prompt_submit(
+            "rid-next-turn", "sid-next-turn", session, "next prompt"
+        )
+
+    thread = real_thread(target=admit_next_turn, daemon=True)
+    thread.start()
+    assert thread.join(1.0) is None
+    assert not thread.is_alive(), "next-turn admission deadlocked"
+    assert result["accepted"] is True
+    assert agent._pending_steer is None
+    assert "_steer_accepted" not in session["_completion_pending"][0]
+
+
 def test_notification_turn_releases_claim_when_prompt_admission_fails(monkeypatch):
     import tools.async_delegation as async_delegation
 

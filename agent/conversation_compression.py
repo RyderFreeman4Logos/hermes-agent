@@ -4626,7 +4626,11 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
-        agent._awaiting_cache_usage_after_compression = True
+        # Arm the post-compression cache latch only after a committed rewrite.
+        # Failed persist rolls _compression_made_progress back to False and
+        # must not over-arm an unrelated later usage.
+        if _compression_made_progress:
+            agent._awaiting_cache_usage_after_compression = True
         # Compaction rewrote the transcript, so the usage anchor's base
         # message-list snapshot no longer describes what will be sent —
         # invalidate it. Context checks fall back to full estimation until
@@ -4805,12 +4809,12 @@ def _compress_context_via_codex_app_server(
             approx_tokens=approx_tokens,
             force=True,
         )
-        # An empty usage report must consume the pending post-compaction verdict
-        # rather than leaving preflight deferral armed until some unrelated later
-        # Codex turn supplies usage. Minimal external test engines may not expose
-        # the ContextEngine update hook; preserve their existing bookkeeping.
+        # Compact RPC usage is bookkeeping: account it, but do not spend the
+        # post-compression latch. The next useful Codex response consumes it.
         if hasattr(agent.context_compressor, "update_from_response"):
-            _record_codex_app_server_usage(agent, result)
+            _record_codex_app_server_usage(
+                agent, result, consume_compression_bound=False
+            )
     except Exception:
         logger.debug("codex compaction bookkeeping failed", exc_info=True)
 

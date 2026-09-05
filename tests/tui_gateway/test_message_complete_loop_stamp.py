@@ -241,3 +241,116 @@ def test_make_agent_wires_cache_callback_on_synthetic_agent(monkeypatch):
     agent = server._make_agent("sid-wire", "session-key")
     assert callable(getattr(agent, "_tui_cache_callback", None))
     assert getattr(agent, "_tui_cache_owner_session", None) == "sid-wire"
+
+
+def _real_shaped_counters(**extra):
+    """Session counters as AIAgent initializes them (zeros, not missing)."""
+    ns = types.SimpleNamespace(
+        session_id="session-key",
+        session_api_calls=0,
+        session_prompt_tokens=0,
+        session_cache_read_tokens=0,
+        session_cache_write_tokens=0,
+        _awaiting_cache_usage_after_compression=False,
+        _first_turn_usage=None,
+        _tui_provider_response_index=0,
+        **extra,
+    )
+    return ns
+
+
+def test_unavailable_first_record_does_not_become_miss_from_zero_counters(
+    frames, turn_env
+):
+    from agent.conversation_loop import _ingest_successful_provider_usage
+
+    class _Agent:
+        def __init__(self):
+            self.__dict__.update(_real_shaped_counters().__dict__)
+
+        def run_conversation(self, _prompt, *, turn_origin="user", **_kwargs):
+            self.session_api_calls = 1
+            self.session_prompt_tokens = 4_000
+            _ingest_successful_provider_usage(
+                self,
+                {
+                    "prompt_tokens": 4_000,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "cache_telemetry": "unavailable",
+                },
+                first_call=True,
+            )
+            return {"final_response": "reply", "messages": []}
+
+        def clear_interrupt(self):
+            return None
+
+    agent = _Agent()
+    session = _session(agent=agent, running=True)
+    sid = "loop-stamp-zero-counters-unavailable"
+    server._sessions[sid] = session
+    try:
+        server._attach_tui_cache_callback(agent, sid)
+        server._run_prompt_submit("rid", sid, session, "wake")
+    finally:
+        server._sessions.pop(sid, None)
+
+    payload = _complete_payloads(frames)[0]
+    assert payload["cache_info"]["state"] == "unavailable"
+    assert "read_tokens" not in payload["cache_info"]
+    assert "prompt_tokens" not in payload["cache_info"]
+    assert payload["cache_info"].get("compression_bound") is not True
+
+
+def test_same_wake_post_compression_usage_publishes_compression_bound(
+    frames, turn_env
+):
+    from agent.conversation_loop import _ingest_successful_provider_usage
+
+    class _Agent:
+        def __init__(self):
+            self.__dict__.update(_real_shaped_counters().__dict__)
+
+        def run_conversation(self, _prompt, *, turn_origin="user", **_kwargs):
+            _ingest_successful_provider_usage(
+                self,
+                {
+                    "prompt_tokens": 2_000,
+                    "cache_read_tokens": 1_900,
+                    "cache_write_tokens": 0,
+                    "cache_telemetry": "reported",
+                },
+                first_call=True,
+            )
+            self._awaiting_cache_usage_after_compression = True
+            _ingest_successful_provider_usage(
+                self,
+                {
+                    "prompt_tokens": 800,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 25,
+                    "cache_telemetry": "reported",
+                },
+                first_call=False,
+            )
+            return {"final_response": "reply", "messages": []}
+
+        def clear_interrupt(self):
+            return None
+
+    agent = _Agent()
+    session = _session(agent=agent, running=True)
+    sid = "loop-stamp-same-wake-bound"
+    server._sessions[sid] = session
+    try:
+        server._attach_tui_cache_callback(agent, sid)
+        server._run_prompt_submit("rid", sid, session, "wake")
+    finally:
+        server._sessions.pop(sid, None)
+
+    payload = _complete_payloads(frames)[0]
+    assert payload["cache_info"]["compression_bound"] is True
+    assert payload["cache_info"]["attribution"] == "post_compression"
+    assert payload["cache_info"]["state"] == "cold_write"
+    assert agent._awaiting_cache_usage_after_compression is False

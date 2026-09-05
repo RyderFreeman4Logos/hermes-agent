@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 CACHE_HIT_ERROR_THRESHOLD = 95
-POST_COMPRESSION_CACHE_NOTE = "post-compression cold prefix (expected)"
 
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")

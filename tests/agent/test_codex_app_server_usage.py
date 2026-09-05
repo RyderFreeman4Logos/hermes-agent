@@ -153,3 +153,50 @@ def test_cache_info_from_usage_marks_post_compression_boundary():
     )
 
     assert info["compression_bound"] is True
+
+
+def test_codex_empty_compact_usage_does_not_clear_bound_latch():
+    from agent.codex_runtime import (
+        _record_codex_app_server_compaction,
+        _record_codex_app_server_usage,
+    )
+
+    agent = _make_agent()
+    agent.context_compressor = SimpleNamespace(
+        compression_count=0,
+        last_compression_rough_tokens=0,
+        last_prompt_tokens=0,
+        last_completion_tokens=0,
+        awaiting_real_usage_after_compression=False,
+        _verify_compaction_cleared_threshold=False,
+    )
+    compact = SimpleNamespace(
+        compacted=True,
+        thread_id="t1",
+        turn_id="c1",
+        token_usage_last=None,
+    )
+
+    _record_codex_app_server_compaction(agent, compact, approx_tokens=4_000, force=True)
+    assert agent._awaiting_cache_usage_after_compression is True
+
+    empty = _record_codex_app_server_usage(
+        agent, compact, consume_compression_bound=False
+    )
+    assert empty["cache_telemetry"] == "unavailable"
+    assert agent._awaiting_cache_usage_after_compression is True
+
+    next_usage = _record_codex_app_server_usage(
+        agent,
+        SimpleNamespace(
+            token_usage_last={
+                "inputTokens": 800,
+                "cachedInputTokens": 0,
+                "outputTokens": 40,
+                "totalTokens": 840,
+            }
+        ),
+    )
+    assert next_usage["cache_telemetry"] == "reported"
+    assert agent._first_turn_usage["cache_attribution"] == "post_compression"
+    assert agent._awaiting_cache_usage_after_compression is False

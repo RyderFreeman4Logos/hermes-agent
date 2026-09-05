@@ -385,7 +385,9 @@ def execute_current(
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
-        return callback(request)
+        return _execute_attempt(
+            request, callback, name=name, model_name=model_name, metadata=metadata
+        )
     return execute(
         request,
         callback,
@@ -409,7 +411,9 @@ async def execute_current_async(
     """Run an async provider attempt under the inherited turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
-        return await callback(request)
+        return await _execute_attempt_async(
+            request, callback, name=name, model_name=model_name, metadata=metadata
+        )
     return await execute_async(
         request,
         callback,

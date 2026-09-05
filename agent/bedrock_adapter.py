@@ -1318,6 +1318,9 @@ def call_converse(
     )
 
     try:
+        from agent import relay_llm
+
+        relay_llm.capture_transport_request(kwargs)
         response = client.converse(**kwargs)
     except Exception as exc:
         if is_stale_connection_error(exc):

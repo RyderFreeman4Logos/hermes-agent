@@ -596,8 +596,8 @@ pr = 182
 name = "fix-terminal-harden-long-task-launch-and-comple"
 title = "fix(terminal): harden long-task launch and completion lifecycle"
 branch = "topic/upgrade-pr13-01-terminal-20260821"
-head = "efcfa6441402559ce8fb35f73321ee7e38c01cad"
-tree = "c8dea189fa191f1de4823e9e154887fb670ffc3f"
+head = "2cd7e0fecaac225f8814f734c8a022ea4fbfabdd"
+tree = "14913128908049b3f8b9c1a4ba8dd145c7cc9d5c"
 base_ref = "pin/official-main-83467c28-20260906"
 base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
 parent = "83467c28f78987acdeb55636fb625946ec572a30"
@@ -609,17 +609,17 @@ unique_on_pin = true
 unique_count = 1
 vs_pin_count = 1
 stacked_prereq_count = 0
-owned_diffsha_vs_base = "6d5a3f72a37dc9a1eafa997fafe9cc01f1e59a94623f801289cdde114d472dfa"
-owned_diff_bytes_vs_base = 25577
-full_diffsha_vs_pin = "6d5a3f72a37dc9a1eafa997fafe9cc01f1e59a94623f801289cdde114d472dfa"
-full_diff_bytes_vs_pin = 25577
+owned_diffsha_vs_base = "6892c1fe55aa7af46eb499e96130ab61774aff9a9d0dae413ab730132317a29f"
+owned_diff_bytes_vs_base = 26477
+full_diffsha_vs_pin = "6892c1fe55aa7af46eb499e96130ab61774aff9a9d0dae413ab730132317a29f"
+full_diff_bytes_vs_pin = 26477
 owned_commits = [
-  "efcfa6441402559ce8fb35f73321ee7e38c01cad",
+  "2cd7e0fecaac225f8814f734c8a022ea4fbfabdd",
 ]
 owned_subjects = [
   "fix(terminal): harden long-task launch and completion lifecycle",
 ]
-notes = "unique-on-pin 1; omitted timeout stays FOREGROUND; omitted background auto-promotes only above threshold (intentional live omission vs some v11 claims)"
+notes = "unique-on-pin 1; replay-safe successor; omitted timeout stays FOREGROUND; omitted background auto-promotes only above threshold; product unchanged; 8 tests migrated; source 28 + composition 55; prefix 24+1 not full 45 green"
 
 [[patch]]
 order = 19

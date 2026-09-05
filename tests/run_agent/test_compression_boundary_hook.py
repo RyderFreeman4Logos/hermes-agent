@@ -285,6 +285,109 @@ class TestCompressionBoundaryHook:
             assert agent.session_id != original_sid
 
 
+_BOUNDARY_CASES = [
+    (mode, outcome)
+    for mode in ("rotation", "in-place", "memory-rotation", "memory-in-place")
+    for outcome in (
+        "success", "success-without-progress-flag", "summary-error", "abort",
+        "noop-copy", "noop-identity", "empty", "fence-cancel",
+        *(("persist-error", "growth") if not mode.startswith("memory") else ()),
+        *(("prompt-error",) if mode == "in-place" else ()),
+    )
+]
+
+
+@pytest.mark.parametrize("mode,outcome", _BOUNDARY_CASES)
+@pytest.mark.parametrize("pending", [False, True], ids=["fresh", "already-pending"])
+def test_public_compression_boundary_outcome_matrix(tmp_path, monkeypatch, mode, outcome, pending):
+    """Admission follows the committed boundary, not the summary progress hint."""
+    import copy
+    from contextlib import ExitStack
+
+    import agent.conversation_compression as compression
+    from hermes_state import SessionDB
+
+    assert Path(compression.__file__).resolve() == Path(__file__).resolve().parents[2] / "agent/conversation_compression.py"
+    memory_only = mode.startswith("memory")
+    in_place = mode.endswith("in-place")
+    with ExitStack() as stack:
+        db = None if memory_only else SessionDB(db_path=tmp_path / "boundary.db")
+        if db is not None:
+            stack.callback(db.close)
+        agent = TestCompressionBoundaryHook()._make_agent(db)
+        agent.compression_in_place = in_place
+        agent._awaiting_cache_usage_after_compression = pending
+        messages = [{"role": "user", "content": "synthetic " * 100}]
+        original_sid = agent.session_id
+        if db is not None:
+            agent._ensure_db_session()
+            db.append_message(original_sid, "user", messages[0]["content"])
+            # This entire input is the durable history, not an unflushed turn.
+            agent._persist_user_message_idx = len(messages)
+        before_rows = db.get_messages(original_sid) if db is not None else None
+        fence = compression.CompressionCommitFence()
+        compressor = MagicMock()
+        compressor.compression_count = 1
+        compressor.last_prompt_tokens = 0
+        compressor.last_completion_tokens = 0
+        compressor._last_summary_error = None
+        compressor._last_aux_model_failure_model = None
+        compressor._last_compress_aborted = outcome == "abort"
+        # Deliberately inconsistent hints: semantic no-op never commits,
+        # and a real publication need not have a plugin progress flag.
+        compressor._last_compression_made_progress = outcome != "success-without-progress-flag"
+        compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+        if outcome == "summary-error":
+            compressor.compress.side_effect = RuntimeError("synthetic summary failure")
+        elif outcome in {"noop-copy", "noop-identity"}:
+            compressor.compress.side_effect = lambda rows, **kwargs: (
+                copy.deepcopy(rows) if outcome == "noop-copy" else rows
+            )
+        elif outcome == "empty":
+            compressor.compress.return_value = []
+        elif outcome == "growth":
+            compressor.compress.return_value = [{"role": "user", "content": "synthetic " * 1000}]
+            monkeypatch.setattr("agent.context_compressor.salvage_grown_transcript", lambda *a, **k: None)
+        elif outcome == "fence-cancel":
+            def cancel(rows, **kwargs):
+                assert fence.cancel_before_commit()
+                return [{"role": "user", "content": "summary"}]
+            compressor.compress.side_effect = cancel
+        agent.context_compressor = compressor
+        persist = None
+        if db is not None:
+            method = "archive_and_compact" if in_place else "publish_compression_child"
+            persist = stack.enter_context(patch.object(db, method, wraps=getattr(db, method)))
+            if outcome == "persist-error":
+                persist.side_effect = RuntimeError("synthetic persist failure")
+            if outcome == "prompt-error":
+                stack.enter_context(patch.object(db, "update_system_prompt", side_effect=RuntimeError("synthetic prompt failure")))
+        if outcome == "summary-error":
+            with pytest.raises(RuntimeError, match="synthetic summary failure"):
+                agent._compress_context(messages, "sys", approx_tokens=1000, commit_fence=fence)
+        else:
+            agent._compress_context(messages, "sys", approx_tokens=1000, commit_fence=fence)
+        success = outcome.startswith("success")
+        assert agent._awaiting_cache_usage_after_compression is (pending or success)
+        assert compressor.compress.call_count == 1
+        if persist is not None:
+            assert persist.call_count == int(success or outcome in {"persist-error", "prompt-error"})
+            if success:
+                assert db.get_messages(agent.session_id) != before_rows
+                assert (agent.session_id != original_sid) == (not in_place)
+                assert agent._last_compaction_in_place is in_place
+            elif outcome != "prompt-error":
+                # Prompt-update failure is after archive committed: this test
+                # claims only latch admission, not a new transcript rollback.
+                assert db.get_messages(original_sid) == before_rows
+        else:
+            assert agent._session_db is None
+            assert agent.session_id == original_sid
+        notifications = [c for c in compressor.on_session_start.call_args_list
+                         if c.kwargs.get("boundary_reason") == "compression"]
+        assert len(notifications) == int(success and not memory_only)
+
+
 class TestSessionCompressEvent:
     """The session:compress event_callback fires after a compression split."""
 

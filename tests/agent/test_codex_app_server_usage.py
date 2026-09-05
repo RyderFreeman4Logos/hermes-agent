@@ -200,3 +200,100 @@ def test_codex_empty_compact_usage_does_not_clear_bound_latch():
     assert next_usage["cache_telemetry"] == "reported"
     assert agent._first_turn_usage["cache_attribution"] == "post_compression"
     assert agent._awaiting_cache_usage_after_compression is False
+
+
+_CODEX_USAGE = {
+    "empty": None,
+    "unavailable": {"inputTokens": 800},
+    "null": {"inputTokens": 800, "cachedInputTokens": None},
+    "zero": {"inputTokens": 800, "cachedInputTokens": 0},
+    "hit": {"inputTokens": 40, "cachedInputTokens": 760},
+}
+
+
+@pytest.mark.parametrize("compact_usage", _CODEX_USAGE)
+@pytest.mark.parametrize("next_usage", _CODEX_USAGE)
+def test_public_codex_compact_bookkeeping_matrix(compact_usage, next_usage):
+    """Compact RPC accounting is not the next real-response cache observation."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    from agent.conversation_compression import compress_context
+    from agent.transports.codex_app_server_session import TurnResult
+
+    assert Path(compress_context.__code__.co_filename).resolve() == Path(__file__).resolve().parents[2] / "agent/conversation_compression.py"
+    agent = _make_agent()
+    agent.api_mode = "codex_app_server"
+    agent._cached_system_prompt = "synthetic"
+    agent._emit_status = lambda *a, **k: None
+    agent._emit_warning = lambda *a, **k: None
+    agent._awaiting_cache_usage_after_compression = False
+    agent.context_compressor = SimpleNamespace(
+        compression_count=0, update_from_response=lambda usage: None,
+    )
+    compact = TurnResult(token_usage_last=_CODEX_USAGE[compact_usage])
+    agent._codex_session = MagicMock()
+    agent._codex_session.compact_thread.return_value = compact
+    events = []
+    agent._tui_cache_callback = lambda *args: events.append(args)
+    messages = [{"role": "user", "content": "synthetic"}]
+    returned, _ = compress_context(agent, messages, "sys", force=True)
+    assert returned is messages  # Codex, not Hermes, owns the rewritten thread.
+    assert agent._codex_session.compact_thread.call_count == 1
+    assert agent.context_compressor.compression_count == 1
+    assert agent.session_api_calls == 1  # Proves accounting was not swallowed.
+    assert not events
+    assert agent._awaiting_cache_usage_after_compression is True
+    usage = _record_codex_app_server_usage(agent, TurnResult(token_usage_last=_CODEX_USAGE[next_usage]))
+    assert agent._awaiting_cache_usage_after_compression is False
+    if next_usage == "empty":
+        assert not events
+        assert usage == {"cache_telemetry": "unavailable"}
+    else:
+        assert events[-1][4]["attribution"] == "post_compression"
+        info = server._cache_info_from_usage(agent._first_turn_usage)
+        assert info.get("compression_bound") is True
+        assert info["state"] == {"unavailable": "unavailable", "null": "unavailable", "zero": "miss", "hit": "hit"}[next_usage]
+        assert ("read_tokens" in info) == (next_usage in {"zero", "hit"})
+    _record_codex_app_server_usage(agent, TurnResult(token_usage_last=_CODEX_USAGE["zero"]))
+    assert "cache_attribution" not in agent._first_turn_usage
+    assert "attribution" not in events[-1][4]
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "error", "interrupted", "exception", "native", "off", "no-thread", "fence-cancel"])
+def test_public_codex_boundary_outcome_matrix(pending, outcome):
+    from unittest.mock import MagicMock
+
+    from agent.conversation_compression import CompressionCommitFence, compress_context
+    from agent.transports.codex_app_server_session import TurnResult
+
+    agent = _make_agent()
+    agent.api_mode = "codex_app_server"
+    agent.codex_app_server_auto_compaction = outcome if outcome in {"native", "off"} else "hermes"
+    agent._cached_system_prompt = "synthetic"
+    agent._emit_status = lambda *a, **k: None
+    agent._emit_warning = lambda *a, **k: None
+    agent._awaiting_cache_usage_after_compression = pending
+    agent.context_compressor = SimpleNamespace(compression_count=0, update_from_response=lambda usage: None)
+    rpc = MagicMock()
+    rpc.compact_thread.return_value = TurnResult(
+        error="synthetic" if outcome == "error" else None,
+        interrupted=outcome == "interrupted",
+    )
+    if outcome == "exception":
+        rpc.compact_thread.side_effect = RuntimeError("synthetic compact failure")
+    agent._codex_session = None if outcome == "no-thread" else rpc
+    fence = CompressionCommitFence()
+    if outcome == "fence-cancel":
+        assert fence.cancel_before_commit()
+    messages = [{"role": "user", "content": "synthetic"}]
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="synthetic compact failure"):
+            compress_context(agent, messages, "sys", commit_fence=fence)
+    else:
+        returned, _ = compress_context(agent, messages, "sys", commit_fence=fence)
+        assert returned is messages
+    assert agent._awaiting_cache_usage_after_compression is (pending or outcome == "success")
+    assert rpc.compact_thread.call_count == int(outcome in {"success", "error", "interrupted", "exception"})
+    assert agent.context_compressor.compression_count == int(outcome == "success")

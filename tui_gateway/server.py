@@ -7184,26 +7184,20 @@ def _get_usage(agent) -> dict:
 def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
     if not isinstance(record, dict):
         return {"state": "unavailable", "pct": 0}
+    state = str(record.get("state") or "unavailable")
+    if state == "no_field":
+        state = "unavailable"
     info: dict[str, int | str] = {
-        "state": str(record.get("state") or "unavailable"),
-        "pct": int(record.get("pct") or 0),
+        "state": state,
+        "pct": int(record.get("pct") or 0) if state != "unavailable" else 0,
     }
-    for key in ("read_tokens", "prompt_tokens"):
-        if key in record:
-            try:
-                info[key] = max(0, int(record[key]))
-            except (TypeError, ValueError):
-                pass
-    if info["state"] == "no_field":
-        return {
-            "state": "unavailable",
-            "pct": 0,
-            **(
-                {"attribution": "post_compression", "compression_bound": True}
-                if record.get("attribution") == "post_compression"
-                else {}
-            ),
-        }
+    if state != "unavailable":
+        for key in ("read_tokens", "prompt_tokens"):
+            if key in record:
+                try:
+                    info[key] = max(0, int(record[key]))
+                except (TypeError, ValueError):
+                    pass
     if record.get("attribution") == "post_compression":
         info["attribution"] = "post_compression"
         info["compression_bound"] = True
@@ -7211,28 +7205,30 @@ def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
 
 
 def _cache_info_from_usage(usage: Any) -> dict[str, int | str]:
+    info: dict[str, int | str] = {"state": "unavailable", "pct": 0}
     if not isinstance(usage, dict):
-        return {"state": "unavailable", "pct": 0}
+        return info
+    # Boundary provenance is independent of numeric telemetry availability.
+    if usage.get("cache_attribution") == "post_compression":
+        info["attribution"] = "post_compression"
+        info["compression_bound"] = True
+    if usage.get("cache_telemetry") != "reported":
+        return info
     try:
         read_tokens = max(0, int(usage.get("cache_read_tokens", 0) or 0))
         write_tokens = max(0, int(usage.get("cache_write_tokens", 0) or 0))
         prompt_tokens = max(0, int(usage.get("prompt_tokens", 0) or 0))
     except (TypeError, ValueError):
-        return {"state": "unavailable", "pct": 0}
-    if usage.get("cache_telemetry") != "reported":
-        return {"state": "unavailable", "pct": 0}
+        return info
     pct = cache_hit_percent(read_tokens, prompt_tokens)
     state = "hit" if read_tokens else "cold_write" if write_tokens else "miss"
-    info: dict[str, int | str] = {
+    info.update({
         "read_tokens": read_tokens,
         "prompt_tokens": prompt_tokens,
         "pct": pct,
         "state": state,
         "level": "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info",
-    }
-    if usage.get("cache_attribution") == "post_compression":
-        info["attribution"] = "post_compression"
-        info["compression_bound"] = True
+    })
     return info
 
 
@@ -7250,11 +7246,13 @@ def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
         return
     session = _sessions.get(sid) or {}
     agent = session.get("agent")
-    info = _cache_info_from_first_call(session.get("first_provider_response"))
-    if info["state"] == "unavailable" and "read_tokens" not in info and "prompt_tokens" not in info:
+    record = session.get("first_provider_response")
+    # An observed unknown record is authoritative too; only absence falls back.
+    if isinstance(record, dict):
+        info = _cache_info_from_first_call(record)
+    else:
         usage = getattr(agent, "_first_turn_usage", None) if agent is not None else None
-        if isinstance(usage, dict):
-            info = _cache_info_from_usage(usage)
+        info = _cache_info_from_usage(usage)
     session["first_provider_response"] = {
         **info,
         "owner": "tui_gateway",
@@ -7291,19 +7289,17 @@ def _attach_tui_cache_callback(agent, sid: str):
         if already and not post_compression:
             return
         agent._tui_first_provider_response_recorded = True
-        cache_info = _cache_info_from_usage(getattr(agent, "_first_turn_usage", None))
-        if cache_info["state"] == "unavailable":
-            cache_info = (
-                {"state": "unavailable", "pct": 0}
-                if state == "no_field"
-                else {
-                    "read_tokens": max(0, int(_read or 0)),
-                    "prompt_tokens": max(0, int(_prompt or 0)),
-                    "pct": pct,
-                    "state": state,
-                    "level": "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info",
-                }
-            )
+        usage = getattr(agent, "_first_turn_usage", None)
+        cache_info = _cache_info_from_usage(usage)
+        if not isinstance(usage, dict):
+            cache_info = _cache_info_from_first_call({
+                "state": state,
+                "pct": pct,
+                "read_tokens": _read,
+                "prompt_tokens": _prompt,
+            })
+            if cache_info["state"] != "unavailable":
+                cache_info["level"] = "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info"
         if isinstance(record, dict) and record.get("attribution") == "post_compression":
             cache_info["attribution"] = "post_compression"
             cache_info["compression_bound"] = True

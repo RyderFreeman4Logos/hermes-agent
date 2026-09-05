@@ -437,8 +437,8 @@ pr = 178
 name = "fix-cache-preserve-stable-prefix-routing-after"
 title = "fix(cache): preserve stable-prefix routing after compression"
 branch = "topic/176-short-gap-cache-20260821"
-head = "4ff7c811ec8382116a0718a8db40c6ad21d33d7d"
-tree = "725a169599ea9c57ce944e25f9b71b1f111e202d"
+head = "c050a05041c699684cd28a9d428402ed79560101"
+tree = "fffd8c32cf3a4be122a02f28d77235e29c7623ff"
 base_ref = "pin/official-main-83467c28-20260906"
 base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
 parent = "dda1754cea1c9ffd532c836f5949b15f4ca7c4a3"
@@ -450,13 +450,13 @@ unique_on_pin = true
 unique_count = 2
 vs_pin_count = 2
 stacked_prereq_count = 0
-owned_diffsha_vs_base = "b24db86a2ce0a5b3ad84b82c0dfa168ee26bd6bd532bac72260b9a1c068f96a6"
-owned_diff_bytes_vs_base = 7242
-full_diffsha_vs_pin = "b24db86a2ce0a5b3ad84b82c0dfa168ee26bd6bd532bac72260b9a1c068f96a6"
-full_diff_bytes_vs_pin = 7242
+owned_diffsha_vs_base = "302206d5280771a77bc34b3d6832e0574eafd3cee1931154c993ea0c145e6272"
+owned_diff_bytes_vs_base = 7248
+full_diffsha_vs_pin = "302206d5280771a77bc34b3d6832e0574eafd3cee1931154c993ea0c145e6272"
+full_diff_bytes_vs_pin = 7248
 owned_commits = [
   "dda1754cea1c9ffd532c836f5949b15f4ca7c4a3",
-  "4ff7c811ec8382116a0718a8db40c6ad21d33d7d",
+  "c050a05041c699684cd28a9d428402ed79560101",
 ]
 owned_subjects = [
   "test(tui): cover compression-bound cache explanation",

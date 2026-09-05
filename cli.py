@@ -8846,7 +8846,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.provider = self.requested_provider = resolved["provider"]
             self.api_key = resolved.get("api_key") or ""
             self.base_url = resolved["base_url"]
-            self.api_mode = resolved.get("api_mode") or ""
+            self.api_mode = _stored_runtime.get("api_mode") or resolved.get("api_mode") or ""
             self._credential_pool = resolved.get("credential_pool")
             self._explicit_api_key = None
             self._explicit_base_url = self.base_url

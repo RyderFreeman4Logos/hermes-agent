@@ -1267,7 +1267,7 @@ def test_real_lock_api_internal_errors_fail_closed_skips_compression(
     parent_sid = "ERRORING_LOCK_TEST"
     db.create_session(parent_sid, source="discord")
 
-    def _fail_lock_write(_fn):
+    def _fail_lock_write(_fn, **_kwargs):
         raise error
 
     monkeypatch.setattr(db, "_execute_write", _fail_lock_write)

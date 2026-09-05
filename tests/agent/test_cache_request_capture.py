@@ -678,3 +678,302 @@ def test_auxiliary_direct_and_deadline_capture_before_failure(monkeypatch):
     assert events[0][1] == events[1][1] == direct
     assert events[2][1] == events[3][1]
     assert events[2][1]["model"] == "deadline"
+
+
+def test_auxiliary_stream_and_fallback_openers_capture_before_sdk(monkeypatch):
+    from agent import auxiliary_client as auxiliary, relay_llm
+
+    events = []
+
+    class Completions:
+        def create(self, **kwargs):
+            events.append(("open", dict(kwargs)))
+            if kwargs.get("stream"):
+                raise RuntimeError("stream not supported")
+            return "response"
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: events.append(("capture", dict(request))),
+    )
+    monkeypatch.setattr(auxiliary, "_aux_progress_active", lambda: True)
+
+    request = {"model": "aux-stream", "messages": []}
+    result = auxiliary._create_with_progress(client, request)
+
+    assert result == "response"
+    assert [kind for kind, _request in events] == ["capture", "open"] * 2
+    assert events[0][1] == events[1][1]
+    assert events[0][1]["stream"] is True
+    assert events[2][1] == events[3][1] == request
+
+
+def test_create_bounded_is_used_for_deadline_create_with_progress(monkeypatch):
+    from agent import auxiliary_client as auxiliary, relay_llm
+
+    events = []
+    bounded = []
+
+    class Completions:
+        def create(self, **kwargs):
+            events.append(("open", dict(kwargs)))
+            raise RuntimeError("opener failed")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    real_bounded = auxiliary._create_bounded
+
+    def wrapped(create_fn, timeout_s):
+        bounded.append(timeout_s)
+        return real_bounded(create_fn, timeout_s)
+
+    monkeypatch.setattr(auxiliary, "_create_bounded", wrapped)
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: events.append(("capture", dict(request))),
+    )
+
+    deadline = {"model": "deadline", "messages": [], "timeout": 1}
+    with auxiliary.aux_host_candidate_deadline(1):
+        with pytest.raises(RuntimeError, match="opener failed"):
+            auxiliary._create_with_progress(client, deadline)
+
+    assert bounded == [1]
+    assert [kind for kind, _request in events] == ["capture", "open"]
+    assert events[0][1] == events[1][1]
+    assert events[0][1]["model"] == "deadline"
+
+
+def test_codex_runtime_stream_opener_captures_before_sdk(monkeypatch):
+    from agent import codex_runtime, relay_llm
+
+    events = []
+
+    class Client:
+        def __init__(self):
+            self.responses = self
+
+        def create(self, **kwargs):
+            events.append(("open", dict(kwargs)))
+            raise RuntimeError("codex opener failed")
+
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: events.append(("capture", dict(request))),
+    )
+
+    agent = SimpleNamespace(
+        _interrupt_requested=False,
+        session_id="",
+        provider="openai-codex",
+        _fire_stream_delta=lambda text: None,
+        _fire_reasoning_delta=lambda text: None,
+        _fire_streamed_codex_commentary=lambda text: None,
+        _touch_activity=lambda *args, **kwargs: None,
+        _is_codex_backend=lambda: False,
+        _claim_stream_writer=lambda: object(),
+    )
+    with pytest.raises(RuntimeError, match="codex opener failed"):
+        codex_runtime.run_codex_stream(agent, {"model": "codex-m"}, client=Client())
+
+    assert [kind for kind, _request in events] == ["capture", "open"]
+    assert events[0][1] == events[1][1]
+    assert events[0][1]["stream"] is True
+
+
+def test_execute_current_no_turn_sets_capture_context(monkeypatch, tmp_path):
+    from agent import relay_llm, relay_runtime
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    monkeypatch.setattr(relay_runtime, "active_turn", lambda: None)
+
+    def callback(request):
+        relay_llm.capture_transport_request(request)
+        return "ok"
+
+    result = relay_llm.execute_current(
+        {"model": "m", "messages": []},
+        callback,
+        name="provider",
+        model_name="m",
+        metadata={
+            "api_mode": "chat_completions",
+            "route": "https://provider.example.test/v1",
+            "api_request_id": "no-turn:0",
+        },
+    )
+
+    assert result == "ok"
+    captures = _captures(tmp_path)
+    assert len(captures) == 1
+    assert captures[0]["route"]["provider"] == "provider"
+
+
+@pytest.mark.asyncio
+async def test_execute_current_async_no_turn_sets_capture_context(
+    monkeypatch, tmp_path
+):
+    from agent import relay_llm, relay_runtime
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    monkeypatch.setattr(relay_runtime, "active_turn", lambda: None)
+
+    async def callback(request):
+        relay_llm.capture_transport_request(request)
+        return "ok"
+
+    result = await relay_llm.execute_current_async(
+        {"model": "m", "messages": []},
+        callback,
+        name="provider",
+        model_name="m",
+        metadata={
+            "api_mode": "chat_completions",
+            "route": "https://provider.example.test/v1",
+            "api_request_id": "no-turn-async:0",
+        },
+    )
+
+    assert result == "ok"
+    captures = _captures(tmp_path)
+    assert len(captures) == 1
+
+
+def test_codex_direct_auxiliary_stream_captures_once(monkeypatch, tmp_path):
+    from agent import auxiliary_client as auxiliary
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    opened = []
+    base_url = "https://chatgpt.com/backend-api/codex"
+
+    class Responses:
+        def create(self, **kwargs):
+            opened.append(dict(kwargs))
+            return SimpleNamespace(output=[], usage=None)
+
+    real_client = SimpleNamespace(
+        api_key="[REDACTED]",
+        base_url=base_url,
+        responses=Responses(),
+        close=lambda: None,
+    )
+    client = auxiliary.CodexAuxiliaryClient(real_client, "gpt-5.4")
+    monkeypatch.setattr(
+        auxiliary,
+        "_resolve_task_provider_model",
+        lambda *args, **kwargs: (
+            "openai-codex",
+            "gpt-5.4",
+            base_url,
+            "[REDACTED]",
+            "codex_responses",
+        ),
+    )
+    monkeypatch.setattr(
+        auxiliary,
+        "_get_cached_client",
+        lambda *args, **kwargs: (client, "gpt-5.4"),
+    )
+    monkeypatch.setattr(auxiliary, "_get_task_extra_body", lambda task: {})
+    monkeypatch.setattr(
+        auxiliary, "_effective_provider_for_client", lambda *args: "openai-codex"
+    )
+    monkeypatch.setattr(auxiliary, "_acquire_sync_aux_semaphore", lambda task: None)
+    monkeypatch.setattr(
+        auxiliary,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+    result = auxiliary.call_llm(
+        task="moa_aggregator",
+        provider="openai-codex",
+        model="gpt-5.4",
+        messages=[{"role": "user", "content": "hello"}],
+        stream=True,
+    )
+
+    assert result.choices
+    assert len(opened) == 1
+    captures = _captures(tmp_path)
+    assert len(captures) == 1
+    saved = captures[0]
+    assert saved["route"]["provider"] == "openai-codex"
+    assert saved["route"]["api_mode"] == "codex_responses"
+    assert saved["request"] == opened[0]
+
+
+@pytest.mark.asyncio
+async def test_async_codex_fallback_captures_once(monkeypatch, tmp_path):
+    from agent import auxiliary_client as auxiliary
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    opened = []
+
+    class Responses:
+        def create(self, **kwargs):
+            opened.append(dict(kwargs))
+            return SimpleNamespace(output=[], usage=None)
+
+    real_client = SimpleNamespace(
+        api_key="[REDACTED]",
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=Responses(),
+        close=lambda: None,
+    )
+    client = auxiliary.AsyncCodexAuxiliaryClient(
+        auxiliary.CodexAuxiliaryClient(real_client, "gpt-5.4")
+    )
+
+    @auxiliary._relay_auxiliary_call_async
+    async def run(task):
+        auxiliary._set_relay_auxiliary_route(
+            "openai-codex", "gpt-5.4", "codex_responses"
+        )
+        return await auxiliary._relay_async_completion(
+            client, {"model": "gpt-5.4", "messages": []}
+        )
+
+    await run("title_generation")
+
+    assert len(opened) == 1
+    assert len(_captures(tmp_path)) == 1
+
+
+def test_bedrock_nonstream_converse_captures_before_sdk(monkeypatch):
+    from agent import bedrock_adapter, relay_llm
+
+    opened = []
+    captured = []
+
+    class Client:
+        def converse(self, **kwargs):
+            opened.append(dict(kwargs))
+            return {"output": {"message": {"content": [{"text": "ok"}]}}}
+
+    monkeypatch.setattr(
+        bedrock_adapter, "_get_bedrock_runtime_client", lambda region: Client()
+    )
+    monkeypatch.setattr(
+        bedrock_adapter, "normalize_converse_response", lambda response: response
+    )
+    monkeypatch.setattr(
+        relay_llm,
+        "capture_transport_request",
+        lambda request: captured.append(dict(request)),
+    )
+
+    bedrock_adapter.call_converse(
+        "us-east-1", "m", [{"role": "user", "content": [{"text": "x"}]}]
+    )
+
+    assert captured == opened

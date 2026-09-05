@@ -79,6 +79,77 @@ def test_bare_cli_route_without_endpoint_is_rejected(config_boundary):
     assert written["provider"] == "unresolved"
 
 
+@pytest.mark.parametrize("consumer", CONSUMERS)
+def test_applied_route_replaces_old_nested_gateway_route(consumer, config_boundary, tmp_path):
+    db = SessionDB(db_path=tmp_path / "nested.db")
+    try:
+        db.create_session(session_id="route", source="cli", model=MODEL)
+        db.patch_session_model_config("route", {"gateway_runtime": {
+            "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+        }})
+        result = ms.ModelSwitchResult(success=True, new_model=MODEL, target_provider="custom:lab",
+                                      base_url=PRIVATE, api_key="route-key", reasoning_config={})
+        route = produce("applied", result, db)
+        assert route["provider"] == "custom:lab"
+        if consumer.startswith("cli"):
+            obj = cli_agent("custom:lab" if consumer == "cli-same" else "openrouter")
+            obj._restore_session_model(db.get_session("route"))
+            assert obj.base_url == PRIVATE and obj.api_key == "route-key"
+        elif consumer == "gateway":
+            obj = object.__new__(gateway.GatewayRunner)
+            obj._session_model_overrides = {}
+            obj.session_store = SimpleNamespace(get_model_override=lambda _: {"model": MODEL, **route})
+            obj._rehydrate_session_model_override("route")
+            _, runtime = obj._resolve_session_agent_runtime(session_key="route", user_config={})
+            assert runtime["base_url"] == PRIVATE and runtime["api_key"] == "route-key"
+        else:
+            obj = agent()
+            obj._session_init_model_config = {"pending_model_switch_after_compression": {"model": MODEL, **route}}
+            restored = ms.restore_model_switch_after_compression(obj)
+            assert restored is not None
+            assert restored.base_url == PRIVATE and restored.api_key == "route-key"
+    finally:
+        db.close()
+
+
+def test_real_db_rollback_preserves_absent_billing_identity(config_boundary, tmp_path):
+    db = SessionDB(db_path=tmp_path / "rollback.db")
+    try:
+        db.create_session(session_id="route", source="cli", model="ambient-model")
+        obj = agent()
+        obj._session_db, obj.session_id = db, "route"
+        result = ms.ModelSwitchResult(success=True, new_model=MODEL, target_provider="custom:lab",
+                                      base_url=PRIVATE, api_key="route-key", reasoning_config={})
+        ms.schedule_model_switch_after_compression(obj, result)
+        before = db.get_session("route")["model_config"]
+        obj._deferred_model_switch_fault_after = "db"
+        assert ms.apply_model_switch_after_compression(obj) == "failed"
+        row = db.get_session("route")
+        assert not row["billing_provider"]
+        assert row["model_config"] == before and row["model"] == "ambient-model"
+        assert obj.model == "ambient-model" and obj.base_url == OTHER and obj.api_key == "ambient-key"
+        assert ms.get_model_switch_after_compression(obj) is result
+    finally:
+        db.close()
+
+
+def test_gateway_store_read_failure_cannot_fall_back(config_boundary, monkeypatch):
+    obj = object.__new__(gateway.GatewayRunner)
+    obj._session_model_overrides = {}
+
+    def ambient_forbidden():
+        raise AssertionError("ambient resolution after a store failure")
+
+    monkeypatch.setattr(gateway, "_resolve_runtime_agent_kwargs", ambient_forbidden)
+
+    def unavailable(_):
+        raise OSError("synthetic store unavailable")
+
+    obj.session_store = SimpleNamespace(get_model_override=unavailable)
+    with pytest.raises(ValueError, match="restore.*route"):
+        obj._resolve_session_agent_runtime(session_key="route", user_config={})
+
+
 def test_catalog_route_real_resolution(config_boundary, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-route-key")
     public = "https://openrouter.ai/api/v1"

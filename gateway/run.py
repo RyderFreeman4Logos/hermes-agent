@@ -27352,10 +27352,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             persisted = store.get_model_override(session_key)
         except Exception:
-            logger.debug(
-                "Failed to read persisted session model override", exc_info=True
-            )
-            return
+            raise ValueError("Cannot restore saved model route; session store unavailable") from None
         if not persisted:
             return
         from hermes_cli.runtime_provider import resolve_persisted_model_route

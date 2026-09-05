@@ -1289,7 +1289,14 @@ def _classify_by_status(
                 should_fallback=True,
                 # A same-session xAI OAuth Grok success can follow this exact
                 # 403 (#209), so it is not proof that the credential is spent.
-                error_context={"billing_unverified": True} if xai_spending_limit else {},
+                error_context=(
+                    {
+                        "billing_unverified": True,
+                        "xai_spending_limit": True,
+                    }
+                    if xai_spending_limit
+                    else {}
+                ),
             )
         return result_fn(
             FailoverReason.auth,

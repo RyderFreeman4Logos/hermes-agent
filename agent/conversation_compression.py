@@ -4626,6 +4626,7 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
+        agent._awaiting_cache_usage_after_compression = True
         # Compaction rewrote the transcript, so the usage anchor's base
         # message-list snapshot no longer describes what will be sent —
         # invalidate it. Context checks fall back to full estimation until

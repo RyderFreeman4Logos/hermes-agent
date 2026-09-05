@@ -4245,7 +4245,20 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     _ingest_successful_provider_usage(
-                        agent, usage_dict, first_call=api_call_count == 1
+                        agent,
+                        # Cache provenance belongs to this response, not advisor spend.
+                        {
+                            "prompt_tokens": aggregator_usage.prompt_tokens,
+                            "completion_tokens": aggregator_usage.output_tokens,
+                            "total_tokens": aggregator_usage.total_tokens,
+                            "input_tokens": aggregator_usage.input_tokens,
+                            "output_tokens": aggregator_usage.output_tokens,
+                            "cache_read_tokens": aggregator_usage.cache_read_tokens,
+                            "cache_write_tokens": aggregator_usage.cache_write_tokens,
+                            "cache_telemetry": aggregator_usage.cache_telemetry,
+                            "reasoning_tokens": aggregator_usage.reasoning_tokens,
+                        },
+                        first_call=api_call_count == 1,
                     )
                     # Capture the boundary latch before update_from_response()
                     # consumes it. Only a real provider prompt count for the

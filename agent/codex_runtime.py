@@ -23,6 +23,10 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.stream_payload_bound import (
+    StreamPayloadBoundExceeded,
+    authoritative_stream_text,
+)
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
@@ -640,11 +644,28 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         # codex_responses commentary channel).
         if not getattr(agent, "show_commentary", True):
             return
+        completed_text = authoritative_stream_text(agent)
+        if not completed_text:
+            fire = getattr(agent, "_fire_stream_delta", None)
+            if fire is None:
+                return
+            try:
+                fire(text, interim=True)
+            except StreamPayloadBoundExceeded:
+                raise
+            except Exception:
+                logger.debug("_fire_stream_delta raised", exc_info=True)
+                return
+            completed_text = authoritative_stream_text(agent)
+        if not completed_text.strip():
+            return
         emit = getattr(agent, "_emit_interim_assistant_message", None)
         if emit is None:
             return
         try:
-            emit({"role": "assistant", "content": text})
+            emit({"role": "assistant", "content": completed_text})
+        except StreamPayloadBoundExceeded:
+            raise
         except Exception:
             logger.debug(
                 "_emit_interim_assistant_message raised", exc_info=True,
@@ -772,8 +793,16 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    agent._reset_stream_delivery_tracking(flush=False)
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
+    except StreamPayloadBoundExceeded:
+        try:
+            agent._codex_session.close()
+        except Exception:
+            pass
+        agent._codex_session = None
+        raise
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -838,6 +867,23 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
+
+    if turn.interrupted or turn.error is not None:
+        partial_text = authoritative_stream_text(agent)
+        turn.final_text = partial_text
+        turn.projected_messages = [
+            message
+            for message in turn.projected_messages
+            if not (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and not message.get("tool_calls")
+            )
+        ]
+        if partial_text:
+            turn.projected_messages.append(
+                {"role": "assistant", "content": partial_text}
+            )
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
@@ -1217,12 +1263,16 @@ def _consume_codex_event_stream(
                 if on_commentary_message is None and on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
+                    except StreamPayloadBoundExceeded:
+                        raise
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text and active_message_phase == "analysis":
                 if on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
+                    except StreamPayloadBoundExceeded:
+                        raise
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text:
@@ -1238,6 +1288,8 @@ def _consume_codex_event_stream(
                     if on_text_delta is not None:
                         try:
                             on_text_delta(delta_text)
+                        except StreamPayloadBoundExceeded:
+                            raise
                         except Exception:
                             logger.debug("Codex stream on_text_delta raised", exc_info=True)
             continue
@@ -1282,6 +1334,8 @@ def _consume_codex_event_stream(
                     active_summary_index = summary_index
                 try:
                     on_reasoning_delta(reasoning_text)
+                except StreamPayloadBoundExceeded:
+                    raise
                 except Exception:
                     logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             continue
@@ -1325,6 +1379,8 @@ def _consume_codex_event_stream(
                     if commentary_text:
                         try:
                             on_commentary_message(commentary_text)
+                        except StreamPayloadBoundExceeded:
+                            raise
                         except Exception:
                             logger.debug(
                                 "Codex stream on_commentary_message raised",
@@ -1605,10 +1661,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
+    deltas_were_sent = {"yes": False}
 
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
-        agent._fire_stream_delta(text)
+        deltas_were_sent["yes"] = (
+            agent._fire_stream_delta(text) or deltas_were_sent["yes"]
+        )
 
     def _on_reasoning_delta(text: str) -> None:
         agent._fire_reasoning_delta(text)
@@ -1742,6 +1801,23 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if deltas_were_sent["yes"]:
+                    partial_text = authoritative_stream_text(agent)
+                    return SimpleNamespace(
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=partial_text)],
+                        )],
+                        output_text=partial_text,
+                        usage=None,
+                        status="completed",
+                        id=None,
+                        model=api_kwargs.get("model"),
+                        incomplete_details=None,
+                        error=None,
+                    )
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -1749,6 +1825,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         attempt + 1, max_stream_retries + 1,
                         agent._client_log_context(), exc,
                     )
+                    agent._codex_streamed_text_parts.clear()
+                    agent._reset_stream_delivery_tracking(flush=False)
                     continue
                 _log_codex_request_failure(
                     agent,

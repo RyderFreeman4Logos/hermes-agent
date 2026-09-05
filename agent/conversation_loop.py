@@ -1938,6 +1938,7 @@ def run_conversation(
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
+    agent._queued_interim_texts = set()
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
@@ -2011,6 +2012,7 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        agent._reset_stream_delivery_tracking(flush=False)
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,

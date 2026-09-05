@@ -258,8 +258,13 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
     """Return True when ``msg`` is internal recovery scaffolding that must never
     be persisted to the durable transcript (SQLite session store or JSON log)."""
-    return isinstance(msg, dict) and any(
-        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
+    return isinstance(msg, dict) and (
+        any(msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS)
+        or (
+            msg.get("role") == "system"
+            and msg.get("display_kind") == "hidden"
+            and str(msg.get("content", "")).startswith("[Agent loop timing]")
+        )
     )
 
 
@@ -6574,8 +6579,9 @@ class AIAgent:
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
-    def _reset_stream_delivery_tracking(self) -> None:
+    def _reset_stream_delivery_tracking(self, *, flush: bool = True) -> None:
         """Reset tracking for text delivered during the current model response."""
+        return self._complete_stream_delivery_tracking(flush=flush)
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
         # turned out not to be a tag prefix should reach the UI.  Then
@@ -6615,18 +6621,45 @@ class AIAgent:
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
 
-    def _record_streamed_assistant_text(self, text: str) -> None:
-        """Accumulate visible assistant text emitted through stream callbacks."""
-        # Single-writer guard (#65991): a superseded stream must not pollute the
-        # turn's accumulated text (which also feeds the interim-visible-text
-        # de-dup comparison), even when a caller reaches this directly (the
-        # tool-suppressed content path) rather than through _fire_stream_delta.
+    def _complete_stream_delivery_tracking(self, *, flush: bool = True) -> None:
+        """Finish or discard one attempt, then clear its delivery state."""
+        think_scrubber = getattr(self, "_stream_think_scrubber", None)
+        context_scrubber = getattr(self, "_stream_context_scrubber", None)
+        if flush:
+            think_tail = think_scrubber.flush() if think_scrubber is not None else ""
+            if think_tail and context_scrubber is not None:
+                think_tail = context_scrubber.feed(think_tail)
+            if think_tail:
+                self._emit_admitted_stream_text(think_tail)
+            context_tail = (
+                context_scrubber.flush() if context_scrubber is not None else ""
+            )
+            if context_tail:
+                self._emit_admitted_stream_text(context_tail)
+        else:
+            if think_scrubber is not None:
+                think_scrubber.reset()
+            if context_scrubber is not None:
+                context_scrubber.reset()
+        self._current_streamed_assistant_text = ""
+        self._current_streamed_payload_bytes = 0
+
+    def _record_streamed_assistant_text(
+        self, text: str, *, admitted: bool = False
+    ) -> None:
+        """Accumulate assistant text only after display or TTS accepted it."""
         if self._stream_writer_superseded():
             return
         if isinstance(text, str) and text:
-            self._current_streamed_assistant_text = (
-                getattr(self, "_current_streamed_assistant_text", "") + text
+            from agent.stream_payload_bound import (
+                accumulate_stream_text,
+                admit_stream_payload,
             )
+
+            if not admitted:
+                admit_stream_payload(self, text)
+            existing = getattr(self, "_current_streamed_assistant_text", "") or ""
+            self._current_streamed_assistant_text = accumulate_stream_text(existing, text)
 
     @staticmethod
     def _normalize_interim_visible_text(text: str) -> str:
@@ -6743,35 +6776,21 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
-        cb = getattr(self, "interim_assistant_callback", None)
-        if cb is None or not isinstance(text, str):
+        if not isinstance(text, str):
             return
-        visible = self._strip_think_blocks(text).strip()
-        if visible:
-            visible = redact_sensitive_text(visible)
-        if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
-            return
-        try:
-            cb(visible, already_streamed=False)
-            self._record_delivered_interim_text(visible)
-        except Exception:
-            logger.debug("interim_assistant_callback error", exc_info=True)
+        visible = redact_sensitive_text(self._strip_think_blocks(text).strip())
+        if visible and visible != "(empty)":
+            self._emit_interim_assistant_message({"role": "assistant", "content": visible})
 
     def _emit_interim_assistant_message(
-        self, assistant_msg: Dict[str, Any]
-    ) -> None:
+        self, assistant_msg: Dict[str, Any], *, admitted: bool = False
+    ) -> bool:
         """Surface a real mid-turn assistant commentary message to the UI layer.
 
-        Does NOT set ``_response_was_previewed`` — that flag means "the final
-        response was already shown to the user," but this helper is called for
-        ordinary tool-call narration, intermediate acknowledgements, and
-        verification candidates alike. Setting it here would cause the CLI to
-        suppress a *different* final summary (e.g. from ``_handle_max_iterations``)
-        when the only streamed text was unrelated mid-turn commentary. (#65919
-        review: response-loss blocker)
+        This does not mark the possibly different final response as previewed.
         """
         if not isinstance(assistant_msg, dict):
-            return
+            return False
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         undelivered_parts: List[str] = []
         pending_keys: set[str] = set()
@@ -6790,41 +6809,51 @@ class AIAgent:
             if commentary_parts
             else self._interim_assistant_visible_text(assistant_msg)
         )
-        if (
-            not visible
-            or visible == "(empty)"
-            or self._interim_text_was_delivered(visible)
+        if not visible or visible == "(empty)" or self._interim_text_was_delivered(
+            visible
         ):
-            return
+            return False
         already_streamed = self._interim_content_was_streamed(visible)
-        try:
-            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+        if not admitted:
+            from agent.stream_payload_bound import admit_stream_payload, authoritative_stream_text
 
-            enqueue_plugin_stream_hook(
-                "on_interim_message",
-                turn_id=getattr(self, "_current_turn_id", "") or "",
-                iteration=int(getattr(self, "_api_call_count", 0) or 0),
-                session_id=self.session_id or "",
-                model=self.model or "",
-                provider=self.provider or "",
-                surface=self.platform or "cli",
-                text=visible,
-                already_streamed=already_streamed,
-            )
-        except Exception:
-            logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
+            streamed = authoritative_stream_text(self)
+            unseen = visible[len(streamed) :] if visible.startswith(streamed) else visible
+            admit_stream_payload(self, unseen)
+        hook_key = self._normalize_interim_visible_text(visible)
+        queued = getattr(self, "_queued_interim_texts", set())
+        if hook_key not in queued:
+            try:
+                from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+                enqueue_plugin_stream_hook(
+                    "on_interim_message",
+                    turn_id=getattr(self, "_current_turn_id", "") or "",
+                    iteration=int(getattr(self, "_api_call_count", 0) or 0),
+                    session_id=self.session_id or "",
+                    model=self.model or "",
+                    provider=self.provider or "",
+                    surface=self.platform or "cli",
+                    text=visible,
+                    already_streamed=already_streamed,
+                )
+                queued.add(hook_key)
+                self._queued_interim_texts = queued
+            except Exception:
+                logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
-            return
+            return False
         try:
             cb(visible, already_streamed=already_streamed)
-            if undelivered_parts:
-                for part in undelivered_parts:
-                    self._record_delivered_interim_text(part)
-            else:
-                self._record_delivered_interim_text(visible)
+            if not already_streamed:
+                self._record_streamed_assistant_text(visible, admitted=True)
+            for part in undelivered_parts or [visible]:
+                self._record_delivered_interim_text(part)
+            return True
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+            return False
 
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the single-writer guard fields (#65991).
@@ -6933,13 +6962,48 @@ class AIAgent:
         except Exception:
             logger.debug("on_stream_end plugin hook enqueue failed", exc_info=True)
 
-    def _fire_stream_delta(self, text: str) -> None:
-        """Fire all registered stream delta callbacks (display + TTS)."""
+    def _emit_admitted_stream_text(self, text: str, *, interim: bool = False) -> bool:
+        """Admit once, then fan visible text out to every stream consumer."""
+        from agent.stream_payload_bound import admit_stream_payload
+
+        admit_stream_payload(self, text)
+        callbacks = [
+            cb
+            for cb in (self.stream_delta_callback, self._stream_callback)
+            if cb is not None
+        ]
+        delivered = False
+        for cb in callbacks:
+            try:
+                cb(text)
+                delivered = True
+            except Exception:
+                pass
+        if delivered:
+            self._record_streamed_assistant_text(text, admitted=True)
+        if interim:
+            message = {"role": "assistant", "content": text}
+            delivered = self._emit_interim_assistant_message(message, admitted=True) or delivered
+        try:
+            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
+
+            enqueue_plugin_stream_hook(
+                "on_stream_delta",
+                **self._stream_hook_base_payload(),
+                delta=text,
+                kind="text",
+            )
+        except Exception:
+            logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
+        return delivered
+
+    def _fire_stream_delta(self, text: str, *, interim: bool = False) -> bool:
+        """Fire display/TTS callbacks and report physical delivery."""
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_stream_delta")
-            return
+            return False
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -6979,28 +7043,8 @@ class AIAgent:
             ):
                 text = text.lstrip("\n")
         if not text:
-            return
-        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
-        try:
-            from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
-
-            enqueue_plugin_stream_hook(
-                "on_stream_delta",
-                **self._stream_hook_base_payload(),
-                delta=text,
-                kind="text",
-            )
-        except Exception:
-            logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
-        if delivered:
-            self._record_streamed_assistant_text(text)
+            return False
+        return self._emit_admitted_stream_text(text, interim=interim)
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
@@ -7009,6 +7053,10 @@ class AIAgent:
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
+        if isinstance(text, str) and text:
+            from agent.stream_payload_bound import admit_stream_payload
+
+            admit_stream_payload(self, text)
         cb = self.reasoning_callback
         if cb is not None:
             try:

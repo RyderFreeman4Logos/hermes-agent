@@ -350,6 +350,172 @@ class TestStreamingCallbacks:
 
         assert deltas == ["a", "b", "c"]
 
+    @pytest.mark.parametrize("pending", [False, True], ids=["direct", "pending"])
+    @pytest.mark.parametrize(
+        "delivery",
+        ["display", "tts", "display+tts", "all-fail", "none"],
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_suppressed_tool_text_uses_physical_delivery_for_partial_recovery(
+        self, mock_close, mock_create, pending, delivery, monkeypatch,
+    ):
+        """Suppressed direct/pending text shares display/TTS retry authority."""
+        import httpx
+
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+        from run_agent import AIAgent
+
+        text = "suppressed text"
+        if pending:
+            monkeypatch.setattr(
+                "agent.chat_completion_helpers._provider_stream_text_may_be_sse",
+                lambda _text: True,
+            )
+        tool_chunk = _make_stream_chunk(tool_calls=[
+            _make_tool_call_delta(index=0, tc_id="call_1", name="terminal"),
+        ])
+        chunks = (
+            [_make_stream_chunk(content=text), tool_chunk]
+            if pending
+            else [tool_chunk, _make_stream_chunk(content=text)]
+        )
+
+        def _stream(*_args, **_kwargs):
+            yield from chunks
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = _stream
+        mock_create.return_value = mock_client
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+
+        display = []
+        tts = []
+
+        def _display(delta):
+            display.append(delta)
+            if delivery == "all-fail":
+                raise RuntimeError("display failed")
+
+        def _tts(delta):
+            tts.append(delta)
+            if delivery == "all-fail":
+                raise RuntimeError("tts failed")
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=(
+                _display if delivery in {"display", "display+tts", "all-fail"} else None
+            ),
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._stream_callback = (
+            _tts if delivery in {"tts", "display+tts", "all-fail"} else None
+        )
+
+        physically_delivered = delivery in {"display", "tts", "display+tts"}
+        if physically_delivered:
+            response = agent._interruptible_streaming_api_call({})
+            assert response.id == PARTIAL_STREAM_STUB_ID
+            assert response.choices[0].message.content.startswith(text)
+            assert "the action was not executed" in response.choices[0].message.content
+        else:
+            with pytest.raises(httpx.RemoteProtocolError):
+                agent._interruptible_streaming_api_call({})
+
+        for callback, observed in (
+            (agent.stream_delta_callback, display),
+            (agent._stream_callback, tts),
+        ):
+            if callback and physically_delivered:
+                assert observed[0] == text
+                assert len(observed) == 2
+                assert "the action was not executed" in observed[1]
+            elif callback:
+                assert observed == [text]
+            else:
+                assert observed == []
+        if physically_delivered:
+            assert agent._current_streamed_assistant_text.startswith(text)
+            assert "the action was not executed" in agent._current_streamed_assistant_text
+        else:
+            assert agent._current_streamed_assistant_text == ""
+
+    @pytest.mark.parametrize(
+        ("delivery", "expected_attempts"),
+        [
+            pytest.param("all-fail", 2, id="callback-failures-retry"),
+            pytest.param("plugin-only", 2, id="plugin-only-retries"),
+            pytest.param("tts", 1, id="tts-delivery-does-not-retry"),
+        ],
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_transient_text_drop_retries_only_without_physical_delivery(
+        self, mock_close, mock_create, delivery, expected_attempts, monkeypatch,
+    ):
+        """Retry authority comes only from successful display/TTS delivery."""
+        from run_agent import AIAgent
+        import httpx
+
+        attempts = 0
+
+        def _stream(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            yield _make_stream_chunk(content="first" if attempts == 1 else "retry")
+            if attempts == 1:
+                raise httpx.RemoteProtocolError("peer closed connection")
+            yield _make_stream_chunk(finish_reason="stop")
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = _stream
+        mock_create.return_value = mock_client
+
+        def _fail(_text):
+            raise RuntimeError("delivery failed")
+
+        plugin_deltas = []
+        monkeypatch.setattr(
+            "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+            lambda hook, **payload: (
+                plugin_deltas.append(payload["delta"])
+                if hook == "on_stream_delta"
+                else None
+            ),
+        )
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=None if delivery == "plugin-only" else _fail,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        tts = []
+        agent._stream_callback = tts.append if delivery == "tts" else (
+            None if delivery == "plugin-only" else _fail
+        )
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert attempts == expected_attempts
+        assert response.choices[0].message.content == (
+            "retry" if expected_attempts == 2 else "first"
+        )
+        assert plugin_deltas == (["first", "retry"] if expected_attempts == 2 else ["first"])
+        assert tts == (["first"] if delivery == "tts" else [])
 
 
 
@@ -673,6 +839,130 @@ class TestCodexStreamCallbacks:
         agent._run_codex_stream({}, client=mock_client)
         assert "Hello from Codex!" in deltas
 
+
+    @pytest.mark.parametrize(
+        ("event_type", "callback_name"),
+        [
+            ("response.output_text.delta", "on_text_delta"),
+            ("response.reasoning_summary_text.delta", "on_reasoning_delta"),
+        ],
+    )
+    def test_codex_callback_propagates_stream_payload_bound(
+        self, event_type, callback_name,
+    ):
+        from agent.codex_runtime import _consume_codex_event_stream
+        from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+        overflow = StreamPayloadBoundExceeded(256 * 1024 + 1)
+
+        def _overflow(_text):
+            raise overflow
+
+        with pytest.raises(StreamPayloadBoundExceeded) as caught:
+            _consume_codex_event_stream(
+                [SimpleNamespace(type=event_type, delta="x")],
+                model="test/model",
+                **{callback_name: _overflow},
+            )
+
+        assert caught.value is overflow
+
+    @pytest.mark.parametrize(
+        ("delivery", "expected_attempts"),
+        [
+            pytest.param("display", 1, id="display-no-retry"),
+            pytest.param("tts", 1, id="tts-no-retry"),
+            pytest.param("all-fail", 2, id="callback-failures-retry"),
+            pytest.param("plugin-only", 2, id="plugin-only-retry"),
+        ],
+    )
+    def test_codex_midstream_drop_retries_only_without_physical_delivery(
+        self, delivery, expected_attempts, monkeypatch,
+    ):
+        import httpx
+
+        from run_agent import AIAgent
+
+        attempts = []
+
+        class _FakeCreateStream:
+            def __init__(self, text, *, fail):
+                self.text = text
+                self.fail = fail
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    type="response.output_text.delta",
+                    delta=self.text,
+                )
+                if self.fail:
+                    raise httpx.RemoteProtocolError("peer closed connection")
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(status="completed", id="r2", usage=None),
+                )
+
+            def close(self):
+                return None
+
+        def _create(**_kwargs):
+            attempt = len(attempts) + 1
+            attempts.append(attempt)
+            return _FakeCreateStream(
+                "first" if attempt == 1 else "retry",
+                fail=attempt == 1,
+            )
+
+        delivered = []
+
+        def _display(text):
+            if delivery == "all-fail":
+                raise RuntimeError("display failed")
+            delivered.append(text)
+
+        def _tts(text):
+            if delivery == "all-fail":
+                raise RuntimeError("tts failed")
+            delivered.append(text)
+
+        plugin_deltas = []
+        monkeypatch.setattr(
+            "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+            lambda hook, **payload: (
+                plugin_deltas.append(payload["delta"])
+                if hook == "on_stream_delta"
+                else None
+            ),
+        )
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=(
+                None if delivery in {"tts", "plugin-only"} else _display
+            ),
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+        agent._stream_callback = (
+            _tts if delivery == "tts" else (_display if delivery == "all-fail" else None)
+        )
+        mock_client = MagicMock()
+        mock_client.responses.create.side_effect = _create
+
+        response = agent._run_codex_stream({}, client=mock_client)
+
+        assert len(attempts) == expected_attempts
+        assert response.output_text == (
+            "retry" if expected_attempts == 2 else "first"
+        )
+        assert delivered == (["first"] if delivery in {"display", "tts"} else [])
+        assert plugin_deltas == (
+            ["first", "retry"] if expected_attempts == 2 else ["first"]
+        )
 
     def test_codex_remote_protocol_error_retries_then_raises(self):
         """Transport errors from ``responses.create`` retry once then re-raise.
@@ -1013,7 +1303,7 @@ class TestPartialToolCallWarning:
         agent._interrupt_requested = False
 
         fired_deltas: list = []
-        agent._fire_stream_delta = lambda text: fired_deltas.append(text)
+        agent._fire_stream_delta = lambda text: fired_deltas.append(text) or True
         agent._current_streamed_assistant_text = "Let me write the audit: "
 
         import os as _os
@@ -1089,9 +1379,9 @@ class TestPartialToolCallWarning:
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
-        agent._fire_stream_delta = lambda text: None
-        # Empty recovered text — the exact "0 chars recovered, no tool call"
-        # production condition.
+        agent._fire_stream_delta = lambda text: True
+        # A physical sink accepted the delta while recovered text is empty —
+        # the exact partial-stub condition.
         agent._current_streamed_assistant_text = ""
 
         import os as _os
@@ -1118,30 +1408,22 @@ class TestPartialToolCallWarning:
 
 
 class TestSilentRetryMidToolCall:
-    """Regression: when the stream dies mid tool-call JSON after text was
-    already delivered, we previously stubbed the turn with a "retry manually"
-    warning.  Now: if the error is a transient connection error AND a tool
-    call was in flight, silently retry the stream (the user sees a brief
-    reconnect marker + duplicated preamble, which is strictly better than
-    a lost action).  If no tool call was in flight, or the error isn't
-    transient, the existing stub-with-warning behaviour is preserved.
-    """
+    """A physical display/TTS write commits the provider attempt."""
 
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_silent_retry_recovers_tool_call(
+    def test_mid_tool_drop_after_delivery_does_not_retry(
         self, mock_close, mock_create, mock_replace,
     ):
-        """First attempt: text + partial tool-call + connection drop.
-        Second attempt: text + complete tool-call.  Response should contain
-        the recovered tool call; no warning stub should be returned."""
+        """A dropped partial tool call returns one safe partial, never replay."""
         from run_agent import AIAgent
         import httpx as _httpx
 
         attempts = {"n": 0}
 
-        def _first_stream():
+        def _stream(*_args, **_kwargs):
+            attempts["n"] += 1
             yield _make_stream_chunk(content="Let me write the audit: ")
             yield _make_stream_chunk(tool_calls=[
                 _make_tool_call_delta(index=0, tc_id="call_1", name="write_file"),
@@ -1151,26 +1433,9 @@ class TestSilentRetryMidToolCall:
             ])
             raise _httpx.RemoteProtocolError("peer closed connection")
 
-        def _second_stream():
-            yield _make_stream_chunk(content="Let me write the audit: ")
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_1", name="write_file"),
-            ])
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(
-                    index=0, arguments='{"path": "/tmp/x", "content": "hi"}',
-                ),
-            ])
-            yield _make_stream_chunk(finish_reason="tool_calls")
-
-        def _pick_stream(*a, **kw):
-            attempts["n"] += 1
-            return _first_stream() if attempts["n"] == 1 else _second_stream()
-
         mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = _pick_stream
+        mock_client.chat.completions.create.side_effect = _stream
         mock_create.return_value = mock_client
-
         agent = AIAgent(
             api_key="test-key",
             base_url="https://openrouter.ai/api/v1",
@@ -1181,9 +1446,8 @@ class TestSilentRetryMidToolCall:
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
-
-        fired_deltas: list = []
-        agent._fire_stream_delta = lambda text: fired_deltas.append(text)
+        fired_deltas = []
+        agent._fire_stream_delta = lambda text: fired_deltas.append(text) or True
 
         import os as _os
         _prev = _os.environ.get("HERMES_STREAM_RETRIES")
@@ -1196,31 +1460,12 @@ class TestSilentRetryMidToolCall:
             else:
                 _os.environ["HERMES_STREAM_RETRIES"] = _prev
 
-        assert attempts["n"] == 2, (
-            f"Expected silent retry (2 attempts), got {attempts['n']}"
-        )
-        # Response should carry the recovered tool call, not a warning stub.
+        assert attempts["n"] == 1
         msg = response.choices[0].message
-        tool_calls = getattr(msg, "tool_calls", None)
-        assert tool_calls, (
-            f"Silent retry should recover the tool call, got tool_calls={tool_calls!r} "
-            f"content={getattr(msg, 'content', None)!r}"
-        )
-        _tc0 = tool_calls[0]
-        _name = (
-            _tc0["function"]["name"] if isinstance(_tc0, dict)
-            else _tc0.function.name
-        )
-        assert _name == "write_file"
-        # User saw a reconnect marker between attempts.
-        assert any("reconnecting" in d.lower() for d in fired_deltas), (
-            f"Expected a reconnect marker delta, fired_deltas={fired_deltas}"
-        )
-        # Stub-path warning must NOT appear (this was the whole point).
-        joined = "".join(fired_deltas)
-        assert "Stream stalled" not in joined, (
-            f"Stub-path warning leaked into silent-retry path: {joined!r}"
-        )
+        assert msg.tool_calls is None
+        assert fired_deltas[0] == "Let me write the audit: "
+        assert "the action was not executed" in msg.content
+        assert not any("reconnecting" in delta.lower() for delta in fired_deltas)
 
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     @patch("run_agent.AIAgent._create_request_openai_client")
@@ -1257,7 +1502,7 @@ class TestSilentRetryMidToolCall:
         agent._interrupt_requested = False
 
         fired_deltas: list = []
-        agent._fire_stream_delta = lambda text: fired_deltas.append(text)
+        agent._fire_stream_delta = lambda text: fired_deltas.append(text) or True
 
         import os as _os
         _prev = _os.environ.get("HERMES_STREAM_RETRIES")
@@ -1310,10 +1555,10 @@ class TestSilentRetryMidToolCall:
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
+            stream_delta_callback=lambda _text: None,
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
-        agent._current_streamed_assistant_text = "Here's my answer so far"
 
         import os as _os
         _prev = _os.environ.get("HERMES_STREAM_RETRIES")
@@ -1526,6 +1771,133 @@ class TestBedrockIamStreamingFallback:
         assert response.choices[0].message.content == "hi"
         assert getattr(agent, "_disable_streaming", False) is True
 
+
+@pytest.mark.parametrize(
+    "delivery",
+    ["display", "tts", "all-fail", "plugin-only"],
+)
+def test_bedrock_drop_communicates_physical_delivery_to_outer_recovery(
+    delivery, monkeypatch,
+):
+    """Bedrock returns a partial only after display/TTS acknowledged text."""
+    pytest.importorskip(
+        "botocore.exceptions",
+        reason="botocore (with working exceptions module) required",
+    )
+    from hermes_constants import PARTIAL_STREAM_STUB_ID
+    from run_agent import AIAgent
+
+    delivered = []
+
+    def _display(text):
+        if delivery == "all-fail":
+            raise RuntimeError("display failed")
+        delivered.append(text)
+
+    def _tts(text):
+        if delivery == "all-fail":
+            raise RuntimeError("tts failed")
+        delivered.append(text)
+
+    plugin_deltas = []
+    monkeypatch.setattr(
+        "agent.plugin_stream_hooks.has_stream_observer_hooks",
+        lambda: delivery == "plugin-only",
+    )
+    monkeypatch.setattr(
+        "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+        lambda hook, **payload: (
+            plugin_deltas.append(payload["delta"])
+            if hook == "on_stream_delta"
+            else None
+        ),
+    )
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="anthropic.claude-3-sonnet-20240229-v1:0",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        stream_delta_callback=(
+            None if delivery in {"tts", "plugin-only"} else _display
+        ),
+    )
+    agent.api_mode = "bedrock_converse"
+    agent._interrupt_requested = False
+    agent._stream_callback = (
+        _tts if delivery == "tts" else (_display if delivery == "all-fail" else None)
+    )
+
+    def _events():
+        yield {"contentBlockDelta": {"delta": {"text": "first"}}}
+        raise ConnectionError("bedrock connection dropped")
+
+    client = MagicMock()
+    client.converse_stream.return_value = {"stream": _events()}
+    with patch(
+        "agent.bedrock_adapter._get_bedrock_runtime_client",
+        return_value=client,
+    ):
+        if delivery in {"display", "tts"}:
+            response = agent._interruptible_streaming_api_call(
+                {"modelId": agent.model, "messages": []}
+            )
+            assert response.id == PARTIAL_STREAM_STUB_ID
+            assert response.choices[0].message.content == "first"
+        else:
+            with pytest.raises(ConnectionError, match="bedrock connection dropped"):
+                agent._interruptible_streaming_api_call(
+                    {"modelId": agent.model, "messages": []}
+                )
+
+    assert client.converse_stream.call_count == 1
+    assert delivered == (["first"] if delivery in {"display", "tts"} else [])
+    assert plugin_deltas == ["first"]
+
+
+def test_bedrock_delivery_does_not_swallow_stream_payload_bound():
+    pytest.importorskip(
+        "botocore.exceptions",
+        reason="botocore (with working exceptions module) required",
+    )
+    from agent.stream_payload_bound import (
+        DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        StreamPayloadBoundExceeded,
+    )
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="anthropic.claude-3-sonnet-20240229-v1:0",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        stream_delta_callback=lambda _text: None,
+    )
+    agent.api_mode = "bedrock_converse"
+    agent._interrupt_requested = False
+    client = MagicMock()
+    client.converse_stream.return_value = {
+        "stream": iter([
+            {"contentBlockDelta": {"delta": {"text": "first"}}},
+            {
+                "contentBlockDelta": {
+                    "delta": {"text": "x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES}
+                }
+            },
+        ])
+    }
+
+    with patch(
+        "agent.bedrock_adapter._get_bedrock_runtime_client",
+        return_value=client,
+    ):
+        with pytest.raises(StreamPayloadBoundExceeded):
+            agent._interruptible_streaming_api_call(
+                {"modelId": agent.model, "messages": []}
+            )
 
 
 class _BlockingEventStream:

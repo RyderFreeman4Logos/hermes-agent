@@ -208,3 +208,86 @@ def test_inner_tool_continuation_persists_one_timing_row():
     ]
     assert len(timing_rows) == 1
     assert "Current loop start: 2026-08-26T00:00:00-07:00" in timing_rows[0]["content"]
+
+
+def test_output_cap_compression_rearms_missing_timing_once():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.model = "some/model"
+    agent.max_tokens = 65_536
+    agent.compression_enabled = True
+    agent.context_compressor.context_length = 200_000
+    agent.context_compressor.should_compress = MagicMock(return_value=False)
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent._fallback_chain = []
+
+    exc = Exception(
+        "max_tokens: 65536 > context_window: 200000 "
+        "- input_tokens: 199000 = available_tokens: 1000"
+    )
+    exc.status_code = 400
+    exc.code = 400
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [
+        exc,
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="done", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            model="some/model",
+            usage=None,
+        ),
+    ]
+    mock_compress = MagicMock(
+        return_value=(
+            [
+                {"role": "assistant", "content": "previous"},
+                {"role": "user", "content": "hello"},
+            ],
+            "You are helpful.",
+        )
+    )
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent.context_compressor, "update_model"),
+        patch.object(agent, "_compress_context", mock_compress),
+    ):
+        result = agent.run_conversation("hello")
+
+    mock_compress.assert_called_once()
+    retry_messages = agent.client.chat.completions.create.call_args_list[1].kwargs[
+        "messages"
+    ]
+    retry_timing = [
+        message
+        for message in retry_messages
+        if "[Agent loop timing]" in str(message.get("content", ""))
+    ]
+    persisted_timing = [
+        message
+        for message in result["messages"]
+        if "[Agent loop timing]" in str(message.get("content", ""))
+    ]
+    assert len(retry_timing) == 1
+    assert len(persisted_timing) == 1
+    assert "cache_control" not in retry_timing[0]

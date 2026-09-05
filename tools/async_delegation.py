@@ -500,6 +500,10 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
+    if evt.get("type") == "heartbeat":
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        return "" if runtime_heartbeat.is_event_current(evt) else None
     if evt.get("type") != "async_delegation":
         return ""
     delegation_id = str(evt.get("delegation_id") or "")
@@ -1139,6 +1143,13 @@ def dispatch_async_delegation_batch(
     runner admission remains off the foreground thread. If no runner takes
     ownership, ``on_not_started`` receives the terminal status exactly once.
     """
+    from tools.runtime_heartbeat import (
+        inspect_delegation,
+        preflight_current_heartbeat,
+        runtime_heartbeat,
+    )
+
+    heartbeat_interval = preflight_current_heartbeat()
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -1208,10 +1219,18 @@ def dispatch_async_delegation_batch(
         finally:
             _finalize_batch(delegation_id, combined, status)
 
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
     try:
         # Propagate the dispatching profile to the detached batch children.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
+        runtime_heartbeat.cancel(delegation_id)
         with _records_lock:
             _records.pop(delegation_id, None)
             _pending_admission_ids.discard(delegation_id)
@@ -1238,6 +1257,9 @@ def _finalize_batch(
     event_record, _interrupt_fn, on_not_started = claimed
 
     _invoke_not_started(on_not_started, status)
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    runtime_heartbeat.cancel(delegation_id)
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
 
@@ -1429,6 +1451,9 @@ def _finalize_stalled(delegation_id: str) -> None:
         return
     event_record, _interrupt_fn, on_not_started = claimed
     _invoke_not_started(on_not_started, "stalled")
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    runtime_heartbeat.cancel(delegation_id)
 
     completed_at = event_record.get("completed_at") or time.time()
     duration = round(

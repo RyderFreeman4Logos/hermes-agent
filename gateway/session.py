@@ -94,7 +94,7 @@ from .whatsapp_identity import (
     canonical_whatsapp_identifier,
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
-from utils import atomic_replace, sanitize_persisted_base_url
+from utils import atomic_replace, sanitize_persisted_model_config
 from agent.turn_context import extract_api_content_sidecar
 
 # Session keys/ids flow into filesystem paths downstream (e.g.
@@ -774,11 +774,14 @@ def sanitize_model_override(
             continue
         if value in (None, ""):
             continue
-        if key == "base_url":
-            value = sanitize_persisted_base_url(value)
-            if value is None:
-                continue
-        cleaned[key] = str(value)
+        cleaned[key] = value
+    cleaned = sanitize_persisted_model_config(cleaned)
+    if "base_url" in cleaned:
+        cleaned["base_url"] = str(cleaned["base_url"])
+    if "provider" in cleaned:
+        cleaned["provider"] = str(cleaned["provider"])
+    if "model" in cleaned:
+        cleaned["model"] = str(cleaned["model"])
     reasoning = override.get("reasoning_config")
     if isinstance(reasoning, dict):
         reasoning_cleaned = {

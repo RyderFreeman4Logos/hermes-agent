@@ -102,7 +102,9 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
-def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
+def _record_codex_app_server_usage(
+    agent, turn, *, consume_compression_bound: bool = True
+) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
     Codex app-server reports usage via thread/tokenUsage/updated as:
@@ -115,6 +117,9 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     Even when Codex omits usage for a turn, Hermes should still count that turn
     as one API call for session/status accounting.
+
+    Compaction RPCs pass consume_compression_bound=False so empty compact usage
+    cannot spend the post-compression latch before the next useful response.
     """
     agent.session_api_calls += 1
 
@@ -128,7 +133,9 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             # No usage means this turn cannot adjudicate the pending compaction.
             # Consume the marker so a later unrelated reading is not charged to
             # it and preflight deferral cannot stay latched indefinitely.
-            compressor.update_from_response({})
+            update = getattr(compressor, "update_from_response", None)
+            if callable(update):
+                update({})
         if agent._session_db and agent.session_id:
             try:
                 if not agent._session_db_created:
@@ -149,7 +156,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                     "Codex app-server api-call persistence failed (session=%s): %s",
                     agent.session_id, exc,
                 )
-        agent._awaiting_cache_usage_after_compression = False
+        if consume_compression_bound:
+            agent._awaiting_cache_usage_after_compression = False
         return {"cache_telemetry": "unavailable"}
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, normalize_usage
@@ -199,7 +207,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
     from agent.conversation_loop import _ingest_successful_provider_usage
 
-    _ingest_successful_provider_usage(agent, usage_dict, first_call=True)
+    if consume_compression_bound:
+        _ingest_successful_provider_usage(agent, usage_dict, first_call=True)
 
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:

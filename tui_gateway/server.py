@@ -7181,44 +7181,6 @@ def _get_usage(agent) -> dict:
     return usage
 
 
-def _cache_counter_snapshot(agent) -> dict[str, int | None]:
-    def count(name: str, *, optional: bool = False) -> int | None:
-        value = getattr(agent, name, 0 if not optional else None)
-        if value is None:
-            return None if optional else 0
-        try:
-            return max(0, int(value))
-        except (TypeError, ValueError):
-            return None if optional else 0
-
-    return {
-        "calls": count("session_api_calls"),
-        "prompt_tokens": count("session_prompt_tokens"),
-        "read_tokens": count("session_cache_read_tokens", optional=True),
-        "write_tokens": count("session_cache_write_tokens", optional=True),
-    }
-
-
-def _cache_info_for_turn(agent, baseline: dict[str, int | None] | None) -> dict[str, int | str]:
-    current = _cache_counter_snapshot(agent)
-    if current["read_tokens"] is None or current["write_tokens"] is None:
-        return {"state": "unavailable", "pct": 0}
-    before = baseline or {key: 0 for key in current}
-    delta = {
-        key: max(0, int(current[key] or 0) - int(before.get(key, 0) or 0))
-        for key in current
-    }
-    if delta["calls"] == 0 or delta["prompt_tokens"] == 0:
-        return {"state": "unavailable", "pct": 0}
-    pct = cache_hit_percent(delta["read_tokens"], delta["prompt_tokens"])
-    return {
-        "state": "hit" if delta["read_tokens"] else "cold_write" if delta["write_tokens"] else "miss",
-        "pct": pct,
-        "read_tokens": delta["read_tokens"],
-        "prompt_tokens": delta["prompt_tokens"],
-    }
-
-
 def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
     if not isinstance(record, dict):
         return {"state": "unavailable", "pct": 0}
@@ -7289,13 +7251,10 @@ def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
     session = _sessions.get(sid) or {}
     agent = session.get("agent")
     info = _cache_info_from_first_call(session.get("first_provider_response"))
-    if (
-        info["state"] == "unavailable"
-        and "read_tokens" not in info
-        and "prompt_tokens" not in info
-        and agent is not None
-    ):
-        info = _cache_info_for_turn(agent, session.get("_cache_counter_baseline"))
+    if info["state"] == "unavailable" and "read_tokens" not in info and "prompt_tokens" not in info:
+        usage = getattr(agent, "_first_turn_usage", None) if agent is not None else None
+        if isinstance(usage, dict):
+            info = _cache_info_from_usage(usage)
     session["first_provider_response"] = {
         **info,
         "owner": "tui_gateway",
@@ -7325,8 +7284,11 @@ def _attach_tui_cache_callback(agent, sid: str):
             getattr(agent, "_tui_cache_owner_session", None) != sid
             or not isinstance(session, dict)
             or session.get("agent") is not agent
-            or getattr(agent, "_tui_first_provider_response_recorded", False)
         ):
+            return
+        already = getattr(agent, "_tui_first_provider_response_recorded", False)
+        post_compression = isinstance(record, dict) and record.get("attribution") == "post_compression"
+        if already and not post_compression:
             return
         agent._tui_first_provider_response_recorded = True
         cache_info = _cache_info_from_usage(getattr(agent, "_first_turn_usage", None))
@@ -12733,7 +12695,6 @@ def _run_prompt_submit(
             agent._tui_first_provider_response_recorded = False
             session.pop("first_provider_response", None)
             session["_cache_status_emitted"] = False
-            session["_cache_counter_baseline"] = _cache_counter_snapshot(agent)
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.
             with session["history_lock"]:

@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -3912,7 +3915,14 @@ class TestRunConversation:
         assert result["final_response"] == "Using Postgres instead."
         assert len(requests) == 2
 
-        replay = requests[1]["messages"]
+        replay = [
+            message
+            for message in requests[1]["messages"]
+            if not (
+                message.get("role") == "system"
+                and "[Agent loop timing]" in str(message.get("content", ""))
+            )
+        ]
         assert [m["role"] for m in replay[-3:]] == [
             "user",
             "assistant",
@@ -4922,7 +4932,14 @@ class TestRunConversation:
         # prompt), not the original multi-message window. Without this, the
         # output-cap retry would call the compressor but re-transmit the same
         # oversized request forever.
-        second_messages = second_call.get("messages", [])
+        second_messages = [
+            message
+            for message in second_call.get("messages", [])
+            if not (
+                message.get("role") == "system"
+                and "[Agent loop timing]" in str(message.get("content", ""))
+            )
+        ]
         assert second_messages[-1].get("content") == "hello"
         assert len(second_messages) == 2
         assert second_messages[0]["role"] == "system"

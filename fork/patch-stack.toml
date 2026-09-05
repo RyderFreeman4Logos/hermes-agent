@@ -534,8 +534,8 @@ pr = 179
 name = "fix-model-after-compression-switch-and-deferred"
 title = "fix(model): after-compression switch and deferred --reasoning"
 branch = "topic/upgrade-after-compression-model-and-reasoning-20260821"
-head = "334c0c02ff2035ecfcec4cc9d51534272bb7c651"
-tree = "3d717ad3015b91b0e28f9fd02504cbfa437b8019"
+head = "b022d89f5ab41ad62d7df2dff0a3a0d68c07dc35"
+tree = "a292a3b357b98581b9831536749f9b2bbeba1525"
 base_ref = "pin/official-main-83467c28-20260906"
 base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
 parent = "83467c28f78987acdeb55636fb625946ec572a30"
@@ -547,17 +547,17 @@ unique_on_pin = true
 unique_count = 1
 vs_pin_count = 1
 stacked_prereq_count = 0
-owned_diffsha_vs_base = "c194423faf8904b4ef786bec17858655de9d743372d430b1a0b1e7644a130f27"
-owned_diff_bytes_vs_base = 80825
-full_diffsha_vs_pin = "c194423faf8904b4ef786bec17858655de9d743372d430b1a0b1e7644a130f27"
-full_diff_bytes_vs_pin = 80825
+owned_diffsha_vs_base = "55ce4de235bef31b43f016ff63aeebc31f1ca64e87f64c40ab76e6e64e3885ab"
+owned_diff_bytes_vs_base = 82019
+full_diffsha_vs_pin = "55ce4de235bef31b43f016ff63aeebc31f1ca64e87f64c40ab76e6e64e3885ab"
+full_diff_bytes_vs_pin = 82019
 owned_commits = [
-  "334c0c02ff2035ecfcec4cc9d51534272bb7c651",
+  "b022d89f5ab41ad62d7df2dff0a3a0d68c07dc35",
 ]
 owned_subjects = [
   "feat(model-switch): defer route changes until compression commits",
 ]
-notes = "unique-on-pin 1; defer until committed compaction; historical empty omission 6d5b14356f599f82bbd35fb5b434240481878dd2 (zero-diff) retained not replayed; not ancestor of this HEAD"
+notes = "unique-on-pin 1; replay-safe successor; defer until committed compaction; historical empty omission 6d5b14356f599f82bbd35fb5b434240481878dd2 (zero-diff) retained not replayed; not ancestor of this HEAD; prefix 22+1 not full 44 green"
 
 [[patch]]
 order = 17

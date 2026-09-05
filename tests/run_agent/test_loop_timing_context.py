@@ -39,7 +39,7 @@ def test_loop_timing_is_default_on_but_config_gated():
     assert agent._loop_timing_last_stop == stop
 
 
-def test_next_cycle_keeps_prior_timing_in_historical_prefix():
+def test_next_cycle_normalized_timing_stays_exact_once_through_tool_continuation():
     t1 = datetime(2026, 8, 26, 0, 0, 0, tzinfo=UTC_MINUS_7)
     t1_stop = datetime(2026, 8, 26, 0, 0, 3, tzinfo=UTC_MINUS_7)
     t2 = datetime(2026, 8, 26, 0, 1, 0, tzinfo=UTC_MINUS_7)
@@ -63,8 +63,12 @@ def test_next_cycle_keeps_prior_timing_in_historical_prefix():
             skip_context_files=True,
             skip_memory=True,
         )
-    agent.client = MagicMock()
-    agent.client.chat.completions.create.return_value = SimpleNamespace(
+    tool_call = SimpleNamespace(
+        id="call-1",
+        type="function",
+        function=SimpleNamespace(name="test_tool", arguments="{}"),
+    )
+    done = SimpleNamespace(
         choices=[
             SimpleNamespace(
                 message=SimpleNamespace(content="done", tool_calls=None),
@@ -74,13 +78,41 @@ def test_next_cycle_keeps_prior_timing_in_historical_prefix():
         model="test/model",
         usage=None,
     )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [
+        done,
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=None, tool_calls=[tool_call]),
+                    finish_reason="tool_calls",
+                )
+            ],
+            model="test/model",
+            usage=None,
+        ),
+        done,
+    ]
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
     agent.compression_enabled = False
     agent._fallback_chain = []
+    agent.valid_tool_names = {"test_tool"}
+
+    def execute_tool_call(_assistant_message, messages, *_args):
+        messages.append(
+            {
+                "role": "tool",
+                "name": "test_tool",
+                "tool_call_id": "call-1",
+                "content": "ok",
+            }
+        )
 
     with (
         patch("agent.conversation_loop._loop_timing_context", side_effect=timing),
+        patch.object(agent, "_execute_tool_calls", side_effect=execute_tool_call),
+        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -88,8 +120,13 @@ def test_next_cycle_keeps_prior_timing_in_historical_prefix():
         first = agent.run_conversation("hello")
         second = agent.run_conversation("again", conversation_history=first["messages"])
 
+    assert second["final_response"] == "done"
+    assert agent.client.chat.completions.create.call_count == 3
     first_sent = agent.client.chat.completions.create.call_args_list[0].kwargs["messages"]
     second_sent = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    continuation_sent = agent.client.chat.completions.create.call_args_list[2].kwargs[
+        "messages"
+    ]
 
     def timing_messages(messages):
         return [
@@ -117,10 +154,16 @@ def test_next_cycle_keeps_prior_timing_in_historical_prefix():
     assert [wire(message) for message in second_sent[: len(first_sent)]] == [
         wire(message) for message in first_sent
     ]
+    current_stamp = "Current loop start: 2026-08-26T00:01:00-07:00"
     second_timing = timing_messages(second_sent)
-    assert "Current loop start: 2026-08-26T00:01:00-07:00" in second_timing[-1]["content"]
+    continuation_timing = timing_messages(continuation_sent)
+    persisted_timing = timing_messages(second["messages"])
+    assert all(
+        len([message for message in rows if current_stamp in message["content"]]) == 1
+        for rows in (second_timing, continuation_timing, persisted_timing)
+    )
     assert "Previous loop start: 2026-08-26T00:00:00-07:00" not in second_timing[-1]["content"]
-    assert all("cache_control" not in message for message in second_timing)
+    assert all("cache_control" not in message for message in continuation_timing)
 
 
 def test_inner_tool_continuation_persists_one_timing_row():

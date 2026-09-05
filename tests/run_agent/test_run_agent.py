@@ -3054,6 +3054,7 @@ class TestRunConversation:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
         ):
             result = agent.run_conversation("hello")
 
@@ -3072,6 +3073,9 @@ class TestRunConversation:
                 "cache_control": {"type": "ephemeral"},
             },
         ]
+        timing = agent.client.chat.completions.create.call_args.kwargs["messages"][-1]
+        assert timing["content"].startswith("[Agent loop timing]\nCurrent loop start:")
+        assert "cache_control" not in timing
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)

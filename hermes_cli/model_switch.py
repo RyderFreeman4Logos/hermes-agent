@@ -737,6 +737,11 @@ def _applied_model_config(agent: Any, result: ModelSwitchResult) -> dict:
         base_url=result.base_url or None,
         api_mode=result.api_mode or None,
     )
+    if "gateway_runtime" in config:
+        # CLI resume prefers this nested route over the top-level projection.
+        config["gateway_runtime"] = {
+            key: config[key] for key in ("provider", "base_url", "api_mode")
+        }
     if result.reasoning_config is not None:
         config["reasoning_config"] = copy.deepcopy(result.reasoning_config)
     return config

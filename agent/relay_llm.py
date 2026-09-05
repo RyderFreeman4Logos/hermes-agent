@@ -1502,3 +1502,176 @@ def _run_awaitable(value: Any) -> Any:
     raise RuntimeError(
         "Synchronous Relay LLM execution cannot run on an event-loop thread"
     )
+
+
+from agent import physical_attempt_diagnostics
+
+_cache_scope_base = globals().get("_request_with_cache_scope")
+
+
+def _physical_request_with_cache_scope(
+    request: dict[str, Any], session_id: str
+) -> dict[str, Any]:
+    """Attach a digest-only scope without replacing an existing cache scope."""
+    if _cache_scope_base is not None:
+        request = _cache_scope_base(request, session_id)
+    extra_body = request.get("extra_body")
+    cache_scope = request.get("prompt_cache_key")
+    if cache_scope is None and isinstance(extra_body, dict):
+        cache_scope = extra_body.get("prompt_cache_key")
+    scope = physical_attempt_diagnostics.prepare_cache_scope(cache_scope or session_id)
+    return request if scope is None else {
+        **request,
+        "_hermes_physical_attempt_cache_scope": scope,
+    }
+
+
+def _record_attempt(
+    request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None
+) -> None:
+    request_id = str((metadata or {}).get("api_request_id") or "")
+    correlation, marker, loop = request_id.rpartition(":api:")
+    try:
+        loop_number = int(loop) if marker and correlation else None
+    except ValueError:
+        loop_number = None
+        correlation = ""
+    physical_attempt_diagnostics.start_attempt(
+        request,
+        api_mode=str((metadata or {}).get("api_mode") or "unknown"),
+        route=str((metadata or {}).get("api_mode") or "unknown"),
+        provider=name,
+        model=str(request.get("model") or model_name),
+        retry=int((metadata or {}).get("retry_count") or 0),
+        loop=loop_number,
+        correlation=correlation,
+        scope=physical_attempt_diagnostics.take_cache_scope(request),
+    )
+
+
+_execute_without_physical_attempt = execute
+
+
+def _execute_with_physical_attempt(
+    request: dict[str, Any],
+    callback: Callable[[dict[str, Any]], Any],
+    *,
+    session_id: str,
+    name: str,
+    model_name: str,
+    metadata: dict[str, Any] | None = None,
+    defer_logical_completion: bool = False,
+) -> Any:
+    if _cache_scope_base is None:
+        request = _physical_request_with_cache_scope(request, session_id)
+    if isinstance(callback, _RememberingSend):
+        callback = callback._callback
+
+    def record_then_callback(final_request: dict[str, Any]) -> Any:
+        _record_attempt(final_request, name=name, model_name=model_name, metadata=metadata)
+        return callback(final_request)
+
+    return _execute_without_physical_attempt(
+        request,
+        record_then_callback,
+        session_id=session_id,
+        name=name,
+        model_name=model_name,
+        metadata=metadata,
+        defer_logical_completion=defer_logical_completion,
+    )
+
+
+_execute_async_without_physical_attempt = execute_async
+
+
+async def _execute_async_with_physical_attempt(
+    request: dict[str, Any],
+    callback: Callable[[dict[str, Any]], Any],
+    *,
+    session_id: str,
+    name: str,
+    model_name: str,
+    metadata: dict[str, Any] | None = None,
+    defer_logical_completion: bool = False,
+) -> Any:
+    if _cache_scope_base is None:
+        request = _physical_request_with_cache_scope(request, session_id)
+    if isinstance(callback, _RememberingSend):
+        callback = callback._callback
+
+    async def record_then_callback(final_request: dict[str, Any]) -> Any:
+        _record_attempt(final_request, name=name, model_name=model_name, metadata=metadata)
+        return await callback(final_request)
+
+    return await _execute_async_without_physical_attempt(
+        request,
+        record_then_callback,
+        session_id=session_id,
+        name=name,
+        model_name=model_name,
+        metadata=metadata,
+        defer_logical_completion=defer_logical_completion,
+    )
+
+
+_stream_without_physical_attempt = stream
+
+
+def _stream_with_physical_attempt(
+    request: dict[str, Any],
+    stream_factory: Callable[[dict[str, Any]], Any],
+    *,
+    session_id: str,
+    name: str,
+    model_name: str,
+    finalizer: Callable[[], Any],
+    on_stream_created: Callable[[Any], None] | None = None,
+    on_chunk: Callable[[Any], None] | None = None,
+    chunk_adapter: Callable[[Any], Any] | None = None,
+    accept_chunk: Callable[[Any], bool] | None = None,
+    completed_response_predicate: Callable[[Any], bool] | None = None,
+    metadata: dict[str, Any] | None = None,
+    defer_logical_completion: bool = False,
+) -> "ManagedLlmStream":
+    request = _physical_request_with_cache_scope(request, session_id)
+    if isinstance(stream_factory, _RememberingSend):
+        stream_factory = stream_factory._callback
+
+    def record_then_stream(final_request: dict[str, Any]) -> Any:
+        _record_attempt(final_request, name=name, model_name=model_name, metadata=metadata)
+        return stream_factory(final_request)
+
+    return _stream_without_physical_attempt(
+        request,
+        record_then_stream,
+        session_id=session_id,
+        name=name,
+        model_name=model_name,
+        finalizer=finalizer,
+        on_stream_created=on_stream_created,
+        on_chunk=on_chunk,
+        chunk_adapter=chunk_adapter,
+        accept_chunk=accept_chunk,
+        completed_response_predicate=completed_response_predicate,
+        metadata=metadata,
+        defer_logical_completion=defer_logical_completion,
+    )
+
+
+_relay_request_body_without_physical_scope = _relay_request_body
+
+
+def _relay_request_body_with_physical_scope(
+    request: dict[str, Any], metadata: dict[str, Any] | None
+) -> dict[str, Any]:
+    body = _relay_request_body_without_physical_scope(request, metadata)
+    body.pop("_hermes_physical_attempt_cache_scope", None)
+    return body
+
+
+_request_with_cache_scope = _physical_request_with_cache_scope
+_relay_request_body = _relay_request_body_with_physical_scope
+execute = _execute_with_physical_attempt
+execute_async = _execute_async_with_physical_attempt
+stream = _stream_with_physical_attempt

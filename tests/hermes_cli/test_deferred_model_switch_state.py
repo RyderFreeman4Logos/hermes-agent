@@ -122,6 +122,26 @@ def test_scheduling_persists_secret_free_descriptor():
     assert "new.example" not in json.dumps(stored)
 
 
+def test_deferred_apply_keeps_runtime_url_but_never_persists_unsafe_route():
+    agent = _Agent()
+    agent.session_id = "session-1"
+    agent._session_db = _SessionDB()
+    agent._session_init_model_config = {"max_iterations": 7}
+    result = _result()
+    result.base_url = "https://user:route-marker@new.example/v1?api_key=query-marker&region=us"
+
+    schedule_model_switch_after_compression(agent, result)
+    assert apply_model_switch_after_compression(agent) == "applied"
+
+    stored = json.loads(agent._session_db.row["model_config"])
+    durable = json.dumps(stored) + json.dumps(agent._session_db.row)
+    assert "route-marker" not in durable
+    assert "query-marker" not in durable
+    assert "base_url" not in stored
+    assert agent.base_url == result.base_url
+    assert agent._session_db.row["billing_base_url"] is None
+
+
 def test_successful_apply_runs_once_and_orders_hook_after_switch():
     agent = _Agent()
     result = _result()

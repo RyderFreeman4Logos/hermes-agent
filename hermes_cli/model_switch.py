@@ -51,7 +51,12 @@ from agent.models_dev import (
     get_model_info,
     list_provider_models,
 )
-from utils import base_url_host_matches, base_url_hostname
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    sanitize_persisted_base_url,
+    sanitize_persisted_model_config,
+)
 
 # Providers whose picker model list should NOT be capped by max_models.
 # OpenCode Zen / Go are aggregators whose full catalogs (70+ models each) must
@@ -694,6 +699,20 @@ def _persist_session_model_config(
     system_prompt: Optional[str] = None,
 ) -> None:
     """Persist a secret-free route descriptor through existing DB seams."""
+    config = sanitize_persisted_model_config(config)
+    persisted_base_url = sanitize_persisted_base_url(
+        result.base_url if result is not None else config.get("base_url")
+    )
+    if persisted_base_url is None and "base_url" in config:
+        config.pop("base_url", None)
+    elif persisted_base_url is not None:
+        config["base_url"] = persisted_base_url
+    runtime = config.get("gateway_runtime")
+    if isinstance(runtime, dict):
+        if persisted_base_url is None:
+            runtime.pop("base_url", None)
+        else:
+            runtime["base_url"] = persisted_base_url
     db = getattr(agent, "_session_db", None)
     sid = getattr(agent, "session_id", None)
     if db is not None and sid:
@@ -710,7 +729,7 @@ def _persist_session_model_config(
                 update_route(
                     sid,
                     provider=result.target_provider,
-                    base_url=result.base_url,
+                    base_url=persisted_base_url,
                     billing_mode=result.api_mode or None,
                 )
     setattr(agent, "_session_init_model_config", _copy_state(config))
@@ -766,7 +785,11 @@ def _snapshot_runtime(agent: Any) -> dict:
         "model", "provider", "requested_provider", "base_url", "api_mode",
         "api_key", "client", "_anthropic_client", "_anthropic_api_key",
         "_anthropic_base_url", "_is_anthropic_oauth", "_config_context_length",
-        "_client_kwargs", "request_overrides", "reasoning_config",
+        "_reasoning_echo_flag", "_transport_cache",
+        "_use_prompt_caching", "_use_native_cache_layout",
+        "_provider_fallback_active", "_provider_fallback_route",
+        "_client_kwargs", "_credential_pool", "_credential_pool_entry_id",
+        "_custom_providers", "request_overrides", "reasoning_config",
         "_primary_runtime", "_cached_system_prompt", "_fallback_chain",
         "_fallback_model", "_fallback_activated", "_fallback_index",
         "_session_init_model_config", "ui_route",
@@ -775,19 +798,29 @@ def _snapshot_runtime(agent: Any) -> dict:
         name: _copy_state(getattr(agent, name, _RUNTIME_MISSING))
         for name in names
     }
+    mutable_refs = {
+        name: getattr(agent, name)
+        for name in names
+        if isinstance(getattr(agent, name, None), (dict, list, set))
+    }
+    snapshot["__mutable_refs__"] = mutable_refs
+    snapshot["__mutable_states__"] = _copy_state(mutable_refs)
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None and hasattr(compressor, "__dict__"):
-        snapshot["__context_compressor_state__"] = {
-            name: _copy_state(value)
-            for name, value in compressor.__dict__.items()
-        }
+        snapshot["__context_compressor_state__"] = _copy_state(
+            compressor.__dict__
+        )
     return snapshot
 
 
 def _restore_runtime(agent: Any, snapshot: dict) -> None:
     compressor_state = snapshot.get("__context_compressor_state__")
+    mutable_refs = snapshot.get("__mutable_refs__", {})
+    mutable_states = snapshot.get("__mutable_states__", {})
     for name, value in snapshot.items():
-        if name == "__context_compressor_state__":
+        if name in {
+            "__context_compressor_state__", "__mutable_refs__", "__mutable_states__"
+        }:
             continue
         if value is _RUNTIME_MISSING:
             try:
@@ -796,6 +829,19 @@ def _restore_runtime(agent: Any, snapshot: dict) -> None:
                 pass
         else:
             setattr(agent, name, value)
+    for name, original in mutable_refs.items():
+        current = getattr(agent, name, None)
+        if current is not original:
+            setattr(agent, name, original)
+        state = mutable_states.get(name)
+        if isinstance(original, dict) and isinstance(state, dict):
+            original.clear()
+            original.update(state)
+        elif isinstance(original, list) and isinstance(state, list):
+            original[:] = state
+        elif isinstance(original, set) and isinstance(state, set):
+            original.clear()
+            original.update(state)
     compressor = getattr(agent, "context_compressor", None)
     if compressor_state is not None and compressor is not None:
         compressor.__dict__.clear()

@@ -1359,7 +1359,10 @@ def call_converse_stream(
         guardrail_config=guardrail_config,
     )
 
+    from agent import relay_llm
+
     try:
+        relay_llm.capture_transport_request(kwargs)
         response = client.converse_stream(**kwargs)
     except Exception as exc:
         if is_streaming_access_denied_error(exc):
@@ -1371,6 +1374,7 @@ def call_converse_stream(
                 "falling back to non-streaming converse().",
                 region, model,
             )
+            relay_llm.capture_transport_request(kwargs)
             return normalize_converse_response(client.converse(**kwargs))
         if is_stale_connection_error(exc):
             logger.warning(

@@ -1202,6 +1202,9 @@ class GeminiNativeClient:
             return self._stream_completion(model=model, request=request, timeout=timeout)
 
         url = f"{self.base_url}/models/{model}:generateContent"
+        from agent import relay_llm
+
+        relay_llm.capture_transport_request(request)
         response = self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
         if response.status_code != 200:
             raise gemini_http_error(response)
@@ -1223,6 +1226,9 @@ class GeminiNativeClient:
 
         def _generator() -> Iterator[_GeminiStreamChunk]:
             try:
+                from agent import relay_llm
+
+                relay_llm.capture_transport_request(request)
                 with self._http.stream("POST", url, json=request, headers=stream_headers, timeout=timeout) as response:
                     if response.status_code != 200:
                         body_text = read_streaming_error_body(response)

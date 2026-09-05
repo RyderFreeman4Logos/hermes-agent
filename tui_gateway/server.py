@@ -38,6 +38,10 @@ from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    cache_hit_percent,
+)
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
@@ -2511,6 +2515,8 @@ def write_json(obj: dict) -> bool:
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     params: dict = {"type": event, "session_id": sid}
     if payload is not None:
+        if event == "message.complete":
+            payload = {**payload, "completed_at": payload.get("completed_at", time.time())}
         params["payload"] = payload
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
@@ -7175,6 +7181,198 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _cache_counter_snapshot(agent) -> dict[str, int | None]:
+    def count(name: str, *, optional: bool = False) -> int | None:
+        value = getattr(agent, name, 0 if not optional else None)
+        if value is None:
+            return None if optional else 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return None if optional else 0
+
+    return {
+        "calls": count("session_api_calls"),
+        "prompt_tokens": count("session_prompt_tokens"),
+        "read_tokens": count("session_cache_read_tokens", optional=True),
+        "write_tokens": count("session_cache_write_tokens", optional=True),
+    }
+
+
+def _cache_info_for_turn(agent, baseline: dict[str, int | None] | None) -> dict[str, int | str]:
+    current = _cache_counter_snapshot(agent)
+    if current["read_tokens"] is None or current["write_tokens"] is None:
+        return {"state": "unavailable", "pct": 0}
+    before = baseline or {key: 0 for key in current}
+    delta = {
+        key: max(0, int(current[key] or 0) - int(before.get(key, 0) or 0))
+        for key in current
+    }
+    if delta["calls"] == 0 or delta["prompt_tokens"] == 0:
+        return {"state": "unavailable", "pct": 0}
+    pct = cache_hit_percent(delta["read_tokens"], delta["prompt_tokens"])
+    return {
+        "state": "hit" if delta["read_tokens"] else "cold_write" if delta["write_tokens"] else "miss",
+        "pct": pct,
+        "read_tokens": delta["read_tokens"],
+        "prompt_tokens": delta["prompt_tokens"],
+    }
+
+
+def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
+    if not isinstance(record, dict):
+        return {"state": "unavailable", "pct": 0}
+    info: dict[str, int | str] = {
+        "state": str(record.get("state") or "unavailable"),
+        "pct": int(record.get("pct") or 0),
+    }
+    for key in ("read_tokens", "prompt_tokens"):
+        if key in record:
+            try:
+                info[key] = max(0, int(record[key]))
+            except (TypeError, ValueError):
+                pass
+    if info["state"] == "no_field":
+        return {
+            "state": "unavailable",
+            "pct": 0,
+            **(
+                {"attribution": "post_compression", "compression_bound": True}
+                if record.get("attribution") == "post_compression"
+                else {}
+            ),
+        }
+    if record.get("attribution") == "post_compression":
+        info["attribution"] = "post_compression"
+        info["compression_bound"] = True
+    return info
+
+
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str]:
+    if not isinstance(usage, dict):
+        return {"state": "unavailable", "pct": 0}
+    try:
+        read_tokens = max(0, int(usage.get("cache_read_tokens", 0) or 0))
+        write_tokens = max(0, int(usage.get("cache_write_tokens", 0) or 0))
+        prompt_tokens = max(0, int(usage.get("prompt_tokens", 0) or 0))
+    except (TypeError, ValueError):
+        return {"state": "unavailable", "pct": 0}
+    if usage.get("cache_telemetry") != "reported":
+        return {"state": "unavailable", "pct": 0}
+    pct = cache_hit_percent(read_tokens, prompt_tokens)
+    state = "hit" if read_tokens else "cold_write" if write_tokens else "miss"
+    info: dict[str, int | str] = {
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+        "pct": pct,
+        "state": state,
+        "level": "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info",
+    }
+    if usage.get("cache_attribution") == "post_compression":
+        info["attribution"] = "post_compression"
+        info["compression_bound"] = True
+    return info
+
+
+def _cache_status_text(info: dict[str, Any]) -> str:
+    state = str(info.get("state") or "unavailable")
+    if state == "hit":
+        return f"cache {int(info.get('pct') or 0)}%"
+    if state == "unavailable":
+        return "cache unavailable"
+    return f"cache {state.upper()}"
+
+
+def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
+    if "cache_info" in payload:
+        return
+    session = _sessions.get(sid) or {}
+    agent = session.get("agent")
+    info = _cache_info_from_first_call(session.get("first_provider_response"))
+    if (
+        info["state"] == "unavailable"
+        and "read_tokens" not in info
+        and "prompt_tokens" not in info
+        and agent is not None
+    ):
+        info = _cache_info_for_turn(agent, session.get("_cache_counter_baseline"))
+    session["first_provider_response"] = {
+        **info,
+        "owner": "tui_gateway",
+        "request_index": 1,
+        "timestamp": time.time(),
+        "session": hashlib.sha256(
+            f"{sid}:{getattr(agent, 'session_id', '')}".encode()
+        ).hexdigest(),
+    }
+    payload["cache_info"] = info
+    if info["state"] != "unavailable" and not session.get("_cache_status_emitted"):
+        session["_cache_status_emitted"] = True
+        _emit("status.update", sid, {"kind": "cache_hit", "text": _cache_status_text(info), "cache_record": session["first_provider_response"]})
+
+
+def _attach_tui_cache_callback(agent, sid: str):
+    """Publish the first provider cache response for each TUI wake."""
+    agent._tui_cache_owner_session = sid
+    agent._tui_first_provider_response_record_enabled = True
+    agent._tui_first_provider_response_recorded = False
+
+    def emit_cache_state(
+        state: str, pct: int, _read: int, _prompt: int, record: dict | None = None
+    ) -> None:
+        session = _sessions.get(sid)
+        if (
+            getattr(agent, "_tui_cache_owner_session", None) != sid
+            or not isinstance(session, dict)
+            or session.get("agent") is not agent
+            or getattr(agent, "_tui_first_provider_response_recorded", False)
+        ):
+            return
+        agent._tui_first_provider_response_recorded = True
+        cache_info = _cache_info_from_usage(getattr(agent, "_first_turn_usage", None))
+        if cache_info["state"] == "unavailable":
+            cache_info = (
+                {"state": "unavailable", "pct": 0}
+                if state == "no_field"
+                else {
+                    "read_tokens": max(0, int(_read or 0)),
+                    "prompt_tokens": max(0, int(_prompt or 0)),
+                    "pct": pct,
+                    "state": state,
+                    "level": "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info",
+                }
+            )
+        if isinstance(record, dict) and record.get("attribution") == "post_compression":
+            cache_info["attribution"] = "post_compression"
+            cache_info["compression_bound"] = True
+        cache_state = str(cache_info.get("state") or state)
+        cache_record = dict(record or {})
+        cache_record.update(
+            state=cache_state,
+            pct=cache_info.get("pct"),
+            owner="tui_gateway",
+            request_index=1,
+            timestamp=cache_record.get("timestamp", time.time()),
+            session=hashlib.sha256(
+                f"{sid}:{getattr(agent, 'session_id', '')}".encode()
+            ).hexdigest(),
+        )
+        for key in ("read_tokens", "prompt_tokens", "attribution", "compression_bound"):
+            if key in cache_info:
+                cache_record[key] = cache_info[key]
+        session["first_provider_response"] = cache_record
+        if cache_state != "unavailable":
+            session["_cache_status_emitted"] = True
+            _emit("status.update", sid, {
+                "kind": "cache_hit",
+                "text": _cache_status_text(cache_info),
+                "cache_record": cache_record,
+            })
+
+    agent._tui_cache_callback = emit_cache_state
+    return agent
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''.
 
@@ -8657,7 +8855,7 @@ def _make_agent(
 
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
 
     from run_agent import AIAgent
 
@@ -8778,7 +8976,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -8825,6 +9023,7 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _init_session(
@@ -12531,6 +12730,10 @@ def _run_prompt_submit(
             # the turn runs. No-op for every other session shape.
             _sync_bot_capabilities(sid, session)
             agent = session["agent"]
+            agent._tui_first_provider_response_recorded = False
+            session.pop("first_provider_response", None)
+            session["_cache_status_emitted"] = False
+            session["_cache_counter_baseline"] = _cache_counter_snapshot(agent)
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.
             with session["history_lock"]:
@@ -12996,6 +13199,7 @@ def _run_prompt_submit(
                 if _error_surface:
                     payload["error_surface"] = _error_surface
             _retire_turn_marker(session, marker_key)
+            _stamp_loop_cache_info(sid, payload)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────

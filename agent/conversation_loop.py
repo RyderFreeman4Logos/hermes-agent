@@ -156,6 +156,27 @@ def _loop_timing_context(
     return "\n".join(lines)
 
 
+def _drop_redundant_previous_loop_start(text: str, history) -> str:
+    """Drop Previous loop start when history already has that Current stamp."""
+    if not text or not history:
+        return text
+    lines = text.splitlines()
+    previous = next(
+        (line for line in lines if line.startswith("Previous loop start: ")), None
+    )
+    if previous is None:
+        return text
+    needle = f"Current loop start: {previous[len('Previous loop start: '):]}"
+    if any(
+        isinstance(message, dict)
+        and "[Agent loop timing]" in str(message.get("content", ""))
+        and needle in str(message.get("content", ""))
+        for message in history
+    ):
+        return "\n".join(line for line in lines if line != previous)
+    return text
+
+
 # One-time wrap-up notice appended when a wall-clock run budget crosses its
 # 80% threshold (agent.run_budget_seconds / --run-budget). Mirrors the Codex
 # CLI budget wrap-up template: stop new work, deliver from current state.

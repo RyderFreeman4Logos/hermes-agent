@@ -8846,6 +8846,7 @@ def _init_session(
             "history": history,
             "history_lock": threading.Lock(),
             "history_version": 0,
+            "_live_rail_lock": threading.RLock(),
             "inflight_turn": None,
             "created_at": now,
             "last_active": now,
@@ -10275,6 +10276,7 @@ def _deferred_session_record(
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
+        "_live_rail_lock": threading.RLock(),
         "image_counter": 0,
         "inflight_turn": None,
         "last_active": now,
@@ -11744,32 +11746,61 @@ def _ack_steered_completion_ingest(session: dict, snapshot: list | None = None) 
 
 
 def _bind_completion_steer_guards(session: dict, agent) -> None:
-    """ACK on drain (ingest); unmark on interrupt wipe so pending can replay."""
+    """Make one session's live rail atomic across admission and finalization."""
     if agent is None or getattr(agent, "_completion_steer_guards", False):
         return
+    # ponytail: session-wide control lock; split only if control-call latency matters.
+    rail_lock = session.setdefault("_live_rail_lock", threading.RLock())
     orig_clear = getattr(agent, "clear_interrupt", None)
     if callable(orig_clear):
 
         def _clear(*args, **kwargs):
-            had = bool(getattr(agent, "_pending_steer", None))
-            result = orig_clear(*args, **kwargs)
-            if had and not getattr(agent, "_pending_steer", None):
-                with session["history_lock"]:
-                    for evt in session.get("_completion_pending") or []:
-                        evt.pop("_steer_accepted", None)
-                        evt.pop("_steer_publication", None)
-            return result
+            with rail_lock:
+                had = bool(getattr(agent, "_pending_steer", None))
+                result = orig_clear(*args, **kwargs)
+                if had and not getattr(agent, "_pending_steer", None):
+                    with session["history_lock"]:
+                        for evt in session.get("_completion_pending") or []:
+                            evt.pop("_steer_accepted", None)
+                            evt.pop("_steer_publication", None)
+                return result
 
         agent.clear_interrupt = _clear
+    orig_steer = getattr(agent, "steer", None)
+    if callable(orig_steer):
+
+        def _steer(*args, **kwargs):
+            with rail_lock:
+                return orig_steer(*args, **kwargs)
+
+        agent.steer = _steer
+    orig_interrupt = getattr(agent, "interrupt", None)
+    if callable(orig_interrupt):
+
+        def _interrupt(*args, **kwargs):
+            with rail_lock:
+                return orig_interrupt(*args, **kwargs)
+
+        agent.interrupt = _interrupt
     orig_apply = getattr(agent, "_apply_pending_steer_to_tool_results", None)
     if callable(orig_apply):
 
         def _apply(*args, **kwargs):
-            orig_apply(*args, **kwargs)
-            if not getattr(agent, "_pending_steer", None):
-                _ack_steered_completion_ingest(session)
+            with rail_lock:
+                result = orig_apply(*args, **kwargs)
+                if not getattr(agent, "_pending_steer", None):
+                    _ack_steered_completion_ingest(session)
+                return result
 
         agent._apply_pending_steer_to_tool_results = _apply
+    orig_drain = getattr(agent, "_drain_pending_steer", None)
+    if callable(orig_drain):
+
+        def _drain(*args, **kwargs):
+            with rail_lock:
+                return orig_drain(*args, **kwargs)
+
+        agent._drain_pending_steer = _drain
     agent._completion_steer_guards = True
 
 
@@ -11970,51 +12001,52 @@ def _deliver_completions_via_steer(
     if batch_key not in emitted:
         _emit("status.update", sid, {"kind": "process", "text": text})
         emitted.add(batch_key)
-    publication = object()
-    replaced: dict[int, dict] = {}
-    with session["history_lock"]:
-        _bind_completion_steer_guards(session, session.get("agent"))
-        pending = session.setdefault("_completion_pending", [])
-        for evt in events:
-            key = _notification_event_dedup_key(evt)
-            match = next(
-                (
-                    (index, item)
-                    for index, item in enumerate(pending)
-                    if _notification_event_dedup_key(item) == key
-                ),
-                None,
-            )
-            staged = dict(match[1] if match is not None else evt)
-            staged["_steer_accepted"] = True
-            staged["_steer_publication"] = publication
-            if match is None:
-                pending.append(staged)
-            else:
-                pending[match[0]] = staged
-                replaced[id(staged)] = match[1]
-    try:
-        accepted = bool(steer(text))
-    except Exception:
-        accepted = False
-    if not accepted:
+    with session.setdefault("_live_rail_lock", threading.RLock()):
+        publication = object()
+        replaced: dict[int, dict] = {}
         with session["history_lock"]:
-            pending = session.get("_completion_pending") or []
-            session["_completion_pending"] = [
-                replaced[id(item)]
-                if item.get("_steer_publication") is publication and id(item) in replaced
-                else item
-                for item in pending
-                if item.get("_steer_publication") is not publication
-                or id(item) in replaced
-            ]
-        return False
-    # steer() True is staging only — ACK at leftover/tool-result ingest.
-    with session["history_lock"]:
-        for item in session.get("_completion_pending") or []:
-            if item.get("_steer_publication") is publication:
-                item.pop("_steer_publication", None)
-    return True
+            _bind_completion_steer_guards(session, session.get("agent"))
+            pending = session.setdefault("_completion_pending", [])
+            for evt in events:
+                key = _notification_event_dedup_key(evt)
+                match = next(
+                    (
+                        (index, item)
+                        for index, item in enumerate(pending)
+                        if _notification_event_dedup_key(item) == key
+                    ),
+                    None,
+                )
+                staged = dict(match[1] if match is not None else evt)
+                staged["_steer_accepted"] = True
+                staged["_steer_publication"] = publication
+                if match is None:
+                    pending.append(staged)
+                else:
+                    pending[match[0]] = staged
+                    replaced[id(staged)] = match[1]
+        try:
+            accepted = bool(steer(text))
+        except Exception:
+            accepted = False
+        if not accepted:
+            with session["history_lock"]:
+                pending = session.get("_completion_pending") or []
+                session["_completion_pending"] = [
+                    replaced[id(item)]
+                    if item.get("_steer_publication") is publication and id(item) in replaced
+                    else item
+                    for item in pending
+                    if item.get("_steer_publication") is not publication
+                    or id(item) in replaced
+                ]
+            return False
+        # steer() True is staging only — ACK at leftover/tool-result ingest.
+        with session["history_lock"]:
+            for item in session.get("_completion_pending") or []:
+                if item.get("_steer_publication") is publication:
+                    item.pop("_steer_publication", None)
+        return True
 
 
 def _deliver_completion_notifications(
@@ -12975,35 +13007,37 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> bool:
-    with session["history_lock"]:
-        if session.get("_closing"):
-            session["running"] = False
-            return False
-        if (
-            queued_prompt_generation is not None
-            and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
-        ):
-            session["running"] = False
-            return False
-        if image_paths is None:
-            images = list(session.get("attached_images", []))
-            session["attached_images"] = []
-        else:
-            images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
-        agent = session["agent"]
-    # clear_interrupt() can be wrapped by completion-steer bookkeeping.  Keep
-    # it outside history_lock: the wrapper may need that same non-reentrant
-    # lock to roll back a pending steer.
-    if hasattr(agent, "clear_interrupt"):
-        try:
-            agent.clear_interrupt()
-        except Exception:
-            pass
+    # The live rail is one lifecycle: claim it before admitting a new turn so
+    # clear, completion publication, user steer/interrupt, and finalizer drain
+    # cannot acknowledge a state another member immediately erases.
+    with session.setdefault("_live_rail_lock", threading.RLock()):
+        with session["history_lock"]:
+            if session.get("_closing"):
+                session["running"] = False
+                return False
+            if (
+                queued_prompt_generation is not None
+                and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+            ):
+                session["running"] = False
+                return False
+            if image_paths is None:
+                images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            else:
+                images = list(image_paths)
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            agent = session["agent"]
+            _bind_completion_steer_guards(session, agent)
+        if hasattr(agent, "clear_interrupt"):
+            try:
+                agent.clear_interrupt()
+            except Exception:
+                pass
     # Desktop/TUI observability (#86647): this is the ONE INFO record proving
     # a Desktop/TUI prompt was accepted by THIS process, and it ties together
     # every id a rotation-mute trace needs — the UI session id, the gateway

@@ -132,6 +132,135 @@ def test_admitted_completion_steer_does_not_deadlock_next_turn(monkeypatch):
     assert "_steer_accepted" not in session["_completion_pending"][0]
 
 
+class _ClearBarrierAgent:
+    """Small live-rail model for deterministic admission handoffs."""
+
+    def __init__(self):
+        self._pending_steer = None
+        self._interrupt_requested = False
+        self.clear_entered = threading.Event()
+        self.release_clear = threading.Event()
+        self.action_started = threading.Event()
+        self.steers: list[str] = []
+
+    def clear_interrupt(self):
+        self.clear_entered.set()
+        assert self.release_clear.wait(1.0), "clear release barrier timed out"
+        self._pending_steer = None
+        self._interrupt_requested = False
+        return True
+
+    def steer(self, text):
+        self._pending_steer = text
+        self.steers.append(text)
+        self.action_started.set()
+        return True
+
+    def interrupt(self):
+        self._interrupt_requested = True
+        self.action_started.set()
+
+    def _apply_pending_steer_to_tool_results(self):
+        self._pending_steer = None
+        self.action_started.set()
+
+    def _drain_pending_steer(self):
+        text = self._pending_steer
+        self._pending_steer = None
+        self.action_started.set()
+        return text
+
+
+@pytest.mark.parametrize("action", ("completion", "steer", "interrupt", "ingest", "finalizer"))
+def test_new_turn_handoff_serializes_clear_with_live_rail_actions(monkeypatch, action):
+    """A stale clear cannot acknowledge and then erase a live-rail action."""
+
+    class _NotStartedThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    agent = _ClearBarrierAgent()
+    session = _session(agent=agent, running=True)
+    server._bind_completion_steer_guards(session, agent)
+    event = _completion("proc-atomic-handoff", 0, "echo done")
+    marked: list[str] = []
+    drained: list[str | None] = []
+    real_thread = threading.Thread
+    monkeypatch.setattr(server.threading, "Thread", _NotStartedThread)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_start_usage_ticker",
+        lambda *args, **kwargs: (threading.Event(), types.SimpleNamespace(join=lambda: None)),
+    )
+    monkeypatch.setattr(
+        server,
+        "_mark_completion_events_consumed",
+        lambda events: marked.extend(evt["session_id"] for evt in events),
+    )
+    if action == "finalizer":
+        with session["history_lock"]:
+            session["_completion_pending"] = [{**event, "_steer_accepted": True}]
+        assert agent.steer("completion")
+        agent.action_started.clear()
+
+    admission = real_thread(
+        target=server._run_prompt_submit,
+        args=("rid-atomic", "sid-atomic", session, "next prompt"),
+        daemon=True,
+    )
+    admission.start()
+    assert agent.clear_entered.wait(1.0)
+
+    if action == "completion":
+        operation = lambda: server._deliver_completions_via_steer(
+            "sid-atomic", session, [event], set()
+        )
+    elif action == "steer":
+        operation = lambda: agent.steer("correction")
+    elif action == "interrupt":
+        operation = agent.interrupt
+    elif action == "ingest":
+        with session["history_lock"]:
+            session["_completion_pending"] = [
+                {**event, "_steer_accepted": True}
+            ]
+        agent._pending_steer = "completion"
+        operation = agent._apply_pending_steer_to_tool_results
+    elif action == "finalizer":
+        operation = lambda: drained.append(agent._drain_pending_steer())
+    else:
+        raise AssertionError(action)
+    live_action = real_thread(target=operation, daemon=True)
+    live_action.start()
+    assert not agent.action_started.wait(0.1), "live rail action passed stale clear"
+    agent.release_clear.set()
+    assert agent.action_started.wait(1.0)
+    admission.join(1.0)
+    live_action.join(1.0)
+    assert not admission.is_alive(), "new-turn admission deadlocked"
+    assert not live_action.is_alive(), "live rail action deadlocked"
+    if action == "completion":
+        assert agent._pending_steer
+        assert session["_completion_pending"][0]["_steer_accepted"] is True
+        assert agent.steers == [agent._pending_steer]
+    elif action == "steer":
+        assert agent._pending_steer == "correction"
+    elif action == "interrupt":
+        assert agent._interrupt_requested is True
+    elif action == "ingest":
+        assert marked == ["proc-atomic-handoff"]
+    else:
+        assert drained == [None]
+        server._flush_pending_completions_if_idle("sid-atomic", session, set())
+        assert len(agent.steers) == 2
+        assert agent.steers[-1] != "completion"
+        assert session["_completion_pending"][0]["_steer_accepted"] is True
+
+
 def test_notification_turn_releases_claim_when_prompt_admission_fails(monkeypatch):
     import tools.async_delegation as async_delegation
 

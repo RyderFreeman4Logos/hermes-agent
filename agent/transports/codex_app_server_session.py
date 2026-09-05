@@ -37,9 +37,22 @@ from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
 )
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.transports.codex_event_projector import CodexEventProjector
 
 logger = logging.getLogger(__name__)
+
+
+def _dispatch_event_callback(callback: Optional[Callable[[dict], None]], note: dict) -> None:
+    """Contain ordinary display faults but preserve terminal stream bounds."""
+    if callback is None:
+        return
+    try:
+        callback(note)
+    except StreamPayloadBoundExceeded:
+        raise
+    except Exception:
+        logger.debug("on_event callback raised", exc_info=True)
 
 
 # How many tailing stderr lines from the codex subprocess to attach to a
@@ -646,13 +659,7 @@ class CodexAppServerSession:
                     # preamble are projected into messages but never reach
                     # the tool-progress display, silently hiding tool
                     # bubbles around approvals.
-                    if self._on_event is not None:
-                        try:
-                            self._on_event(pending)
-                        except Exception:  # pragma: no cover - display callback
-                            logger.debug(
-                                "on_event callback raised", exc_info=True
-                            )
+                    _dispatch_event_callback(self._on_event, pending)
                     _apply_token_usage_notification(result, pending)
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
@@ -694,11 +701,7 @@ class CodexAppServerSession:
                 )
                 continue
 
-            if self._on_event is not None:
-                try:
-                    self._on_event(note)
-                except Exception:  # pragma: no cover - display callback
-                    logger.debug("on_event callback raised", exc_info=True)
+            _dispatch_event_callback(self._on_event, note)
 
             _apply_token_usage_notification(result, note)
             _apply_compaction_notification(result, note)
@@ -926,11 +929,7 @@ class CodexAppServerSession:
                 )
                 continue
 
-            if self._on_event is not None:
-                try:
-                    self._on_event(note)
-                except Exception:  # pragma: no cover - display callback
-                    logger.debug("on_event callback raised", exc_info=True)
+            _dispatch_event_callback(self._on_event, note)
 
             _apply_token_usage_notification(result, note)
             _apply_compaction_notification(result, note)

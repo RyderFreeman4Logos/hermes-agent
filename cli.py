@@ -8863,6 +8863,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=self.api_key or "",
                     base_url=self.base_url or "",
                     api_mode=self.api_mode or "",
+                    credential_pool=self._credential_pool if _stored_runtime else ...,
                 )
             except Exception:
                 self.agent = None

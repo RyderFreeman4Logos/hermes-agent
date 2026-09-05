@@ -470,8 +470,8 @@ pr = 185
 name = "fix-delegate-require-standard-model-pool-profil"
 title = "fix(delegate): require standard model pool profile"
 branch = "topic/upgrade-pr13-04-lineage-cache-delegate-20260821"
-head = "7334512d8850ae17f94ef32184e09946d23808b4"
-tree = "692454b0c3b225aa6a732b5ce02c6efade55c257"
+head = "5e627f7d39f5daf013658f6094ef33bfe0f41228"
+tree = "2e020f4cef307095dc5e012475ca04d01bbb3b3d"
 base_ref = "pin/official-main-83467c28-20260906"
 base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
 parent = "83467c28f78987acdeb55636fb625946ec572a30"
@@ -483,17 +483,17 @@ unique_on_pin = true
 unique_count = 1
 vs_pin_count = 1
 stacked_prereq_count = 0
-owned_diffsha_vs_base = "edbf8553cd91283f1ef8aa65ccf56fa4fc22612630200c7f20d76beb8da077a2"
-owned_diff_bytes_vs_base = 39528
-full_diffsha_vs_pin = "edbf8553cd91283f1ef8aa65ccf56fa4fc22612630200c7f20d76beb8da077a2"
-full_diff_bytes_vs_pin = 39528
+owned_diffsha_vs_base = "f6cc25ab12c14215a41b7d8767223226a3daadfdcbc19b0bf0f13c2f009aefc5"
+owned_diff_bytes_vs_base = 38760
+full_diffsha_vs_pin = "f6cc25ab12c14215a41b7d8767223226a3daadfdcbc19b0bf0f13c2f009aefc5"
+full_diff_bytes_vs_pin = 38760
 owned_commits = [
-  "7334512d8850ae17f94ef32184e09946d23808b4",
+  "5e627f7d39f5daf013658f6094ef33bfe0f41228",
 ]
 owned_subjects = [
   "fix(delegate): require standard model pool profile",
 ]
-notes = "unique-on-pin 1; non-empty delegation.model_pool requires explicit standard"
+notes = "unique-on-pin 1; replay-safe successor; non-empty delegation.model_pool requires explicit standard; prefix 19+1 not full 43 green"
 
 [[patch]]
 order = 15

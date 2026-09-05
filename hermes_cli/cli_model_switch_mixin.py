@@ -114,14 +114,15 @@ def _print_switch_summary(cli, result, old_model, *, one_turn: bool, strict_cont
 
 
 def _switch_model_from(
-    cli, raw_input, *, is_global, explicit_provider, user_providers, custom_providers):
+    cli, raw_input, *, is_global, explicit_provider, user_providers, custom_providers,
+    validate_live: bool = True):
     """``switch_model`` seeded with this CLI's live route."""
     from hermes_cli.model_switch import switch_model
     return switch_model(
         raw_input=raw_input, current_provider=cli.provider or "", current_model=cli.model or "",
         current_base_url=cli.base_url or "", current_api_key=cli.api_key or "", is_global=is_global,
         explicit_provider=explicit_provider, user_providers=user_providers,
-        custom_providers=custom_providers)
+        custom_providers=custom_providers, validate_live=validate_live)
 
 
 def _run_confirm_and_apply(cli, target, *args) -> None:
@@ -691,7 +692,9 @@ class CLIModelSwitchMixin:
             _cprint(f"  ✗ {request.error_messages()[0]}")
             return
         one_turn = request.is_once
-        persist_global = resolve_persist_behavior(
+        after_compression = request.is_after_compression
+        reasoning = request.reasoning
+        persist_global = False if after_compression else resolve_persist_behavior(
             request.is_global, request.is_session, is_once=one_turn,
             explicit_provider=request.explicit_provider)
 
@@ -716,17 +719,29 @@ class CLIModelSwitchMixin:
         user_provs = ctx.user_providers if ctx is not None else None
         custom_provs = ctx.custom_providers if ctx is not None else None
 
-        if not request.target and not request.explicit_provider:
+        if not request.target and not request.explicit_provider and not reasoning:
             return _show_model_picker(self, ctx, request.force_refresh)
 
+        model_input = request.target
+        explicit_provider = request.explicit_provider
+        if reasoning and not model_input and not explicit_provider:
+            model_input = self.model or ""
+            explicit_provider = self.provider or ""
+
         result = _switch_model_from(
-            self, request.target, is_global=persist_global,
-            explicit_provider=request.explicit_provider,
-            user_providers=user_provs, custom_providers=custom_provs)
+            self, model_input, is_global=persist_global,
+            explicit_provider=explicit_provider,
+            user_providers=user_provs, custom_providers=custom_provs,
+            validate_live=not after_compression)
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
-        _merge_preflight_warning(self, result, custom_provs)
+        if reasoning:
+            from hermes_constants import parse_reasoning_effort
+            result.reasoning_config = parse_reasoning_effort(reasoning)
+        result.is_after_compression = after_compression
+        if not after_compression:
+            _merge_preflight_warning(self, result, custom_provs)
         _run_confirm_and_apply(
             self, self._confirm_and_apply_cli_model_switch,
             result, persist_global, one_turn, custom_provs)
@@ -738,6 +753,42 @@ class CLIModelSwitchMixin:
         from cli import _cprint
         if not self._confirm_expensive_model_switch(result):
             _cprint("  Model switch cancelled.")
+            return
+        if getattr(result, "is_after_compression", False):
+            if self.agent is None:
+                _cprint("  ✗ No active session is available for deferred switching.")
+                return
+            from hermes_cli.model_switch import (
+                format_model_for_display, schedule_model_switch_after_compression)
+            old_model = str(self.model or "")
+
+            def _sync_deferred_model_switch(applied_result, _old_model, _old_provider):
+                applied_agent = self.agent
+                self.model = applied_result.new_model
+                self.provider = applied_result.target_provider
+                self.requested_provider = applied_result.target_provider
+                self._explicit_api_key = applied_result.api_key
+                self._explicit_base_url = applied_result.base_url
+                self.api_key = getattr(applied_agent, "api_key", applied_result.api_key)
+                self.base_url = getattr(applied_agent, "base_url", applied_result.base_url)
+                self.api_mode = getattr(applied_agent, "api_mode", applied_result.api_mode)
+                self.reasoning_config = applied_result.reasoning_config
+                self._pending_one_turn_model_restore = None
+                self._pending_model_switch_note = (
+                    "[Note: model was just switched from "
+                    f"{format_model_for_display(old_model)} to "
+                    f"{format_model_for_display(applied_result.new_model)} via "
+                    f"{applied_result.provider_label or applied_result.target_provider}. "
+                    "Adjust your self-identification accordingly.]")
+
+            replaced = schedule_model_switch_after_compression(
+                self.agent, result, on_applied=_sync_deferred_model_switch)
+            _cprint(
+                "  ✓ Model switch scheduled after the next successful compression: "
+                f"{format_model_for_display(result.new_model)}")
+            _cprint(f"    Provider: {result.provider_label or result.target_provider}")
+            if replaced is not None:
+                _cprint("    (replaced the previously scheduled model switch)")
             return
         _commit_model_switch(self, result, persist_global=persist_global, one_turn=one_turn)
 

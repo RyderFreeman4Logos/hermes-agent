@@ -8379,15 +8379,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         elif isinstance(raw, dict):
             config = dict(raw)
         config = sanitize_persisted_model_config(config)
-        safe_patch = dict(patch)
-        if "base_url" in safe_patch:
-            safe_patch["base_url"] = sanitize_persisted_base_url(
-                safe_patch["base_url"]
-            )
-        if isinstance(safe_patch.get("gateway_runtime"), dict):
-            safe_patch["gateway_runtime"] = sanitize_persisted_model_config(
-                safe_patch["gateway_runtime"]
-            )
+        deletions = {key for key, value in patch.items() if value is None}
+        safe_patch = sanitize_persisted_model_config(
+            {key: value for key, value in patch.items() if value is not None}
+        )
+        if "base_url" in patch and "base_url" not in safe_patch:
+            deletions.add("base_url")
+        for key in deletions:
+            safe_patch[key] = None
         for key, value in safe_patch.items():
             if value is None:
                 config.pop(key, None)

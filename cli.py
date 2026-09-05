@@ -230,7 +230,7 @@ from utils import (
     base_url_host_matches,
     base_url_hostname,
     fast_safe_load,
-    sanitize_persisted_base_url,
+    sanitize_persisted_model_config,
 )
 
 _hermes_home = get_hermes_home()
@@ -8789,10 +8789,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Deriving the top-level from **route guarantees the two shapes
         # can never diverge — the asymmetry that caused the original
         # stale-key bug (#85261 simplify-code review).
-        persisted_base_url = sanitize_persisted_base_url(result.base_url)
-        route = {
+        persisted = sanitize_persisted_model_config({
             "provider": provider or None,
-            "base_url": persisted_base_url,
+            "base_url": result.base_url or None,
+            "api_mode": result.api_mode or None,
+        })
+        # Explicit None deletes stale keys on merge (both shapes).
+        route = {
+            "provider": persisted.get("provider"),
+            "base_url": persisted.get("base_url"),
             "api_mode": result.api_mode or None,
         }
         try:

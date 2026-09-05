@@ -31,7 +31,7 @@ OVERRIDE = {
     "model": "gpt-5o",
     "provider": "openai",
     "api_key": "sk-SUPER-SECRET-do-not-persist",
-    "base_url": "https://api.openai.example/v1",
+    "base_url": "https://api.openai.com/v1",
     "api_mode": "responses",
 }
 
@@ -82,7 +82,7 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
     assert persisted == {
         "model": "gpt-5o",
         "provider": "openai",
-        "base_url": "https://api.openai.example/v1",
+        "base_url": "https://api.openai.com/v1",
     }
 
 
@@ -109,7 +109,7 @@ def test_runner_rehydrates_override_after_restart(store_factory):
         return_value={
             "api_key": "sk-fresh-from-keychain",
             "api_mode": "responses",
-            "base_url": "https://api.openai.example/v1",
+            "base_url": "https://api.openai.com/v1",
             "provider": "openai",
         },
     ):
@@ -118,7 +118,7 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     override = runner._session_model_overrides[session_key]
     assert override["model"] == "gpt-5o"
     assert override["provider"] == "openai"
-    assert override["base_url"] == "https://api.openai.example/v1"
+    assert override["base_url"] == "https://api.openai.com/v1"
     # Credentials come from live resolution, never from disk.
     assert override["api_key"] == "sk-fresh-from-keychain"
     assert override["api_mode"] == "responses"
@@ -131,7 +131,7 @@ def test_sanitize_model_override():
     assert sanitize_model_override(OVERRIDE) == {
         "model": "gpt-5o",
         "provider": "openai",
-        "base_url": "https://api.openai.example/v1",
+        "base_url": "https://api.openai.com/v1",
     }
 
 
@@ -153,7 +153,7 @@ def test_sanitize_model_override_keeps_benign_route_query():
     override = {
         "model": "gpt-5o",
         "provider": "openai",
-        "base_url": "https://api.example/v1?api-version=2024-01-01&region=us",
+        "base_url": "https://api.openai.com/v1?api-version=2024-01-01&region=us",
     }
 
     assert sanitize_model_override(override) == override

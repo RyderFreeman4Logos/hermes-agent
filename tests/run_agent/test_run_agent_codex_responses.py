@@ -10,6 +10,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent.conversation_loop import _is_xai_bad_credentials_403
 
 
 @pytest.fixture(autouse=True)
@@ -2407,3 +2408,125 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
     )
 
     assert "".join(reasoning_streamed) == "Need to inspect files."
+
+
+class _XaiForbidden403(Exception):
+    status_code = 403
+
+    def __init__(self, body, text="Error code: 403"):
+        self.body = body
+        super().__init__(text)
+
+
+class _Unauthorized401(Exception):
+    status_code = 401
+
+
+@pytest.mark.parametrize(
+    ("body", "text", "expected"),
+    [
+        ({"code": "unauthenticated:bad-credentials"}, "Error code: 403", True),
+        (
+            {"error": "bad-credentials is not the cause"},
+            "HTTP 403: bad-credentials is not the cause",
+            False,
+        ),
+        ({"code": "unauthenticated:bad-credentials-extra"}, "Error code: 403", False),
+        (
+            {"code": "other", "message": "OAuth2 access token could not be validated"},
+            "Error code: 403",
+            True,
+        ),
+        (
+            {"code": "other", "message": "not OAuth2 access token could be validated"},
+            "Error code: 403",
+            False,
+        ),
+    ],
+)
+def test_xai_403_marker_matching_is_structured_and_exact(body, text, expected):
+    assert _is_xai_bad_credentials_403(
+        "xai-oauth", 403, _XaiForbidden403(body, text)
+    ) is expected
+
+
+def test_run_conversation_xai_403_body_only_refreshes_and_retries(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403(
+                {
+                    "code": "unauthenticated:bad-credentials",
+                    "message": "OAuth2 access token could not be validated",
+                }
+            )
+        return _codex_message_response("OK")
+
+    refreshes = {"count": 0}
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        assert force is True
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 1
+    assert calls["api"] == 2
+    assert result["completed"] is True
+    assert result["final_response"] == "OK"
+
+
+def test_run_conversation_xai_403_shares_one_shot_budget_with_401(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+    refreshes = {"count": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403({"code": "unauthenticated:bad-credentials"})
+        raise _Unauthorized401("HTTP 401: unauthorized")
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 1
+    assert result.get("completed") is not True
+
+
+@pytest.mark.parametrize(
+    ("builder", "body"),
+    [
+        (_build_xai_oauth_agent, {"code": "personal-team-blocked:spending-limit"}),
+        (_build_xai_oauth_agent, {"error": "forbidden by policy"}),
+        (_build_agent, {"code": "unauthenticated:bad-credentials"}),
+    ],
+)
+def test_run_conversation_unrelated_403_does_not_refresh(monkeypatch, builder, body):
+    agent = builder(monkeypatch)
+    refreshes = {"count": 0}
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    def _api_call(_api_kwargs):
+        raise _XaiForbidden403(body)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 0
+    assert result.get("completed") is not True

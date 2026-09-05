@@ -5887,6 +5887,8 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
+        self._runner._attach_model_switch_after_compression(ctx.session_key, agent)
+
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -7016,6 +7018,102 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sessions:
             return None
         return sessions.get(session_key)
+
+    def _attach_model_switch_after_compression(
+        self,
+        session_key: Optional[str],
+        agent: Any,
+    ) -> None:
+        """Bind conversation-scoped deferred route state to a live agent."""
+        if not session_key:
+            return
+        state = self._peek_session_state(session_key)
+        pending = (
+            state.conversation.after_compression_model_switch
+            if state is not None
+            else None
+        )
+        if pending is None:
+            return
+
+        from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+        def _on_applied(result, old_model, _old_provider):
+            current = self._peek_session_state(session_key)
+            if (
+                current is None
+                or current.conversation.after_compression_model_switch is not result
+            ):
+                return
+            current.conversation.after_compression_model_switch = None
+            current.conversation.model_override = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            }
+            if result.reasoning_config is not None:
+                current.conversation.model_override["reasoning_config"] = dict(
+                    result.reasoning_config
+                )
+            async_store = getattr(self, "_async_session_store", None)
+            if async_store is not None:
+                loop = getattr(self, "_gateway_loop", None)
+                if loop is None or not loop.is_running():
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                if loop is not None and loop.is_running():
+                    persist = safe_schedule_threadsafe(
+                        async_store.set_model_override(
+                            session_key,
+                            current.conversation.model_override,
+                        ),
+                        loop,
+                        logger=logger,
+                        log_message="Failed to schedule deferred session model override persistence",
+                    )
+
+                    def _log_persist_failure(future):
+                        try:
+                            future.result()
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist deferred session model override",
+                                exc_info=True,
+                            )
+
+                    if persist is not None:
+                        persist.add_done_callback(_log_persist_failure)
+                else:
+                    store = getattr(self, "session_store", None)
+                    if store is not None:
+                        try:
+                            store.set_model_override(
+                                session_key,
+                                current.conversation.model_override,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist deferred session model override",
+                                exc_info=True,
+                            )
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            if pending_notes is not None:
+                pending_notes[session_key] = (
+                    f"[Note: model was just switched from {old_model} to "
+                    f"{result.new_model} via "
+                    f"{result.provider_label or result.target_provider}. "
+                    "Adjust your self-identification accordingly.]"
+                )
+
+        schedule_model_switch_after_compression(
+            agent,
+            pending,
+            on_applied=_on_applied,
+        )
 
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
@@ -9741,8 +9839,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if resolved_session_key:
             _r_state = self._peek_session_state(resolved_session_key)
-            if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-                return _r_state.conversation.reasoning_override
+            if _r_state is not None:
+                if _r_state.conversation.reasoning_override is not None:
+                    return _r_state.conversation.reasoning_override
+                model_override = _r_state.conversation.model_override
+                if isinstance(model_override, dict):
+                    model_reasoning = model_override.get("reasoning_config")
+                    if isinstance(model_reasoning, dict):
+                        return dict(model_reasoning)
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -27248,36 +27352,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             persisted = store.get_model_override(session_key)
         except Exception:
-            logger.debug(
-                "Failed to read persisted session model override", exc_info=True
-            )
-            return
+            raise ValueError("Cannot restore saved model route; session store unavailable") from None
         if not persisted:
             return
+        from hermes_cli.runtime_provider import resolve_persisted_model_route
+
+        runtime = resolve_persisted_model_route(persisted)
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
-            "provider": persisted.get("provider"),
-            "base_url": persisted.get("base_url"),
+            "provider": runtime["provider"],
+            "base_url": runtime["base_url"],
+            "api_key": runtime.get("api_key") or "",
+            "api_mode": runtime.get("api_mode") or "",
+            "credential_pool": runtime.get("credential_pool"),
         }
-        provider = persisted.get("provider")
-        if provider:
-            # Re-resolve credentials for the persisted provider. On failure
-            # (e.g. credentials were removed since the switch) keep the
-            # credential-less override — _resolve_session_agent_runtime falls
-            # back to env-based resolution and applies model/provider on top.
-            try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
-                override["api_key"] = runtime.get("api_key")
-                override["api_mode"] = runtime.get("api_mode")
-                override["credential_pool"] = runtime.get("credential_pool")
-                if not override.get("base_url"):
-                    override["base_url"] = runtime.get("base_url")
-            except Exception:
-                logger.debug(
-                    "Credential re-resolution failed for persisted override "
-                    "(provider=%s); using credential-less override",
-                    provider, exc_info=True,
-                )
+        if isinstance(persisted.get("reasoning_config"), dict):
+            override["reasoning_config"] = dict(persisted["reasoning_config"])
+        provider = runtime["provider"]
         self._session_state(session_key).conversation.model_override = override
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
@@ -27292,8 +27383,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         The gateway /model command stores per-session overrides in
         ``_session_model_overrides``.  These must take precedence over
         config.yaml defaults so the switched model is actually used for
-        subsequent messages.  Fields with ``None`` values are skipped so
-        partial overrides don't clobber valid config defaults.
+        subsequent messages. Missing fields preserve partial overrides;
+        explicit empty values clear stale ambient credentials and pools.
         """
         _apply_state = self._peek_session_state(session_key)
         override = _apply_state.conversation.model_override if _apply_state else None
@@ -27301,9 +27392,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return model, runtime_kwargs
         model = override.get("model", model)
         for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
-            val = override.get(key)
-            if val is not None:
-                runtime_kwargs[key] = val
+            if key in override:
+                runtime_kwargs[key] = override[key]
         if (
             runtime_kwargs.get("api_key")
             and runtime_kwargs.get("credential_pool") is None

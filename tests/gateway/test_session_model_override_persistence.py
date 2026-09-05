@@ -2,9 +2,9 @@
 
 ``GatewayRunner._session_model_overrides`` is in-memory, so before persistence
 a gateway restart silently reverted every session to the global default model.
-The non-secret parts (model/provider/base_url) are now written through to the
-session store (``SessionEntry.model_override`` in sessions.json) and lazily
-rehydrated on first use after a restart, with credentials re-resolved through
+The non-secret parts (model/provider/base_url/reasoning_config) are now written
+through to the session store (``SessionEntry.model_override`` in sessions.json)
+and lazily rehydrated on first use after a restart, with credentials re-resolved through
 the normal runtime provider resolution.
 
 Covers:
@@ -15,7 +15,6 @@ Covers:
   - api_key is NEVER serialized to sessions.json
 """
 import json
-from unittest.mock import patch
 
 import pytest
 
@@ -31,7 +30,7 @@ OVERRIDE = {
     "model": "gpt-5o",
     "provider": "openai",
     "api_key": "sk-SUPER-SECRET-do-not-persist",
-    "base_url": "https://api.openai.example/v1",
+    "base_url": "https://api.openai.com/v1",
     "api_mode": "responses",
 }
 
@@ -82,7 +81,7 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
     assert persisted == {
         "model": "gpt-5o",
         "provider": "openai",
-        "base_url": "https://api.openai.example/v1",
+        "base_url": "https://api.openai.com/v1",
     }
 
 
@@ -95,33 +94,27 @@ def _make_runner(store):
     return runner
 
 
-def test_runner_rehydrates_override_after_restart(store_factory):
+def test_runner_rehydrates_override_after_restart(store_factory, monkeypatch):
     store = store_factory()
     entry = store.get_or_create_session(_make_source())
     session_key = entry.session_key
-    store.set_model_override(session_key, OVERRIDE)
+    store.set_model_override(session_key, {
+        **OVERRIDE, "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+    })
 
     # Simulated restart: fresh store + fresh runner with an empty in-memory
     # override map, credentials re-resolved via runtime provider resolution.
     runner = _make_runner(store_factory())
-    with patch(
-        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
-        return_value={
-            "api_key": "sk-fresh-from-keychain",
-            "api_mode": "responses",
-            "base_url": "https://api.openai.example/v1",
-            "provider": "openai",
-        },
-    ):
-        runner._rehydrate_session_model_override(session_key)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-openrouter-key")
+    runner._rehydrate_session_model_override(session_key)
 
     override = runner._session_model_overrides[session_key]
     assert override["model"] == "gpt-5o"
-    assert override["provider"] == "openai"
-    assert override["base_url"] == "https://api.openai.example/v1"
+    assert override["provider"] == "openrouter"
+    assert override["base_url"] == "https://openrouter.ai/api/v1"
     # Credentials come from live resolution, never from disk.
-    assert override["api_key"] == "sk-fresh-from-keychain"
-    assert override["api_mode"] == "responses"
+    assert override["api_key"] == "synthetic-openrouter-key"
+    assert override["api_mode"] == "chat_completions"
 
 
 def test_sanitize_model_override():
@@ -131,5 +124,29 @@ def test_sanitize_model_override():
     assert sanitize_model_override(OVERRIDE) == {
         "model": "gpt-5o",
         "provider": "openai",
-        "base_url": "https://api.openai.example/v1",
+        "base_url": "https://api.openai.com/v1",
     }
+
+
+def test_sanitize_model_override_rejects_credential_bearing_urls():
+    unsafe = {
+        "model": "gpt-5o",
+        "provider": "openai",
+        "base_url": "https://user:route-marker@api.example/v1?api_key=query-marker",
+    }
+
+    cleaned = sanitize_model_override(unsafe)
+
+    assert cleaned == {"model": "gpt-5o", "provider": "unresolved"}
+    assert "route-marker" not in json.dumps(cleaned)
+    assert "query-marker" not in json.dumps(cleaned)
+
+
+def test_sanitize_model_override_keeps_benign_route_query():
+    override = {
+        "model": "gpt-5o",
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1?api-version=2024-01-01&region=us",
+    }
+
+    assert sanitize_model_override(override) == override

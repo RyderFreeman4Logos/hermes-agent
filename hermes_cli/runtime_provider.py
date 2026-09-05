@@ -726,7 +726,9 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
-def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
+def _get_named_custom_provider(
+    requested_provider: str, *, config: Optional[dict] = None,
+) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
         return None
@@ -765,8 +767,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             if (canonical or "").strip().lower() == requested_norm:
                 return None
 
-    config = load_config()
-    
+    if config is None:
+        config = load_config()
+
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
     if isinstance(providers, dict):
@@ -891,58 +894,101 @@ def has_named_custom_provider(requested_provider: str) -> bool:
         return False
 
 
-def find_custom_provider_identity(base_url: str) -> Optional[str]:
-    """Map an endpoint URL back to its canonical ``custom:<name>`` menu key.
+def is_safe_route_alias(value: str) -> bool:
+    """Admit identifiers, not endpoints, encoded URLs or credential-shaped names."""
+    from agent.redact import redact_sensitive_text
 
-    Returns the ``custom:<normalized-name>`` slug of the first ``providers:``
-    / ``custom_providers:`` entry whose base_url matches, or ``None`` when no
-    entry owns the URL.
+    return bool(
+        isinstance(value, str)
+        and re.fullmatch(r"(?:custom:)?[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value)
+        and redact_sensitive_text(value, force=True) == value
+    )
 
-    Session persistence stores the agent's *resolved* provider, and for every
-    named custom endpoint that is the literal string ``"custom"`` — the entry
-    name is lost, and the api_key is deliberately never persisted. The
-    endpoint URL is the one durable fact that survives the round-trip, so
-    this reverse lookup lets persist/rebuild paths recover the entry identity
-    (and with it key_env/api_key/api_mode resolution via
-    :func:`_get_named_custom_provider`) instead of failing with
-    ``auth_unavailable`` or silently rebuilding with placeholder credentials.
+
+def validated_custom_provider_identity(
+    provider: str = "", *, base_url: Optional[str] = None,
+) -> Optional[str]:
+    """Return a safe alias with one owner and a faithful forward resolution.
+
+    Inspect raw entries before the compatibility view deduplicates them: two
+    names that collapse to one slug must not select whichever entry came first.
+    No endpoint or credential is returned to persistence callers.
     """
-    target = _normalize_base_url_for_match(base_url)
-    if not target:
-        return None
     try:
         config = load_config()
+        entries = []
+        providers = config.get("providers")
+        if isinstance(providers, dict):
+            for key, entry in providers.items():
+                if isinstance(entry, dict) and _config_mod.is_provider_enabled(entry):
+                    entries.append((str(entry.get("name") or key), str(key),
+                                    entry.get("api") or entry.get("url") or entry.get("base_url") or ""))
+        legacy = config.get("custom_providers", [])
+        if not isinstance(legacy, list):
+            return None
+        for entry in legacy:
+            # Normalize each raw entry separately so collisions remain visible.
+            for item in get_compatible_custom_providers({"custom_providers": [entry]}):
+                entries.append((item["name"], str(item.get("provider_key") or ""), item["base_url"]))
+        target = base_url.strip().rstrip("/") if base_url else None
+        candidates = [item for item in entries if (
+            str(item[2]).strip().rstrip("/") == target if target is not None
+            else provider.lower() in custom_provider_aliases(item[0], item[1])
+        )]
+        if len(candidates) != 1:
+            return None
+        name, key, endpoint = candidates[0]
+        alias = custom_provider_slug(name, key)
+        # Check original casing too: slug lowercasing must not hide a secret prefix.
+        if not is_safe_route_alias((key or name).strip().replace(" ", "-")) or not is_safe_route_alias(alias):
+            return None
+        owners = [item for item in entries
+                  if alias in custom_provider_aliases(item[0], item[1])]
+        if len(owners) != 1:
+            return None
+        forward = _get_named_custom_provider(alias, config=config)
+        if not forward or forward["base_url"].strip().rstrip("/") != str(endpoint).strip().rstrip("/"):
+            return None
+        return alias
     except Exception:
         return None
 
-    providers = config.get("providers")
-    if isinstance(providers, dict):
-        for ep_name, entry in providers.items():
-            if not isinstance(entry, dict):
-                continue
-            entry_url = (
-                entry.get("api") or entry.get("url") or entry.get("base_url") or ""
-            )
-            if _normalize_base_url_for_match(entry_url) == target:
-                return custom_provider_slug(str(ep_name), str(ep_name))
 
+def find_custom_provider_identity(base_url: str) -> Optional[str]:
+    """Reverse a route only when its existing config alias round-trips uniquely."""
+    return validated_custom_provider_identity(base_url=base_url) if base_url else None
+
+
+def resolve_persisted_model_route(route: dict) -> dict:
+    """Resolve persisted identity without any ambient endpoint/key fallback.
+
+    Failure is explicit and content-free. Callers must abort resume, not apply
+    a partial result over ambient credentials. Private endpoints live in config
+    only; all custom aliases are revalidated even on same-provider resumes.
+    """
+    from utils import sanitize_persisted_model_config
+
+    cleaned = sanitize_persisted_model_config(route)
+    provider = cleaned.get("provider")
+    if not provider or provider in {"custom", "auto", "unresolved"}:
+        raise ValueError("Cannot restore saved model route; select a configured provider again")
     try:
-        custom_providers = get_compatible_custom_providers(config)
+        expected = None
+        if provider.startswith("custom:"):
+            entry = _get_named_custom_provider(provider)
+            expected = entry["base_url"] if entry else None
+            if not expected or validated_custom_provider_identity(provider) != provider:
+                raise ValueError("unresolved alias")
+        runtime = resolve_runtime_provider(
+            requested=provider, explicit_base_url=cleaned.get("base_url"),
+        )
+        if expected and runtime.get("base_url", "").rstrip("/") != expected.rstrip("/"):
+            raise ValueError("route changed during resolution")
+        if not runtime.get("base_url"):
+            raise ValueError("missing endpoint")
+        return {**runtime, "provider": provider}
     except Exception:
-        custom_providers = None
-    for entry in custom_providers or []:
-        if not isinstance(entry, dict):
-            continue
-        name = entry.get("name")
-        if not isinstance(name, str) or not name.strip():
-            continue
-        if _normalize_base_url_for_match(entry.get("base_url")) == target:
-            return custom_provider_slug(
-                name,
-                str(entry.get("provider_key", "") or ""),
-            )
-
-    return None
+        raise ValueError("Cannot restore saved model route; select a configured provider again") from None
 
 
 def find_custom_provider_identity_by_model(model: str) -> Optional[str]:
@@ -1849,6 +1895,8 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+    if requested_provider == "unresolved":
+        raise ValueError("Cannot restore saved model route; select a configured provider again")
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /

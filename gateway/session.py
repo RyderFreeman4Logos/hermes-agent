@@ -94,7 +94,7 @@ from .whatsapp_identity import (
     canonical_whatsapp_identifier,
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
-from utils import atomic_replace
+from utils import atomic_replace, sanitize_persisted_model_config
 from agent.turn_context import extract_api_content_sidecar
 
 # Session keys/ids flow into filesystem paths downstream (e.g.
@@ -751,25 +751,48 @@ def build_session_context_prompt(
 # Keys of a /model session override that are safe to persist to disk.
 # ``api_key`` (and anything else, e.g. ``api_mode`` which is re-derived from
 # provider resolution) is intentionally excluded: credentials must NEVER be
-# written to sessions.json.  On rehydration after a gateway restart the
-# runner re-resolves credentials via the normal runtime provider resolution.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+# written to sessions.json. ``reasoning_config`` is limited to non-secret
+# effort settings below. On rehydration after a gateway restart the runner
+# re-resolves credentials via the normal runtime provider resolution.
+PERSISTABLE_MODEL_OVERRIDE_KEYS = (
+    "model",
+    "provider",
+    "base_url",
+    "reasoning_config",
+)
 
 
-def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
-    """Return a copy of *override* containing only persistable, non-secret keys.
-
-    Returns ``None`` when the input is empty/not a dict or no persistable
-    values remain, so callers can store the result directly on
-    ``SessionEntry.model_override``.
-    """
+def sanitize_model_override(
+    override: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return a copy of *override* containing only safe persisted values."""
     if not isinstance(override, dict):
         return None
-    cleaned = {
-        k: str(v)
-        for k, v in override.items()
-        if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
-    }
+    cleaned: Dict[str, Any] = {}
+    for key, value in override.items():
+        if key not in PERSISTABLE_MODEL_OVERRIDE_KEYS or key == "reasoning_config":
+            continue
+        if value in (None, ""):
+            continue
+        cleaned[key] = value
+    cleaned = sanitize_persisted_model_config(cleaned)
+    if "base_url" in cleaned:
+        cleaned["base_url"] = str(cleaned["base_url"])
+    if "provider" in cleaned:
+        cleaned["provider"] = str(cleaned["provider"])
+    if "model" in cleaned:
+        cleaned["model"] = str(cleaned["model"])
+    reasoning = override.get("reasoning_config")
+    if isinstance(reasoning, dict):
+        reasoning_cleaned = {
+            key: value
+            for key, value in reasoning.items()
+            if key in {"enabled", "effort"}
+            and isinstance(value, (bool, str))
+            and value != ""
+        }
+        if reasoning_cleaned:
+            cleaned["reasoning_config"] = reasoning_cleaned
     return cleaned or None
 
 
@@ -862,14 +885,15 @@ class SessionEntry:
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
 
-    # Session-scoped /model override (model/provider/base_url ONLY — never
+    # Session-scoped /model override (model/provider/base_url plus the
+    # non-secret reasoning_config — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
     # in-memory, so before this field a gateway restart silently reverted
     # every session to the global default model.  api_key/api_mode are
     # re-resolved through the normal runtime provider resolution when the
     # override is rehydrated after a restart and are never written to disk
     # (see sanitize_model_override / SessionStore.set_model_override).
-    model_override: Optional[Dict[str, str]] = None
+    model_override: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -3104,7 +3128,7 @@ class SessionStore:
     ) -> None:
         """Persist (or clear) the session-scoped /model override.
 
-        Only non-secret keys (model/provider/base_url — see
+        Only non-secret keys (model/provider/base_url/reasoning_config — see
         ``sanitize_model_override``) are written; ``api_key``/``api_mode``
         are re-resolved at rehydration time via the normal runtime provider
         resolution.  Pass ``None`` (or a dict with no persistable values)
@@ -3121,7 +3145,7 @@ class SessionStore:
             entry.model_override = cleaned
             self._save()
 
-    def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
+    def get_model_override(self, session_key: str) -> Optional[Dict[str, Any]]:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
             self._ensure_loaded_locked()

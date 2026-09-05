@@ -6213,9 +6213,13 @@ def _apply_model_switch(
         is_global_flag = parsed_flags.is_global
         is_session = parsed_flags.is_session
         one_turn = parsed_flags.is_once
+        is_after_compression = parsed_flags.is_after_compression
+        reasoning = parsed_flags.reasoning
     else:
         model_input, explicit_provider, is_global_flag, _force_refresh, is_session = parsed_flags
         one_turn = False
+        is_after_compression = False
+        reasoning = ""
     # Conflict validation delegates to the shared single-owner parser; the
     # TUI surfaces it as a raised ValueError (its historical behavior)
     # using the canonical error copy.
@@ -6231,7 +6235,7 @@ def _apply_model_switch(
             explicit_provider=explicit_provider,
         )
     )
-    if not model_input:
+    if not model_input and not is_after_compression:
         raise ValueError("model value required")
 
     agent = session.get("agent")
@@ -6286,9 +6290,29 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        is_after_compression=is_after_compression,
+        reasoning=reasoning,
+        validate_live=not is_after_compression,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
+
+    if is_after_compression:
+        if agent is None:
+            raise ValueError("--after-compression requires a live session")
+        try:
+            from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+            schedule_model_switch_after_compression(agent, result)
+        except Exception as exc:
+            raise ValueError(f"Could not schedule model switch: {exc}") from exc
+        return {
+            "value": result.new_model,
+            "warning": result.warning_message or "",
+            "confirm_required": False,
+            "scope": "after_compression",
+            "deferred": True,
+        }
 
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
 
@@ -13861,6 +13885,7 @@ def _(rid, params: dict) -> dict:
                     "confirm_required": result.get("confirm_required", False),
                     "confirm_message": result.get("confirm_message", ""),
                     "scope": result.get("scope", "session"),
+                    "deferred": result.get("deferred", False),
                 },
             )
         except Exception as e:

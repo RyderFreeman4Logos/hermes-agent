@@ -226,7 +226,12 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import base_url_host_matches, base_url_hostname, fast_safe_load
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    fast_safe_load,
+    sanitize_persisted_model_config,
+)
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -8760,22 +8765,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not db or not sid:
             return
         provider = result.target_provider
-        # Bare "custom" is the resolved billing class, not a routable
-        # identity — persisting it verbatim makes a later resume hard-fail
-        # when the config default has moved off the custom endpoint
-        # (resolve_runtime_provider only trusts config base_url for bare
-        # custom while the config provider is still custom-ish). Heal to
-        # the durable custom:<name> menu key, else drop the provider —
-        # same recovery the TUI gateway applies on its read path.
-        if str(provider or "").strip().lower() == "custom":
-            try:
-                from hermes_cli.runtime_provider import canonical_custom_identity
-                provider = canonical_custom_identity(
-                    base_url=result.base_url or None,
-                    model=result.new_model or None,
-                ) or None
-            except Exception:
-                provider = None
         # Both shapes use the same or-None discipline so stale keys from a
         # previous switch are deleted (not merely omitted) in BOTH the
         # nested gateway_runtime dict (CLI reader) and the top-level keys
@@ -8784,9 +8773,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Deriving the top-level from **route guarantees the two shapes
         # can never diverge — the asymmetry that caused the original
         # stale-key bug (#85261 simplify-code review).
-        route = {
+        persisted = sanitize_persisted_model_config({
             "provider": provider or None,
             "base_url": result.base_url or None,
+            "api_mode": result.api_mode or None,
+        })
+        # Explicit None deletes stale keys on merge (both shapes).
+        route = {
+            "provider": persisted.get("provider"),
+            "base_url": persisted.get("base_url"),
             "api_mode": result.api_mode or None,
         }
         try:
@@ -8813,13 +8808,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Without this restore a resumed session silently falls back to the
         config default model, losing the user's last ``/model`` choice.
 
-        When the stored provider differs from the ambient one, credentials
-        are re-resolved for the stored provider (mirroring the gateway's
-        ``_rehydrate_session_model_override``) — the ambient ``self.api_key``
-        belongs to the config-default provider and must not be sent to the
-        session's endpoint. On resolution failure the ambient credentials are
-        kept so the session still opens (the first turn surfaces the auth
-        error instead of the resume dying).
+        Always re-resolve a stored route, even if its provider name is unchanged.
+        An unresolved/deleted/ambiguous alias aborts resume and detaches the
+        ambient client; no endpoint or credentials may fall back silently.
 
         Skips when the session has no model recorded or when the CLI was
         launched with an explicit ``-m`` override (user intent wins).
@@ -8836,62 +8827,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from hermes_state import SessionDB as _SessionDB
         _stored_runtime = _SessionDB.session_gateway_runtime(session_meta)
         stored_provider = _stored_runtime.get("provider") or None
-        stored_base_url = _stored_runtime.get("base_url") or None
-        stored_api_mode = _stored_runtime.get("api_mode") or None
-        # Heal bare "custom" persisted by older builds / gateway turns: it's
-        # the resolved billing class, not a routable identity. Recover the
-        # durable custom:<name> menu key from the endpoint, else drop the
-        # provider so resume keeps the ambient default. (Stricter than the
-        # TUI gateway's recovery, which keeps bare "custom" when a base_url
-        # exists — the CLI's resolve path would hard-fail on it, #14676.)
-        if str(stored_provider or "").strip().lower() == "custom":
-            try:
-                from hermes_cli.runtime_provider import canonical_custom_identity
-                stored_provider = canonical_custom_identity(
-                    base_url=stored_base_url or None,
-                    model=stored_model or None,
-                ) or None
-            except Exception:
-                stored_provider = None
         model_changed = stored_model != self.model
         provider_changed = bool(stored_provider) and stored_provider != self.provider
-        if not model_changed and not provider_changed:
-            return
-        self.model = stored_model
-        if stored_provider:
-            self.provider = stored_provider
-            self.requested_provider = stored_provider
-            if stored_base_url:
-                self.base_url = stored_base_url
-            if stored_api_mode:
-                self.api_mode = stored_api_mode
-        if provider_changed:
-            # Stale launch-time explicit overrides belong to the AMBIENT
-            # provider; carrying them into the restored provider's
-            # resolution poisons _ensure_runtime_credentials on startup
-            # resume (same leak _apply_model_switch_result guards against
-            # by overwriting _explicit_* on every switch).
-            self._explicit_api_key = None
-            self._explicit_base_url = stored_base_url
-            # Re-resolve credentials for the restored provider. api_key is
-            # never persisted to the session DB (by design) — the normal
-            # runtime provider resolution owns credentials.
+        if _stored_runtime:
+            from hermes_cli.runtime_provider import resolve_persisted_model_route
+
             try:
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                resolved = resolve_runtime_provider(requested=stored_provider)
-                if resolved.get("api_key"):
-                    self.api_key = resolved["api_key"]
-                    self._credential_pool = resolved.get("credential_pool")
-                if not stored_base_url and resolved.get("base_url"):
-                    self.base_url = resolved["base_url"]
-                if not stored_api_mode and resolved.get("api_mode"):
-                    self.api_mode = resolved["api_mode"]
-            except Exception:
-                logger.debug(
-                    "Credential re-resolution for resumed session provider "
-                    "%s failed; keeping ambient credentials",
-                    stored_provider, exc_info=True,
-                )
+                resolved = resolve_persisted_model_route(_stored_runtime)
+            except ValueError:
+                # Resume may already have replaced history/session identity. Do
+                # not leave a usable ambient client attached to that history.
+                self.api_key = self.base_url = None
+                self._explicit_api_key = self._explicit_base_url = None
+                self._credential_pool = None
+                self.provider = self.requested_provider = "unresolved"
+                self.agent = None
+                raise
+            self.provider = self.requested_provider = resolved["provider"]
+            self.api_key = resolved.get("api_key") or ""
+            self.base_url = resolved["base_url"]
+            self.api_mode = _stored_runtime.get("api_mode") or resolved.get("api_mode") or ""
+            self._credential_pool = resolved.get("credential_pool")
+            self._explicit_api_key = None
+            self._explicit_base_url = self.base_url
+        self.model = stored_model
         # If the agent is already running (mid-chat /resume), swap it
         # in-place so the next turn uses the restored model. On startup
         # --resume the agent isn't built yet — _init_agent will pick up
@@ -8904,11 +8863,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=self.api_key or "",
                     base_url=self.base_url or "",
                     api_mode=self.api_mode or "",
+                    credential_pool=self._credential_pool if _stored_runtime else ...,
                 )
             except Exception:
-                logger.debug(
-                    "In-place agent model swap on resume failed", exc_info=True
-                )
+                self.agent = None
+                raise ValueError("Cannot restore saved model route; select a configured provider again") from None
+        if not model_changed and not provider_changed:
+            return
         msg = f"Model restored from session: {stored_model}"
         if stored_provider:
             msg += f" ({stored_provider})"
@@ -11539,7 +11500,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         custom_provs = ctx.custom_providers if ctx is not None else None
 
         # No args at all: open prompt_toolkit-native picker modal
-        if not model_input and not explicit_provider:
+        if (
+            not model_input
+            and not explicit_provider
+            and not request.is_after_compression
+        ):
             model_display = self.model or "unknown"
             provider_display = get_label(self.provider) if self.provider else "unknown"
 
@@ -11584,10 +11549,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            is_after_compression=request.is_after_compression,
+            reasoning=request.reasoning,
+            validate_live=not request.is_after_compression,
         )
 
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
+            return
+        result.is_after_compression = request.is_after_compression
+
+        if request.is_after_compression:
+            agent = getattr(self, "agent", None)
+            if agent is None:
+                _cprint("  ✗ --after-compression requires a live session.")
+                return
+            try:
+                from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+                schedule_model_switch_after_compression(agent, result)
+            except Exception as exc:
+                _cprint(f"  ✗ Could not schedule model switch: {exc}")
+                return
+            _cprint(f"  ✓ Model switch scheduled after compression: {result.new_model}")
             return
 
         if self.agent is not None:

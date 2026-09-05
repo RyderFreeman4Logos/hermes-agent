@@ -96,6 +96,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
+from utils import sanitize_persisted_base_url, sanitize_persisted_model_config
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -8252,6 +8253,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
+        # The JSON is a durable route boundary. Normalize valid model
+        # configuration here so callers cannot bypass route sanitization.
+        if isinstance(model_config_json, str):
+            try:
+                parsed_model_config = json.loads(model_config_json)
+            except (json.JSONDecodeError, TypeError):
+                parsed_model_config = None
+            if isinstance(parsed_model_config, dict):
+                model_config_json = json.dumps(
+                    sanitize_persisted_model_config(parsed_model_config)
+                )
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
@@ -8365,7 +8378,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 config = {}
         elif isinstance(raw, dict):
             config = dict(raw)
-        for key, value in patch.items():
+        config = sanitize_persisted_model_config(config)
+        deletions = {key for key, value in patch.items() if value is None}
+        safe_patch = sanitize_persisted_model_config(
+            {key: value for key, value in patch.items() if value is not None}
+        )
+        if "base_url" in patch and "base_url" not in safe_patch:
+            deletions.add("base_url")
+        for key in deletions:
+            safe_patch[key] = None
+        for key, value in safe_patch.items():
             if value is None:
                 config.pop(key, None)
             else:
@@ -8576,6 +8598,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
+        route = sanitize_persisted_model_config({"provider": provider, "base_url": base_url or None})
+        provider = route.get("provider") or ""
+        persisted_base_url = route.get("base_url") or ""
 
         def _do(conn):
             conn.execute(
@@ -8586,7 +8611,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    system_prompt = NULL,
                    system_prompt_hash = NULL
                    WHERE id = ?""",
-                (provider, base_url, billing_mode, session_id),
+                (provider, persisted_base_url, billing_mode, session_id),
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)

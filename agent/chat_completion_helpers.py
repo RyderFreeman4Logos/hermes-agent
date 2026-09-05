@@ -28,6 +28,10 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from agent.stream_payload_bound import (
+    StreamPayloadBoundExceeded,
+    accumulate_stream_text,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason,
@@ -3478,6 +3482,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 def _on_text(text):
                     _bedrock_response_started["yes"] = True
                     _fire_first()
+                    accumulate_stream_text(
+                        getattr(agent, "_current_streamed_assistant_text", ""),
+                        text,
+                    )
                     deltas_were_sent["yes"] = agent._fire_stream_delta(text) or deltas_were_sent["yes"]
 
                 def _on_tool(name):

@@ -42,6 +42,12 @@ DEFAULT_CONFIG = {
         # behavior everywhere.
         "terminal_continue": True,
     },
+    "debug": {
+        "cache_requests": {
+            "enabled": False,
+            "strict_write": False,
+        },
+    },
     "agent": {
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a

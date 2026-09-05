@@ -3247,6 +3247,9 @@ def create_anthropic_message(
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
         try:
+            from agent import relay_llm
+
+            relay_llm.capture_transport_request(stream_kwargs)
             with stream_fn(**stream_kwargs) as stream:
                 if callable(on_response):
                     try:
@@ -3281,4 +3284,7 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
+    from agent import relay_llm
+
+    relay_llm.capture_transport_request(create_kwargs)
     return messages_api.create(**create_kwargs)

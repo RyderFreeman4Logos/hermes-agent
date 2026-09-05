@@ -484,6 +484,27 @@ def _aux_progress_active() -> bool:
 
 
 @contextlib.contextmanager
+def aux_host_candidate_deadline(seconds, *, total_deadline=None, idle_timeout=None, fence=None):
+    """Bind auxiliary work to one host fence. Pin adapter: context marker only."""
+    yield
+
+
+def _create_bounded(create_fn, timeout_s: float) -> Any:
+    """Run a blocking provider call while preserving capture context."""
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+    from tools.thread_context import propagate_context_to_thread
+
+    executor = DaemonThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="hermes-aux-attempt-deadline"
+    )
+    future = executor.submit(propagate_context_to_thread(create_fn))
+    try:
+        return future.result(timeout=max(0.1, float(timeout_s) if timeout_s else 1.0))
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+@contextlib.contextmanager
 def _aux_thread_local_hook(local: threading.local, hook):
     """Install one thread-local hook callback and restore its prior value.
 
@@ -9365,6 +9386,10 @@ def _create_with_progress(
     _notify_aux_dispatch()
     _notify_aux_progress()  # Preserve the watchdog's historical dispatch tick.
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
+        if not _client_streams_internally(client):
+            from agent import relay_llm
+
+            relay_llm.capture_transport_request(kwargs)
         response = client.chat.completions.create(**kwargs)
         if not _client_streams_internally(client):
             _notify_aux_provider_response()

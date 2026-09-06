@@ -110,8 +110,11 @@ def _admit_prompt_turn(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
-        with contextlib.suppress(Exception):
-            agent.clear_interrupt()
+    # clear_interrupt() can be wrapped by completion-steer bookkeeping. Keep it
+    # outside history_lock: the wrapper may need that same non-reentrant lock.
+    _bind_completion_steer_guards(session, agent)
+    with contextlib.suppress(Exception):
+        agent.clear_interrupt()
     return images, agent
 
 
@@ -370,10 +373,18 @@ def _run_post_turn_followups(
     prompt wins over every auto follow-up (drain it, skip the rest); a leftover /steer is
     requeued first so it isn't dropped; then goal continuation, then completion
     notifications.  Each nested submit re-checks ``running`` under the lock."""
-    steer = result.get("pending_steer") if isinstance(result, dict) else None
-    if isinstance(steer, str) and steer.strip():
+    leftover = result.get("pending_steer") if isinstance(result, dict) else None
+    if not (isinstance(leftover, str) and leftover.strip()):
+        drain = getattr(session.get("agent"), "_drain_pending_steer", None)
+        if callable(drain):
+            with contextlib.suppress(Exception):
+                leftover = drain()
+    if isinstance(leftover, str) and leftover.strip():
         with session["history_lock"]:
-            _enqueue_prompt(session, steer, session.get("transport"))
+            _enqueue_prompt(session, leftover, session.get("transport"))
+        _ack_steered_completion_ingest(session)
+    elif not getattr(session.get("agent"), "_pending_steer", None):
+        _ack_steered_completion_ingest(session)
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:

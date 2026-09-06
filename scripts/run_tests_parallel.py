@@ -783,6 +783,23 @@ _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _out_of_tree_collection_bounds(file: Path, repo_root: Path) -> List[str]:
+    """Stop nested pytest from collecting host /tmp for an out-of-tree probe.
+
+    A probe under ``/tmp/.../probe/test_*.py`` makes pytest walk ancestors
+    until it ``scandir('/tmp')``. Unreadable host files there (for example a
+    foreign fcitx log symlink) then abort collection. In-tree files keep the
+    repo rootdir/conftest. Caller ``--rootdir`` is overridden for out-of-tree
+    files so a repo rootdir cannot reintroduce the walk.
+    """
+    try:
+        file.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        root = str(file.resolve().parent)
+        return [f"--rootdir={root}", f"--confcutdir={root}"]
+    return []
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
@@ -790,7 +807,10 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> _AttemptResult:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    cmd = [
+        sys.executable, "-m", "pytest", str(file),
+        *pytest_args, *_out_of_tree_collection_bounds(file, repo_root),
+    ]
 
     # Give this subprocess its own pytest temp root.
     #

@@ -315,6 +315,7 @@ class ComputeHost:
                 sid, key, session_id=key, model_override=frame.get("model_override"),
                 reasoning_config_override=frame.get("reasoning_config_override"),
                 service_tier_override=frame.get("service_tier_override"),
+                memory_provider_mode_override=frame.get("memory_provider_mode_override"),
                 platform_override=frame.get("source"),
                 context_cwd_is_launch_artifact=bool(
                     frame.get("context_cwd_is_launch_artifact", False)),
@@ -362,6 +363,8 @@ class ComputeHost:
         session["profile_home"] = profile_home or session.get("profile_home")
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        with contextlib.suppress(Exception):
+            server._persist_live_session_runtime(session)
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:

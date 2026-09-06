@@ -178,13 +178,35 @@ def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> T
     return tuple(is_truthy_value(section.get(k), default=True) for k in ("memory_enabled", "user_profile_enabled"))
 
 
+def get_memory_provider_mode(memory_config: Optional[Dict[str, Any]] = None) -> str:
+    """Return the profile's frozen memory routing mode.
+
+    Explicit values win. If the key is absent, Mempal becomes authoritative
+    only when both built-in Markdown stores are disabled; other configurations
+    retain the historical hybrid behavior.
+    """
+    memory_config = memory_config or {}
+    if "provider_mode" in memory_config:
+        mode = str(memory_config.get("provider_mode") or "hybrid").strip().lower()
+        return "authoritative" if mode == "authoritative" else "hybrid"
+    provider = str(memory_config.get("provider") or "").strip().lower()
+    if (
+        provider == "mempal"
+        and not memory_config.get("memory_enabled", True)
+        and not memory_config.get("user_profile_enabled", True)
+    ):
+        return "authoritative"
+    return "hybrid"
+
+
 @no_cache_check_fn
 def check_memory_requirements() -> bool:
-    """Snapshot store flags and report whether the built-in tool is available."""
+    """Expose the core memory tool for built-in or authoritative storage."""
     _memory_surface_flags.set(None)
+    section = get_builtin_memory_config()
     flags = get_builtin_memory_store_flags()
     _memory_surface_flags.set(flags)
-    return flags[0] or flags[1]
+    return get_memory_provider_mode(section) == "authoritative" or flags[0] or flags[1]
 
 
 def _memory_target_error(store: "MemoryStore", target: str) -> Optional[Dict[str, Any]]:

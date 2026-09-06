@@ -1506,6 +1506,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
+    memory_provider_mode = model_config.get("memory_provider_mode")
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        overrides["memory_provider_mode_override"] = memory_provider_mode
     return overrides
 
 
@@ -1536,6 +1539,9 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
             config[key] = value
         else:
             config.pop(key, None)
+    memory_provider_mode = getattr(agent, "_memory_provider_mode", None)
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        config["memory_provider_mode"] = memory_provider_mode
     return config
 
 
@@ -2261,7 +2267,8 @@ def _make_agent(
     sid: str, key: str, session_id: str | None = None, session_db=None,
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
-    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None):
+    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
+    memory_provider_mode_override: str | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -2297,6 +2304,7 @@ def _make_agent(
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
+        memory_provider_mode_override=memory_provider_mode_override,
         **_agent_cbs(sid))
     if context_cwd_is_launch_artifact is None:
         with _sessions_lock:

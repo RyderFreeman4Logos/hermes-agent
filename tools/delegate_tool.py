@@ -130,6 +130,8 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
+    model_profile: Optional[str] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -171,7 +173,7 @@ def _build_child_agent(
         parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_max_tokens=override_max_tokens, override_acp_command=override_acp_command,
-        override_acp_args=override_acp_args,
+        override_acp_args=override_acp_args, override_fallback_chain=override_fallback_chain,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -211,6 +213,7 @@ def _build_child_agent(
     # reference), and no parent teardown can close it out from under a background child (#81267).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     child._progress_identity_ref = child_session_ref
+    child._delegate_model_profile = model_profile
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
@@ -307,32 +310,137 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
+def _model_pool(cfg: dict) -> dict:
+    pool = cfg.get("model_pool") or {}
+    return pool if isinstance(pool, dict) else {}
+
+
+def _available_model_profile_names(cfg: Optional[dict] = None) -> List[str]:
+    if cfg is None:
+        cfg = _load_config()
+    return [str(name) for name in _model_pool(cfg) if str(name).strip()]
+
+
+def _default_model_profile_name(cfg: dict) -> Optional[str]:
+    names = _available_model_profile_names(cfg)
+    return "standard" if "standard" in names else None
+
+
+def _normalize_profile_fallback_chain(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    chain: List[Dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        normalized = dict(entry)
+        normalized["provider"] = provider
+        normalized["model"] = model
+        chain.append(normalized)
+    return chain
+
+
+def _credentials_for_model_profile(
+    cfg: dict, parent_agent, profile_name: Optional[str]
+) -> dict:
+    """Resolve child creds; an explicit unknown profile fails closed."""
+    name = str(profile_name or "").strip() or None
+    pool = _model_pool(cfg)
+    if pool and "standard" not in _available_model_profile_names(cfg):
+        raise ValueError(
+            "Non-empty model_pool requires an explicit 'standard' profile."
+        )
+    if name is None:
+        if pool:
+            name = _default_model_profile_name(cfg)
+            if name is None:
+                raise ValueError(
+                    "Non-empty model_pool requires an explicit 'standard' profile."
+                )
+        else:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
+            creds.setdefault("fallback_chain", None)
+            return creds
+
+    if name not in pool:
+        available = ", ".join(_available_model_profile_names(cfg)) or "(none)"
+        raise ValueError(f"Unknown {name!r}. Configured: {available}.")
+    profile = pool[name]
+    if not isinstance(profile, dict):
+        raise ValueError(f"{name!r} is not a mapping.")
+
+    overlay = {
+        "model": str(profile.get("model") or "").strip() or None,
+        "provider": str(profile.get("provider") or "").strip() or None,
+        "base_url": str(profile.get("base_url") or "").strip() or None,
+        "api_key": str(profile.get("api_key") or "").strip() or None,
+        "api_mode": str(profile.get("api_mode") or "").strip().lower() or None,
+    }
+    # A non-empty pool is the only routing source; ignore global delegation
+    # route keys so a global pin cannot override a selected tier.
+    global_route_keys = {"model", "provider", "base_url", "api_key", "api_mode"}
+    merged = {k: v for k, v in cfg.items() if k not in global_route_keys}
+    for key, value in overlay.items():
+        if value:
+            merged[key] = value
+    creds = _resolve_delegation_credentials(merged, parent_agent)
+    if overlay["model"]:
+        creds["model"] = overlay["model"]
+    if overlay["provider"]:
+        creds["provider"] = overlay["provider"]
+    creds["fallback_chain"] = _normalize_profile_fallback_chain(
+        profile.get("fallback_chain")
+    )
+    return creds
+
+
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
+    top_profile: Optional[str] = None, cfg: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = {
-        "override_provider": creds["provider"], "override_base_url": creds["base_url"],
-        "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
-        "override_request_overrides": creds.get("request_overrides"),
-        "override_max_tokens": creds.get("max_output_tokens"), "override_acp_command": creds.get("command"),
-        "override_acp_args": creds.get("args"),
-    }
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        route_profile = str(t.get("model_profile") or "").strip() or top_profile
+        try:
+            task_creds = (
+                _credentials_for_model_profile(cfg, parent_agent, route_profile)
+                if cfg is not None else creds
+            )
+        except ValueError as exc:
+            return [], str(exc)
+        resolved_profile = route_profile or ("standard" if _model_pool(cfg or {}) else None)
+        logger.info(
+            "delegate_task: resolved profile=%s model=%s provider=%s reasoning=%s fallback=%s",
+            resolved_profile, task_creds.get("model"), task_creds.get("provider"),
+            (cfg or {}).get("reasoning_effort") or "", task_creds.get("fallback_chain"),
+        )
+        overrides = {
+            "override_provider": task_creds["provider"], "override_base_url": task_creds["base_url"],
+            "override_api_key": task_creds["api_key"], "override_api_mode": task_creds["api_mode"],
+            "override_request_overrides": task_creds.get("request_overrides"),
+            "override_max_tokens": task_creds.get("max_output_tokens"), "override_acp_command": task_creds.get("command"),
+            "override_acp_args": task_creds.get("args"),
+            "override_fallback_chain": task_creds.get("fallback_chain"),
+            "model_profile": resolved_profile,
+        }
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                model=task_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
         except ValueError as exc:
@@ -359,7 +467,8 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
-    message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    message: Optional[str] = None, model_profile: Optional[str] = None, parent_agent=None,
+    credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -404,13 +513,14 @@ def delegate_task(
             "delegate_task: ignoring caller-supplied max_iterations=%s; using delegation.max_iterations=%s from config",
             max_iterations, default_max_iter,
         )
-    # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
-    # a per-call override shaped like the delegation config section.
+    top_profile = str(model_profile or "").strip() or None
     try:
-        creds = _resolve_delegation_credentials(credentials_cfg if credentials_cfg else cfg, parent_agent)
+        creds = _credentials_for_model_profile(
+            credentials_cfg if credentials_cfg else cfg, parent_agent, top_profile,
+        )
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
+        # spawn loudly (#80450). Unknown/missing-standard model_pool profiles fail closed here too.
         return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
@@ -431,7 +541,8 @@ def delegate_task(
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=live_deleg_id, live_writers=live_writers,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, top_profile=top_profile,
+        cfg=credentials_cfg if credentials_cfg else cfg,
     )
     if err:
         return tool_error(err)
@@ -489,7 +600,8 @@ _DESCRIPTION_HEAD = (
     "succeeded.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Omitted model_profile uses standard. Unknown names and a pool without "
+    "standard fail closed. Results are returned as an array, one entry per task."
 )
 
 def _build_tasks_param_description() -> str:
@@ -512,6 +624,30 @@ def _build_dynamic_schema_overrides() -> dict:
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    profile_names = _available_model_profile_names()
+    profile_prop = dict(overrides_params["properties"].get("model_profile") or {})
+    profile_prop["description"] = (
+        "Named pool tier. Omitted uses standard. Unknown names and a pool "
+        "without standard fail closed. Per-task value overrides this."
+    )
+    if profile_names:
+        profile_prop["enum"] = profile_names
+    else:
+        profile_prop.pop("enum", None)
+    overrides_params["properties"]["model_profile"] = profile_prop
+    tasks_prop = dict(overrides_params["properties"]["tasks"])
+    tasks_items = dict(tasks_prop.get("items") or {})
+    tasks_item_props = dict(tasks_items.get("properties") or {})
+    task_profile_prop = dict(tasks_item_props.get("model_profile") or {})
+    task_profile_prop["description"] = "Per-task pool tier. Overrides the top-level model_profile."
+    if profile_names:
+        task_profile_prop["enum"] = profile_names
+    else:
+        task_profile_prop.pop("enum", None)
+    tasks_item_props["model_profile"] = task_profile_prop
+    tasks_items["properties"] = tasks_item_props
+    tasks_prop["items"] = tasks_items
+    overrides_params["properties"]["tasks"] = tasks_prop
 
     return {"description": _build_top_level_description(), "parameters": overrides_params}
 
@@ -564,6 +700,10 @@ DELEGATE_TASK_SCHEMA = {
                             "returns on its own the moment it finishes. Independent work (separate PR reviews, "
                             "unrelated fixes) should stay ungrouped so nothing waits for the slowest sibling.",
                         ),
+                        "model_profile": _p(
+                            "string",
+                            "Per-task pool tier. Overrides the top-level model_profile.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -586,6 +726,11 @@ DELEGATE_TASK_SCHEMA = {
                 "string",
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
+            ),
+            "model_profile": _p(
+                "string",
+                "Named pool tier. Omitted uses standard. Unknown names and a pool "
+                "without standard fail closed. Per-task value overrides this.",
             ),
         },
         "required": [],
@@ -622,6 +767,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        model_profile=args.get("model_profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

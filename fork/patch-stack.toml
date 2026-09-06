@@ -1,0 +1,510 @@
+# Candidate mutable ledger for replay order and exact published heads.
+# Not frozen-v9. Not a new full freeze. Do not embed candidate-ledger SHA-256.
+# #188 is generated integration (consumes this); #213 is foreign excluded.
+# Unpublished #227 successor is not adopted; keep frozen-v9 unique-on-pin head.
+schema_version = 1
+name = "docker-freeman-hermes"
+kind = "candidate-mutable-ledger"
+fork = "RyderFreeman4Logos/hermes-agent"
+upstream = "NousResearch/hermes-agent"
+upstream_remote = "upstream"
+upstream_ref = "refs/remotes/upstream/main"
+upstream_base = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+generated_pr = 188
+close_phase_allowed = false
+campaign_green = false
+immutable_tested_manifest = "hermes-final-manifest-20260905-frozen-v9.toml"
+immutable_tested_manifest_sha256 = "a5b508a100ee42aafa10243eec84b8e0cb5973b1ccfcd17d17b8440e70fbb9b1"
+head_overlay_prs = [62, 180, 253]
+unpublished_heads_adopted = false
+
+[exclusions]
+pr188_reason = "generated integration; consumes ledger; not a source owner"
+pr213_reason = "foreign; never replay from this ledger"
+pr227_unpublished = "08609860a9ad6d82c5f2770c3208956afc8151dd not adopted"
+
+[[patch]]
+order = 1
+pr = 40
+name = "keep-saturated-admission-non-blocking-and-finali"
+title = "fix(delegate): keep saturated admission non-blocking and finalize queued children"
+branch = "fix/delegate-force-background-bounded-admission"
+head = "4e06ce34672816b776858c5ab8229876edcecf13"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 2
+pr = 41
+name = "preserve-request-override-provenance"
+title = "fix(agent): preserve request override provenance"
+branch = "fix/request-overrides-runtime-provenance"
+head = "113a8e35db9181e4c5de50df1b8ecd6515c4468a"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [152]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 3
+pr = 42
+name = "keep-managed-heartbeats-invisible-to-user-automa"
+title = "fix(runtime): keep managed heartbeats invisible to user automation"
+branch = "fix/runtime-heartbeat-managed-targets"
+head = "706626782e3ccff7fd61ddd4080ed2465b02694e"
+base_ref = "fix/delegate-force-background-bounded-admission"
+base_sha = "4e06ce34672816b776858c5ab8229876edcecf13"
+depends_on = [40]
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 4
+pr = 14
+name = "jitter-retry-lock-acquire-on-sqlite-busy"
+title = "fix(compression): jitter-retry lock acquire on SQLite busy"
+branch = "feat/compression-lock-jitter-retry"
+head = "8a2b25aa99fcb1670462ba3767b03fe2d1509012"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [37]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 5
+pr = 148
+name = "dedupe-commentary-and-final-emissions"
+title = "fix(tui): dedupe commentary and final emissions"
+branch = "topic/142-tui-commentary-final-dedupe-20260820"
+head = "99fa03fec5946b25a941f91551955c89e4bc556d"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 6
+pr = 149
+name = "silence-routine-child-command-tail-completions"
+title = "fix(delegate): silence routine child command-tail completions"
+branch = "topic/141-child-tail-silence-20260819"
+head = "de75a3d79328cacdd52c58e478f6d900a4e7bc03"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 7
+pr = 150
+name = "count-incomplete-continuations-accurately"
+title = "fix(codex): count incomplete continuations accurately"
+branch = "topic/codex-incomplete-continuation-20260820"
+head = "669f617c5f23cd33e19cfac610edb3192f54789e"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 8
+pr = 151
+name = "restore-manual-compression-completion-fence"
+title = "fix(tui): restore manual compression completion fence"
+branch = "topic/147-manual-compress-fence-20260820"
+head = "2f98ac087ec176d9f485067d69bb3d52c3ed6201"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 9
+pr = 161
+name = "standard-tier-429-immediate-chain-advance-withou"
+title = "fix(delegate): standard-tier 429 immediate chain advance without mid-run fallback"
+branch = "topic/154-std-fallback-live-20260820"
+head = "5d1cd567a8a855d0b24fa3011b74d62aa4f11f5b"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 10
+pr = 212
+name = "hedge-spending-limit-403-and-stop-leaking-it-ont"
+title = "fix(xai): hedge spending-limit 403 and stop leaking it onto non-xAI children"
+branch = "topic/iss209-xai-billing-unverified-085c062d-20260826"
+head = "3964bc145b12fc1068e25c7845e329fd93d04d01"
+base_ref = "topic/154-std-fallback-live-20260820"
+base_sha = "5d1cd567a8a855d0b24fa3011b74d62aa4f11f5b"
+depends_on = [161]
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 11
+pr = 162
+name = "carry-authoritative-external-provider-backend"
+title = "feat(memory): carry authoritative external provider backend"
+branch = "topic/143-auth-mem-live-20260820"
+head = "06a67d67ecf6206805297cbd2eda3edb0e07c05f"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [171]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 12
+pr = 165
+name = "bound-lean-digest-concurrency-and-retries"
+title = "fix(compression): bound lean digest concurrency and retries"
+branch = "topic/163-aux-concurrency-20260821"
+head = "1ac7eb050c11068b24bfaf2781f2f7b44f092cb0"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [153]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 13
+pr = 160
+name = "preserve-configured-fallback-destinations"
+title = "fix(auxiliary): preserve configured fallback destinations"
+branch = "topic/159-aux-codex-dest-live-20260820"
+head = "117ca3bb9bdb8722ca55ca5722969d19ab52199a"
+base_ref = "topic/163-aux-concurrency-20260821"
+base_sha = "1ac7eb050c11068b24bfaf2781f2f7b44f092cb0"
+depends_on = [165]
+required = true
+supersedes = [158]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 14
+pr = 227
+name = "capture-sanitized-cache-request-pairs"
+title = "fix(observability): capture sanitized cache request pairs"
+branch = "topic/cache-pair-dump-224-20260826"
+head = "6ccffad0cc2dee0c23eb0616058aa2ab20ca2fbf"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [174, 205]
+overlay = false
+notes = "frozen-v9 unique-on-pin 6ccffad0; successor review unpublished; do not adopt 08609860"
+
+[[patch]]
+order = 15
+pr = 180
+name = "repair-cache-telemetry-on-f293"
+title = "fix(tui): repair cache telemetry on f293"
+branch = "topic/upgrade-pr13-07-tui-cache-completion-20260821"
+head = "34d3778634c62410583a8792f63959d688ce5ab2"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [156, 167]
+previous_published_head = "0bf0e5b2b65f1396665850d65bafaa50bb77988b"
+archive = "refs/archive/pr180/0bf0e5b2b65f1396665850d65bafaa50bb77988b"
+overlay = true
+notes = "published 2026-09-06; parent=previous frozen-v9 head; pin base retained"
+
+[[patch]]
+order = 16
+pr = 178
+name = "preserve-stable-prefix-routing-after-compression"
+title = "fix(cache): preserve stable-prefix routing after compression"
+branch = "topic/176-short-gap-cache-20260821"
+head = "ae4f51a7ad4ad0c99754fcc514d171804cf586bf"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [177]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 17
+pr = 185
+name = "require-standard-model-pool-profile"
+title = "fix(delegate): require standard model pool profile"
+branch = "topic/upgrade-pr13-04-lineage-cache-delegate-20260821"
+head = "b882053e51e3f24784603722160c7eb74dd74e47"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 18
+pr = 186
+name = "protect-fallback-and-oversized-active-turns"
+title = "fix(compression): protect fallback and oversized active turns"
+branch = "topic/upgrade-pr13-05-compression-active-turn-20260821"
+head = "6510ecdec7a3d7b9c24d4e1ce63157488dca3173"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [207, 208]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 19
+pr = 179
+name = "after-compression-switch-and-deferred-reasoning"
+title = "fix(model): after-compression switch and deferred --reasoning"
+branch = "topic/upgrade-after-compression-model-and-reasoning-20260821"
+head = "76b53cdb664b355d00e7107bf302fb68e4239298"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [155, 168]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 20
+pr = 181
+name = "preserve-session-identity-across-fallback"
+title = "fix(auxiliary): preserve session identity across fallback"
+branch = "topic/upgrade-pr13-08-session-identity-20260821"
+head = "b082887fef8a7c6aed498e6f425277d47a61c259"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 21
+pr = 182
+name = "harden-long-task-launch-and-completion-lifecycle"
+title = "fix(terminal): harden long-task launch and completion lifecycle"
+branch = "topic/upgrade-pr13-01-terminal-20260821"
+head = "892742d7debf70930148f3fb5b31c3e1ae8fca50"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 22
+pr = 183
+name = "coordinate-sessiondb-writes-across-processes"
+title = "fix(state): coordinate SessionDB writes across processes"
+branch = "topic/upgrade-pr13-02-sessiondb-20260821"
+head = "1667987555fdbc499afa2d15a42db336a3f837a8"
+base_ref = "feat/compression-lock-jitter-retry"
+base_sha = "8a2b25aa99fcb1670462ba3767b03fe2d1509012"
+depends_on = [14]
+required = true
+supersedes = [38]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 23
+pr = 184
+name = "guard-watermarks-and-process-notifications"
+title = "fix(compression): guard watermarks and process notifications"
+branch = "topic/upgrade-pr13-03-watermark-security-20260821"
+head = "e00cf8f3b8b17de7d26c28be0901cd78699a4e40"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 24
+pr = 187
+name = "bound-fallback-deadlines-and-host-budgets"
+title = "fix(compression): bound fallback deadlines and host budgets"
+branch = "topic/upgrade-pr13-06-fallback-digest-status-20260821"
+head = "cb5d6420aa5fab68291d600d729c7546474d2c0a"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 25
+pr = 210
+name = "persist-loop-timing-in-history-for-monotonic-pre"
+title = "fix(cache): persist loop timing in history for monotonic prefix"
+branch = "topic/iss206-persist-timing-af8870f7-20260826"
+head = "d074edc134f1707fa558a16e0ab0ebab91f7b189"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = [198]
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 26
+pr = 199
+name = "refresh-xai-oauth-on-bad-credentials-403"
+title = "fix(agent): refresh xAI OAuth on bad-credentials 403"
+branch = "topic/ledger-xai403-refresh-20260823"
+head = "3fbca9d8e49f39b6812ac1d35bcdef338006b002"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 27
+pr = 173
+name = "defer-notified-process-waits"
+title = "fix: defer notified process waits"
+branch = "topic/172-wait-tool-20260821"
+head = "fcafda3150e5354c7da77bb85cad04dfbc7d102f"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 28
+pr = 204
+name = "skip-file-handlers-when-agent-log-is-read-only"
+title = "fix(logging): skip file handlers when agent.log is read-only"
+branch = "ledger/issue201-erofs-f293-20260825"
+head = "f1911a0b39fe0ee08e2415952d5f50c65bf2912a"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 29
+pr = 62
+name = "batch-busy-completion-backlog-into-one-idle-turn"
+title = "fix(tui): batch busy completion backlog into one idle turn"
+branch = "fix/issue61-completion-backlog-batching"
+head = "79b7e4ba56010569e8f006d89fc5416b20b9fd47"
+base_ref = "topic/147-manual-compress-fence-20260820"
+base_sha = "2f98ac087ec176d9f485067d69bb3d52c3ed6201"
+depends_on = [151]
+required = true
+supersedes = []
+previous_published_head = "70a4bbf881345c31f863dc6e83b856e2ae017eb9"
+archive = "refs/archive/pr62/70a4bbf881345c31f863dc6e83b856e2ae017eb9"
+overlay = true
+notes = "published 2026-09-06; parent=previous frozen-v9 head; not a freeze"
+
+[[patch]]
+order = 30
+pr = 251
+name = "cap-parallel-test-runner-workers"
+title = "fix: cap parallel test runner workers"
+branch = "topic/test-runner-pid-cap-20260831"
+head = "b803165e4cce94cd3877dd84d3e7d0623eca12a8"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 31
+pr = 253
+name = "contain-linux-test-runner-process-trees"
+title = "fix: contain Linux test-runner process trees"
+branch = "topic/test-runner-tree-containment-20260901"
+head = "790667c143a5202090d7ffd48fc79501ba41bf15"
+base_ref = "topic/test-runner-pid-cap-20260831"
+base_sha = "b803165e4cce94cd3877dd84d3e7d0623eca12a8"
+depends_on = [251]
+required = true
+supersedes = []
+previous_published_head = "3e08a2d0b77ba4976c4d890425df5a0aff818ee9"
+archive = "refs/archive/pr253/3e08a2d0b77ba4976c4d890425df5a0aff818ee9"
+overlay = true
+notes = "published 2026-09-06 SOURCE-FOCUSED PASS; parent f9d3eb7e; exact 12-test pass; not a freeze"
+
+[[patch]]
+order = 32
+pr = 252
+name = "remember-current-turn-sends-once-across-physical"
+title = "fix(cache): remember current-turn sends once across physical-attempt wrappers"
+branch = "topic/pr227-remember-once-seam-20260901"
+head = "8caa379012278163c0c9da2b8ed86b173b111145"
+base_ref = "topic/cache-pair-dump-224-20260826"
+base_sha = "6ccffad0cc2dee0c23eb0616058aa2ab20ca2fbf"
+depends_on = [227]
+required = true
+supersedes = []
+overlay = false
+notes = "head from immutable tested frozen-v9"

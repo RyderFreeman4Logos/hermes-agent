@@ -1015,6 +1015,34 @@ def run_debug_delete(args):
             print(f"  ✗ Could not delete {url}: {exc}")
 
 
+def run_debug_cache_diff(args) -> None:
+    """Compare two captured request dumps and print first-byte/JSON/cache diffs."""
+    from agent.cache_request_capture import compare_captures
+
+    left_path = Path(getattr(args, "left", "") or "")
+    right_path = Path(getattr(args, "right", "") or "")
+    try:
+        left = json.loads(left_path.read_text(encoding="utf-8"))
+        right = json.loads(right_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"✗ cache-diff failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    report = compare_captures(left, right)
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        return
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    print(f"equal={report['equal']} claim={report['claim']}")
+    print(f"first_byte={report['first_differing_byte']} json={report['json_pointer']}")
+    print(
+        "message={index} tools={tools} cache_scope={scope}".format(
+            index=report["message"]["index"],
+            tools=report["tools"]["changed"],
+            scope=report["cache_scope"]["changed"],
+        )
+    )
+
+
 def run_debug(args):
     """Route debug subcommands."""
     # Opportunistic sweep of expired pastes on every ``hermes debug`` call.
@@ -1032,13 +1060,16 @@ def run_debug(args):
         run_debug_share(args)
     elif subcmd == "delete":
         run_debug_delete(args)
+    elif subcmd == "cache-diff":
+        run_debug_cache_diff(args)
     else:
         # Default: show help
         print("Usage: hermes debug <command>")
         print()
         print("Commands:")
-        print("  share    Upload debug report to a paste service and print URL")
-        print("  delete   Delete a previously uploaded paste")
+        print("  share       Upload debug report to a paste service and print URL")
+        print("  delete      Delete a previously uploaded paste")
+        print("  cache-diff  Compare two captured provider-bound requests")
         print()
         print("Options (share):")
         print("  --lines N    Number of log lines to include (default: 200)")
@@ -1050,3 +1081,7 @@ def run_debug(args):
         print()
         print("Options (delete):")
         print("  <url> ...    One or more paste URLs to delete")
+        print()
+        print("Options (cache-diff):")
+        print("  LEFT RIGHT   Capture JSON paths")
+        print("  --json       Print the machine-readable report only")

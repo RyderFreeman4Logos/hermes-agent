@@ -7,6 +7,7 @@ import contextvars
 import inspect
 import json
 import logging
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -40,7 +41,8 @@ _TRANSPORT_CAPTURE_CONTEXT: contextvars.ContextVar[_TransportCaptureState | None
 _HTTPX_WRAP_DEPTH = 0
 _HTTPX_CLIENT_SEND = None
 _HTTPX_ASYNC_CLIENT_SEND = None
-# ponytail: process-wide httpx Client/AsyncClient.send wrap + depth count; per-thread wrap if concurrent captures overlap unwrap
+_HTTPX_WRAP_LOCK = threading.Lock()
+# ponytail: process-wide httpx send wrap + locked depth; client-local event_hooks if wrap must leave process methods alone
 
 
 def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -> None:
@@ -103,47 +105,49 @@ def _wrap_httpx_send() -> None:
     global _HTTPX_WRAP_DEPTH, _HTTPX_CLIENT_SEND, _HTTPX_ASYNC_CLIENT_SEND
     import httpx
 
-    if _HTTPX_WRAP_DEPTH == 0:
-        sync_send = httpx.Client.send
-        async_send = httpx.AsyncClient.send
-        _HTTPX_CLIENT_SEND = sync_send
-        _HTTPX_ASYNC_CLIENT_SEND = async_send
+    with _HTTPX_WRAP_LOCK:
+        if _HTTPX_WRAP_DEPTH == 0:
+            sync_send = httpx.Client.send
+            async_send = httpx.AsyncClient.send
+            _HTTPX_CLIENT_SEND = sync_send
+            _HTTPX_ASYNC_CLIENT_SEND = async_send
 
-        def send(self, request, *args, **kwargs):
-            try:
-                _capture_httpx_request(request)
-            except Exception:
-                if cache_request_capture.strict_write_enabled():
-                    raise
-            return sync_send(self, request, *args, **kwargs)
+            def send(self, request, *args, **kwargs):
+                try:
+                    _capture_httpx_request(request)
+                except Exception:
+                    if cache_request_capture.strict_write_enabled():
+                        raise
+                return sync_send(self, request, *args, **kwargs)
 
-        async def asend(self, request, *args, **kwargs):
-            try:
-                _capture_httpx_request(request)
-            except Exception:
-                if cache_request_capture.strict_write_enabled():
-                    raise
-            return await async_send(self, request, *args, **kwargs)
+            async def asend(self, request, *args, **kwargs):
+                try:
+                    _capture_httpx_request(request)
+                except Exception:
+                    if cache_request_capture.strict_write_enabled():
+                        raise
+                return await async_send(self, request, *args, **kwargs)
 
-        httpx.Client.send = send
-        httpx.AsyncClient.send = asend
-    _HTTPX_WRAP_DEPTH += 1
+            httpx.Client.send = send
+            httpx.AsyncClient.send = asend
+        _HTTPX_WRAP_DEPTH += 1
 
 
 def _unwrap_httpx_send() -> None:
     global _HTTPX_WRAP_DEPTH, _HTTPX_CLIENT_SEND, _HTTPX_ASYNC_CLIENT_SEND
-    if _HTTPX_WRAP_DEPTH == 0:
-        return
-    _HTTPX_WRAP_DEPTH -= 1
-    if _HTTPX_WRAP_DEPTH == 0:
-        import httpx
+    with _HTTPX_WRAP_LOCK:
+        if _HTTPX_WRAP_DEPTH == 0:
+            return
+        _HTTPX_WRAP_DEPTH -= 1
+        if _HTTPX_WRAP_DEPTH == 0:
+            import httpx
 
-        if _HTTPX_CLIENT_SEND is not None:
-            httpx.Client.send = _HTTPX_CLIENT_SEND
-            _HTTPX_CLIENT_SEND = None
-        if _HTTPX_ASYNC_CLIENT_SEND is not None:
-            httpx.AsyncClient.send = _HTTPX_ASYNC_CLIENT_SEND
-            _HTTPX_ASYNC_CLIENT_SEND = None
+            if _HTTPX_CLIENT_SEND is not None:
+                httpx.Client.send = _HTTPX_CLIENT_SEND
+                _HTTPX_CLIENT_SEND = None
+            if _HTTPX_ASYNC_CLIENT_SEND is not None:
+                httpx.AsyncClient.send = _HTTPX_ASYNC_CLIENT_SEND
+                _HTTPX_ASYNC_CLIENT_SEND = None
 
 
 @contextmanager

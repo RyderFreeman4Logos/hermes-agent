@@ -15,7 +15,12 @@ from typing import Any
 from agent.redact import _SENSITIVE_BODY_KEYS, _redact_url_userinfo, redact_sensitive_text
 from hermes_constants import get_hermes_home
 
-__all__ = ["capture_provider_request", "enabled", "strict_write_enabled"]
+__all__ = [
+    "capture_provider_request",
+    "compare_captures",
+    "enabled",
+    "strict_write_enabled",
+]
 
 _SCHEMA = "hermes.cache_request.v1"
 _REDACTED = "[REDACTED]"
@@ -298,3 +303,118 @@ def _persist(payload: dict[str, Any]) -> None:
             except OSError:
                 pass
         os.close(rootfd)
+
+
+def _body_bytes(payload: dict[str, Any]) -> tuple[bytes, str]:
+    record = payload.get("body_bytes") if isinstance(payload, dict) else None
+    if not isinstance(record, dict):
+        return b"", "kwargs_fallback"
+    status = str(record.get("status") or "kwargs_fallback")
+    data = record.get("data")
+    if not isinstance(data, str) or not data:
+        return b"", status
+    try:
+        return base64.b64decode(data), status
+    except (TypeError, ValueError):
+        return b"", status
+
+
+def _first_byte(left: bytes, right: bytes) -> int | None:
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if left[index] != right[index]:
+            return index
+    return limit if len(left) != len(right) else None
+
+
+def _first_difference(left: Any, right: Any, path: tuple[Any, ...] = ()) -> tuple[Any, ...] | None:
+    if type(left) is not type(right) or not isinstance(left, (dict, list)):
+        return path if left != right else None
+    if isinstance(left, list):
+        if len(left) != len(right):
+            return path + ("length",)
+        for index, (left_child, right_child) in enumerate(zip(left, right)):
+            difference = _first_difference(left_child, right_child, path + (index,))
+            if difference is not None:
+                return difference
+        return None
+    preferred = (
+        "messages",
+        "input",
+        "tools",
+        "toolConfig",
+        "system",
+        "instructions",
+        "prompt_cache_key",
+        "cache_control",
+    )
+    keys = [key for key in preferred if key in left or key in right]
+    keys.extend(sorted((left.keys() | right.keys()) - set(keys), key=str))
+    for key in keys:
+        if key not in left or key not in right:
+            return path + (key,)
+        difference = _first_difference(left[key], right[key], path + (key,))
+        if difference is not None:
+            return difference
+    return None
+
+
+def _json_pointer(path: tuple[Any, ...] | None) -> str | None:
+    if path is None:
+        return None
+    parts = []
+    for item in path:
+        if item == "length":
+            parts.append("-")
+            continue
+        text = str(item).replace("~", "~0").replace("/", "~1")
+        parts.append(text)
+    return "/" + "/".join(parts)
+
+
+def _message_location(path: tuple[Any, ...] | None) -> dict[str, Any]:
+    if not path or path[0] not in {"messages", "input"}:
+        return {"index": None, "field": None}
+    index = path[1] if len(path) > 1 and isinstance(path[1], int) else None
+    field = path[-1] if len(path) > 1 and path[-1] not in {"messages", "input", "length"} else None
+    return {"index": index, "field": field}
+
+
+def _tools_changed(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (left.get("tools") or left.get("toolConfig")) != (
+        right.get("tools") or right.get("toolConfig")
+    )
+
+
+def _cache_scope_changed(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    keys = ("prompt_cache_key", "cache_control")
+    return any(left.get(key) != right.get(key) for key in keys)
+
+
+def compare_captures(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    """Compare two persisted captures. Never claims exact-wire on sanitized/omitted bytes."""
+    left_body, left_status = _body_bytes(left)
+    right_body, right_status = _body_bytes(right)
+    wire_comparable = left_status == "exact_wire" and right_status == "exact_wire"
+    left_request = left.get("request") if isinstance(left.get("request"), dict) else {}
+    right_request = right.get("request") if isinstance(right.get("request"), dict) else {}
+    if not isinstance(left_request, dict):
+        left_request = {}
+    if not isinstance(right_request, dict):
+        right_request = {}
+    path = _first_difference(left_request, right_request)
+    equal_bodies = left_body == right_body
+    return {
+        "equal": equal_bodies and path is None,
+        "wire_comparable": wire_comparable,
+        "claim": "exact_wire" if wire_comparable else "unavailable_wire",
+        "first_differing_byte": _first_byte(left_body, right_body) if not equal_bodies else None,
+        "left_bytes": len(left_body),
+        "right_bytes": len(right_body),
+        "json_pointer": _json_pointer(path),
+        "message": _message_location(path),
+        "tools": {"changed": _tools_changed(left_request, right_request)},
+        "cache_scope": {"changed": _cache_scope_changed(left_request, right_request)},
+        "left": {"status": left_status},
+        "right": {"status": right_status},
+    }

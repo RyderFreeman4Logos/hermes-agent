@@ -1102,7 +1102,7 @@ class TestShareConsentGate:
         assert "Aborted" not in capsys.readouterr().out
 
 
-def _write_capture(path, *, prompt: str, status: str = "exact_wire") -> None:
+def _write_capture(path, *, prompt: str, status: str = "exact_wire", data=None) -> None:
     import base64
     import json
 
@@ -1110,6 +1110,8 @@ def _write_capture(path, *, prompt: str, status: str = "exact_wire") -> None:
         {"model": "probe-model", "messages": [{"role": "system", "content": prompt}]},
         separators=(",", ":"),
     ).encode("utf-8")
+    if data is None:
+        data = base64.b64encode(body).decode("ascii")
     path.write_text(
         json.dumps(
             {
@@ -1122,7 +1124,7 @@ def _write_capture(path, *, prompt: str, status: str = "exact_wire") -> None:
                 },
                 "body_bytes": {
                     "encoding": "base64",
-                    "data": base64.b64encode(body).decode("ascii"),
+                    "data": data,
                     "status": status,
                 },
                 "route": {
@@ -1135,6 +1137,43 @@ def _write_capture(path, *, prompt: str, status: str = "exact_wire") -> None:
         )
         + "\n",
         encoding="utf-8",
+    )
+
+
+def _run_public_cache_diff(tmp_path, left, right):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    home = tmp_path / "iso-home"
+    hermes_home = tmp_path / "iso-hermes"
+    tmp = tmp_path / "iso-tmp"
+    home.mkdir()
+    hermes_home.mkdir()
+    tmp.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["HERMES_HOME"] = str(hermes_home)
+    env["TMPDIR"] = str(tmp)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = str(repo)
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "debug",
+            "cache-diff",
+            str(left),
+            str(right),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        env=env,
+        timeout=30,
     )
 
 
@@ -1201,4 +1240,83 @@ class TestCacheDiff:
         assert "exact_wire" not in (report.get("claim") or "")
         assert report["left"]["status"] == "sanitized"
         assert report["right"]["status"] == "omitted"
+
+    def test_public_cli_invalid_alphabet_does_not_claim_exact_wire(self, tmp_path):
+        left = tmp_path / "a.json"
+        right = tmp_path / "b.json"
+        _write_capture(left, prompt="SYS-A", data="@@@not-base64@@@")
+        _write_capture(right, prompt="SYS-B")
+        result = _run_public_cache_diff(tmp_path, left, right)
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        assert report["claim"] != "exact_wire"
+        assert report["wire_comparable"] is False
+        assert report["left"]["status"] != "exact_wire"
+        combined = result.stdout + result.stderr
+        assert "@@@not-base64@@@" not in combined
+        assert "body_bytes" not in combined
+        assert "SYS-A" not in combined
+
+    def test_public_cli_invalid_padding_does_not_claim_exact_wire(self, tmp_path):
+        left = tmp_path / "a.json"
+        right = tmp_path / "b.json"
+        _write_capture(left, prompt="SYS-A", data="AAA")
+        _write_capture(right, prompt="SYS-B")
+        result = _run_public_cache_diff(tmp_path, left, right)
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        assert report["claim"] != "exact_wire"
+        assert report["wire_comparable"] is False
+        assert report["left"]["status"] != "exact_wire"
+        combined = result.stdout + result.stderr
+        assert "body_bytes" not in combined
+        assert "SYS-A" not in combined
+
+    def test_public_cli_non_string_data_does_not_claim_exact_wire(self, tmp_path):
+        left = tmp_path / "a.json"
+        right = tmp_path / "b.json"
+        _write_capture(left, prompt="SYS-A", data=["not", "a", "string"])
+        _write_capture(right, prompt="SYS-B")
+        result = _run_public_cache_diff(tmp_path, left, right)
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        assert report["claim"] != "exact_wire"
+        assert report["wire_comparable"] is False
+        assert report["left"]["status"] != "exact_wire"
+        combined = result.stdout + result.stderr
+        assert "body_bytes" not in combined
+        assert "SYS-A" not in combined
+
+    def test_public_cli_valid_exact_wire_vs_kwargs_fallback(self, tmp_path):
+        left = tmp_path / "a.json"
+        right = tmp_path / "b.json"
+        _write_capture(left, prompt="SYS-A")
+        _write_capture(right, prompt="SYS-A", status="kwargs_fallback")
+        result = _run_public_cache_diff(tmp_path, left, right)
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        assert report["claim"] == "unavailable_wire"
+        assert report["wire_comparable"] is False
+        assert report["left"]["status"] == "exact_wire"
+        assert report["right"]["status"] == "kwargs_fallback"
+        combined = result.stdout + result.stderr
+        assert "body_bytes" not in combined
+        assert "SYS-A" not in combined
+
+    def test_public_cli_valid_exact_wire_pair_keeps_claim(self, tmp_path):
+        left = tmp_path / "a.json"
+        right = tmp_path / "b.json"
+        _write_capture(left, prompt="SYS-A")
+        _write_capture(right, prompt="SYS-B")
+        result = _run_public_cache_diff(tmp_path, left, right)
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        assert report["claim"] == "exact_wire"
+        assert report["wire_comparable"] is True
+        assert report["left"]["status"] == "exact_wire"
+        assert report["right"]["status"] == "exact_wire"
+        combined = result.stdout + result.stderr
+        assert "body_bytes" not in combined
+        assert "SYS-A" not in combined
+        assert "SYS-B" not in combined
 

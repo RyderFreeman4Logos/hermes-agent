@@ -90,6 +90,8 @@ def _lift_common_custom_fields(entry: Dict[str, Any], result: Dict[str, Any], *,
     extra_body = entry.get("extra_body")
     if isinstance(extra_body, dict):
         result["extra_body"] = dict(extra_body)
+    if isinstance(entry.get("send_session_id"), bool):
+        result["send_session_id"] = entry["send_session_id"]
     _lift_extra_headers(entry, result)
     if api_mode:
         result["api_mode"] = api_mode

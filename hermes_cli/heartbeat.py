@@ -37,9 +37,11 @@ _UNIT_SECONDS = {
 
 # field -> (coercer, default used when the stored value is missing/falsy)
 _STATE_FIELDS = {
-    "prompt": (str, ""), "interval_seconds": (int, 0), "status": (str, "active"),
-    "created_at": (float, 0.0), "last_fired_at": (float, 0.0), "fire_count": (int, 0),
+    "prompt": (str, ""), "interval_seconds": (int, 0), "route": (str, ""),
+    "status": (str, "active"), "created_at": (float, 0.0), "last_fired_at": (float, 0.0),
+    "fire_count": (int, 0),
 }
+_PURPOSES = {"heartbeat", "cache_warm"}
 
 
 def parse_interval(text: str) -> Optional[int]:
@@ -67,6 +69,7 @@ class HeartbeatState:
 
     prompt: str
     interval_seconds: int
+    route: str = ""
     status: str = "active"          # active | paused | cleared
     created_at: float = 0.0
     last_fired_at: float = 0.0
@@ -81,7 +84,7 @@ class HeartbeatState:
         return cls(**{name: coerce(data.get(name) or default) for name, (coerce, default) in _STATE_FIELDS.items()})
 
     def is_due(self, now: Optional[float] = None) -> bool:
-        if self.status != "active" or not self.prompt or self.interval_seconds <= 0:
+        if self.status != "active" or self.interval_seconds <= 0 or (not self.prompt and not self.route):
             return False
         return (time.time() if now is None else now) - (self.last_fired_at or self.created_at) >= self.interval_seconds
 
@@ -99,12 +102,16 @@ def _get_session_db() -> Optional[Any]:
         return None
 
 
-def load_heartbeat(session_id: str) -> Optional[HeartbeatState]:
+def _meta_key(session_id: str, purpose: str = "heartbeat") -> str:
+    return f"{purpose}:{session_id}"
+
+
+def load_heartbeat(session_id: str, *, purpose: str = "heartbeat") -> Optional[HeartbeatState]:
     db = _get_session_db() if session_id else None
     if db is None:
         return None
     try:
-        raw = db.get_meta(f"heartbeat:{session_id}")
+        raw = db.get_meta(_meta_key(session_id, purpose))
     except Exception as exc:
         logger.debug("HeartbeatManager: get_meta failed: %s", exc)
         return None
@@ -116,7 +123,7 @@ def load_heartbeat(session_id: str) -> Optional[HeartbeatState]:
     return None if state is None or state.status == "cleared" else state
 
 
-def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
+def save_heartbeat(session_id: str, state: HeartbeatState, *, purpose: str = "heartbeat") -> None:
     if not session_id:
         return
     db = _get_session_db()
@@ -125,7 +132,7 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
         _warn_dropped_write("HeartbeatManager", "heartbeat", session_id)
         return
     try:
-        db.set_meta(f"heartbeat:{session_id}", state.to_json())
+        db.set_meta(_meta_key(session_id, purpose), state.to_json())
     except Exception as exc:
         logger.debug("HeartbeatManager: set_meta failed: %s", exc)
 
@@ -137,9 +144,12 @@ class HeartbeatManager:
     idle; a non-None return is the user-role message to inject.
     """
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, *, purpose: str = "heartbeat"):
+        if purpose not in _PURPOSES:
+            raise ValueError(f"unsupported heartbeat purpose: {purpose}")
         self.session_id = session_id
-        self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
+        self._purpose = purpose
+        self._state: Optional[HeartbeatState] = load_heartbeat(session_id, purpose=purpose)
         self._last_claim: Optional[tuple[float, int]] = None  # (last_fired_at, fire_count) before the last due_prompt
 
     @property
@@ -173,7 +183,29 @@ class HeartbeatManager:
             raise ValueError(f"interval must be at least {MIN_INTERVAL_SECONDS}s")
         self._state = HeartbeatState(prompt=prompt, interval_seconds=interval_seconds, status="active",
                                      created_at=time.time())
-        save_heartbeat(self.session_id, self._state)
+        save_heartbeat(self.session_id, self._state, purpose=self._purpose)
+        return self._state
+
+    def arm_cache_warm(
+        self, route: str, interval_seconds: int, *, now: Optional[float] = None
+    ) -> HeartbeatState:
+        """Arm one bodyless internal cache warm for this session."""
+        if self._purpose != "cache_warm":
+            raise ValueError("cache warm requires purpose='cache_warm'")
+        route = str(route or "").strip()
+        if not route:
+            raise ValueError("cache warm route is empty")
+        interval_seconds = int(interval_seconds)
+        if interval_seconds < MIN_INTERVAL_SECONDS:
+            raise ValueError(f"interval must be at least {MIN_INTERVAL_SECONDS}s")
+        self._state = HeartbeatState(
+            prompt="",
+            route=route,
+            interval_seconds=interval_seconds,
+            status="active",
+            created_at=time.time() if now is None else now,
+        )
+        save_heartbeat(self.session_id, self._state, purpose=self._purpose)
         return self._state
 
     def _set_status(self, status: str, *, reanchor: bool = False) -> Optional[HeartbeatState]:
@@ -182,7 +214,7 @@ class HeartbeatManager:
         self._state.status = status
         if reanchor:
             self._state.last_fired_at = time.time()
-        save_heartbeat(self.session_id, self._state)
+        save_heartbeat(self.session_id, self._state, purpose=self._purpose)
         return self._state
 
     def pause(self) -> Optional[HeartbeatState]:
@@ -210,8 +242,8 @@ class HeartbeatManager:
         self._last_claim = (s.last_fired_at, s.fire_count)
         s.last_fired_at = now if now is not None else time.time()
         s.fire_count += 1
-        save_heartbeat(self.session_id, s)
-        return s.render_prompt()
+        save_heartbeat(self.session_id, s, purpose=self._purpose)
+        return "" if self._purpose == "cache_warm" else s.render_prompt()
 
     def abandon_fire(self) -> bool:
         """Rewind the fire recorded by the last :meth:`due_prompt` whose turn never started, so the tick stays
@@ -220,13 +252,13 @@ class HeartbeatManager:
         claim, s = self._last_claim, self._state
         if claim is None or s is None:
             return False
-        current = load_heartbeat(self.session_id)
+        current = load_heartbeat(self.session_id, purpose=self._purpose)
         if current is None or current.status != "active" or (current.last_fired_at, current.fire_count) != (
                 s.last_fired_at, s.fire_count):
             return False
         s.last_fired_at, s.fire_count = claim
         self._last_claim = None
-        save_heartbeat(self.session_id, s)
+        save_heartbeat(self.session_id, s, purpose=self._purpose)
         return True
 
 

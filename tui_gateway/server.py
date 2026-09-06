@@ -912,6 +912,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
+        for _stop, thread in list(_notification_pollers):
+            if _stop is stop_event and thread is not threading.current_thread():
+                thread.join(timeout=0.3)
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -12740,6 +12743,37 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _poll_owned_completion(
+    stop_event: threading.Event, sid: str, session: dict, timeout: float
+):
+    """Wait for an owned completion, but abort promptly when the poller stops.
+
+    ``get_completion_for_owner`` cannot see ``stop_event``. Poll without
+    parking on the queue wait, then sleep on the stop event so a closed
+    session cannot steal the next owner's completions.
+    """
+    import queue as _queue_mod
+    from tools.process_registry import process_registry
+
+    deadline = time.monotonic() + timeout
+    while True:
+        if stop_event.is_set() or session.get("_finalized"):
+            raise _queue_mod.Empty
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _queue_mod.Empty
+        try:
+            return process_registry.get_completion_for_owner(
+                lambda candidate: not _notification_event_belongs_elsewhere(
+                    sid, session, candidate
+                ),
+                timeout=0,
+            )
+        except _queue_mod.Empty:
+            if stop_event.wait(min(remaining, 0.05)):
+                raise _queue_mod.Empty
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -12856,13 +12890,10 @@ def _notification_poller_loop(
                     )
                     if _active is not None and getattr(_active, "is_set", lambda: False)():
                         timeout = 2.0
-            evt = process_registry.get_completion_for_owner(
-                lambda candidate: not _notification_event_belongs_elsewhere(
-                    sid, session, candidate
-                ),
-                timeout=timeout,
-            )
+            evt = _poll_owned_completion(stop_event, sid, session, timeout)
         except Exception:
+            if stop_event.is_set() or session.get("_finalized"):
+                break
             _flush_pending_completions_if_idle(sid, session, _emitted)
             continue
 

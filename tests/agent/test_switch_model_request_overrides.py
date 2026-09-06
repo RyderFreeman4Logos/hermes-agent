@@ -115,3 +115,99 @@ def test_switch_endpoint_mismatch_does_not_inherit():
     )
     arh._apply_switched_provider_request_overrides(a, "custom:main-think")
     assert "extra_body" not in a.request_overrides  # base_url mismatch -> cleared
+
+
+def test_failed_switch_restores_original_request_overrides_deeply():
+    """Failed client rebuild must restore the nested override graph, not an alias."""
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "openrouter"
+    agent.model = "x-ai/grok-4"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.api_key = "or-key-original"
+    agent.api_mode = "chat_completions"
+    agent.client = MagicMock(name="OriginalOpenRouterClient")
+    agent._client_kwargs = {
+        "api_key": "or-key-original",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    agent.context_compressor = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = None
+    agent._anthropic_client = None
+    agent._is_anthropic_oauth = False
+    agent._cached_system_prompt = "cached"
+    agent._primary_runtime = {}
+    agent._fallback_activated = False
+    agent._fallback_index = 0
+    agent._fallback_chain = []
+    agent._fallback_model = None
+    agent._config_context_length = None
+    agent.runtime_capabilities = {"native_compaction": False}
+    original = {"extra_body": {"nested": {"value": "primary"}}}
+    agent.request_overrides = original
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("simulated client build failure")
+
+    agent._create_openai_client = boom
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        with pytest.raises(RuntimeError, match="simulated client build failure"):
+            agent.switch_model(
+                new_model="openai/gpt-5",
+                new_provider="openai-codex",
+                api_key="codex-key-new",
+                base_url="https://chatgpt.com/backend-api/codex/responses",
+                api_mode="chat_completions",
+            )
+
+    assert agent.request_overrides == original
+    agent.request_overrides["extra_body"]["nested"]["value"] = "mutated"
+    assert original["extra_body"]["nested"]["value"] == "primary"
+
+
+def test_copy_request_overrides_hostile_deepcopy_does_not_poison_snapshot():
+    """Hostile __deepcopy__ must not leave rollback without a usable override dict."""
+    class HostileCopy:
+        def __deepcopy__(self, _memo):
+            raise ValueError("hostile")
+
+        def __repr__(self):
+            return "PAYLOAD-SENTINEL-41"
+
+    nested = {"owned": True, "hostile": HostileCopy()}
+    copied = arh._copy_request_overrides(nested)
+    assert copied is not nested
+    assert copied["owned"] is True
+    copied["owned"] = False
+    assert nested["owned"] is True
+
+
+def test_primary_runtime_snapshot_deep_copies_request_overrides():
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    agent.model = "m"
+    agent.provider = "p"
+    agent.requested_provider = "p"
+    agent.base_url = "https://example.invalid/v1"
+    agent.api_mode = "chat_completions"
+    agent.api_key = "k"
+    agent._client_kwargs = {"api_key": "k"}
+    agent._use_prompt_caching = False
+    agent._use_native_cache_layout = False
+    agent.reasoning_config = None
+    agent._reasoning_echo_flag = False
+    original = {"extra_body": {"nested": {"value": 1}}}
+    agent.request_overrides = original
+    agent.runtime_capabilities = {}
+    agent.context_compressor = None
+    rt = arh._build_primary_runtime_snapshot(agent, "chat_completions")
+    assert rt["request_overrides"] == original
+    rt["request_overrides"]["extra_body"]["nested"]["value"] = 2
+    assert original["extra_body"]["nested"]["value"] == 1

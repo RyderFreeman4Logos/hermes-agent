@@ -46,6 +46,11 @@ DEFAULT_CONFIG = {
         # terminal's session (tmux/kitty/wezterm pane, tty). false = resume globally most-recent.
         "terminal_continue": True,
     },
+    # Opt-in HMAC digests of adjacent physical attempts. Default off: no observability dir,
+    # no raw payloads/headers/cookies/URLs. See agent/physical_attempt_diagnostics.py.
+    "observability": {
+        "physical_attempt_digests": {"enabled": False},
+    },
     "agent": {
         # Turn cap. null = unlimited (default; caps caused silent mid-task truncation). Positive int
         # caps; "none"/"unlimited"/"inf"/0/-1 also mean unlimited (resolve_turn_limit).

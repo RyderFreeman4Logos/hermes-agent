@@ -301,21 +301,24 @@ def _refresh_credentials_after_401(
     agent: Any, api_error: Exception, _retry: TurnRetryState, status_code: Optional[int]
 ) -> bool:
     """Per-provider one-shot credential refresh on 401 (codex/xai, vertex, nous, copilot,
-    anthropic), printing user-facing diagnostics when the nous/anthropic refresh fails.
-    Returns True when a refresh succeeded and the call should be retried."""
-    from agent.conversation_loop import _is_copilot_provider
+    anthropic) and xAI OAuth bad-credentials 403. Prints user-facing diagnostics when
+    the nous/anthropic refresh fails. Returns True when a refresh succeeded and the
+    call should be retried."""
+    from agent.conversation_loop import _is_copilot_provider, _is_xai_bad_credentials_403
 
-    if status_code != 401:
+    xai_bad_403 = _is_xai_bad_credentials_403(agent.provider, status_code, api_error)
+    if status_code != 401 and not xai_bad_403:
         return False
     if (
         agent.api_mode == "codex_responses"
         and agent.provider in {"openai-codex", "xai-oauth"}
+        and (status_code == 401 or xai_bad_403)
         and not _retry.codex_auth_retry_attempted
     ):
         _retry.codex_auth_retry_attempted = True
         if agent._try_refresh_codex_client_credentials(force=True):
             _label = "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
-            agent._buffer_vprint(f"🔐 {_label} auth refreshed after 401. Retrying request...")
+            agent._buffer_vprint(f"🔐 {_label} auth refreshed after {status_code}. Retrying request...")
             return True
     if agent.api_mode == "chat_completions" and agent.provider == "vertex" and not _retry.vertex_auth_retry_attempted:
         _retry.vertex_auth_retry_attempted = True

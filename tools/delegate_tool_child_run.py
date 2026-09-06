@@ -492,7 +492,12 @@ def _build_result_entry(
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
-        "model": _str_or_none(getattr(child, "model", None)),
+        "model": _str_or_none(getattr(child, "model", None)) if (
+            result.get("completed", False) or getattr(child, "_delegate_has_successful_llm_request", False)
+        ) else None,
+        "provider": _str_or_none(getattr(child, "provider", None)) if (
+            result.get("completed", False) or getattr(child, "_delegate_has_successful_llm_request", False)
+        ) else None,
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.

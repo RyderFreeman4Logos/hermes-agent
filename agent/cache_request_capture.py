@@ -81,8 +81,9 @@ def capture_provider_request(
 
     The input is copied while redacting secrets; the
     provider's request is untouched. Capture is best-effort unless strict write
-    mode is enabled. ``body`` is the exact HTTP/client transport bytes when
-    the SDK serialized them; otherwise the sanitized payload is serialized.
+    mode is enabled. ``body`` is already-buffered HTTP bytes when available.
+    Privacy wins over exact-wire identity: sensitive bytes are sanitized or
+    omitted and labeled; unchanged secret-free bytes may be ``exact_wire``.
     """
     if not enabled():
         return
@@ -96,9 +97,11 @@ def capture_provider_request(
         retry_value = 0
     try:
         request_payload = _redact(request)
-        body_bytes = bytes(body) if isinstance(body, (bytes, bytearray)) else _serialize_body(
-            request_payload
-        )
+        if isinstance(body, (bytes, bytearray)):
+            body_bytes, status = _sanitize_transport_body(bytes(body))
+        else:
+            body_bytes = _serialize_body(request_payload)
+            status = "kwargs_fallback"
         _persist(
             {
                 "schema": _SCHEMA,
@@ -118,6 +121,7 @@ def capture_provider_request(
                 "body_bytes": {
                     "encoding": "base64",
                     "data": base64.b64encode(body_bytes).decode("ascii"),
+                    "status": status,
                 },
             }
         )
@@ -134,6 +138,30 @@ def _serialize_body(request: dict[str, Any]) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _sanitize_transport_body(body: bytes) -> tuple[bytes, str]:
+    """Return persistable body bytes and an honest capture status.
+
+    ``exact_wire`` is only for unchanged secret-free buffered bytes.
+    """
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return b"", "omitted"
+    redacted_text = _redact_scalar(text)
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        if redacted_text != text:
+            return redacted_text.encode("utf-8"), "sanitized"
+        return body, "exact_wire"
+    redacted_obj = _redact(parsed)
+    if redacted_obj != parsed or redacted_text != text:
+        return json.dumps(redacted_obj, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        ), "sanitized"
+    return body, "exact_wire"
 
 
 def _identity_value(value: Any) -> str | None:

@@ -291,6 +291,76 @@ class TestFallbackChainResetOnTransportRecovery:
         assert agent.model == "glm-4.7"
 
 
+class XaiSpendingLimitError(Exception):
+    status_code = 403
+
+    def __init__(self):
+        super().__init__(
+            'HTTP 403: {"code":"personal-team-blocked:spending-limit",'
+            '"error":"Your team has reached its spending limit."}'
+        )
+        self.response = SimpleNamespace(headers={})
+        self.body = {
+            "error": {
+                "code": "personal-team-blocked:spending-limit",
+                "message": "Your team has reached its spending limit.",
+            }
+        }
+
+
+class TestStandardChildXaiSpendingLimitFallback:
+    def test_standard_child_continues_after_xai_spending_limit_fallback(self):
+        """An xAI spending-limit 403 is not terminal while another fallback remains."""
+        fb_chain = [
+            {"provider": "xai-oauth", "model": "grok-4.6"},
+            {"provider": "openai", "model": "gpt-4o"},
+        ]
+        agent = _make_agent_with_fallback(fb_chain)
+        agent._delegate_model_profile = "standard"
+        agent._credential_pool = None
+        calls = []
+
+        def fake_api_call(api_kwargs):
+            calls.append((agent.provider, agent.model))
+            if len(calls) == 1:
+                raise RateLimitError()
+            if calls[-1][0] == "xai-oauth":
+                raise XaiSpendingLimitError()
+            return _mock_response("Recovered after xAI fallback")
+
+        mock_fb_client = MagicMock()
+        mock_fb_client.api_key = "fallback-key"
+        mock_fb_client.base_url = "https://fallback.invalid/v1"
+        mock_fb_client._custom_headers = None
+        mock_fb_client.default_headers = None
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.turn_recovery.time.sleep"),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_fb_client, "resolved"),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after xAI fallback"
+        assert calls == [
+            ("zai", "glm-5.1"),
+            ("xai-oauth", "grok-4.6"),
+            ("openai", "gpt-4o"),
+        ]
+
+
 # Defensive: pure-timeout cycle without 429 still works
 
 

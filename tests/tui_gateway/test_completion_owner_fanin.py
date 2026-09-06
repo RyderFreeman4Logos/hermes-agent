@@ -63,11 +63,12 @@ def test_pending_live_child_fanin_uses_owner_get_timeout(monkeypatch):
     )
     poller.start()
     try:
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline and not seen:
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
             time.sleep(0.01)
         assert seen, "owner get was never called"
-        assert 2.0 in seen
+        assert all(t is not None and 0 <= t <= 2.0 for t in seen)
+        assert len(seen) >= 2
     finally:
         stop.set()
         poller.join(2)

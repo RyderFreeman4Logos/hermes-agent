@@ -364,13 +364,7 @@ def test_mixed_completion_batch_keeps_parent_order_and_ack_path(monkeypatch):
 
 
 def _run_poller_until(sid: str, sess: dict, pred, timeout: float = 2.0) -> None:
-    stop = threading.Event()
-    thread = threading.Thread(
-        target=server._notification_poller_loop,
-        args=(stop, sid, sess),
-        daemon=True,
-    )
-    thread.start()
+    stop = _start_test_poller(sid, sess)
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
@@ -378,8 +372,54 @@ def _run_poller_until(sid: str, sess: dict, pred, timeout: float = 2.0) -> None:
                 break
             time.sleep(0.01)
     finally:
+        _stop_test_poller(stop)
+
+
+def _start_test_poller(sid: str, sess: dict) -> threading.Event:
+    stop = server._start_notification_poller(sid, sess)
+    sess["_notif_stop"] = stop
+    return stop
+
+
+def _stop_test_poller(stop: threading.Event, timeout: float = 2.0) -> None:
+    stop.set()
+    for _stop, thread in list(server._notification_pollers):
+        if _stop is stop:
+            thread.join(timeout=timeout)
+
+
+def test_poller_stop_unblocks_owner_wait_without_stealing_later_queue(monkeypatch):
+    """stop_event must abort get_completion_for_owner, not finish its timeout.
+
+    A leftover poller otherwise drains the next test's isolated queue into a
+    dead session and mid-loop steers stay empty.
+    """
+    isolated: queue_mod.Queue = queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_collect_kanban_notifications", lambda *_a, **_k: [])
+    sess = _session(running=True, agent=_SteerAgent())
+    sid = "sid_stop_unblocks"
+    server._sessions[sid] = sess
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    stop = _start_test_poller(sid, sess)
+    try:
         stop.set()
-        thread.join(timeout=2.0)
+        _stop_test_poller(stop, timeout=0.3)
+        assert not any(
+            th.is_alive() for _s, th in server._notification_pollers if _s is stop
+        ), "poller ignored stop_event during owner wait"
+        later: queue_mod.Queue = queue_mod.Queue()
+        monkeypatch.setattr(process_registry, "completion_queue", later)
+        later.put(_completion("proc_later", 0, "echo later"))
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline and later.qsize() != 1:
+            time.sleep(0.01)
+        assert later.qsize() == 1
+    finally:
+        _stop_test_poller(stop)
+        server._sessions.pop(sid, None)
 
 
 def test_busy_completions_coalesce_to_one_ingest_batch_idle_stays_immediate(
@@ -448,13 +488,7 @@ def test_busy_completions_coalesce_to_one_ingest_batch_idle_stays_immediate(
     for evt in events:
         process_registry._completion_consumed.discard(evt["session_id"])
 
-    stop = threading.Event()
-    thread = threading.Thread(
-        target=server._notification_poller_loop,
-        args=(stop, busy_sid, busy_sess),
-        daemon=True,
-    )
-    thread.start()
+    stop = _start_test_poller(busy_sid, busy_sess)
     try:
         for evt in events:
             isolated.put(evt)
@@ -483,8 +517,7 @@ def test_busy_completions_coalesce_to_one_ingest_batch_idle_stays_immediate(
             assert str(evt["exit_code"]) in turn_text
         assert isolated.empty()
     finally:
-        stop.set()
-        thread.join(timeout=2.0)
+        _stop_test_poller(stop)
         server._sessions.pop(busy_sid, None)
         for evt in events:
             process_registry._completion_consumed.discard(evt["session_id"])
@@ -621,13 +654,7 @@ def test_child_tails_after_compress_do_not_each_start_a_parent_turn(monkeypatch)
     for evt in (*child_events, parent_evt):
         process_registry._completion_consumed.discard(evt["session_id"])
 
-    stop = threading.Event()
-    thread = threading.Thread(
-        target=server._notification_poller_loop,
-        args=(stop, sid, sess),
-        daemon=True,
-    )
-    thread.start()
+    stop = _start_test_poller(sid, sess)
     try:
         isolated.put(child_events[0])
         # Give #131's 0.1s singleton flush a chance to fire before the
@@ -661,8 +688,7 @@ def test_child_tails_after_compress_do_not_each_start_a_parent_turn(monkeypatch)
         assert "proc_parent" in turns[1]
         assert isolated.empty()
     finally:
-        stop.set()
-        thread.join(timeout=2.0)
+        _stop_test_poller(stop)
         server._sessions.pop(sid, None)
         ad._delete_durable_delegation("deleg_live")
         ad._reset_for_tests()
@@ -706,13 +732,7 @@ def test_midloop_completions_use_steer_rail_not_new_turns(monkeypatch):
     for evt in events:
         process_registry._completion_consumed.discard(evt["session_id"])
 
-    stop = threading.Event()
-    thread = threading.Thread(
-        target=server._notification_poller_loop,
-        args=(stop, sid, sess),
-        daemon=True,
-    )
-    thread.start()
+    stop = _start_test_poller(sid, sess)
     try:
         for evt in events:
             isolated.put(evt)
@@ -741,8 +761,7 @@ def test_midloop_completions_use_steer_rail_not_new_turns(monkeypatch):
             "proc_mid_c",
         }
     finally:
-        stop.set()
-        thread.join(timeout=2.0)
+        _stop_test_poller(stop)
         server._sessions.pop(sid, None)
         for evt in events:
             process_registry._completion_consumed.discard(evt["session_id"])
@@ -782,13 +801,7 @@ def test_llm_blocked_pileup_is_one_steer_batch_zero_drops(monkeypatch):
     for evt in events:
         process_registry._completion_consumed.discard(evt["session_id"])
 
-    stop = threading.Event()
-    thread = threading.Thread(
-        target=server._notification_poller_loop,
-        args=(stop, sid, sess),
-        daemon=True,
-    )
-    thread.start()
+    stop = _start_test_poller(sid, sess)
     try:
         isolated.put(events[0])
         time.sleep(0.15)
@@ -813,8 +826,7 @@ def test_llm_blocked_pileup_is_one_steer_batch_zero_drops(monkeypatch):
         pending_ids = {evt.get("session_id") for evt in pending}
         assert pending_ids == {"proc_llm_a", "proc_llm_b"}
     finally:
-        stop.set()
-        thread.join(timeout=2.0)
+        _stop_test_poller(stop)
         server._sessions.pop(sid, None)
         for evt in events:
             process_registry._completion_consumed.discard(evt["session_id"])

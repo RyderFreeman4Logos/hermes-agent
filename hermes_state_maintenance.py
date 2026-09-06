@@ -342,16 +342,17 @@ class SessionMaintenanceMixin:
             optimized = self.optimize_fts()  # manages its own lock
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
-        with self._lock:
-            # PASSIVE, not TRUNCATE: a manual `hermes sessions vacuum` runs in a transient CLI
-            # process; a TRUNCATE reset here would race a live gateway writer.
-            self._try_checkpoint("PASSIVE", "WAL checkpoint (PASSIVE) before VACUUM failed: %s")
-            self._conn.execute("VACUUM")
-            # VACUUM rewrites every page THROUGH the WAL; without this TRUNCATE a 3 GB DB leaves a 3 GB -wal.
-            self._try_checkpoint("TRUNCATE", "WAL checkpoint (TRUNCATE) after VACUUM failed: %s")
-            # TRUNCATE may replace the WAL inode; adopt the new sidecars so the
-            # write-path generation guard does not halt this connection.
-            self._record_db_file_identity()
+        with self._advisory_write_lock():
+            with self._lock:
+                # PASSIVE, not TRUNCATE: a manual `hermes sessions vacuum` runs in a transient CLI
+                # process; a TRUNCATE reset here would race a live gateway writer.
+                self._try_checkpoint("PASSIVE", "WAL checkpoint (PASSIVE) before VACUUM failed: %s")
+                self._conn.execute("VACUUM")
+                # VACUUM rewrites every page THROUGH the WAL; without this TRUNCATE a 3 GB DB leaves a 3 GB -wal.
+                self._try_checkpoint("TRUNCATE", "WAL checkpoint (TRUNCATE) after VACUUM failed: %s")
+                # TRUNCATE may replace the WAL inode; adopt the new sidecars so the
+                # write-path generation guard does not halt this connection.
+                self._record_db_file_identity()
         return optimized
 
     def maybe_auto_prune_and_vacuum(

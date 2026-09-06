@@ -32,7 +32,12 @@ from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.stream_payload_bound import (
+    DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+    StreamPayloadBoundExceeded,
+    persist_interrupted_stream_partial,
+)
+from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call, stop_thinking_spinner
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_final_response import finish_text_response
@@ -1378,6 +1383,21 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
         except InterruptedError:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
+        except StreamPayloadBoundExceeded as api_error:
+            s.thinking_spinner = stop_thinking_spinner(agent, s.thinking_spinner)
+            s.interrupted = True
+            s._turn_exit_reason = "stream_payload_bound_exceeded"
+            s.final_response = persist_interrupted_stream_partial(
+                agent,
+                s.messages,
+                elapsed=time.time() - (s.api_start_time or time.time()),
+                exceeded=True,
+                size=getattr(api_error, "size", 0),
+                bound=getattr(api_error, "bound", None) or DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+            )
+            agent._vprint(f"{agent.log_prefix}⚠ {s.final_response}", force=True)
+            agent._persist_session(s.messages, s.conversation_history)
+            return None
         except Exception as api_error:
             _ae = _run_phase(handle_api_error, agent, s, api_error=api_error)
             if _ae.action == "return":

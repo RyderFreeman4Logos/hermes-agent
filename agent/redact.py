@@ -1424,4 +1424,6 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
-        return redact_sensitive_text(original)
+        # Logs are not a navigation surface: strip URL userinfo/query
+        # credentials that default tool-output redaction deliberately keeps.
+        return redact_sensitive_text(original, redact_url_credentials=True)

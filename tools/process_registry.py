@@ -8,6 +8,7 @@ import codecs
 from contextlib import suppress
 import json
 import logging
+import math
 import os
 import platform
 import shlex
@@ -337,6 +338,7 @@ class ProcessSession:
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
+    delegated_child: bool = False               # Spawned from a native delegate_task child
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
     _watch_suppressed: int = field(default=0, repr=False)    # matches dropped by rate limit
@@ -376,7 +378,7 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "watch_patterns")
+    "parent_session_id", "notify_on_complete", "delegated_child", "watch_patterns")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -738,6 +740,9 @@ class ProcessRegistry:
 
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        extra.setdefault("delegated_child", is_delegated_child_process_context())
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id or task_id, session_key=session_key, cwd=cwd,
@@ -1188,6 +1193,7 @@ class ProcessRegistry:
                 # Stable producer identity across checkpoint recovery (unlike a
                 # consumer-observed completion timestamp).
                 "started_at": session.started_at,
+                "delegated_child": bool(getattr(session, "delegated_child", False)),
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)
@@ -1205,6 +1211,29 @@ class ProcessRegistry:
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
+
+    @staticmethod
+    def _is_routine_delegated_child_completion(evt: dict) -> bool:
+        """Whether a completed native-child command needs no parent turn."""
+        if not isinstance(evt, dict):
+            return False
+        started_at = evt.get("started_at")
+        return (
+            evt.get("type") == "completion"
+            and evt.get("delegated_child") is True
+            and type(evt.get("exit_code")) is int
+            and evt["exit_code"] == 0
+            and evt.get("completion_reason") == "exited"
+            and evt.get("termination_source") == ""
+            and isinstance(evt.get("session_id"), str)
+            and bool(evt["session_id"])
+            and isinstance(evt.get("command"), str)
+            and bool(evt["command"])
+            and isinstance(started_at, (int, float))
+            and not isinstance(started_at, bool)
+            and math.isfinite(started_at)
+            and started_at > 0
+        )
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on

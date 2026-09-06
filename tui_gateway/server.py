@@ -2522,6 +2522,8 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    if event == "message.complete" and isinstance(payload, dict):
+        _stamp_loop_cache_info(sid, payload)
     write_json(_event_frame(event, sid, payload))
 
 
@@ -7009,11 +7011,16 @@ def _compress_session_history(
     with session["history_lock"]:
         if int(session.get("history_version", 0)) != history_version:
             # External mutation during compaction — drop the compressed
-            # result so we don't clobber concurrent edits.
+            # result so we don't clobber concurrent edits, and clear the
+            # post-compression cache flags the uncommitted compress set.
             finalize_context_engine_compression_notification(
                 agent,
                 committed=False,
             )
+            compressor = getattr(agent, "context_compressor", None)
+            if compressor is not None:
+                compressor.awaiting_real_usage_after_compression = False
+            agent._awaiting_cache_usage_after_compression = False
             usage = _get_usage(agent)
             return 0, usage
         session["history"] = compressed

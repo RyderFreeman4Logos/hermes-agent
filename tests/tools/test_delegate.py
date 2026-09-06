@@ -1364,6 +1364,63 @@ class TestChildCredentialLeasing(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
+    def test_non_xai_child_drops_xai_billing_terminal(self):
+        """A DeepSeek child must not relay an xAI billing terminal from its parent (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "deepseek-v4-flash"
+        child.provider = "deepseek"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Billing or credits exhausted: xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+
+    def test_standard_child_hides_unverified_xai_fallback_terminal(self):
+        """A standard child must not relay an xAI fallback's unverified terminal (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "grok-4.6"
+        child.provider = "xai-oauth"
+        child._delegate_model_profile = "standard"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Provider reported usage/credit exhaustion (unverified): xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "billing_unverified": True,
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertIsNone(result["model"])
+
 
 class TestDelegateHeartbeat(unittest.TestCase):
     """Heartbeat propagates child activity to parent during delegation.

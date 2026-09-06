@@ -1596,14 +1596,15 @@ class TestTryPaymentFallback:
         _aux_unhealthy_logged_at.clear()
 
     def test_skips_failed_provider(self):
+        """Payment fallback skips the failed provider and every non-Codex destination (#160)."""
         mock_client = MagicMock()
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_nous", return_value=(mock_client, "nous-model")), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
             client, model, label = _try_payment_fallback("openrouter", task="compression")
-        assert client is mock_client
-        assert model == "nous-model"
-        assert label == "nous"
+        assert client is None
+        assert model is None
+        assert label == ""
 
 
 
@@ -4115,16 +4116,12 @@ class TestAuxUnhealthyCache:
 
 
     def test_payment_fallback_skips_unhealthy(self):
-        """_try_payment_fallback also consults the unhealthy cache so a 402
-        on OpenRouter doesn't cause a second OR call within the same chain
-        iteration if it gets re-entered."""
+        """_try_payment_fallback skips failed/unhealthy rungs and non-Codex destinations (#160)."""
         from agent.auxiliary_client import (
             _try_payment_fallback,
             _mark_provider_unhealthy,
         )
         nous_client = MagicMock()
-        # Mark BOTH the failed provider (openrouter) and a sibling (custom)
-        # unhealthy. The chain should still find nous.
         _mark_provider_unhealthy("local/custom")
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._try_openrouter") as or_try, \
@@ -4132,9 +4129,9 @@ class TestAuxUnhealthyCache:
              patch("agent.auxiliary_client._try_custom_endpoint") as custom_try, \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
             client, model, label = _try_payment_fallback("openrouter", task="compression")
-        assert client is nous_client
-        assert label == "nous"
-        # OR is skipped via skip_chain_labels (failed provider), custom via unhealthy cache.
+        assert client is None
+        assert model is None
+        assert label == ""
         or_try.assert_not_called()
         custom_try.assert_not_called()
 
@@ -4259,8 +4256,8 @@ class TestCompressionFallbackContextFilter:
         small_client = MagicMock(name="small_client")
         large_client = MagicMock(name="large_client")
         entries = [
-            self._make_chain_entry("small-provider", "tiny-8k"),
-            self._make_chain_entry("big-provider", "huge-1m"),
+            self._make_chain_entry("openai-codex", "tiny-8k"),
+            self._make_chain_entry("openai-codex", "huge-1m"),
         ]
 
         def fake_resolve(entry):
@@ -4289,7 +4286,7 @@ class TestCompressionFallbackContextFilter:
             "L2 bug: chain returned the first reachable candidate without "
             "screening by context window.")
         assert model == "huge-1m"
-        assert "big-provider" in label
+        assert "openai-codex" in label
 
 
     # ── same-provider, different-model chain entries ────────────────────
@@ -4541,7 +4538,7 @@ class TestSynchronousFallbackCachePlans:
     def _run_configured_fallback(monkeypatch, entry):
         from agent.auxiliary_client import (
             _call_fallback_candidate_sync,
-            _try_configured_fallback_chain,
+            _resolve_fallback_entry,
         )
 
         client = MagicMock()
@@ -4558,10 +4555,8 @@ class TestSynchronousFallbackCachePlans:
             "agent.auxiliary_client._get_auxiliary_task_config",
             lambda task: {"fallback_chain": [entry]},
         )
-        fallback_client, fallback_model, label = _try_configured_fallback_chain(
-            task="moa_aggregator",
-            failed_provider="primary",
-        )
+        fallback_client, fallback_model = _resolve_fallback_entry(entry)
+        label = f"fallback_chain[0]({entry['provider']})"
         tools = [{
             "type": "function",
             "function": {
@@ -4635,7 +4630,7 @@ class TestAsynchronousFallbackCachePlans:
         """Async mirror parity: per-destination cache replan, not verbatim pass-through."""
         from agent.auxiliary_client import (
             _call_fallback_candidate_async,
-            _try_configured_fallback_chain,
+            _resolve_fallback_entry,
         )
 
         entry = {
@@ -4659,10 +4654,8 @@ class TestAsynchronousFallbackCachePlans:
             "agent.auxiliary_client._get_auxiliary_task_config",
             lambda task: {"fallback_chain": [entry]},
         )
-        fallback_client, fallback_model, label = _try_configured_fallback_chain(
-            task="moa_aggregator",
-            failed_provider="primary",
-        )
+        fallback_client, fallback_model = _resolve_fallback_entry(entry)
+        label = f"fallback_chain[0]({entry['provider']})"
         tools = [{
             "type": "function",
             "function": {

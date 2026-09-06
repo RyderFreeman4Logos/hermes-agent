@@ -175,6 +175,21 @@ def _ack_steered_completion_ingest(session: dict) -> None:
         _mark_completion_events_consumed(accepted)
 
 
+def _filter_routine_delegated_child_completions(events: list) -> list:
+    """Consume silent child successes before completion fan-in projects them."""
+    from tools.process_registry import ProcessRegistry
+
+    visible = []
+    silent = []
+    for evt in events:
+        if ProcessRegistry._is_routine_delegated_child_completion(evt):
+            silent.append(evt)
+        else:
+            visible.append(evt)
+    _mark_completion_events_consumed(silent)
+    return visible
+
+
 def _bind_completion_steer_guards(session: dict, agent) -> None:
     """ACK on drain (ingest); unmark on interrupt wipe so pending can replay."""
     if agent is None or getattr(agent, "_completion_steer_guards", False):
@@ -352,6 +367,7 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
         if not fresh:
             return
         pending = fresh
+    pending = _filter_routine_delegated_child_completions(pending)
     if not pending:
         return
     if running:

@@ -1168,6 +1168,17 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        from agent.delegation_context import is_delegated_child_context
+
+        delegated_child = is_delegated_child_context()
+        process_task_id = str(task_id or "") if delegated_child else effective_task_id
+        if delegated_child and background:
+            # A native delegate shares this process registry with its parent.
+            # Keep its subprocesses addressable by the child task only; a child
+            # completion must not become a parent session notification.
+            session_key = ""
+            notify_on_complete = False
+            watch_patterns = None
 
         _pre_exec_block(command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key)
         # Pre-exec security checks (tirith + dangerous command detection);
@@ -1177,7 +1188,7 @@ def terminal_tool(
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if background:
             return spawn_background_process(
-                command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
+                command=command, env=env, env_type=env_type, effective_task_id=process_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,

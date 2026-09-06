@@ -77,6 +77,22 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env("TERMINAL_DISK_WARNING_GB", 500.0, float, "number")
 
 
+def _auto_background_timeout_threshold() -> int:
+    """Seconds above which an omitted-background call is auto-promoted."""
+    threshold = 200
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        terminal_config = load_config_readonly().get("terminal") or {}
+        threshold = max(1, int(terminal_config.get("auto_background_timeout_threshold", 200)))
+    except (AttributeError, TypeError, ValueError):
+        logger.warning("Invalid terminal.auto_background_timeout_threshold; using 200s")
+        threshold = 200
+    except Exception:
+        logger.debug("Could not load terminal auto-background threshold", exc_info=True)
+    return threshold
+
+
 # Approval / sudo-prompt UI callbacks (CLI registers prompt_toolkit-aware
 # ones). Thread-local so overlapping ACP sessions, each on its own executor
 # thread, can't stomp on each other (GHSA-qg5c-hvr5-hjgr). Gateway mode
@@ -635,6 +651,7 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "auto_background_timeout_threshold": _auto_background_timeout_threshold(),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": _tenv("TERMINAL_SSH_HOST", ""),
@@ -879,11 +896,13 @@ class _ExecPlan:
     cwd: str
     host_cwd: Optional[str]
     effective_timeout: int
+    background: bool
+    auto_promoted: bool = False
 
 
 def _plan_execution(
     command: Any, *, task_id: Optional[str], timeout: Optional[int],
-    background: bool, _host_local: bool,
+    background: Optional[bool], _host_local: bool,
 ) -> _ExecPlan:
     """Resolve backend, env-cache key, image, cwd and timeout for one call.
 
@@ -942,6 +961,29 @@ def _plan_execution(
     # value is truthy and would fire an immediate "-Ns" timeout.
     if timeout is not None and timeout <= 0:
         raise _Rejected(tool_error(f"timeout must be a positive number of seconds (got {timeout})."))
+    effective_timeout = timeout or config["timeout"]
+    background_was_omitted = background is None
+    background = False if background_was_omitted else bool(background)
+    auto_background_threshold = int(config.get("auto_background_timeout_threshold", 200))
+    auto_promoted = background_was_omitted and effective_timeout > auto_background_threshold
+    if auto_promoted:
+        try:
+            from gateway.session_context import async_delivery_supported
+
+            if not async_delivery_supported():
+                raise _Rejected(tool_error(
+                    "Long terminal command was not started: this session cannot "
+                    "deliver a managed background completion. Use a short bounded "
+                    f"timeout at or below {auto_background_threshold}s."
+                ))
+        except _Rejected:
+            raise
+        except Exception:
+            raise _Rejected(tool_error(
+                "Long terminal command was not started because async completion "
+                "delivery could not be verified."
+            ))
+        background = True
     if not background:
         if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
             raise _Rejected(tool_error(
@@ -955,7 +997,8 @@ def _plan_execution(
 
     return _ExecPlan(
         config=config, env_type=env_type, effective_task_id=effective_task_id,
-        image=image, cwd=cwd, host_cwd=host_cwd, effective_timeout=timeout or config["timeout"],
+        image=image, cwd=cwd, host_cwd=host_cwd, effective_timeout=effective_timeout,
+        background=background, auto_promoted=auto_promoted,
     )
 
 
@@ -1131,7 +1174,7 @@ def _degraded_result(e: EnvironmentConnectionError, task_id: Optional[str]) -> s
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = False,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
@@ -1175,7 +1218,9 @@ def terminal_tool(
         verdict = _run_approval_guards(command, env_type, plan.config, force=force)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
-        if background:
+        if plan.auto_promoted:
+            notify_on_complete = True
+        if plan.background:
             return spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
@@ -1221,12 +1266,11 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
-                "default": False
+                "description": "Run in the background, returning a session_id. When omitted, Hermes keeps the command in the foreground unless its effective timeout exceeds terminal.auto_background_timeout_threshold; then it uses managed background execution with completion notification. Explicit background=false always keeps the command in the foreground (subject to the foreground timeout cap). Pair background=true with notify=true for bounded work; leave notifications off only for servers, watchers, and daemons.",
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When background is omitted, Hermes promotes the call to managed background execution with completion notification only when the effective timeout exceeds terminal.auto_background_timeout_threshold. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
                 "minimum": 1
             },
             "workdir": {
@@ -1298,7 +1342,7 @@ def _handle_terminal(args, **kw):
             )
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=args.get("background"),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),

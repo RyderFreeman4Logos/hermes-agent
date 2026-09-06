@@ -5686,14 +5686,19 @@ _aux_sem_lock = threading.Lock()
 
 def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
     """``auxiliary.<task>.max_concurrency`` as a positive int, or None. Vision uses this key for
-    its encode/resize CPU pool; its LLM calls stay concurrent."""
+    its encode/resize CPU pool; its LLM calls stay concurrent. Unset compression defaults to 2
+    so lean digest harvest cannot fan out unbounded (#165)."""
     if not task or task == "vision":
         return None
+    default = 2 if task == "compression" else None
+    raw = _get_auxiliary_task_config(task).get("max_concurrency")
+    if raw is None:
+        return default
     try:
-        value = int(_get_auxiliary_task_config(task).get("max_concurrency"))
-    except (TypeError, ValueError):  # missing (None) or malformed
-        return None
-    return value if value > 0 else None
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 def _cached_semaphore(store: dict, key: Any, limit: int, factory: Callable[[int], Any]) -> Any:

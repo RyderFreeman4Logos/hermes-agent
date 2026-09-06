@@ -388,6 +388,8 @@ def cmd_status(args) -> None:
     config = load_config()
     mem_config = config.get("memory", {})
     provider_name = mem_config.get("provider", "")
+    from tools.memory_tool import get_memory_provider_mode
+    provider_mode = get_memory_provider_mode(mem_config)
 
     # Memory tool enablement for the CLI platform via the canonical resolver, respecting the
     # check_fn gate when both stores are disabled.
@@ -395,6 +397,15 @@ def cmd_status(args) -> None:
     from tools.memory_tool import check_memory_requirements
     cli_tools = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
     memory_tool_enabled = ("memory" in cli_tools) and check_memory_requirements()
+    memory_enabled = mem_config.get("memory_enabled", True)
+    user_profile_enabled = mem_config.get("user_profile_enabled", True)
+    built_in_injection = "enabled" if (memory_enabled or user_profile_enabled) else "disabled"
+    if provider_mode == "authoritative":
+        core_tool_routing = "authoritative_provider"
+    elif memory_tool_enabled:
+        core_tool_routing = "built_in_store"
+    else:
+        core_tool_routing = "hidden"
 
     print("\nMemory status\n" + "─" * 40)
     print("  Built-in (MEMORY.md / USER.md):")
@@ -402,6 +413,9 @@ def cmd_status(args) -> None:
     print(f"    User profile:       {_mark(mem_config.get('user_profile_enabled', True))}")
     print(f"    Memory tool:        {_mark(memory_tool_enabled)}")
     print(f"  Provider:  {provider_name or '(none — built-in only)'}")
+    print(f"  provider_mode={provider_mode}")
+    print(f"  built_in_injection={built_in_injection}")
+    print(f"  core_tool_routing={core_tool_routing}")
 
     providers = _get_available_providers()
     match = _find_provider(providers, provider_name)

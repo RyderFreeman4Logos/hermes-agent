@@ -1225,11 +1225,12 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     return kwargs
 
 
-def _init_memory(agent, _agent_cfg, skip_memory, platform):
+def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_provider_mode_override=None):
     # Persistent memory (MEMORY.md + USER.md) — loaded from disk
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
+    agent._memory_provider_mode = "hybrid"
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
@@ -1244,13 +1245,19 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
         "memory" in (agent.enabled_toolsets or [])
         and "memory" not in (agent.disabled_toolsets or [])
     )
+    mem_config = {}
     if not skip_memory or _memory_toolset_requested:
         # Memory is optional — don't break agent init
         with suppress(Exception):
             from tools.memory_tool import (
                 MemoryStore, get_builtin_memory_config, get_builtin_memory_store_flags,
+                get_memory_provider_mode,
             )
             mem_config = get_builtin_memory_config(_agent_cfg)
+            agent._memory_provider_mode = get_memory_provider_mode(mem_config)
+            if memory_provider_mode_override in {"authoritative", "hybrid"}:
+                agent._memory_provider_mode = memory_provider_mode_override
+            agent._session_init_model_config["memory_provider_mode"] = agent._memory_provider_mode
             agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
                 _agent_cfg
             )
@@ -1269,11 +1276,11 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-            if _mem_provider_name and _mem_provider_name.strip():
+            if (_mem_provider_name and _mem_provider_name.strip()) or agent._memory_provider_mode == "authoritative":
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
+                agent._memory_manager = _MemoryManager(provider_mode=agent._memory_provider_mode)
+                _mp = _load_mem(_mem_provider_name) if _mem_provider_name else None
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None and _mem_provider_name not in _warned_unavailable_providers:
@@ -1287,10 +1294,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
-                    agent._memory_manager = None
+                    if agent._memory_provider_mode != "authoritative":
+                        agent._memory_manager = None
         except Exception as _mpe:
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
-            agent._memory_manager = None
+            if agent._memory_provider_mode != "authoritative":
+                agent._memory_manager = None
 
     from agent.memory_manager import inject_memory_provider_tools
     inject_memory_provider_tools(agent)
@@ -2211,6 +2220,7 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None,
+    memory_provider_mode_override: str = None,
 ):
     """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
 
@@ -2294,7 +2304,7 @@ def init_agent(
         _agent_cfg = {}
 
     _apply_display_config(agent, _agent_cfg, platform)
-    _init_memory(agent, _agent_cfg, skip_memory, platform)
+    _init_memory(agent, _agent_cfg, skip_memory, platform, memory_provider_mode_override)
     _apply_agent_section(agent, _agent_cfg)
     cs = _parse_compression_config(agent, _agent_cfg)
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(

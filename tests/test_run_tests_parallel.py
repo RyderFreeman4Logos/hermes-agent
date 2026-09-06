@@ -25,6 +25,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -797,6 +798,29 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
         errors="replace",
         timeout=60,
     )
+
+
+def test_out_of_tree_probe_does_not_collect_host_tmp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nested pytest must not scandir host /tmp for an out-of-tree probe."""
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.delenv("TEMP", raising=False)
+    monkeypatch.delenv("TMP", raising=False)
+    host_tmp = Path(tempfile.gettempdir())
+    probe_root = Path(tempfile.mkdtemp(prefix="hermes-nested-probe-", dir=str(host_tmp)))
+    try:
+        probe_dir = probe_root / "probe"
+        probe_dir.mkdir()
+        (probe_dir / "test_nested_isolation.py").write_text(
+            "def test_smoke():\n    assert True\n", encoding="utf-8"
+        )
+        proc = _run_runner(probe_dir)
+        assert proc.returncode == 0, proc.stdout
+        assert "PermissionError" not in proc.stdout
+        assert "1✓" in proc.stdout or "1 tests passed" in proc.stdout, proc.stdout
+    finally:
+        shutil.rmtree(probe_root, ignore_errors=True)
 
 
 

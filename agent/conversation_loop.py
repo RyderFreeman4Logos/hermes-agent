@@ -312,6 +312,41 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._stream_needs_break = True
 
 
+def _is_xai_bad_credentials_403(
+    provider: str,
+    status_code: Any,
+    api_error: Any,
+    error_context: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """xAI reports an expired or invalid OAuth access token as HTTP 403 with
+    body code ``unauthenticated:bad-credentials`` rather than 401, so the
+    401-only refresh trigger never fires and a long-lived worker keeps its
+    dead in-memory token (#82052). Scoped to xai-oauth: other providers'
+    403s remain non-retryable authorization failures.
+    """
+    if provider != "xai-oauth" or status_code != 403:
+        return False
+    if error_context is None:
+        from agent.agent_runtime_helpers import extract_api_error_context
+
+        error_context = extract_api_error_context(api_error)
+    reason = str((error_context or {}).get("reason") or "").strip().casefold()
+    if reason == "unauthenticated:bad-credentials":
+        return True
+    exact_messages = {
+        "oauth2 access token could not be validated",
+        "the oauth2 access token could not be validated",
+    }
+    for value in (
+        (error_context or {}).get("message"),
+        getattr(api_error, "message", None),
+    ):
+        message = str(value or "").strip().casefold().removesuffix(".")
+        if message in exact_messages:
+            return True
+    return False
+
+
 def _is_copilot_provider(agent: Any) -> bool:
     """Delegate to ``AIAgent._is_copilot_provider``; the fallback keeps the ``github-copilot`` /
     ``github`` aliases so credential recovery is not skipped for them."""

@@ -312,11 +312,11 @@ def _body_bytes(payload: dict[str, Any]) -> tuple[bytes, str]:
     status = str(record.get("status") or "kwargs_fallback")
     data = record.get("data")
     if not isinstance(data, str) or not data:
-        return b"", status
+        return b"", "omitted" if status == "exact_wire" else status
     try:
-        return base64.b64decode(data), status
+        return base64.b64decode(data, validate=True), status
     except (TypeError, ValueError):
-        return b"", status
+        return b"", "omitted"
 
 
 def _first_byte(left: bytes, right: bytes) -> int | None:

@@ -977,3 +977,152 @@ def test_bedrock_nonstream_converse_captures_before_sdk(monkeypatch):
     )
 
     assert captured == opened
+
+
+def _first_byte(left: bytes, right: bytes) -> int | None:
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if left[index] != right[index]:
+            return index
+    return limit if len(left) != len(right) else None
+
+
+def _openai_chat_response(model: str) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl_probe",
+        "object": "chat.completion",
+        "created": 0,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def _send_openai_sdk(*, tmp_path: Path, kwargs: dict[str, Any]) -> dict[str, Any]:
+    import httpx
+    from openai import OpenAI
+
+    from agent import relay_llm
+
+    wire: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        wire["content"] = bytes(request.content)
+        wire["headers"] = dict(request.headers)
+        wire["url"] = str(request.url)
+        return httpx.Response(200, json=_openai_chat_response(str(kwargs["model"])))
+
+    client = OpenAI(
+        api_key="sk-probe-not-a-real-key",
+        base_url="https://provider.example.test/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    def send(request: dict[str, Any]) -> Any:
+        relay_llm.capture_transport_request(request)
+        return client.chat.completions.create(**request)
+
+    relay_llm._execute_attempt(
+        dict(kwargs),
+        send,
+        name="openai",
+        model_name=str(kwargs["model"]),
+        metadata={
+            "api_mode": "chat_completions",
+            "route": "https://provider.example.test/v1",
+            "api_request_id": "sdk-wire:0",
+        },
+    )
+    captures = _captures(tmp_path)
+    assert captures, "expected one persisted capture"
+    captured = captures[-1]
+    return {
+        "wire": wire,
+        "captured": captured,
+        "body": base64.b64decode(captured["body_bytes"]["data"]),
+        "serialized": json.dumps(captured),
+    }
+
+
+def test_openai_sdk_wire_body_is_captured_exactly(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    kwargs = {
+        "model": "probe-model",
+        "messages": [
+            {"role": "system", "content": "SYS-A"},
+            {"role": "user", "content": "hello-prompt"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "tool-desc",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        "prompt_cache_key": "PCK-A",
+    }
+
+    result = _send_openai_sdk(tmp_path=tmp_path, kwargs=kwargs)
+
+    assert result["body"] == result["wire"]["content"]
+    assert result["captured"]["request"]["messages"] == kwargs["messages"]
+    assert result["captured"]["request"]["tools"] == kwargs["tools"]
+    assert result["captured"]["request"]["prompt_cache_key"] == "PCK-A"
+    assert "sk-probe-not-a-real-key" not in result["serialized"]
+    assert result["captured"]["request"]["messages"][1]["content"] == "hello-prompt"
+    assert "chatgpt.com" not in result["serialized"]
+    assert "api.openai.com" not in result["serialized"]
+
+
+def test_openai_sdk_wire_first_diff_is_deterministic(monkeypatch, tmp_path):
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    base = {
+        "model": "probe-model",
+        "messages": [{"role": "system", "content": "SYS-A"}],
+        "tools": [{"type": "function", "function": {"name": "one"}}],
+        "prompt_cache_key": "PCK-A",
+    }
+    message = {
+        **base,
+        "messages": [{"role": "system", "content": "SYS-B"}],
+    }
+    tools = {
+        **base,
+        "tools": [{"type": "function", "function": {"name": "two"}}],
+    }
+    scope = {**base, "prompt_cache_key": "PCK-B"}
+
+    first = _send_openai_sdk(tmp_path=tmp_path, kwargs=base)
+    second = _send_openai_sdk(tmp_path=tmp_path, kwargs=message)
+    third = _send_openai_sdk(tmp_path=tmp_path, kwargs=tools)
+    fourth = _send_openai_sdk(tmp_path=tmp_path, kwargs=scope)
+
+    assert _first_byte(first["body"], second["body"]) == _first_byte(
+        first["wire"]["content"], second["wire"]["content"]
+    )
+    assert _first_difference(first["captured"]["request"], second["captured"]["request"]) == (
+        "messages",
+        0,
+        "content",
+    )
+    assert _first_difference(first["captured"]["request"], third["captured"]["request"]) == (
+        "tools",
+        0,
+        "function",
+        "name",
+    )
+    assert _first_difference(first["captured"]["request"], fourth["captured"]["request"]) == (
+        "prompt_cache_key",
+    )
+    assert json.loads(first["wire"]["content"])["prompt_cache_key"] == "PCK-A"
+    assert json.loads(fourth["wire"]["content"])["prompt_cache_key"] == "PCK-B"

@@ -25,9 +25,20 @@ _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
     {"x-dynamo-parent-session-id", "x-dynamo-session-id"}
 )
 
-_TRANSPORT_CAPTURE_CONTEXT: contextvars.ContextVar[
-    tuple[str, str, dict[str, Any]] | None
-] = contextvars.ContextVar("relay_transport_capture_context", default=None)
+@dataclass
+class _TransportCaptureState:
+    name: str
+    model_name: str
+    metadata: dict[str, Any]
+    pending: dict[str, Any] | None = None
+
+
+_TRANSPORT_CAPTURE_CONTEXT: contextvars.ContextVar[_TransportCaptureState | None] = (
+    contextvars.ContextVar("relay_transport_capture_context", default=None)
+)
+_HTTPX_WRAP_DEPTH = 0
+_HTTPX_CLIENT_SEND = None
+# ponytail: process-wide httpx.Client.send wrap + depth count; per-thread wrap if concurrent captures overlap unwrap
 
 
 def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -> None:
@@ -39,38 +50,101 @@ def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -
         logger.debug("cache low-hit remember failed", exc_info=True)
 
 
-@contextmanager
-def _transport_capture_context(
-    *, name: str, model_name: str, metadata: dict[str, Any] | None
-):
-    token = _TRANSPORT_CAPTURE_CONTEXT.set((name, model_name, metadata or {}))
-    try:
-        yield
-    finally:
-        _TRANSPORT_CAPTURE_CONTEXT.reset(token)
-
-
-def capture_transport_request(request: dict[str, Any]) -> None:
-    """Capture kwargs immediately before a provider SDK opener."""
-    context = _TRANSPORT_CAPTURE_CONTEXT.get()
-    if context is None:
+def _persist_pending_transport_request(*, body: bytes | None = None) -> None:
+    state = _TRANSPORT_CAPTURE_CONTEXT.get()
+    if state is None or state.pending is None:
         return
-    name, model_name, metadata = context
-    request_id = str(metadata.get("api_request_id") or "").strip()
+    request = state.pending
+    request_id = str(state.metadata.get("api_request_id") or "").strip()
     try:
-        retry = int(metadata.get("retry_count") or 0)
+        retry = int(state.metadata.get("retry_count") or 0)
     except (TypeError, ValueError):
         retry = 0
     cache_request_capture.capture_provider_request(
         request,
-        api_mode=str(metadata.get("api_mode") or "unknown"),
-        route=str(metadata.get("route") or "unknown"),
-        provider=name,
-        model=model_name,
+        api_mode=str(state.metadata.get("api_mode") or "unknown"),
+        route=str(state.metadata.get("route") or "unknown"),
+        provider=state.name,
+        model=state.model_name,
         correlation=request_id or None,
         attempt_id=f"{request_id}:attempt:{retry}" if request_id else None,
         retry=retry,
+        body=body,
     )
+    state.pending = None
+
+
+def _capture_httpx_request(request: Any) -> None:
+    state = _TRANSPORT_CAPTURE_CONTEXT.get()
+    if state is None or state.pending is None:
+        return
+    content = getattr(request, "content", None)
+    if not isinstance(content, (bytes, bytearray)):
+        return
+    _persist_pending_transport_request(body=bytes(content))
+
+
+def _wrap_httpx_send() -> None:
+    global _HTTPX_WRAP_DEPTH, _HTTPX_CLIENT_SEND
+    import httpx
+
+    if _HTTPX_WRAP_DEPTH == 0:
+        original = httpx.Client.send
+        _HTTPX_CLIENT_SEND = original
+
+        def send(self, request, *args, **kwargs):
+            try:
+                _capture_httpx_request(request)
+            except Exception:
+                if cache_request_capture.strict_write_enabled():
+                    raise
+            return original(self, request, *args, **kwargs)
+
+        httpx.Client.send = send
+    _HTTPX_WRAP_DEPTH += 1
+
+
+def _unwrap_httpx_send() -> None:
+    global _HTTPX_WRAP_DEPTH, _HTTPX_CLIENT_SEND
+    if _HTTPX_WRAP_DEPTH == 0:
+        return
+    _HTTPX_WRAP_DEPTH -= 1
+    if _HTTPX_WRAP_DEPTH == 0 and _HTTPX_CLIENT_SEND is not None:
+        import httpx
+
+        httpx.Client.send = _HTTPX_CLIENT_SEND
+        _HTTPX_CLIENT_SEND = None
+
+
+@contextmanager
+def _transport_capture_context(
+    *, name: str, model_name: str, metadata: dict[str, Any] | None
+):
+    token = _TRANSPORT_CAPTURE_CONTEXT.set(
+        _TransportCaptureState(name=name, model_name=model_name, metadata=metadata or {})
+    )
+    wrap = cache_request_capture.enabled()
+    if wrap:
+        _wrap_httpx_send()
+    try:
+        yield
+    finally:
+        try:
+            _persist_pending_transport_request()
+        finally:
+            if wrap:
+                _unwrap_httpx_send()
+            _TRANSPORT_CAPTURE_CONTEXT.reset(token)
+
+
+def capture_transport_request(request: dict[str, Any]) -> None:
+    """Stage kwargs until the SDK HTTP body is available, then persist."""
+    state = _TRANSPORT_CAPTURE_CONTEXT.get()
+    if state is None:
+        return
+    if not cache_request_capture.enabled():
+        return
+    state.pending = dict(request)
 
 
 class _RememberingSend:

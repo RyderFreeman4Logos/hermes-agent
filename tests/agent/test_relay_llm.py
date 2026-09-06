@@ -207,6 +207,111 @@ def test_relay_metadata_preserves_provider_name():
     }
 
 
+def test_physical_attempt_unwraps_pre_wrapped_callback_once(relay_turn, monkeypatch):
+    from agent import cache_lowhit_request_dump as dump
+
+    remembered = []
+    monkeypatch.setattr(
+        dump,
+        "remember_sent_request",
+        lambda request, *, api_mode: remembered.append((request, api_mode)),
+    )
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+
+    def provider(request):
+        return {"content": request["messages"][0]["content"]}
+
+    for content in ("physical-a", "physical-b"):
+        result = relay_llm._execute_with_physical_attempt(
+            {"model": "test-model", "messages": [{"role": "user", "content": content}]},
+            relay_llm._RememberingSend(provider, "chat_completions"),
+            session_id="session-1",
+            name="custom",
+            model_name="test-model",
+            metadata={"api_mode": "chat_completions"},
+        )
+        assert result == {"content": content}
+
+    assert len(remembered) == 2
+    assert [request["messages"][0]["content"] for request, _mode in remembered] == [
+        "physical-a",
+        "physical-b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_async_physical_attempt_unwraps_pre_wrapped_callback_once(
+    relay_turn, monkeypatch
+):
+    from agent import cache_lowhit_request_dump as dump
+
+    remembered = []
+    monkeypatch.setattr(
+        dump,
+        "remember_sent_request",
+        lambda request, *, api_mode: remembered.append((request, api_mode)),
+    )
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+
+    async def provider(request):
+        return {"content": request["messages"][0]["content"]}
+
+    for content in ("async-physical-a", "async-physical-b"):
+        result = await relay_llm._execute_async_with_physical_attempt(
+            {"model": "test-model", "messages": [{"role": "user", "content": content}]},
+            relay_llm._RememberingSend(provider, "chat_completions"),
+            session_id="session-1",
+            name="custom",
+            model_name="test-model",
+            metadata={"api_mode": "chat_completions"},
+        )
+        assert result == {"content": content}
+
+    assert len(remembered) == 2
+    assert [request["messages"][0]["content"] for request, _mode in remembered] == [
+        "async-physical-a",
+        "async-physical-b",
+    ]
+
+
+def test_stream_physical_attempt_unwraps_pre_wrapped_factory_once(
+    relay_turn, monkeypatch
+):
+    from agent import cache_lowhit_request_dump as dump
+
+    remembered = []
+    monkeypatch.setattr(
+        dump,
+        "remember_sent_request",
+        lambda request, *, api_mode: remembered.append((request, api_mode)),
+    )
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+
+    def stream_factory(request):
+        return iter([{"delta": request["messages"][0]["content"]}])
+
+    for content in ("stream-physical-a", "stream-physical-b"):
+        stream = relay_llm._stream_with_physical_attempt(
+            {"model": "test-model", "messages": [{"role": "user", "content": content}]},
+            relay_llm._RememberingSend(stream_factory, "chat_completions"),
+            session_id="session-1",
+            name="custom",
+            model_name="test-model",
+            finalizer=lambda: {"content": content},
+            metadata={"api_mode": "chat_completions"},
+        )
+        try:
+            assert list(stream) == [{"delta": content}]
+        finally:
+            stream.close()
+
+    assert len(remembered) == 2
+    assert [request["messages"][0]["content"] for request, _mode in remembered] == [
+        "stream-physical-a",
+        "stream-physical-b",
+    ]
+
+
 def test_provider_request_overlays_interceptor_added_codex_field():
     """Relay rewrites may introduce provider fields absent from the original."""
     original = {"model": "gpt-5.6-sol", "input": "hello"}

@@ -473,6 +473,30 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     )
 
 
+def _is_standard_profile_child(agent) -> bool:
+    return getattr(agent, "_delegate_model_profile", None) == "standard"
+
+
+def _standard_child_has_successful_llm_request(agent) -> bool:
+    return bool(getattr(agent, "_delegate_has_successful_llm_request", False))
+
+
+def _standard_child_can_fallback(
+    agent,
+    *,
+    rate_limited: bool = False,
+    terminal_quota: bool = False,
+    billing: bool = False,
+) -> bool:
+    """Permit pre-success 429 or billing fallback for standard children."""
+    if not _is_standard_profile_child(agent):
+        return True
+    return (
+        (rate_limited or terminal_quota or billing)
+        and not _standard_child_has_successful_llm_request(agent)
+    )
+
+
 def _billing_or_entitlement_message(
     *, capability: str, provider: str, base_url: str, model: str, unverified: bool = False
 ) -> str:

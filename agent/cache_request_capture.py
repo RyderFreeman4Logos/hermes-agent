@@ -75,12 +75,14 @@ def capture_provider_request(
     correlation: str | None = None,
     attempt_id: str | None = None,
     retry: int = 0,
+    body: bytes | None = None,
 ) -> None:
     """Persist one exact physical provider request immediately before transport.
 
     The input is copied while redacting secrets; the
     provider's request is untouched. Capture is best-effort unless strict write
-    mode is enabled.
+    mode is enabled. ``body`` is the exact HTTP/client transport bytes when
+    the SDK serialized them; otherwise the sanitized payload is serialized.
     """
     if not enabled():
         return
@@ -94,7 +96,9 @@ def capture_provider_request(
         retry_value = 0
     try:
         request_payload = _redact(request)
-        body_bytes = _serialize_body(request_payload)
+        body_bytes = bytes(body) if isinstance(body, (bytes, bytearray)) else _serialize_body(
+            request_payload
+        )
         _persist(
             {
                 "schema": _SCHEMA,

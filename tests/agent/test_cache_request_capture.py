@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1110,6 +1111,17 @@ def test_openai_sdk_wire_first_diff_is_deterministic(monkeypatch, tmp_path):
     assert _first_byte(first["body"], second["body"]) == _first_byte(
         first["wire"]["content"], second["wire"]["content"]
     )
+    message_report = capture.compare_captures(first["captured"], second["captured"])
+    tools_report = capture.compare_captures(first["captured"], third["captured"])
+    scope_report = capture.compare_captures(first["captured"], fourth["captured"])
+    assert message_report["json_pointer"] == "/messages/0/content"
+    assert message_report["message"]["index"] == 0
+    assert message_report["first_differing_byte"] == _first_byte(first["body"], second["body"])
+    assert tools_report["tools"]["changed"] is True
+    assert tools_report["json_pointer"] == "/tools/0/function/name"
+    assert scope_report["cache_scope"]["changed"] is True
+    assert scope_report["json_pointer"] == "/prompt_cache_key"
+    assert message_report["wire_comparable"] is True
     assert _first_difference(first["captured"]["request"], second["captured"]["request"]) == (
         "messages",
         0,
@@ -1412,3 +1424,186 @@ def test_non_httpx_fallback_is_not_exact_wire(monkeypatch, tmp_path):
     serialized = json.dumps(captured)
     if "not-a-real-credential" in serialized:
         pytest.fail("fallback capture leaked an auth fixture")
+
+
+def test_concurrent_wrap_lifecycle_restores_original_send(monkeypatch, tmp_path):
+    """Overlapping capture contexts must not unwrap under a live sibling."""
+    import httpx
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    original_sync = httpx.Client.send
+    original_async = httpx.AsyncClient.send
+    ready = threading.Barrier(2, timeout=8)
+    go = threading.Barrier(2, timeout=8)
+    errors: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    def worker(tag: str) -> None:
+        def send_cb(request: dict[str, Any]) -> Any:
+            relay_llm.capture_transport_request(request)
+            ready.wait()
+            go.wait()
+            with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+                return client.send(
+                    httpx.Request(
+                        "POST",
+                        "https://provider.example.test/v1",
+                        content=json.dumps({"tag": tag, "prompt": "keep"}).encode(),
+                    )
+                )
+
+        try:
+            relay_llm._execute_attempt(
+                {
+                    "model": "probe-model",
+                    "messages": [{"role": "user", "content": tag}],
+                },
+                send_cb,
+                name="openai",
+                model_name="probe-model",
+                metadata=_identity_meta(f"race:{tag}"),
+            )
+        except Exception as exc:
+            errors.append(f"{tag}:{type(exc).__name__}")
+
+    threads = [threading.Thread(target=worker, args=("a",)), threading.Thread(target=worker, args=("b",))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        if thread.is_alive():
+            pytest.fail("concurrent wrap worker did not finish")
+    if errors:
+        pytest.fail(f"concurrent wrap raised: {errors}")
+    if getattr(relay_llm, "_HTTPX_WRAP_LOCK", None) is None:
+        pytest.fail("httpx wrap/unwrap has no lifecycle lock")
+    if httpx.Client.send is not original_sync or httpx.AsyncClient.send is not original_async:
+        pytest.fail("httpx send was not restored after concurrent wrap")
+    if relay_llm._HTTPX_WRAP_DEPTH != 0:
+        pytest.fail("wrap depth leaked after concurrent capture")
+    captures = _captures(tmp_path)
+    if len(captures) != 2:
+        pytest.fail("overlapping captures dropped a body")
+    tags = {json.loads(base64.b64decode(item["body_bytes"]["data"]))["tag"] for item in captures}
+    if tags != {"a", "b"}:
+        pytest.fail("concurrent captures crossed bodies")
+    if any(item["body_bytes"].get("status") not in {"exact_wire", "sanitized"} for item in captures):
+        pytest.fail("buffered concurrent captures lacked a wire status")
+
+
+def test_foreign_thread_send_does_not_inherit_parent_pending(monkeypatch, tmp_path):
+    """Foreign threads own no capture context; parent still kwargs-falls back."""
+    import httpx
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    wrap_saw_pending = {"v": False}
+    send_ran = {"v": False}
+    barrier = threading.Barrier(2, timeout=8)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    def foreign_send() -> None:
+        barrier.wait()
+        state = relay_llm._TRANSPORT_CAPTURE_CONTEXT.get()
+        wrap_saw_pending["v"] = state is not None and getattr(state, "pending", None) is not None
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            client.send(
+                httpx.Request(
+                    "POST",
+                    "https://provider.example.test/v1",
+                    content=b'{"foreign":true}',
+                )
+            )
+        send_ran["v"] = True
+
+    def parent_cb(request: dict[str, Any]) -> Any:
+        relay_llm.capture_transport_request(request)
+        thread = threading.Thread(target=foreign_send)
+        thread.start()
+        barrier.wait()
+        thread.join(timeout=8)
+        if thread.is_alive():
+            pytest.fail("foreign send thread did not finish")
+        return "ok"
+
+    relay_llm._execute_attempt(
+        {
+            "model": "probe-model",
+            "messages": [{"role": "user", "content": "parent-prompt"}],
+        },
+        parent_cb,
+        name="openai",
+        model_name="probe-model",
+        metadata=_identity_meta("foreign:0"),
+    )
+    if wrap_saw_pending["v"]:
+        pytest.fail("foreign thread inherited parent capture pending")
+    if not send_ran["v"]:
+        pytest.fail("foreign thread send did not run")
+    captures = _captures(tmp_path)
+    if len(captures) != 1:
+        pytest.fail("foreign send was attributed as a parent capture")
+    captured = captures[0]
+    if captured["body_bytes"].get("status") != "kwargs_fallback":
+        pytest.fail("parent without buffered send must stay kwargs_fallback")
+    if captured["request"]["messages"][0]["content"] != "parent-prompt":
+        pytest.fail("nonsensitive parent prompt was not retained")
+    persisted = base64.b64decode(captured["body_bytes"]["data"])
+    if b'"foreign":true' in persisted:
+        pytest.fail("foreign-thread body was attributed to the parent capture")
+
+
+def test_required_opener_paths_persist_honest_status(monkeypatch, tmp_path):
+    """Chat/Responses/custom/stream/nonstream reach persist with honest labels."""
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    matrix = (
+        ("openai", "chat_completions", False, "chat-prompt"),
+        ("openai-codex", "codex_responses", True, "codex-prompt"),
+        ("custom", "chat_completions", False, "custom-prompt"),
+        ("anthropic", "anthropic_messages", True, "anthropic-prompt"),
+        ("bedrock", "bedrock_converse", False, "bedrock-prompt"),
+        ("gemini", "gemini_native", True, "gemini-prompt"),
+    )
+    for provider, api_mode, stream, prompt in matrix:
+        request = {
+            "model": "probe-model",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": stream,
+        }
+        with relay_llm._transport_capture_context(
+            name=provider,
+            model_name="probe-model",
+            metadata={
+                "api_mode": api_mode,
+                "route": "https://provider.example.test/v1",
+                "api_request_id": f"opener:{provider}:{int(stream)}",
+                "retry_count": 0,
+            },
+        ):
+            relay_llm.capture_transport_request(request)
+    captures = _captures(tmp_path)
+    if len(captures) != len(matrix):
+        pytest.fail("required opener paths did not all persist")
+    by_provider = {item["route"]["provider"]: item for item in captures}
+    for provider, api_mode, stream, prompt in matrix:
+        item = by_provider[provider]
+        if item["route"]["api_mode"] != api_mode:
+            pytest.fail(f"{provider} opener lost api_mode")
+        if item["request"]["messages"][0]["content"] != prompt:
+            pytest.fail(f"{provider} opener lost nonsensitive prompt")
+        if item["request"].get("stream") is not stream:
+            pytest.fail(f"{provider} stream flag was not persisted")
+        if item["body_bytes"].get("status") != "kwargs_fallback":
+            pytest.fail(f"{provider} non-httpx opener claimed wire bytes")
+        if "Authorization" in json.dumps(item):
+            pytest.fail(f"{provider} opener persisted an auth header")

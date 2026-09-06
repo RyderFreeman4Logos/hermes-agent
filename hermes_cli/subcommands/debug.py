@@ -32,6 +32,7 @@ Examples:
     hermes debug share --no-redact  Disable upload-time secret redaction
     hermes debug share --nous       Upload to Nous-internal storage (private)
     hermes debug delete <url>       Delete a previously uploaded paste
+    hermes debug cache-diff A B     Compare two captured provider requests
 """,
     )
     debug_sub = debug_parser.add_subparsers(dest="debug_command")
@@ -96,5 +97,16 @@ Examples:
         nargs="*",
         default=[],
         help="One or more paste URLs to delete (e.g. https://paste.rs/abc123)",
+    )
+    cache_diff_parser = debug_sub.add_parser(
+        "cache-diff",
+        help="Compare two captured provider-bound request dumps",
+    )
+    cache_diff_parser.add_argument("left", help="First capture JSON path")
+    cache_diff_parser.add_argument("right", help="Second capture JSON path")
+    cache_diff_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the machine-readable JSON report only",
     )
     debug_parser.set_defaults(func=cmd_debug)

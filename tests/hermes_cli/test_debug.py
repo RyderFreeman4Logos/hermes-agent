@@ -1,5 +1,6 @@
 """Tests for ``hermes debug`` CLI command and debug utilities."""
 
+import json
 import os
 import urllib.error
 from unittest.mock import MagicMock, patch
@@ -580,6 +581,7 @@ class TestRunDebug:
         assert "hermes debug" in out
         assert "share" in out
         assert "delete" in out
+        assert "cache-diff" in out
 
     def test_share_subcommand_routes(self, hermes_home):
         from hermes_cli.debug import run_debug
@@ -1098,4 +1100,105 @@ class TestShareConsentGate:
 
         mock_upload.assert_not_called()
         assert "Aborted" not in capsys.readouterr().out
+
+
+def _write_capture(path, *, prompt: str, status: str = "exact_wire") -> None:
+    import base64
+    import json
+
+    body = json.dumps(
+        {"model": "probe-model", "messages": [{"role": "system", "content": prompt}]},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "hermes.cache_request.v1",
+                "request": {
+                    "model": "probe-model",
+                    "messages": [{"role": "system", "content": prompt}],
+                    "tools": [{"name": "one"}],
+                    "prompt_cache_key": "PCK-A" if prompt == "SYS-A" else "PCK-B",
+                },
+                "body_bytes": {
+                    "encoding": "base64",
+                    "data": base64.b64encode(body).decode("ascii"),
+                    "status": status,
+                },
+                "route": {
+                    "provider": "openai",
+                    "api_mode": "chat_completions",
+                    "model": "probe-model",
+                    "route": "https://provider.example.test/v1",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+class TestCacheDiff:
+    def test_cache_diff_parser_accepts_paths(self):
+        import argparse
+
+        from hermes_cli.subcommands.debug import build_debug_parser
+
+        parser = argparse.ArgumentParser(prog="hermes")
+        build_debug_parser(parser.add_subparsers(dest="command"), cmd_debug=lambda args: args)
+        ns = parser.parse_args(["debug", "cache-diff", "/tmp/a.json", "/tmp/b.json", "--json"])
+        assert ns.debug_command == "cache-diff"
+        assert ns.left == "/tmp/a.json"
+        assert ns.right == "/tmp/b.json"
+        assert ns.json is True
+
+    def test_cache_diff_reports_first_byte_json_path_and_cache_scope(self, tmp_path, capsys):
+        from types import SimpleNamespace
+
+        from hermes_cli.debug import run_debug
+
+        left = tmp_path / "a.json"
+        right = tmp_path / "b.json"
+        _write_capture(left, prompt="SYS-A")
+        _write_capture(right, prompt="SYS-B")
+        run_debug(
+            SimpleNamespace(
+                debug_command="cache-diff",
+                left=str(left),
+                right=str(right),
+                json=True,
+            )
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert report["equal"] is False
+        assert report["first_differing_byte"] is not None
+        assert report["json_pointer"] == "/messages/0/content"
+        assert report["message"]["index"] == 0
+        assert report["tools"]["changed"] is False
+        assert report["cache_scope"]["changed"] is True
+        assert report["left"]["status"] == "exact_wire"
+        assert report["right"]["status"] == "exact_wire"
+
+    def test_cache_diff_does_not_claim_wire_on_sanitized_or_omitted(self, tmp_path, capsys):
+        from types import SimpleNamespace
+
+        from hermes_cli.debug import run_debug
+
+        left = tmp_path / "a.json"
+        right = tmp_path / "b.json"
+        _write_capture(left, prompt="SYS-A", status="sanitized")
+        _write_capture(right, prompt="SYS-A", status="omitted")
+        run_debug(
+            SimpleNamespace(
+                debug_command="cache-diff",
+                left=str(left),
+                right=str(right),
+                json=True,
+            )
+        )
+        report = json.loads(capsys.readouterr().out)
+        assert report["wire_comparable"] is False
+        assert "exact_wire" not in (report.get("claim") or "")
+        assert report["left"]["status"] == "sanitized"
+        assert report["right"]["status"] == "omitted"
 

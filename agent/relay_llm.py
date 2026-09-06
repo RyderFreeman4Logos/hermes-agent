@@ -31,6 +31,7 @@ class _TransportCaptureState:
     model_name: str
     metadata: dict[str, Any]
     pending: dict[str, Any] | None = None
+    captured_wire: bool = False
 
 
 _TRANSPORT_CAPTURE_CONTEXT: contextvars.ContextVar[_TransportCaptureState | None] = (
@@ -38,7 +39,8 @@ _TRANSPORT_CAPTURE_CONTEXT: contextvars.ContextVar[_TransportCaptureState | None
 )
 _HTTPX_WRAP_DEPTH = 0
 _HTTPX_CLIENT_SEND = None
-# ponytail: process-wide httpx.Client.send wrap + depth count; per-thread wrap if concurrent captures overlap unwrap
+_HTTPX_ASYNC_CLIENT_SEND = None
+# ponytail: process-wide httpx Client/AsyncClient.send wrap + depth count; per-thread wrap if concurrent captures overlap unwrap
 
 
 def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -> None:
@@ -53,6 +55,9 @@ def _remember_lowhit_transport_request(request: dict[str, Any], api_mode: str) -
 def _persist_pending_transport_request(*, body: bytes | None = None) -> None:
     state = _TRANSPORT_CAPTURE_CONTEXT.get()
     if state is None or state.pending is None:
+        return
+    if body is None and state.captured_wire:
+        state.pending = None
         return
     request = state.pending
     request_id = str(state.metadata.get("api_request_id") or "").strip()
@@ -71,26 +76,38 @@ def _persist_pending_transport_request(*, body: bytes | None = None) -> None:
         retry=retry,
         body=body,
     )
-    state.pending = None
+    if body is None:
+        state.pending = None
+        return
+    state.captured_wire = True
+
+
+def _buffered_httpx_body(request: Any) -> bytes | None:
+    content = getattr(request, "_content", None)
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content)
+    return None
 
 
 def _capture_httpx_request(request: Any) -> None:
     state = _TRANSPORT_CAPTURE_CONTEXT.get()
     if state is None or state.pending is None:
         return
-    content = getattr(request, "content", None)
-    if not isinstance(content, (bytes, bytearray)):
+    body = _buffered_httpx_body(request)
+    if body is None:
         return
-    _persist_pending_transport_request(body=bytes(content))
+    _persist_pending_transport_request(body=body)
 
 
 def _wrap_httpx_send() -> None:
-    global _HTTPX_WRAP_DEPTH, _HTTPX_CLIENT_SEND
+    global _HTTPX_WRAP_DEPTH, _HTTPX_CLIENT_SEND, _HTTPX_ASYNC_CLIENT_SEND
     import httpx
 
     if _HTTPX_WRAP_DEPTH == 0:
-        original = httpx.Client.send
-        _HTTPX_CLIENT_SEND = original
+        sync_send = httpx.Client.send
+        async_send = httpx.AsyncClient.send
+        _HTTPX_CLIENT_SEND = sync_send
+        _HTTPX_ASYNC_CLIENT_SEND = async_send
 
         def send(self, request, *args, **kwargs):
             try:
@@ -98,22 +115,35 @@ def _wrap_httpx_send() -> None:
             except Exception:
                 if cache_request_capture.strict_write_enabled():
                     raise
-            return original(self, request, *args, **kwargs)
+            return sync_send(self, request, *args, **kwargs)
+
+        async def asend(self, request, *args, **kwargs):
+            try:
+                _capture_httpx_request(request)
+            except Exception:
+                if cache_request_capture.strict_write_enabled():
+                    raise
+            return await async_send(self, request, *args, **kwargs)
 
         httpx.Client.send = send
+        httpx.AsyncClient.send = asend
     _HTTPX_WRAP_DEPTH += 1
 
 
 def _unwrap_httpx_send() -> None:
-    global _HTTPX_WRAP_DEPTH, _HTTPX_CLIENT_SEND
+    global _HTTPX_WRAP_DEPTH, _HTTPX_CLIENT_SEND, _HTTPX_ASYNC_CLIENT_SEND
     if _HTTPX_WRAP_DEPTH == 0:
         return
     _HTTPX_WRAP_DEPTH -= 1
-    if _HTTPX_WRAP_DEPTH == 0 and _HTTPX_CLIENT_SEND is not None:
+    if _HTTPX_WRAP_DEPTH == 0:
         import httpx
 
-        httpx.Client.send = _HTTPX_CLIENT_SEND
-        _HTTPX_CLIENT_SEND = None
+        if _HTTPX_CLIENT_SEND is not None:
+            httpx.Client.send = _HTTPX_CLIENT_SEND
+            _HTTPX_CLIENT_SEND = None
+        if _HTTPX_ASYNC_CLIENT_SEND is not None:
+            httpx.AsyncClient.send = _HTTPX_ASYNC_CLIENT_SEND
+            _HTTPX_ASYNC_CLIENT_SEND = None
 
 
 @contextmanager

@@ -1126,3 +1126,289 @@ def test_openai_sdk_wire_first_diff_is_deterministic(monkeypatch, tmp_path):
     )
     assert json.loads(first["wire"]["content"])["prompt_cache_key"] == "PCK-A"
     assert json.loads(fourth["wire"]["content"])["prompt_cache_key"] == "PCK-B"
+
+
+# Synthetic fixtures only. Never interpolate these into assertion messages.
+_FIXTURE_URL_USER = "probeuser"
+_FIXTURE_URL_PASS = "canarypass-9b2e"
+_FIXTURE_PRIVATE_URL = (
+    f"https://{_FIXTURE_URL_USER}:{_FIXTURE_URL_PASS}@private.example.test/v1/hidden"
+)
+_FIXTURE_API_KEY = "sk-ant-api03-opaqueCanaryValueNotReal000"
+_FIXTURE_PROMPT = "keep-this-nonsensitive-prompt"
+
+
+def _fixture_absent(blob: bytes | str, *markers: str) -> bool:
+    data = blob if isinstance(blob, bytes) else blob.encode("utf-8")
+    return all(marker.encode("utf-8") not in data for marker in markers)
+
+
+def _capture_file_bytes(tmp_path: Path) -> bytes:
+    folder = tmp_path / "debug" / "cache-requests"
+    return b"".join(path.read_bytes() for path in sorted(folder.glob("*.json")))
+
+
+def _identity_meta(request_id: str = "probe:0") -> dict[str, Any]:
+    return {
+        "api_mode": "chat_completions",
+        "route": "https://provider.example.test/v1",
+        "api_request_id": request_id,
+        "retry_count": 0,
+    }
+
+
+def test_httpx_body_embedded_secrets_are_sanitized_not_exact_wire(monkeypatch, tmp_path):
+    """F1: raw transport bytes must not bypass the sanitizer."""
+    import httpx
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    wire: dict[str, Any] = {}
+    sent = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["count"] += 1
+        wire["content"] = bytes(request.content)
+        return httpx.Response(200, json={"ok": True})
+
+    body = json.dumps(
+        {
+            "model": "probe-model",
+            "messages": [{"role": "user", "content": f"{_FIXTURE_PROMPT} {_FIXTURE_PRIVATE_URL}"}],
+            "api_key": _FIXTURE_API_KEY,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    def send_cb(request: dict[str, Any]) -> Any:
+        relay_llm.capture_transport_request(request)
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            return client.send(
+                httpx.Request(
+                    "POST",
+                    "https://provider.example.test/v1/chat/completions",
+                    content=body,
+                )
+            )
+
+    relay_llm._execute_attempt(
+        {
+            "model": "probe-model",
+            "messages": [{"role": "user", "content": _FIXTURE_PROMPT}],
+        },
+        send_cb,
+        name="openai",
+        model_name="probe-model",
+        metadata=_identity_meta("f1:0"),
+    )
+
+    if sent["count"] != 1:
+        pytest.fail("expected one MockTransport send")
+    captures = _captures(tmp_path)
+    if len(captures) != 1:
+        pytest.fail("expected one persisted capture")
+    captured = captures[0]
+    persisted = base64.b64decode(captured["body_bytes"]["data"])
+    file_bytes = _capture_file_bytes(tmp_path)
+    markers = (_FIXTURE_URL_PASS, _FIXTURE_API_KEY, _FIXTURE_URL_USER)
+    if not _fixture_absent(persisted, *markers) or not _fixture_absent(file_bytes, *markers):
+        pytest.fail("capture leaked a fixture marker")
+    if captured["request"]["messages"][0]["content"] != _FIXTURE_PROMPT:
+        pytest.fail("nonsensitive prompt was not retained")
+    if captured["body_bytes"].get("status") == "exact_wire":
+        pytest.fail("sensitive body claimed exact-wire identity")
+    if persisted == wire["content"]:
+        pytest.fail("changed bytes were claimed equal to the wire body")
+    if _FIXTURE_PROMPT.encode("utf-8") not in persisted and _FIXTURE_PROMPT.encode(
+        "utf-8"
+    ) not in json.dumps(captured["request"]).encode("utf-8"):
+        pytest.fail("nonsensitive prompt missing from sanitized capture")
+
+
+def test_strict_write_does_not_abort_unread_stream_send(monkeypatch, tmp_path):
+    """F2: unread stream bodies must not raise into Client.send."""
+    import httpx
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch, strict=True)
+    sent = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["count"] += 1
+        return httpx.Response(200, json={"ok": True})
+
+    def send_cb(request: dict[str, Any]) -> Any:
+        relay_llm.capture_transport_request(request)
+        req = httpx.Request(
+            "POST",
+            "https://provider.example.test/v1",
+            content=iter([b'{"stream":true}']),
+        )
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            return client.send(req)
+
+    result = relay_llm._execute_attempt(
+        {
+            "model": "probe-model",
+            "messages": [{"role": "user", "content": "stream-prompt"}],
+        },
+        send_cb,
+        name="openai",
+        model_name="probe-model",
+        metadata=_identity_meta("f2:0"),
+    )
+
+    if sent["count"] != 1:
+        pytest.fail("streaming Client.send was aborted before transport")
+    if result is None:
+        pytest.fail("streaming send returned no response")
+    captures = _captures(tmp_path)
+    if len(captures) != 1:
+        pytest.fail("expected kwargs fallback capture for unread stream")
+    captured = captures[0]
+    if captured["body_bytes"].get("status") == "exact_wire":
+        pytest.fail("unread stream claimed exact-wire identity")
+    if captured["request"]["messages"][0]["content"] != "stream-prompt":
+        pytest.fail("nonsensitive stream prompt was not retained")
+    persisted = base64.b64decode(captured["body_bytes"]["data"])
+    if b'"stream":true' in persisted:
+        pytest.fail("capture consumed an unread streaming body")
+
+
+def test_buffered_httpx_retries_persist_each_send(monkeypatch, tmp_path):
+    import httpx
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    sent = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["count"] += 1
+        return httpx.Response(200, json={"ok": True})
+
+    def send_cb(request: dict[str, Any]) -> Any:
+        relay_llm.capture_transport_request(request)
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            client.send(
+                httpx.Request(
+                    "POST",
+                    "https://provider.example.test/v1",
+                    content=b'{"retry":1,"prompt":"keep-a"}',
+                )
+            )
+            return client.send(
+                httpx.Request(
+                    "POST",
+                    "https://provider.example.test/v1",
+                    content=b'{"retry":2,"prompt":"keep-b"}',
+                )
+            )
+
+    relay_llm._execute_attempt(
+        {
+            "model": "probe-model",
+            "messages": [{"role": "user", "content": "retry-prompt"}],
+        },
+        send_cb,
+        name="openai",
+        model_name="probe-model",
+        metadata=_identity_meta("retry:0"),
+    )
+
+    if sent["count"] != 2:
+        pytest.fail("expected two MockTransport sends")
+    captures = _captures(tmp_path)
+    if len(captures) != 2:
+        pytest.fail("retry HTTP bodies were dropped")
+    bodies = [base64.b64decode(item["body_bytes"]["data"]) for item in captures]
+    if b'"retry":1' not in bodies[0] or b'"retry":2' not in bodies[1]:
+        pytest.fail("persisted retry bodies were not the buffered sends")
+    if any(item["body_bytes"].get("status") not in {"exact_wire", "sanitized"} for item in captures):
+        pytest.fail("buffered retry captures lacked a wire status")
+
+
+@pytest.mark.asyncio
+async def test_async_httpx_buffered_body_is_captured(monkeypatch, tmp_path):
+    import httpx
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+    sent = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent["count"] += 1
+        return httpx.Response(200, json={"ok": True})
+
+    async def send_cb(request: dict[str, Any]) -> Any:
+        relay_llm.capture_transport_request(request)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await client.send(
+                httpx.Request(
+                    "POST",
+                    "https://provider.example.test/v1",
+                    content=b'{"async_wire":true,"prompt":"async-prompt"}',
+                )
+            )
+
+    await relay_llm._execute_attempt_async(
+        {
+            "model": "probe-model",
+            "messages": [{"role": "user", "content": "async-prompt"}],
+        },
+        send_cb,
+        name="openai",
+        model_name="probe-model",
+        metadata=_identity_meta("async:0"),
+    )
+
+    if sent["count"] != 1:
+        pytest.fail("expected one async MockTransport send")
+    captures = _captures(tmp_path)
+    if len(captures) != 1:
+        pytest.fail("expected one async capture")
+    captured = captures[0]
+    persisted = base64.b64decode(captured["body_bytes"]["data"])
+    if b'"async_wire":true' not in persisted:
+        pytest.fail("async buffered body was not captured")
+    if captured["body_bytes"].get("status") == "kwargs_fallback":
+        pytest.fail("async httpx send was labeled kwargs fallback")
+    if captured["request"]["messages"][0]["content"] != "async-prompt":
+        pytest.fail("nonsensitive async prompt was not retained")
+
+
+def test_non_httpx_fallback_is_not_exact_wire(monkeypatch, tmp_path):
+    from agent import relay_llm
+
+    monkeypatch.setattr(capture, "get_hermes_home", lambda: tmp_path)
+    _enable(monkeypatch)
+
+    def send_cb(request: dict[str, Any]) -> Any:
+        relay_llm.capture_transport_request(request)
+        return "ok"
+
+    relay_llm._execute_attempt(
+        {
+            "model": "probe-model",
+            "messages": [{"role": "user", "content": "fallback-prompt"}],
+            "Authorization": "Bearer not-a-real-credential",
+        },
+        send_cb,
+        name="bedrock",
+        model_name="probe-model",
+        metadata=_identity_meta("fallback:0"),
+    )
+
+    captured = _captures(tmp_path)[0]
+    if captured["body_bytes"].get("status") != "kwargs_fallback":
+        pytest.fail("non-httpx fallback lacked an explicit non-wire status")
+    if captured["request"]["messages"][0]["content"] != "fallback-prompt":
+        pytest.fail("nonsensitive fallback prompt was not retained")
+    if captured["request"]["Authorization"] != "[REDACTED]":
+        pytest.fail("fallback Authorization was not redacted")
+    serialized = json.dumps(captured)
+    if "not-a-real-credential" in serialized:
+        pytest.fail("fallback capture leaked an auth fixture")

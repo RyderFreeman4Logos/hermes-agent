@@ -510,3 +510,19 @@ required = true
 supersedes = []
 overlay = false
 notes = "head from immutable tested frozen-v9"
+
+[[patch]]
+order = 33
+pr = 267
+name = "strip-url-userinfo-at-non-navigation-egress"
+title = "fix(privacy): strip URL userinfo at non-navigation egress"
+branch = "topic/security256-url-userinfo-export-20260906"
+head = "30c19d4b3fc1b802d9666450f6450e98d34b3ae9"
+tree = "3a440347892f4acb01faf38dd4b98b152d29f2ad"
+base_ref = "pin/official-main-3340bbbd-20260903"
+base_sha = "3340bbbdad8368e7f3d9f6827d61692adbbd87d6"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+notes = "OPEN unique-on-pin baseline #256; independent of #165/#160 (do not duplicate ownership); exact-HEAD 9/250/74; needs integration; not campaign GREEN; #165 historical security FAIL retained"

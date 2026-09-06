@@ -208,6 +208,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         _release_active_session_slot(session)
     if (stop_event := session.get("_notif_stop")) is not None:
         stop_event.set()
+        for _stop, thread in list(_notification_pollers):
+            if _stop is stop_event and thread is not threading.current_thread():
+                thread.join(timeout=0.3)
     agent = session.get("agent")
     with (session.get("history_lock") or contextlib.nullcontext()):
         history = list(session.get("history", []))

@@ -58,9 +58,8 @@ def prepare_iteration(agent: Any,*, messages: Any, api_call_count: Any) -> Itera
 
     # Drain a /steer sent during the last API call into the newest tool message so
     # it lands THIS iteration. Never put in a user message (breaks alternation).
-    _pre_api_steer = agent._drain_pending_steer()
-    if _pre_api_steer:
-        _inject_steer_into_newest_tool_result(agent, messages, _pre_api_steer)
+    # Route through the agent helper so TUI completion-steer ACK wrappers fire.
+    agent._apply_pending_steer_to_tool_results(messages, len(messages))
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, via the
     # same cache-safe channel as /steer (newest tool result); off with no budget.

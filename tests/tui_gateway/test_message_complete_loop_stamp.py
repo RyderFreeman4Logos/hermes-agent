@@ -549,3 +549,47 @@ def test_public_completion_projection_matrix(frames, turn_env, source, state, ep
         assert _complete_payloads(frames)[1]["cache_info"] == {"state": "unavailable", "pct": 0}
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_message_complete_emit_stamps_cache_info_without_prior_payload(frames):
+    """Every message.complete path must carry cache_info, including compute-host."""
+    server._emit("message.complete", "sid", {"text": "hi", "status": "complete"})
+    assert frames[0]["params"]["payload"]["cache_info"] == {"state": "unavailable", "pct": 0}
+
+
+def test_outer_history_race_restores_cache_attribution_flags(monkeypatch):
+    """Uncommitted compress must not leave post-compression cache flags set."""
+    original = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    current = [*original, {"role": "user", "content": "typed during compression"}]
+    compressor = types.SimpleNamespace(awaiting_real_usage_after_compression=False)
+    agent = types.SimpleNamespace(
+        _awaiting_cache_usage_after_compression=False,
+        _compression_skipped_due_to_lock=False,
+        context_compressor=compressor,
+        _cached_system_prompt="",
+        tools=None,
+    )
+
+    def compress(*_args, **_kwargs):
+        compressor.awaiting_real_usage_after_compression = True
+        agent._awaiting_cache_usage_after_compression = True
+        return ([{"role": "user", "content": "summary"}], "")
+
+    agent._compress_context = compress
+    session = _session(agent=agent, history=current, history_version=2)
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    removed, _usage = server._compress_session_history(
+        session,
+        approx_tokens=100,
+        before_messages=original,
+        history_version=1,
+    )
+    assert removed == 0
+    assert session["history"] == current
+    assert compressor.awaiting_real_usage_after_compression is False
+    assert agent._awaiting_cache_usage_after_compression is False

@@ -598,9 +598,18 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
     setattr(fake_title, "maybe_auto_title", lambda *args, **kwargs: None)
     monkeypatch.setitem(sys.modules, "agent.title_generator", fake_title)
 
+    original_emit = server._emit
+
+    def _capture_emit(events):
+        def capturing(event, sid, payload=None):
+            original_emit(event, sid, payload)
+            events.append((event, sid, None if payload is None else dict(payload)))
+
+        return capturing
+
     def run_flag_off():
         events = []
-        monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: events.append((event, sid, payload)))
+        monkeypatch.setattr(server, "_emit", _capture_emit(events))
         monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": False}})
         server._sessions["sid"] = _session(
             agent=_Agent(), model_override={"model": "gold-model", "provider": "gold-provider"}
@@ -616,7 +625,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
 
     def run_flag_on():
         events = []
-        monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: events.append((event, sid, payload)))
+        monkeypatch.setattr(server, "_emit", _capture_emit(events))
         monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
 
         class _FakeSupervisor:

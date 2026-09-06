@@ -112,6 +112,16 @@ class ClassifiedError:
         """
         return bool(self.error_context.get("billing_unverified"))
 
+    def __post_init__(self) -> None:
+        # Structured descriptors are serialized (JSON/pickle) and logged.
+        # Strip URL userinfo before the object is observable.
+        if self.message:
+            from agent.redact import redact_sensitive_text
+
+            self.message = redact_sensitive_text(
+                self.message, force=True, redact_url_credentials=True
+            )
+
 
 
 # ── Provider-specific patterns ──────────────────────────────────────────

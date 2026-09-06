@@ -44,7 +44,9 @@ def _secret_redact(text: str) -> str:
     """Always-on secret redaction. force=True so user config can't disable it."""
     try:
         from agent.redact import redact_sensitive_text
-        out = redact_sensitive_text(text, force=True)
+        out = redact_sensitive_text(
+            text, force=True, redact_url_credentials=True
+        )
     except Exception:
         # Fail CLOSED: if the redactor can't run, do not emit the raw string.
         return "[redaction-unavailable]"

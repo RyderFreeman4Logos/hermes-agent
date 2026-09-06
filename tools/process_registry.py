@@ -784,13 +784,14 @@ class ProcessRegistry:
         return env
 
     def _track_started(self, session: ProcessSession, reader_target, reader_name: str, extra_args=()) -> None:
-        """Start the output reader thread, register the session and checkpoint it."""
-        reader = threading.Thread(target=reader_target, args=(session, *extra_args), daemon=True, name=reader_name)
-        session._reader_thread = reader
-        reader.start()
+        """Register the session, then start the output reader so a spawn-advertised
+        notification survives an immediate reader exit."""
         with self._lock:
             self._prune_if_needed()
             self._running[session.id] = session
+        reader = threading.Thread(target=reader_target, args=(session, *extra_args), daemon=True, name=reader_name)
+        session._reader_thread = reader
+        reader.start()
         self._write_checkpoint()
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
@@ -816,7 +817,8 @@ class ProcessRegistry:
 
     def spawn_local(
         self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "") -> ProcessSession:
+        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
+        notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing."""
@@ -827,7 +829,10 @@ class ProcessRegistry:
         from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
-        session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()))
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
+            notify_on_complete=notify_on_complete,
+        )
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -911,12 +916,15 @@ class ProcessRegistry:
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "") -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
         the correct sandbox context."""
-        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox")
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
+        )
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -1031,7 +1039,8 @@ class ProcessRegistry:
 
     def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
-        one U+FFFD instead of vanishing), reap the child (no zombies), record the exit."""
+        one U+FFFD instead of vanishing), reap the child (no zombies), record the exit.
+        Pipe EOF is not completion: a long child can close stdout and stay alive."""
         with suppress(Exception):
             tail = decoder.decode(b"", final=True)
             if tail:
@@ -1040,7 +1049,20 @@ class ProcessRegistry:
             wait()
         except Exception as e:
             logger.debug("%s wait timed out or failed: %s", label, e)
-        self._finish_exited(session, exit_code())
+        rc = exit_code()
+        if rc is None:
+            proc = getattr(session, "process", None)
+            poll = getattr(proc, "poll", None) if proc is not None else None
+            if callable(poll):
+                with suppress(Exception):
+                    rc = poll()
+            if rc is None and proc is not None:
+                with suppress(Exception):
+                    proc.wait()
+                rc = poll() if callable(poll) else getattr(proc, "returncode", None)
+            if rc is None:
+                return
+        self._finish_exited(session, rc)
 
     @staticmethod
     def _log_delta_command(quoted_log_path: str, offset: int) -> str:

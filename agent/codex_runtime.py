@@ -116,13 +116,14 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     token_counts = {f: getattr(canonical_usage, f) for f in
                     ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")}
     usage_dict = {"prompt_tokens": prompt_tokens, "completion_tokens": canonical_usage.output_tokens,
-                  "total_tokens": total_tokens, **token_counts,
-                  "cache_telemetry": "reported" if canonical_usage.cache_read_tokens else "unavailable"}
+                  "total_tokens": total_tokens, **token_counts}
+    cache_telemetry = "reported" if canonical_usage.cache_read_tokens else "unavailable"
     from agent.turn_usage import _notify_tui_cache
     _notify_tui_cache(agent, canonical_usage)
+    turn_usage = {**usage_dict, "cache_telemetry": cache_telemetry}
     if not getattr(agent, "_first_turn_usage", None):
-        agent._first_turn_usage = dict(usage_dict)
-    agent._last_turn_usage = dict(usage_dict)
+        agent._first_turn_usage = dict(turn_usage)
+    agent._last_turn_usage = dict(turn_usage)
     if compressor is not None:
         try:
             compressor.update_from_response(usage_dict)
@@ -152,7 +153,7 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
         counts=lambda: billing(**token_counts, **cost_fields,
                                billing_mode="subscription_included" if cost_result.status == "included" else None),
     )
-    return {**usage_dict, "last_prompt_tokens": prompt_tokens, **cost_fields}
+    return {**turn_usage, "last_prompt_tokens": prompt_tokens, **cost_fields}
 
 
 def _record_codex_app_server_compaction(agent, turn, *, approx_tokens: int | None = None, force: bool = False) -> bool:

@@ -11,6 +11,7 @@ model/provider. Logger name stays ``agent.conversation_loop`` for caplog parity.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -35,6 +36,47 @@ def _loop_mod():
     import agent.conversation_loop as _cl
 
     return _cl
+
+
+def _notify_tui_cache(agent, canonical_usage=None, *, no_usage: bool = False) -> None:
+    """First-wake TUI cache callback. Index every completed provider attempt."""
+    cache_callback = getattr(agent, "_tui_cache_callback", None)
+    if not callable(cache_callback):
+        return
+    response_index = int(getattr(agent, "_tui_provider_response_index", 0)) + 1
+    agent._tui_provider_response_index = response_index
+    record = {
+        "request_index": response_index,
+        "timestamp": time.monotonic(),
+        "turn_origin": getattr(agent, "_cache_turn_origin", "user"),
+    }
+    try:
+        if no_usage or canonical_usage is None:
+            cache_callback(
+                "no_field", 0, 0, 0,
+                {**record, "state": "no_field", "pct": None},
+            )
+            return
+        cache_read = canonical_usage.cache_read_tokens
+        cache_write = canonical_usage.cache_write_tokens
+        prompt_tokens = canonical_usage.prompt_tokens
+        if cache_read:
+            cache_state = "hit"
+            cache_pct = round(100 * cache_read / prompt_tokens) if prompt_tokens else 0
+        elif cache_write:
+            cache_state, cache_pct = "cold_write", 0
+        else:
+            cache_state, cache_pct = "no_field", 0
+        cache_callback(
+            cache_state, cache_pct, cache_read, prompt_tokens,
+            {
+                **record,
+                "state": cache_state,
+                "pct": cache_pct if cache_state == "hit" else None,
+            },
+        )
+    except Exception:
+        logger.debug("TUI provider-response cache callback failed", exc_info=True)
 
 
 def _fold_moa_usage(agent, canonical_usage):
@@ -76,6 +118,7 @@ def record_response_usage(
     # must remain observable.
     agent.session_api_calls += 1
     if not (hasattr(response, 'usage') and response.usage):
+        _notify_tui_cache(agent, no_usage=True)
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the
             # pending verdict so later readings aren't charged to it and
@@ -105,7 +148,15 @@ def record_response_usage(
         "cache_read_tokens": canonical_usage.cache_read_tokens,
         "cache_write_tokens": canonical_usage.cache_write_tokens,
         "reasoning_tokens": canonical_usage.reasoning_tokens,
+        "cache_telemetry": (
+            "reported"
+            if canonical_usage.cache_read_tokens or canonical_usage.cache_write_tokens
+            else "unavailable"
+        ),
     }
+    _notify_tui_cache(agent, canonical_usage)
+    if not getattr(agent, "_first_turn_usage", None):
+        agent._first_turn_usage = dict(usage_dict)
     # Capture the boundary latch before update_from_response() consumes it: only the real
     # prompt count right after a compaction rearms the budget.
     _completed_compaction_pending = bool(

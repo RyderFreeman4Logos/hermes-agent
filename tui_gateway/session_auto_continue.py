@@ -372,6 +372,9 @@ def _emit_terminal_turn_error(
     payload = {"text": text, "usage": _get_usage(agent) if agent is not None else {}, "status": "error",
                "error": message, "recoverable": True, **({"error_surface": error_surface} if error_surface else {}),
                **({"partial": True} if partial else {}), **({"rendered": rendered} if rendered else {})}
+    first_usage = getattr(agent, "_first_turn_usage", None) or getattr(agent, "_last_turn_usage", None)
+    if first_usage:
+        payload["cache_info"] = _cache_info_from_usage(first_usage)
     if retire_marker:
         _retire_turn_marker(session)
     _emit("message.complete", sid, payload)

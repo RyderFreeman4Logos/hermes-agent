@@ -65,8 +65,10 @@ def _notify_tui_cache(agent, canonical_usage=None, *, no_usage: bool = False) ->
             cache_pct = round(100 * cache_read / prompt_tokens) if prompt_tokens else 0
         elif cache_write:
             cache_state, cache_pct = "cold_write", 0
-        else:
+        elif getattr(canonical_usage, "cache_telemetry", "unavailable") == "unavailable":
             cache_state, cache_pct = "no_field", 0
+        else:
+            cache_state, cache_pct = "miss", 0
         cache_callback(
             cache_state, cache_pct, cache_read, prompt_tokens,
             {
@@ -148,11 +150,7 @@ def record_response_usage(
         "cache_read_tokens": canonical_usage.cache_read_tokens,
         "cache_write_tokens": canonical_usage.cache_write_tokens,
         "reasoning_tokens": canonical_usage.reasoning_tokens,
-        "cache_telemetry": (
-            "reported"
-            if canonical_usage.cache_read_tokens or canonical_usage.cache_write_tokens
-            else "unavailable"
-        ),
+        "cache_telemetry": canonical_usage.cache_telemetry,
     }
     _notify_tui_cache(agent, canonical_usage)
     if not getattr(agent, "_first_turn_usage", None):

@@ -402,11 +402,11 @@ pr = 180
 name = "fix-tui-repair-cache-telemetry-on-f293"
 title = "fix(tui): repair cache telemetry on f293"
 branch = "topic/upgrade-pr13-07-tui-cache-completion-20260821"
-head = "de64e500e84ee6ee0df7e04845a8f29f655c8247"
-tree = "4e7464dbe5d0a950d54addd5aa036dce54b9c723"
+head = "b435c6a2d7e5ff1ed55e48a5ee7482eef74ec6b0"
+tree = "bd0d9a21e140ac25ad56162877a0aaad2bfef2f3"
 base_ref = "fix/runtime-heartbeat-managed-targets"
 base_sha = "9d16bdab80a2933be39f3d6a8aa164e4967f51fb"
-parent = "4e59666cdb92445742ec44b7c3db50ee6cbc116c"
+parent = "db76f8fb190e53434a630effcb811457ddb558c7"
 depends_on = [42]
 required = true
 supersedes = []
@@ -415,14 +415,14 @@ unique_on_pin = false
 unique_count = 3
 vs_pin_count = 4
 stacked_prereq_count = 1
-owned_diffsha_vs_base = "d1faf334b042d4ea1625f7752995992a0a506c1090670051510254e83f36aa1b"
-owned_diff_bytes_vs_base = 69589
-full_diffsha_vs_pin = "af89c31b58763cbb0ad8d52a9315c7baf62b2e3db657b942eae882c6e06f526e"
-full_diff_bytes_vs_pin = 78254
+owned_diffsha_vs_base = "9317a7c531bbbbadbd45bd091079f9f87c4bca01f22ed3790f3834ed80688b67"
+owned_diff_bytes_vs_base = 68905
+full_diffsha_vs_pin = "fd8faa6dad4b4392b76b6936864e31754076bf23e9bac09a12926b230d70825f"
+full_diff_bytes_vs_pin = 77570
 owned_commits = [
-  "d4c7469b51ce50596b4b01c1dd5b7bd619d0ad3c",
-  "4e59666cdb92445742ec44b7c3db50ee6cbc116c",
-  "de64e500e84ee6ee0df7e04845a8f29f655c8247",
+  "74c4d45b91892738ec96cc6f0bf6ab31a09fa63c",
+  "db76f8fb190e53434a630effcb811457ddb558c7",
+  "b435c6a2d7e5ff1ed55e48a5ee7482eef74ec6b0",
 ]
 owned_subjects = [
   "feat(tui): stamp cache-warm telemetry on official split seams",

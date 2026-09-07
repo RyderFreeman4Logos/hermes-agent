@@ -57,6 +57,8 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Include previous/current loop timestamps in the API-only context.
+        "loop_timing_context": True,
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,

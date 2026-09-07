@@ -13,6 +13,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -52,7 +53,7 @@ from agent.turn_response_intake import normalize_model_response
 from agent.turn_tool_round import run_tool_round
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
-from utils import base_url_host_matches
+from utils import base_url_host_matches, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,67 @@ _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 
 # Shared by _apply_active_turn_redirect and the api_messages ghost-row filter so both sites cannot drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+
+
+def _loop_timing_context(
+    agent: Any,
+    *,
+    now: Optional[datetime] = None,
+    stop: bool = False,
+) -> Optional[str]:
+    """Record a loop boundary or return its API-only timing context."""
+    current = now or datetime.now().astimezone()
+    if stop:
+        agent._loop_timing_last_stop = current
+        return None
+
+    previous_start = getattr(agent, "_loop_timing_last_start", None)
+    previous_stop = getattr(agent, "_loop_timing_last_stop", None)
+    agent._loop_timing_last_start = current
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
+        enabled = is_truthy_value(
+            agent_config.get("loop_timing_context")
+            if isinstance(agent_config, dict)
+            else None,
+            default=True,
+        )
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+
+    lines = ["[Agent loop timing]"]
+    if previous_start is not None:
+        lines.append(f"Previous loop start: {previous_start.isoformat(timespec='seconds')}")
+    if previous_stop is not None:
+        lines.append(f"Previous loop stop: {previous_stop.isoformat(timespec='seconds')}")
+    lines.append(f"Current loop start: {current.isoformat(timespec='seconds')}")
+    return "\n".join(lines)
+
+
+def _drop_redundant_previous_loop_start(text: str, history) -> str:
+    """Drop Previous loop start when history already has that Current stamp."""
+    if not text or not history:
+        return text
+    lines = text.splitlines()
+    previous = next(
+        (line for line in lines if line.startswith("Previous loop start: ")), None
+    )
+    if previous is None:
+        return text
+    needle = f"Current loop start: {previous[len('Previous loop start: '):]}"
+    if any(
+        isinstance(message, dict)
+        and "[Agent loop timing]" in str(message.get("content", ""))
+        and needle in str(message.get("content", ""))
+        for message in history
+    ):
+        return "\n".join(line for line in lines if line != previous)
+    return text
 
 
 # One-time wrap-up notice appended when a wall-clock run budget (--run-budget) crosses 80%.

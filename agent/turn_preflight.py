@@ -87,7 +87,10 @@ def run_preflight_compression(
     )()
     _eligible = (
         agent.compression_enabled
-        and len(v.messages) > 1
+        # A freshly appended timing row is metadata, not enough history to
+        # justify compaction before the first provider request. It remains
+        # in this outer-run guard, so tool continuations still compact.
+        and len(v.messages) > 1 + int(bool(getattr(agent, "_loop_timing_persisted_text", "")))
         and v.compression_attempts < max_compression_attempts
     )
     if (

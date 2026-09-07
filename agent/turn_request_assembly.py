@@ -215,6 +215,24 @@ def assemble_api_request(
         api_messages = _initial_cache_plan.messages
         tools_for_api = _initial_cache_plan.tools
 
+    from agent.conversation_loop import _drop_redundant_previous_loop_start
+    _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
+    if _loop_timing_text:
+        persisted = getattr(agent, "_loop_timing_persisted_text", "") or ""
+        if not persisted:
+            persisted = _drop_redundant_previous_loop_start(_loop_timing_text, messages)
+            agent._loop_timing_persisted_text = persisted
+        if persisted and not any(
+            isinstance(message, dict)
+            and message.get("role") == "system"
+            and message.get("content") == persisted
+            for message in messages
+        ):
+            api_messages.append({"role": "system", "content": persisted})
+            messages.append(
+                {"role": "system", "content": persisted, "display_kind": "hidden"}
+            )
+
     # Prepare the persistent-MoA request before measuring compression pressure: the
     # ephemeral advisor output is absent from ``messages``; ``create()`` reuses the
     # prepared request instead of running the advisors again.

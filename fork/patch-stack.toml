@@ -3,6 +3,9 @@
 # #188 is generated integration (consumes this); stays a5bc92d7 until later replay/gates.
 # #213 is foreign excluded. Closed user-drop 14/40/151/150/204/252/267 excluded; not upstream-equivalent.
 # Old #265 remote 518972eb on 3340bbbd is preserved immutable; this WT is a NEW local metadata candidate.
+# v19: admit published canonical test-only source PRs #278/#279. 26 KEEP live-behavior rows unchanged.
+# Counts: 26 KEEP live-behavior (product owned 44) vs 2 test-only sources (owned 2) vs metadata (not in this file).
+# Do not relabel #278/#279 as live-behavior KEEP / product_prs.
 schema_version = 1
 name = "docker-freeman-hermes"
 kind = "candidate-mutable-ledger"
@@ -19,7 +22,10 @@ immutable = false
 historical_frozen_v11 = "hermes-final-manifest-20260906-frozen-v11.toml"
 historical_frozen_v11_sha256 = "afb1c561b5968db19251638d608535ddc18b739d9c183f6164f5681b7183850a"
 product_prs = 26
-owned_unique_commits = 44
+test_only_prs = 2
+product_owned_unique_commits = 44
+test_only_owned_unique_commits = 2
+owned_unique_commits = 46
 stacked_deps = 5
 head_overlay_prs = []
 unpublished_heads_adopted = false
@@ -47,6 +53,8 @@ pr179_empty_omit = "6d5b14356f599f82bbd35fb5b434240481878dd2 zero-diff retained 
 [composition_notes]
 pr227 = "HMAC-only; no v11 HTTPX"
 pr180 = "CanonUsage cache_telemetry field; composition with #227 requires actual replay later"
+pr278 = "test-only canonical source of #276; not live-behavior KEEP; 1 owned commit; no deps"
+pr279 = "test-only canonical source of #277; not live-behavior KEEP; 1 owned commit; no deps"
 no_blind_v11_superset = true
 
 [[patch]]
@@ -891,3 +899,66 @@ owned_subjects = [
 ]
 notes = "stacked on #251; owned 8 excludes #251 prefix; 6 live-identical + 2 harness/isolation repairs — NOT all live patch-ids; do not claim 8 live-identical"
 
+[[patch]]
+order = 27
+pr = 278
+name = "test-delegate-compare-child-db-path-by-file-ide"
+title = "test(delegate): compare child db path by file identity"
+branch = "topic/issue276-test-repair-v18-20260906"
+head = "902390a3746016485651d0e532f8cc6a8b614c0b"
+tree = "8d7b62f6624be5e143d91c8b7c3b2949ad707f72"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+role = "test-only"
+owned_diffsha_vs_base = "9f0da20fbcef63f6471734fdb81627141d6c1abb4ffe9cdb54162ef75b184382"
+owned_diff_bytes_vs_base = 1629
+full_diffsha_vs_pin = "9f0da20fbcef63f6471734fdb81627141d6c1abb4ffe9cdb54162ef75b184382"
+full_diff_bytes_vs_pin = 1629
+owned_commits = [
+  "902390a3746016485651d0e532f8cc6a8b614c0b",
+]
+owned_subjects = [
+  "test(delegate): compare child db path by file identity",
+]
+notes = "canonical test-only source of issue #276; 1 owned commit; no invented deps; not live-behavior KEEP; product blobs unchanged; independent review PASS 0; OPEN non-draft unmerged on official pin"
+
+[[patch]]
+order = 28
+pr = 279
+name = "test-tui-handshake-entered-phase-events-instead"
+title = "test(tui): handshake entered-phase Events instead of 1s waits"
+branch = "topic/issue277-test-repair-v18-20260906"
+head = "a78558b6bc29aa67d394a834bccf699ffb107046"
+tree = "3c2219a95e11fbe66445f624677a4e0640ecabc2"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+role = "test-only"
+owned_diffsha_vs_base = "2a8cb79947fdce20ff0697284ab28365a1a64fd4862cf52e272d89eaafda41be"
+owned_diff_bytes_vs_base = 3994
+full_diffsha_vs_pin = "2a8cb79947fdce20ff0697284ab28365a1a64fd4862cf52e272d89eaafda41be"
+full_diff_bytes_vs_pin = 3994
+owned_commits = [
+  "a78558b6bc29aa67d394a834bccf699ffb107046",
+]
+owned_subjects = [
+  "test(tui): handshake entered-phase Events instead of 1s waits",
+]
+notes = "canonical test-only source of issue #277; 1 owned commit; no invented deps; not live-behavior KEEP; product blobs unchanged; independent review PASS 0; OPEN non-draft unmerged on official pin"

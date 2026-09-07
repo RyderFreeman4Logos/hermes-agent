@@ -367,3 +367,66 @@ def test_compute_host_rebuild_passes_and_persists_frozen_mode(monkeypatch):
     assert child.calls[-1]["memory_provider_mode_override"] == "authoritative"
     assert session["agent"]._memory_provider_mode == "authoritative"
     assert _stored_config(db, key)["memory_provider_mode"] == "authoritative"
+
+
+def test_cli_init_agent_resume_keeps_frozen_mode_after_config_change(monkeypatch):
+    """Fresh CLI rebuild on --resume must keep mode A after live config becomes B."""
+    import types
+
+    import cli as cli_mod
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self._memory_provider_mode = kwargs.get("memory_provider_mode_override") or "hybrid"
+            self._session_db_created = False
+
+        def _ensure_db_session(self):
+            return None
+
+    cli = cli_mod.HermesCLI(compact=True)
+    cli._session_db = object()
+    cli._resumed = True
+    cli.conversation_history = [{"role": "user", "content": "synthetic"}]
+    cli._install_tool_callbacks = lambda: None
+    cli._ensure_tirith_security = lambda: None
+    cli._ensure_runtime_credentials = lambda: True
+    cli._memory_provider_mode_override = None
+    cli._restore_session_memory_mode(
+        {"model_config": json.dumps({"memory_provider_mode": "authoritative"})}
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+        lambda **_kw: None,
+    )
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr("cli._prepare_deferred_agent_startup", lambda: None)
+    monkeypatch.setattr("cli.ChatConsole", lambda: types.SimpleNamespace(print=lambda *_a, **_k: None))
+
+    assert cli._init_agent() is True
+    assert captured["memory_provider_mode_override"] == "authoritative"
+    assert cli.agent._memory_provider_mode == "authoritative"
+
+
+def test_cli_midchat_resume_uses_shared_state_restore():
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+    src = CLICommandsMixin._handle_resume_command.__code__.co_names
+    assert "_restore_session_state" in src
+
+
+def test_background_agent_kwargs_carry_frozen_memory_mode(monkeypatch):
+    from tui_gateway import server
+
+    agent = FakeAgent("authoritative")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"memory": {"provider_mode": "hybrid"}})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "synthetic-model")
+    monkeypatch.setattr(server, "_load_reasoning_config", lambda *_a, **_kw: {})
+    monkeypatch.setattr(server, "_load_service_tier", lambda: None)
+    monkeypatch.setattr(server, "_cfg_max_turns", lambda *_a, **_kw: 25)
+    kwargs = server._background_agent_kwargs(agent, "task-id")
+    assert kwargs["memory_provider_mode_override"] == "authoritative"

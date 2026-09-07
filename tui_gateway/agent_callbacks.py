@@ -275,6 +275,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "reasoning_config": g("reasoning_config") or _load_reasoning_config(str(g("model", "") or "")),
         "service_tier": g("service_tier") or _load_service_tier(),
         "request_overrides": dict(g("request_overrides", {}) or {}),
+        "memory_provider_mode_override": g("_memory_provider_mode"),
         "platform": "tui", "session_db": _get_db(), "fallback_model": fallback}
 
 

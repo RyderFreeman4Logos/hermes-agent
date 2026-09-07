@@ -1312,9 +1312,7 @@ class CLICommandsMixin:
         # -c`/`--resume`. The startup resume paths already call this; without it, the terminal/code-exec
         # tools and relative-path resolution keep operating in the wrong repo. Idempotent and a no-op when
         # the session recorded no cwd. See #38562.
-        self._restore_session_cwd(session_meta)
-        self._restore_session_yolo(session_meta)
-        self._restore_session_model(session_meta)
+        self._restore_session_state(session_meta)
 
     def _resolve_resume_target(self, target: str):
         """``(session_id, meta)`` for a numbered selection, title, or id; None after printing why

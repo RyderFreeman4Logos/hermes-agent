@@ -4,6 +4,7 @@ imported lazily inside each method (import cycle)."""
 
 from __future__ import annotations
 
+import json
 import sys
 
 from rich.markup import escape as _escape
@@ -396,10 +397,27 @@ class CLIAgentSetupMixin:
             session_meta = self._session_db.get_session(self.session_id) or session_meta
         return session_meta
 
+    def _restore_session_memory_mode(self, session_meta: dict) -> None:
+        """Freeze the session's memory provider mode before any agent rebuild."""
+        raw_config = (session_meta or {}).get("model_config")
+        if isinstance(raw_config, str):
+            try:
+                raw_config = json.loads(raw_config)
+            except (TypeError, ValueError):
+                raw_config = {}
+        mode = raw_config.get("memory_provider_mode") if isinstance(raw_config, dict) else None
+        self._memory_provider_mode_override = (
+            mode if mode in {"authoritative", "hybrid"} else None
+        )
+        agent = getattr(self, "agent", None)
+        if agent is not None and self._memory_provider_mode_override is not None:
+            agent._memory_provider_mode = self._memory_provider_mode_override
+
     def _restore_session_state(self, session_meta, *, quiet: bool = False) -> None:
-        """Restore cwd / yolo / model from the resumed session's metadata."""
+        """Restore cwd / yolo / frozen memory mode / model from the resumed session."""
         self._restore_session_cwd(session_meta, quiet=quiet)
         self._restore_session_yolo(session_meta, quiet=quiet)
+        self._restore_session_memory_mode(session_meta)
         self._restore_session_model(session_meta, quiet=quiet)
 
     def _reopen_session(self) -> None:
@@ -524,6 +542,9 @@ class CLIAgentSetupMixin:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config, service_tier=self.service_tier,
+                memory_provider_mode_override=getattr(
+                    self, "_memory_provider_mode_override", None
+                ),
                 request_overrides=request_overrides, providers_allowed=self._providers_only,
                 providers_ignored=self._providers_ignore, providers_order=self._providers_order,
                 provider_sort=self._provider_sort,

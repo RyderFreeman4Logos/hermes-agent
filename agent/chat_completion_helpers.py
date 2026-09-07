@@ -2057,6 +2057,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
         return agent._try_activate_fallback(reason)
 
+    override_snapshot = None
     try:
         from agent.auxiliary_client import resolve_provider_client
         from hermes_cli.fallback_config import resolve_entry_api_key
@@ -2088,6 +2089,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
         old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+        from agent.agent_runtime_helpers import _copy_request_overrides
+        live_overrides = getattr(agent, "request_overrides", {}) or {}
+        override_snapshot = _copy_request_overrides(live_overrides)
+        if not getattr(agent, "_fallback_activated", False):
+            primary_runtime = getattr(agent, "_primary_runtime", None)
+            if isinstance(primary_runtime, dict):
+                # First fallback must freeze the pre-rescope graph so restore_primary_runtime
+                # cannot pick up extra_body mutated by _rescope_fallback_extra_body.
+                primary_runtime["request_overrides"] = _copy_request_overrides(live_overrides)
 
         # Clear the per-config context_length override so the fallback model's own context
         # window is resolved instead of the previous model's stale value.
@@ -2131,6 +2141,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
         return True
     except Exception as e:
+        if override_snapshot is not None:
+            with contextlib.suppress(Exception):
+                agent.request_overrides = override_snapshot
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)

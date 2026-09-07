@@ -3,6 +3,7 @@ replayed-user dedupe. Mixin bound via the MRO, built on SessionDB's _read_ctx/_e
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -488,6 +489,29 @@ class SessionMessagesMixin:
         return int(self._read_one(
             "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ? AND active = 1", (session_id,))[0])
 
+    def get_active_message_source_snapshot(self, session_id: str) -> Tuple[int, str]:
+        """Atomically capture a compression watermark and durable source digest.
+
+        The single statement binds ``MAX(id)`` to every active pre-watermark row it
+        hashes, so a source rewrite cannot be admitted as a later baseline. Rows
+        appended after the watermark are excluded when the digest is checked at
+        publication.
+        """
+        if not session_id:
+            return 0, self._message_source_signature(())
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT messages.*, MAX(id) OVER () AS _compression_watermark "
+                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        if not rows:
+            return 0, self._message_source_signature(())
+        return (
+            int(rows[-1]["_compression_watermark"]),
+            self._message_source_signature(rows, skip_column="_compression_watermark"),
+        )
+
     def _tail_rows_after_watermark(self, conn, sql: str, params) -> Tuple[List[int], int]:
         """``(ids, tool_call_count)`` of the concurrent-tail rows selected by *sql* (``SELECT id, tool_calls``)."""
         rows = conn.execute(sql, params).fetchall()
@@ -507,7 +531,8 @@ class SessionMessagesMixin:
 
     def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
-        lock_holder: Optional[str] = None, tail_count: int = 0) -> int:
+        lock_holder: Optional[str] = None, tail_count: int = 0,
+        source_ids: Optional[List[int]] = None, source_signature: Optional[str] = None) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -525,6 +550,10 @@ class SessionMessagesMixin:
         platform_message_id, token counts, reasoning sidecars all survive byte-exact, and the FTS triggers
         index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
+
+        When *source_signature* is supplied, it must match the complete active pre-watermark
+        durable source; a rewritten source aborts instead of letting a stale summary publish
+        over it. ``source_ids`` remains a narrower compatibility check for direct callers.
         """
         from hermes_state import SessionCompressionInProgressError
         def _do(conn):
@@ -533,6 +562,8 @@ class SessionMessagesMixin:
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
+            self._assert_pre_watermark_source_unchanged(
+                conn, session_id, watermark, source_ids, source_signature)
             patch = model_config_patch is not None
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(
@@ -566,6 +597,64 @@ class SessionMessagesMixin:
                 (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
             return inserted
         return self._execute_write(_do)
+
+    def _assert_pre_watermark_source_unchanged(
+        self, conn, session_id: str, watermark: Optional[int],
+        source_ids: Optional[List[int]], source_signature: Optional[str],
+    ) -> None:
+        if watermark is None:
+            return
+        from hermes_state import SessionCompressionInProgressError
+        if source_ids is not None:
+            current_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                    "AND id <= ? ORDER BY id",
+                    (session_id, int(watermark)),
+                ).fetchall()
+            ]
+            if current_ids != source_ids:
+                raise SessionCompressionInProgressError(
+                    f"Compression source changed before publication: {session_id}"
+                )
+        if source_signature is not None and (
+            self._pre_watermark_source_signature(conn, session_id, watermark)
+            != source_signature
+        ):
+            raise SessionCompressionInProgressError(
+                f"Compression source changed before publication: {session_id}"
+            )
+
+    @staticmethod
+    def _message_source_signature(rows, skip_column: Optional[str] = None) -> str:
+        """Hash every durable message field with an unambiguous type boundary."""
+        digest = hashlib.sha256()
+        for row in rows:
+            for column in row.keys():
+                if column == skip_column:
+                    continue
+                value = row[column]
+                if isinstance(value, bytes):
+                    encoded = value
+                elif value is None:
+                    encoded = b""
+                else:
+                    encoded = str(value).encode("utf-8", "surrogatepass")
+                digest.update(column.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(type(value).__name__.encode("ascii"))
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        return digest.hexdigest()
+
+    def _pre_watermark_source_signature(self, conn, session_id: str, watermark: int) -> str:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? AND active = 1 "
+            "AND id <= ? ORDER BY id",
+            (session_id, int(watermark)),
+        ).fetchall()
+        return self._message_source_signature(rows)
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""

@@ -2274,6 +2274,7 @@ class _CompressionLease:
         self._lifecycle = lifecycle
         self.holder: Optional[str] = None
         self.watermark: Optional[int] = None
+        self.source_signature: Optional[str] = None
         self._refresher: Optional[_CompressionLockLeaseRefresher] = None
         self._released = False
         self._release_guard = threading.Lock()
@@ -2379,7 +2380,12 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
         acquired = try_acquire(lease.sid, lease.holder, ttl_seconds=lease.ttl)
         if acquired:
             try:
-                lease.watermark = lease.db.get_active_message_watermark(lease.sid)
+                snapshot = getattr(lease.db, "get_active_message_source_snapshot", None)
+                if callable(snapshot):
+                    lease.watermark, lease.source_signature = snapshot(lease.sid)
+                else:
+                    lease.watermark = lease.db.get_active_message_watermark(lease.sid)
+                    lease.source_signature = None
                 # A captured watermark makes the commit safe against later rows on BOTH commit
                 # paths; tell the fence so a host may keep this attempt's admission.
                 if commit_fence is not None:
@@ -2391,6 +2397,7 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
                     "will be archived with the snapshot", lease.sid, _wm_err,
                 )
                 lease.watermark = None
+                lease.source_signature = None
         return acquired
     except Exception as _lock_err:
         with _swallow('compression lock cleanup after failed acquire failed: %s'):
@@ -2973,6 +2980,7 @@ def _publish_rotated_compaction(
         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
         watermark=(lease.watermark if _foreign_tail_ceiling is not None else None),
         watermark_ceiling=_foreign_tail_ceiling,
+        source_signature=lease.source_signature,
     )
     # `already_present` stamping is done by run_agent's _sync_persisted_markers;
     # this branch covers inserted/merged only; direct callers must use that wrapper.
@@ -3260,6 +3268,7 @@ def _commit_compaction(
                 agent._session_db.archive_and_compact(
                     agent.session_id, compressed, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=lease.watermark, lock_holder=lease.holder,
+                    source_signature=lease.source_signature,
                     tail_count=sum(1 for m in compressed if id(m) in _tail_tagged_ids),
                 )
                 split_status = "in_place_committed"

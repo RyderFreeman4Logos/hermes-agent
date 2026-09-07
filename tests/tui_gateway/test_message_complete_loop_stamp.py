@@ -242,6 +242,102 @@ def test_usage_without_cache_telemetry_does_not_fake_token_counts():
     assert info == {"state": "unavailable", "pct": 0}
 
 
+def test_cache_info_from_usage_reported_empty_is_miss():
+    info = server._cache_info_from_usage(
+        {
+            "prompt_tokens": 4_000,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_telemetry": "reported",
+        }
+    )
+    assert info == {
+        "state": "miss",
+        "pct": 0,
+        "read_tokens": 0,
+        "prompt_tokens": 4_000,
+    }
+
+
+def test_emit_terminal_turn_error_stamps_first_turn_usage_miss(frames, monkeypatch):
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+    agent = types.SimpleNamespace(
+        provider="",
+        model="",
+        _first_turn_usage={
+            "prompt_tokens": 4_000,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_telemetry": "reported",
+        },
+    )
+    session = _session(agent=agent)
+    sid = "error-complete-miss"
+    server._sessions[sid] = session
+    try:
+        server._emit_terminal_turn_error(sid, session, RuntimeError("boom"))
+    finally:
+        server._sessions.pop(sid, None)
+
+    payload = _complete_payloads(frames)[0]
+    assert payload["status"] == "error"
+    assert payload["cache_info"] == {
+        "state": "miss",
+        "pct": 0,
+        "read_tokens": 0,
+        "prompt_tokens": 4_000,
+    }
+
+
+def test_emit_terminal_turn_error_without_usage_stays_unavailable(frames, monkeypatch):
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+    session = _session()
+    sid = "error-complete-no-usage"
+    server._sessions[sid] = session
+    try:
+        server._emit_terminal_turn_error(sid, session, RuntimeError("boom"))
+    finally:
+        server._sessions.pop(sid, None)
+
+    payload = _complete_payloads(frames)[0]
+    assert payload["status"] == "error"
+    assert payload["cache_info"] == {"state": "unavailable", "pct": 0}
+
+
+def test_message_complete_success_stamps_first_turn_usage_miss(frames, turn_env):
+    class _Agent:
+        def run_conversation(self, _prompt, **_kwargs):
+            self._first_turn_usage = {
+                "prompt_tokens": 4_000,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_telemetry": "reported",
+            }
+            return {"final_response": "reply", "messages": []}
+
+        def clear_interrupt(self):
+            return None
+
+    agent = _Agent()
+    session = _session(agent=agent, running=True)
+    sid = "loop-stamp-usage-miss"
+    server._sessions[sid] = session
+    try:
+        server._attach_tui_cache_callback(agent, sid)
+        server._run_prompt_submit("rid", sid, session, "wake")
+    finally:
+        server._sessions.pop(sid, None)
+
+    payload = _complete_payloads(frames)[0]
+    assert payload["status"] == "complete"
+    assert payload["cache_info"] == {
+        "state": "miss",
+        "pct": 0,
+        "read_tokens": 0,
+        "prompt_tokens": 4_000,
+    }
+
+
 def test_message_complete_does_not_reuse_prior_loop_cache_info(frames, turn_env):
     class _Agent:
         def __init__(self):

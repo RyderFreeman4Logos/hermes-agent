@@ -106,10 +106,16 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
                             counts=lambda: billing(billing_mode="subscription_included"))
         return {}
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    cache_telemetry = (
+        "reported"
+        if "cachedInputTokens" in usage and usage["cachedInputTokens"] is not None
+        else "unavailable"
+    )
     canonical_usage = CanonicalUsage(
         input_tokens=_coerce_usage_int(usage.get("inputTokens")), output_tokens=_coerce_usage_int(usage.get("outputTokens")),
         cache_read_tokens=_coerce_usage_int(usage.get("cachedInputTokens")), cache_write_tokens=0,
         reasoning_tokens=_coerce_usage_int(usage.get("reasoningOutputTokens")), raw_usage=usage,
+        cache_telemetry=cache_telemetry,
     )
     prompt_tokens = canonical_usage.prompt_tokens
     total_tokens = _coerce_usage_int(usage.get("totalTokens")) or canonical_usage.total_tokens
@@ -117,7 +123,6 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
                     ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")}
     usage_dict = {"prompt_tokens": prompt_tokens, "completion_tokens": canonical_usage.output_tokens,
                   "total_tokens": total_tokens, **token_counts}
-    cache_telemetry = "reported" if canonical_usage.cache_read_tokens else "unavailable"
     from agent.turn_usage import _notify_tui_cache
     _notify_tui_cache(agent, canonical_usage)
     turn_usage = {**usage_dict, "cache_telemetry": cache_telemetry}

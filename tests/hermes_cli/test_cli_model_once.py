@@ -198,4 +198,3 @@ def test_cli_reasoning_only_after_compression_keeps_route(monkeypatch):
     assert (pending.new_model, pending.target_provider) == ("old/model", "openrouter")
     assert pending.reasoning_config == {"enabled": True, "effort": "low"}
     assert stub.agent.calls == []
-

@@ -87,6 +87,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     def billing(**extra):
         return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
     if not isinstance(usage, dict) or not usage:
+        from agent.turn_usage import _notify_tui_cache
+        _notify_tui_cache(agent, no_usage=True)
         if compressor is not None and getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage cannot adjudicate the pending compaction; unlatch preflight deferral.
             compressor.update_from_response({})
@@ -104,7 +106,13 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     token_counts = {f: getattr(canonical_usage, f) for f in
                     ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")}
     usage_dict = {"prompt_tokens": prompt_tokens, "completion_tokens": canonical_usage.output_tokens,
-                  "total_tokens": total_tokens, **token_counts}
+                  "total_tokens": total_tokens, **token_counts,
+                  "cache_telemetry": "reported" if canonical_usage.cache_read_tokens else "unavailable"}
+    from agent.turn_usage import _notify_tui_cache
+    _notify_tui_cache(agent, canonical_usage)
+    if not getattr(agent, "_first_turn_usage", None):
+        agent._first_turn_usage = dict(usage_dict)
+    agent._last_turn_usage = dict(usage_dict)
     if compressor is not None:
         try:
             compressor.update_from_response(usage_dict)

@@ -677,25 +677,74 @@ def _get_compress_timeout_executor():
 def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None) -> Tuple[float, float]:
     """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
     ``idle_timeout_seconds <= 0`` disables the progress-aware wrapper. The ceiling is clamped to at least one
-    idle window when the idle budget is positive."""
+    idle window when the idle budget is positive. Configured auxiliary compression / fallback-chain
+    timeouts expand the host ceiling so the host does not preempt a longer candidate request.
+    Unrepresentable (non-finite / overflow) values are ignored."""
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+    aux_timeout = None
+    config_root = compression_cfg
     cfg = compression_cfg
     if cfg is None:
-        cfg = {}
+        config_root = {}
         with contextlib.suppress(Exception):
             from hermes_cli.config import load_config
             raw = load_config()
-            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
-            cfg = maybe if isinstance(maybe, dict) else {}
+            config_root = raw if isinstance(raw, dict) else {}
+    if isinstance(config_root, dict):
+        maybe = config_root.get("compression")
+        cfg = maybe if isinstance(maybe, dict) else config_root
+        auxiliary = config_root.get("auxiliary", {})
+        auxiliary_compression = (
+            auxiliary.get("compression", {}) if isinstance(auxiliary, dict) else {}
+        )
+        raw_aux_timeout = (
+            auxiliary_compression.get("timeout")
+            if isinstance(auxiliary_compression, dict)
+            else None
+        )
+        if raw_aux_timeout is not None:
+            with contextlib.suppress(TypeError, ValueError, OverflowError):
+                parsed = float(raw_aux_timeout)
+                if math.isfinite(parsed) and parsed > 0:
+                    aux_timeout = parsed
+        fallback_chain = (
+            auxiliary_compression.get("fallback_chain")
+            if isinstance(auxiliary_compression, dict)
+            else None
+        )
+        if isinstance(fallback_chain, list):
+            for entry in fallback_chain:
+                if not isinstance(entry, dict):
+                    continue
+                if not str(entry.get("provider") or "").strip():
+                    continue
+                if not str(entry.get("model") or "").strip():
+                    continue
+                raw_timeout = entry.get("timeout")
+                if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
+                    with contextlib.suppress(TypeError, ValueError, OverflowError):
+                        parsed = float(raw_timeout)
+                        if math.isfinite(parsed) and parsed > 0:
+                            aux_timeout = max(aux_timeout or 0.0, parsed)
+    else:
+        cfg = {}
     if isinstance(cfg, dict):
         # Explicit 0/negative idle disables; a non-positive ceiling is ignored.
-        with contextlib.suppress(TypeError, ValueError):
+        with contextlib.suppress(TypeError, ValueError, OverflowError):
             if cfg.get("context_timeout_seconds") is not None:
-                idle = float(cfg["context_timeout_seconds"])
-        with contextlib.suppress(TypeError, ValueError):
-            if cfg.get("context_total_ceiling_seconds") is not None and float(cfg["context_total_ceiling_seconds"]) > 0:
-                ceiling = float(cfg["context_total_ceiling_seconds"])
+                parsed = float(cfg["context_timeout_seconds"])
+                if math.isfinite(parsed):
+                    idle = parsed
+        with contextlib.suppress(TypeError, ValueError, OverflowError):
+            if cfg.get("context_total_ceiling_seconds") is not None:
+                parsed = float(cfg["context_total_ceiling_seconds"])
+                if math.isfinite(parsed) and parsed > 0:
+                    ceiling = parsed
+    if aux_timeout is not None:
+        # The host must not preempt a longer configured compression request.
+        # Its own idle budget still detects a silent provider.
+        ceiling = max(ceiling, aux_timeout)
     if idle > 0:
         ceiling = max(ceiling, idle)
     return idle, ceiling

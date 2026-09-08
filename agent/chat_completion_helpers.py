@@ -1825,6 +1825,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    if getattr(agent, "_delegate_model_profile", None) == "standard":
+        if getattr(agent, "_delegate_has_successful_llm_request", False):
+            return False
+        from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
+        if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+            return False
+        saved_until = getattr(agent, "_rate_limited_until", 0)
+        saved_backoff = getattr(agent, "_rate_limit_backoff_count", 0)
+        try:
+            return _try_activate_fallback_unlocked(agent, reason)
+        finally:
+            agent._rate_limited_until = saved_until
+            agent._rate_limit_backoff_count = saved_backoff
+    return _try_activate_fallback_unlocked(agent, reason)
+
+
+def _try_activate_fallback_unlocked(agent, reason: "FailoverReason | None" = None) -> bool:
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
     while True:

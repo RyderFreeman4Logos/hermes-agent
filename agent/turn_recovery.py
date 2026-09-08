@@ -464,7 +464,10 @@ def recover_after_classification(
     multimodal-tool-content strip → corrupt-image strip → Anthropic OAuth 1M-beta
     disable → per-provider 401 credential refresh → format-recovery strips.
     Returns ``(retry_now, recovered_with_pool)``; the latter feeds the Nous rate-limit guard."""
-    from agent.conversation_loop import _is_nous_inference_route
+    from agent.conversation_loop import _is_nous_inference_route, _is_standard_profile_child
+
+    if _is_standard_profile_child(agent):
+        return False, False
 
     if (
         classified.reason == FailoverReason.billing
@@ -1269,7 +1272,9 @@ def route_classified_error(
     still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
     chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
     from agent.conversation_compression import conversation_history_after_compression
-    from agent.conversation_loop import _arm_fallback_restart, _ra
+    from agent.conversation_loop import (
+        _arm_fallback_restart, _is_standard_profile_child, _ra, _standard_child_can_fallback,
+    )
     from agent.model_metadata import estimate_request_tokens_rough
 
     _provider_overflow_recovery_pending = False
@@ -1392,9 +1397,15 @@ def route_classified_error(
         # Fixes #11314.
         _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
         pool_may_recover = (
-            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
+            False
+            if _is_upstream or _is_standard_profile_child(agent)
+            else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
-        if not pool_may_recover:
+        if not pool_may_recover and _standard_child_can_fallback(
+            agent,
+            rate_limited=is_rate_limited,
+            billing=classified.reason == FailoverReason.billing,
+        ):
             agent._buffer_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             if agent._try_activate_fallback(reason=classified.reason):
                 return _fallback_break()
@@ -1405,6 +1416,7 @@ def route_classified_error(
         classified.is_auth
         and not _retry.auth_failover_attempted
         and agent._fallback_index < len(agent._fallback_chain)
+        and not _is_standard_profile_child(agent)
     ):
         _retry.auth_failover_attempted = True
         agent._buffer_status(

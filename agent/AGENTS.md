@@ -57,7 +57,7 @@ Adding one: register in that table (no `if name == ...` chain); `tools/todo_tool
   a conversation; the ONLY context mutation is compression. Anything that must inject content
   mid-conversation rides a **user message or tool result**, never the system prompt: skill slash
   commands (`agent/skill_commands.py`) inject as a user message; subdirectory `AGENTS.md` hints
-  (`agent/subdirectory_hints.py`) append to the tool result (head+tail truncated past `_MAX_HINT_CHARS = 32_000`, with a warning).
+  (`agent/subdirectory_hints.py`) append to the tool result (head+tail truncated past `_MAX_HINT_CHARS = 8_000`, combined `_MAX_TOTAL_HINT_CHARS = 16_000`, with a warning).
 - **Strict role alternation.** Never two same-role messages in a row; never a synthetic user
   message injected mid-loop. Cron deliveries live in their own session for this reason.
 - **Context files** (`agent/prompt_builder.py`) load from the CWD only at startup and are capped

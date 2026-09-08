@@ -2849,7 +2849,9 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
 
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider", "session_id", "cache_scope",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3378,12 +3380,7 @@ def _prepare_same_provider_retry(
         base_url=retry_base or resolved_base_url, task=task,
     )
     # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
-    if extra_headers:
-        # Copilot's ``x-initiator: user``) across the rebuilt-client retry — dropping them here would let a
-        # recovery retry silently lose capability gating (#60293).
-        # Preserve per-request attribution headers across the rebuilt-client retry — see the sync variant
-        # above (#60293).
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+    _merge_auxiliary_extra_headers(retry_kwargs, extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return retry_client, retry_kwargs
@@ -6016,7 +6013,44 @@ def _build_call_kwargs(
     # OpenCode relay session affinity — same key as the main turn so compression/title/vision
     # calls stay on the conversation's warm backend.
     from agent.opencode_affinity import merge_opencode_session_headers
-    return merge_opencode_session_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
+    kwargs = merge_opencode_session_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
+    session_id = _configured_auxiliary_session_id(provider)
+    if session_id:
+        request_headers = kwargs.get("extra_headers")
+        request_headers = dict(request_headers) if isinstance(request_headers, dict) else {}
+        request_headers.setdefault("session_id", session_id)
+        kwargs["extra_headers"] = request_headers
+    return kwargs
+
+
+def _configured_auxiliary_session_id(provider: str) -> str:
+    """Return the stable session root for an opted-in named custom provider."""
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        entry = _get_named_custom_provider(str(provider or "").strip())
+    except Exception:
+        return ""
+    if not isinstance(entry, dict) or entry.get("send_session_id") is not True:
+        return ""
+    return str(
+        _runtime_main_value("cache_scope")
+        or _runtime_main_value("session_id")
+        or ""
+    ).strip()
+
+
+def _merge_auxiliary_extra_headers(
+    kwargs: Dict[str, Any], caller_headers: Optional[Dict[str, str]],
+) -> None:
+    """Merge per-call headers over generated headers without dropping either."""
+    if not caller_headers:
+        return
+    generated = kwargs.get("extra_headers")
+    merged = dict(generated) if isinstance(generated, dict) else {}
+    # Caller values intentionally win, including an explicit session_id.
+    merged.update(caller_headers)
+    kwargs["extra_headers"] = merged
 
 
 def _validate_llm_response(
@@ -6618,8 +6652,7 @@ def _prepare_aux_request(
         request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task)
-    if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+    _merge_auxiliary_extra_headers(kwargs, extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(request_provider, client_base):
@@ -7141,6 +7174,25 @@ def _call_llm_impl(
     overrides task config; timeout=None reads auxiliary.{task}.timeout; extra_headers override
     client defaults. stream=True returns the raw SDK stream (caller consumes/falls back)
     instead of a validated response. RuntimeError if no provider is configured."""
+    with scoped_runtime_main(main_runtime):
+        return _call_llm_impl_unscoped(
+            task=task, provider=provider, model=model, base_url=base_url,
+            api_key=api_key, main_runtime=main_runtime, messages=messages,
+            temperature=temperature, max_tokens=max_tokens, tools=tools,
+            timeout=timeout, extra_body=extra_body, reasoning_config=reasoning_config,
+            extra_headers=extra_headers, api_mode=api_mode, stream=stream,
+            stream_options=stream_options, route_info=route_info,
+        )
+
+
+def _call_llm_impl_unscoped(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
+    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+) -> Any:
     req, retry_kwargs, candidate_kwargs = _plan_aux_call(
         task, async_mode=False, provider=provider, model=model, base_url=base_url,
         api_key=api_key, main_runtime=main_runtime, messages=messages,
@@ -7326,6 +7378,23 @@ async def _async_call_llm_impl(
 ) -> Any:
     """Centralized asynchronous LLM call; see call_llm() for full documentation.
     No per-request header / api_mode override on the async entry point."""
+    with scoped_runtime_main(main_runtime):
+        return await _async_call_llm_impl_unscoped(
+            task=task, provider=provider, model=model, base_url=base_url,
+            api_key=api_key, main_runtime=main_runtime, messages=messages,
+            temperature=temperature, max_tokens=max_tokens, tools=tools,
+            timeout=timeout, extra_body=extra_body, reasoning_config=reasoning_config,
+            route_info=route_info,
+        )
+
+
+async def _async_call_llm_impl_unscoped(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    route_info: Optional[Dict[str, str]] = None,
+) -> Any:
     req, retry_kwargs, candidate_kwargs = _plan_aux_call(
         task, async_mode=True, provider=provider, model=model, base_url=base_url,
         api_key=api_key, main_runtime=main_runtime, messages=messages,

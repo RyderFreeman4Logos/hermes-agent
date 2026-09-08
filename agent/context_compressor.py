@@ -3186,11 +3186,23 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         routes through main-model fallback + cooldown instead of wiping the compacted turns."""
         # call_llm writes the route it actually selected; never pre-resolve a second, stale pair.
         _aux_route: Dict[str, str] = {}
+        from agent.auxiliary_client import _runtime_main_value
+
+        _session_id = (
+            _runtime_main_value("session_id")
+            or getattr(self, "_session_id", "")
+        )
+        _cache_scope = (
+            _runtime_main_value("cache_scope")
+            or _session_id
+        )
         call_kwargs: Dict[str, Any] = {
             "task": "compression",
             "main_runtime": {
                 "model": self.model, "provider": self.provider, "base_url": self.base_url, "api_key": self.api_key,
                 "api_mode": self.api_mode,
+                "session_id": _session_id,
+                "cache_scope": _cache_scope,
             },
             "messages": [{"role": "user", "content": prompt}], "route_info": _aux_route,
             # NO max_tokens: Anthropic/NIM wires forward it and a hard cap truncates summaries

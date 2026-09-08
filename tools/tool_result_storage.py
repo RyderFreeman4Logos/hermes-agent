@@ -219,6 +219,8 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
     ``config.resolve_threshold(tool_name)``; falls back to inline truncation when no write
     location succeeds. ``history_suffix`` is reserved from the insertion threshold and
     appended after persist-or-keep."""
+    if not isinstance(content, str):
+        return content
     configured_threshold = (
         threshold if threshold is not None else config.resolve_threshold(tool_name)
     )

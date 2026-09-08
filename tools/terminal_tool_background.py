@@ -86,9 +86,10 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty):
+           session_key, effective_pty, notify_on_complete=False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
-                  owner_task_id=task_id or effective_task_id, session_key=session_key)
+                  owner_task_id=task_id or effective_task_id, session_key=session_key,
+                  notify_on_complete=notify_on_complete)
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
@@ -146,10 +147,18 @@ def spawn_background_process(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
     )
     try:
+        notify_unsupported = False
+        if notify_on_complete or watch_patterns:
+            from gateway.session_context import async_delivery_supported
+
+            if not async_delivery_supported():
+                notify_on_complete = False
+                watch_patterns = None
+                notify_unsupported = True
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
-            effective_pty=effective_pty,
+            effective_pty=effective_pty, notify_on_complete=bool(notify_on_complete),
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
@@ -157,7 +166,10 @@ def spawn_background_process(
             result_data["approval"] = approval_note
         if pty_disabled_reason:
             result_data["pty_note"] = pty_disabled_reason
-        if not notify_on_complete and not watch_patterns:
+        if notify_unsupported:
+            result_data["notify_on_complete"] = False
+            result_data["notify_unsupported"] = _ASYNC_UNSUPPORTED_NOTE
+        elif not notify_on_complete and not watch_patterns:
             result_data["hint"] = _SILENT_BACKGROUND_HINT
         if command and _looks_like_homebrew_ci_poller(command):
             existing = result_data.get("hint", "")

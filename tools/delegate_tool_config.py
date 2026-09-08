@@ -439,6 +439,7 @@ def _resolve_child_runtime(
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
     routing_cfg: Optional[Dict[str, Any]] = None,
+    override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -512,11 +513,14 @@ def _resolve_child_runtime(
         "capabilities": _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,
         "reasoning_config": child_reasoning,
-        # Resolve routing and recovery policy from the same configuration owner. A pinned provider, endpoint, or
-        # model never borrows the parent's chain; an explicitly declared child chain still remains available.
-        "fallback_model": _resolve_child_fallback_chain(
-            parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
-            pinned=bool(override_provider or override_base_url or model)),
+        # Profile fallback_chain wins when provided. Else the official routing owner
+        # (auxiliary.review vs delegation) still owns recovery policy.
+        "fallback_model": (
+            (override_fallback_chain or None) if override_fallback_chain is not None
+            else _resolve_child_fallback_chain(
+                parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
+                pinned=bool(override_provider or override_base_url or model))
+        ),
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},

@@ -298,22 +298,40 @@ def test_standard_child_cancellation_does_not_activate_fallback():
     fallback.assert_not_called()
 
 
-def test_standard_child_never_switches_after_first_successful_request():
-    agent = _make_standard_child(max_retries=2)
+def test_standard_child_falls_back_after_first_successful_request():
+    agent = _make_standard_child(max_retries=1)
     calls = []
-    fallback = MagicMock(return_value=False)
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
 
     def api_call(_kwargs):
         calls.append((agent.provider, agent.model))
         if len(calls) == 1:
             return _response("first turn")
-        raise _HTTPError(429, "quota exhausted")
+        if len(calls) == 2:
+            raise _HTTPError(429, "quota exhausted")
+        return _response("fallback turn")
 
     with ExitStack() as stack:
         stack.enter_context(
             patch.object(agent, "_interruptible_api_call", side_effect=api_call)
         )
-        stack.enter_context(patch.object(agent, "_try_activate_fallback", fallback))
+        stack.enter_context(
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, FALLBACK_CHAIN[0]["model"]),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, _provider: model,
+            )
+        )
+        stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200000))
         for context in _common_patches(agent):
             stack.enter_context(context)
         first = agent.run_conversation("first")
@@ -321,14 +339,12 @@ def test_standard_child_never_switches_after_first_successful_request():
 
     assert first["completed"] is True
     assert agent._delegate_has_successful_llm_request is True
-    assert second["completed"] is False
-    assert second["failed"] is True
+    assert second["completed"] is True
     assert calls == [
         (PRIMARY["provider"], PRIMARY["model"]),
         (PRIMARY["provider"], PRIMARY["model"]),
-        (PRIMARY["provider"], PRIMARY["model"]),
+        (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]),
     ]
-    fallback.assert_not_called()
 
 
 def test_delegate_progress_and_result_use_only_successful_fallback_identity():

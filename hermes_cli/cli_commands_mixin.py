@@ -1377,6 +1377,8 @@ class CLICommandsMixin:
         memory_provider_mode = (
             init_config.get("memory_provider_mode") if isinstance(init_config, dict) else None
         ) or getattr(self.agent, "_memory_provider_mode", None)
+        if not isinstance(memory_provider_mode, (str, type(None))):
+            memory_provider_mode = None
         try:
             self._session_db.create_session(
                 session_id=new_session_id, source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),

@@ -7,6 +7,8 @@ splits sessions via parent_session_id chains; sessions are source-tagged
 
 import asyncio
 import atexit
+import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -20,7 +22,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from agent.message_sanitization import _sanitize_surrogates
@@ -318,6 +320,36 @@ def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
     return _state_holders.foreign_state_db_holders(db_path)
 
 
+@contextmanager
+def _session_db_advisory_write_lock(
+    db_path: Path, *, deadline: float, patience_s: float
+):
+    """Serialize SessionDB writers across processes with a sidecar flock."""
+    lock_path = Path(str(db_path) + ".write.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        acquired = False
+        try:
+            while not acquired:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        raise sqlite3.OperationalError(
+                            "database is locked (another Hermes process held the "
+                            f"state.db write lock for over {patience_s:.0f}s)"
+                        ) from exc
+                    time.sleep(min(0.02, remaining_s))
+            yield
+        finally:
+            if acquired:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 # ── Process-wide shared SessionDB registry (#90837) ── lives in hermes_state_registry.py (acquire /
 # release / close_all / release_or_close). Long-lived in-process callers (gateway, tui_gateway, cron,
 # in-process tools) share ONE writer connection per resolved path via hermes_state_registry.acquire(); CLI
@@ -399,6 +431,17 @@ class SessionDB(
             if "system_prompt" in data:
                 data["system_prompt"] = resolved
         return data
+
+    @contextmanager
+    def _advisory_write_lock(self, deadline: Optional[float] = None):
+        """Use the shared sidecar lock for a SessionDB write outside _execute_write."""
+        patience_s = self._WRITE_PATIENCE_S
+        with _session_db_advisory_write_lock(
+            self.db_path,
+            deadline=deadline if deadline is not None else time.monotonic() + patience_s,
+            patience_s=patience_s,
+        ):
+            yield
 
     @staticmethod
     def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> None:
@@ -609,8 +652,9 @@ class SessionDB(
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
-        self._conn = self._open_writer_conn()
-        self._init_schema()
+        with self._advisory_write_lock():
+            self._conn = self._open_writer_conn()
+            self._init_schema()
 
     def _connect_and_init_with_lock_patience(self) -> None:
         """Open + init, waiting out a sibling's write lock with jittered patience:
@@ -794,20 +838,23 @@ class SessionDB(
             self._raise_if_db_replaced()
             fn_started = False
             try:
-                with self._lock:
-                    if self._conn is None:  # close() raced this writer
-                        self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                with _session_db_advisory_write_lock(
+                    self.db_path, deadline=deadline, patience_s=patience_s
+                ):
+                    with self._lock:
+                        if self._conn is None:  # close() raced this writer
+                            self._reopen_after_close_locked(context="write")
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            fn_started = True
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -1098,10 +1145,11 @@ class SessionDB(
         if self._db_corrupt:
             return  # quarantined: never checkpoint over a damaged image
         try:
-            with self._lock:
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-                if result and result[1] > 0:
-                    logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
+            with self._advisory_write_lock():
+                with self._lock:
+                    result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    if result and result[1] > 0:
+                        logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
@@ -1148,31 +1196,33 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
-        with self._lock:
-            if self._conn:
-                if self._db_corrupt:  # quarantined: no checkpoint over a damaged image
-                    logger.warning(
-                        "Skipping the close-time WAL checkpoint for %s: this "
-                        "handle observed structural corruption (%s). Take a "
-                        "snapshot of state.db, -wal and -shm before restarting, "
-                        "then run `hermes sessions recover --source %s --inspect-only`.", self.db_path,
-                        self._db_corrupt_reason, self.db_path,
-                    )
-                elif not self.read_only:  # PASSIVE, not TRUNCATE (see docstring)
-                    try:
-                        # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
-                        # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
-                        # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
-                        # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
-                        # on a sole-opener/quiescent connection.
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except Exception as exc:
-                        logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                conn, self._conn = self._conn, None
-                self._close_connection_quietly(conn)
-                # A clean close lets SQLite unlink the sidecars (a legitimate end of the
-                # generation, not a split): a teardown-race reopen must re-adopt.
-                self._db_sidecar_identity = {}
+        lock = self._advisory_write_lock() if not self.read_only else nullcontext()
+        with lock:
+            with self._lock:
+                if self._conn:
+                    if self._db_corrupt:  # quarantined: no checkpoint over a damaged image
+                        logger.warning(
+                            "Skipping the close-time WAL checkpoint for %s: this "
+                            "handle observed structural corruption (%s). Take a "
+                            "snapshot of state.db, -wal and -shm before restarting, "
+                            "then run `hermes sessions recover --source %s --inspect-only`.", self.db_path,
+                            self._db_corrupt_reason, self.db_path,
+                        )
+                    elif not self.read_only:  # PASSIVE, not TRUNCATE (see docstring)
+                        try:
+                            # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
+                            # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
+                            # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
+                            # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
+                            # on a sole-opener/quiescent connection.
+                            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        except Exception as exc:
+                            logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+                    conn, self._conn = self._conn, None
+                    self._close_connection_quietly(conn)
+                    # A clean close lets SQLite unlink the sidecars (a legitimate end of the
+                    # generation, not a split): a teardown-race reopen must re-adopt.
+                    self._db_sidecar_identity = {}
 
     def __del__(self) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays

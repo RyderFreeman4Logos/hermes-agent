@@ -1387,7 +1387,7 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
-    _should_fallback = (
+    _should_fallback = _standard_child_can_fallback(agent, reason=classified.reason) or (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)
     )
@@ -1402,9 +1402,7 @@ def route_classified_error(
             else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         if not pool_may_recover and _standard_child_can_fallback(
-            agent,
-            rate_limited=is_rate_limited,
-            billing=classified.reason == FailoverReason.billing,
+            agent, reason=classified.reason,
         ):
             agent._buffer_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             if agent._try_activate_fallback(reason=classified.reason):

@@ -304,15 +304,12 @@ def settle_unrecovered_error(
         # Announce the fallback only when a chain exists, else "trying fallback..." lies
         # before a silent abort.
         if agent._has_pending_fallback() and _standard_child_can_fallback(
-            agent, billing=classified.reason == FailoverReason.billing,
+            agent, reason=classified.reason,
         ):
             _label = _NONRETRYABLE_LABELS.get(classified.reason, f"Non-retryable error (HTTP {status_code})")
             agent._buffer_status(f"⚠️ {_label} — trying fallback...")
         if (
-            not _is_standard_profile_child(agent)
-            and _standard_child_can_fallback(
-                agent, billing=classified.reason == FailoverReason.billing,
-            )
+            _standard_child_can_fallback(agent, reason=classified.reason)
             and agent._try_activate_fallback(reason=classified.reason)
         ):
             # Direct ``return _verdict("break")`` is load-bearing: the restart handler
@@ -344,9 +341,7 @@ def settle_unrecovered_error(
             agent._fallback_activated = False
             return _verdict("continue")
         if _is_standard_profile_child(agent) and not _standard_child_can_fallback(
-            agent,
-            rate_limited=is_rate_limited,
-            billing=classified.reason == FailoverReason.billing,
+            agent, reason=classified.reason,
         ):
             return _verdict("return", max_retries_exhausted_result(
                 agent, api_error, classified, max_retries=max_retries, is_rate_limited=is_rate_limited,

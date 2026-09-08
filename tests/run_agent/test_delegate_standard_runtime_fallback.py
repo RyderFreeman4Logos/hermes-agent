@@ -182,36 +182,119 @@ def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldo
 @pytest.mark.parametrize(
     "error",
     [
-        pytest.param(_HTTPError(401, "unauthorized"), id="401"),
-        pytest.param(_HTTPError(500, "server error"), id="5xx"),
-        pytest.param(TimeoutError("request timed out"), id="timeout"),
+        pytest.param(_HTTPError(402, "billing exhausted"), id="billing-402"),
+        pytest.param(
+            _HTTPError(503, "auth_unavailable: no auth available"),
+            id="auth-unavailable-503",
+        ),
+        pytest.param(ValueError("unexpected provider runtime failure"), id="unexpected-runtime"),
         pytest.param(ConnectionError("network connection failed"), id="network"),
     ],
 )
-def test_standard_child_other_errors_retry_same_route_then_fail(error):
-    agent = _make_standard_child(max_retries=2)
+def test_standard_child_any_execution_error_advances_without_retrying_same_hop(error):
+    """A pre-success child never burns its retry budget on a failed provider hop."""
+    agent = _make_standard_child(max_retries=3)
     calls = []
-    fallback = MagicMock(return_value=False)
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
 
     def api_call(_kwargs):
         calls.append((agent.provider, agent.model))
-        raise error
+        if len(calls) == 1:
+            raise error
+        return _response("fallback result")
 
     with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
         stack.enter_context(
-            patch.object(agent, "_interruptible_api_call", side_effect=api_call)
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, FALLBACK_CHAIN[0]["model"]),
+            )
         )
-        stack.enter_context(patch.object(agent, "_try_activate_fallback", fallback))
+        stack.enter_context(
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, _provider: model,
+            )
+        )
+        stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200000))
         for context in _common_patches(agent):
             stack.enter_context(context)
         result = agent.run_conversation("hello")
 
-    assert result["completed"] is False
-    assert result["failed"] is True
+    assert result["completed"] is True
     assert calls == [
         (PRIMARY["provider"], PRIMARY["model"]),
-        (PRIMARY["provider"], PRIMARY["model"]),
+        (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]),
     ]
+
+
+def test_standard_child_advances_across_multiple_failed_hops_then_succeeds():
+    agent = _make_standard_child(max_retries=3)
+    calls = []
+    fallback_clients = []
+    for entry in FALLBACK_CHAIN:
+        client = MagicMock()
+        client.api_key = "fallback-key"
+        client.base_url = entry["base_url"]
+        client._custom_headers = None
+        client.default_headers = None
+        fallback_clients.append(client)
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) < 3:
+            raise _HTTPError(503, "auth_unavailable: no auth available")
+        return _response("second fallback result")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=[
+                    (fallback_clients[0], FALLBACK_CHAIN[0]["model"]),
+                    (fallback_clients[1], FALLBACK_CHAIN[1]["model"]),
+                ],
+            )
+        )
+        stack.enter_context(
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, _provider: model,
+            )
+        )
+        stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200000))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [
+        (PRIMARY["provider"], PRIMARY["model"]),
+        (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]),
+        (FALLBACK_CHAIN[1]["provider"], FALLBACK_CHAIN[1]["model"]),
+    ]
+
+
+def test_standard_child_cancellation_does_not_activate_fallback():
+    agent = _make_standard_child(max_retries=3)
+    fallback = MagicMock(return_value=True)
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(agent, "_interruptible_api_call", side_effect=KeyboardInterrupt)
+        )
+        stack.enter_context(patch.object(agent, "_try_activate_fallback", fallback))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        with pytest.raises(KeyboardInterrupt):
+            agent.run_conversation("hello")
+
     fallback.assert_not_called()
 
 

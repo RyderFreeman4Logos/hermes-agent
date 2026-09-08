@@ -1828,8 +1828,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if getattr(agent, "_delegate_model_profile", None) == "standard":
         if getattr(agent, "_delegate_has_successful_llm_request", False):
             return False
-        from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
-        if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+        if reason == FailoverReason.content_policy_blocked:
             return False
         saved_until = getattr(agent, "_rate_limited_until", 0)
         saved_backoff = getattr(agent, "_rate_limit_backoff_count", 0)

@@ -4,9 +4,8 @@
 # #213 is foreign excluded. Closed user-drop 14/40/151/150/204/252/267 excluded; not upstream-equivalent.
 # Old published #265 7e6904fd (10 owned on 83467c28; parent 93556c7e; older archive 518972eb on 3340bbbd) is preserved immutable history; this WT is a NEW local metadata candidate vs pin 9516ac13 (one cohesive commit; do not orphan old metadata).
 # v21 history: 26 KEEP live-behavior + 2 test-only #278/#279 + metadata #265 on 83467c28. Past FAIL retained: R9 broad FAIL, v19 final review FAIL, v20 MATRIX_FAIL 14/14, #165 historical security FAIL.
-# This successor: retarget 26 KEEP + #278/#279 onto official pin 9516ac13 (42 product + 2 test owned). #186 MUST 253d2542 (not old local topic da81554e). #182 HEAD 17b3b659 (not failed 12a42749 alone).
-# #278/#279 remotes unpublished on 9516ac13 (still old pin 83467c28) — PENDING; freeze LOCAL exact reviewed heads; do not claim remote-exact/admitted.
-# Counts: 26 KEEP live-behavior (product owned computed below) vs 2 test-only sources (owned 2) vs metadata (not in this file).
+# This successor: retarget 26 KEEP + #278/#279 onto official pin 9516ac13. #62 68a82437 adds delivery-repair. #149 a3793cf5 restack-down only. #160 06b03cd3 test adaptation (product Codex-only unchanged; rejected 7b3b8faf never included). #186 MUST 253d2542. #182 HEAD 17b3b659.
+# Counts: 26 KEEP live-behavior vs 2 test-only sources vs metadata (not in this file). Recompute owned unique; do not assume 47/48.
 # Do not relabel #278/#279 as live-behavior KEEP / product_prs.
 # KEEP #210 loop timing (#190). #227 HMAC-only. #186 insertion caps. No #188/#213 mutation.
 schema_version = 1
@@ -28,9 +27,9 @@ historical_frozen_v21 = "hermes-final-manifest-20260907-frozen-v21-83467.toml"
 historical_frozen_v21_sha256 = "f60cc6e18cbad6292019f46915c0bf3f153b79d7f67bd1e79870249222dc1a9f"
 product_prs = 26
 test_only_prs = 2
-product_owned_unique_commits = 42
+product_owned_unique_commits = 44
 test_only_owned_unique_commits = 2
-owned_unique_commits = 44
+owned_unique_commits = 46
 stacked_deps = 5
 head_overlay_prs = []
 unpublished_heads_adopted = true
@@ -142,30 +141,32 @@ pr = 62
 name = "fix-tui-batch-busy-completion-backlog-into-one"
 title = "fix(tui): batch busy completion backlog into one idle turn"
 branch = "fix/issue61-completion-backlog-batching"
-head = "77afa235d84c6ed7ec9e0ae1b5b4321959c3154f"
-tree = "e15cff47ad086aac20a81dc7ebd9429e032a46e0"
+head = "68a8243782ab6526ec129c51be4c93b4f9300ce7"
+tree = "23e222b48fa134af382d65983d4d52dadc6e22df"
 base_ref = "pin/official-main-9516ac13-20260908"
 base_sha = "9516ac130eed1cfde699452bde56284d5fcbc736"
-parent = "9516ac130eed1cfde699452bde56284d5fcbc736"
+parent = "77afa235d84c6ed7ec9e0ae1b5b4321959c3154f"
 depends_on = []
 required = true
 supersedes = []
 overlay = false
 unique_on_pin = true
-unique_count = 1
-vs_pin_count = 1
+unique_count = 2
+vs_pin_count = 2
 stacked_prereq_count = 0
-owned_diffsha_vs_base = "8416717f48342360dcc58a8c820aaf74a16716f5c58da0370d84ff6c7625ce05"
-owned_diff_bytes_vs_base = 38574
-full_diffsha_vs_pin = "8416717f48342360dcc58a8c820aaf74a16716f5c58da0370d84ff6c7625ce05"
-full_diff_bytes_vs_pin = 38574
+owned_diffsha_vs_base = "a337f6c0bce365419b7aacfbfce8a47742bed32ed19caecb971ac14c3c16ce86"
+owned_diff_bytes_vs_base = 38689
+full_diffsha_vs_pin = "a337f6c0bce365419b7aacfbfce8a47742bed32ed19caecb971ac14c3c16ce86"
+full_diff_bytes_vs_pin = 38689
 owned_commits = [
   "77afa235d84c6ed7ec9e0ae1b5b4321959c3154f",
+  "68a8243782ab6526ec129c51be4c93b4f9300ce7",
 ]
 owned_subjects = [
   "fix(tui): coalesce busy completions and ACK steered ingest",
+  "fix(tui): keep official post-turn completion batch off live poller buffer",
 ]
-notes = "unique-on-pin 1 after unwind from #151; steer/ACK coalesce kept; child-silence owned by #149; published exact on 9516ac13"
+notes = "unique-on-pin 2 after unwind from #151 plus delivery-repair 68a82437; steer/ACK coalesce kept; deferred is None live poller; child-silence owned by #149; published exact on 9516ac13"
 
 [[patch]]
 order = 4
@@ -204,30 +205,30 @@ pr = 149
 name = "fix-delegate-silence-routine-child-command-tail"
 title = "fix(delegate): silence routine child command-tail completions"
 branch = "topic/141-child-tail-silence-20260819"
-head = "5e63ba84e13219d34705b215e908fd8d9cfbc054"
-tree = "8d77dae93549d7fed9387b11c126e754e11e2615"
+head = "a3793cf5ea996c92c32366e7510dc12f179f5369"
+tree = "ef643932db58ab83d0bae177f4726591fca8a3a4"
 base_ref = "fix/issue61-completion-backlog-batching"
-base_sha = "77afa235d84c6ed7ec9e0ae1b5b4321959c3154f"
-parent = "77afa235d84c6ed7ec9e0ae1b5b4321959c3154f"
+base_sha = "68a8243782ab6526ec129c51be4c93b4f9300ce7"
+parent = "68a8243782ab6526ec129c51be4c93b4f9300ce7"
 depends_on = [62]
 required = true
 supersedes = []
 overlay = false
 unique_on_pin = false
 unique_count = 1
-vs_pin_count = 2
+vs_pin_count = 3
 stacked_prereq_count = 1
-owned_diffsha_vs_base = "c501b5b98b0e9c932b13ddf6d4ec20c0b6d1c6ff7feac97bfd8946a5b96816b8"
+owned_diffsha_vs_base = "532ad24538db5f51cd996d4e8bcadf8f9044c867af4976ea7fbccd873c6e2454"
 owned_diff_bytes_vs_base = 22265
-full_diffsha_vs_pin = "6dad9a792c46e8242e0a18a48ea9680b5f1430c6e50d711de877dcaef4af293f"
-full_diff_bytes_vs_pin = 59160
+full_diffsha_vs_pin = "cb54e0bee51e70c39ccbfa229c0b6d58deec8e3c5b3ebed5b993b9e1ee1402f8"
+full_diff_bytes_vs_pin = 59275
 owned_commits = [
-  "5e63ba84e13219d34705b215e908fd8d9cfbc054",
+  "a3793cf5ea996c92c32366e7510dc12f179f5369",
 ]
 owned_subjects = [
   "fix(delegate): silence routine child command-tail completions",
 ]
-notes = "stacked on #62; owned 1 excludes #62 prefix; silence routine child success before #62 fan-in; fail-open otherwise; published exact on 9516ac13"
+notes = "restack-down onto repaired #62 68a82437; owned 1 excludes #62 prefix (no duplicate 62); silence routine child success before #62 fan-in; fail-open otherwise; published exact on 9516ac13"
 
 [[patch]]
 order = 6
@@ -359,30 +360,32 @@ pr = 160
 name = "fix-auxiliary-preserve-configured-fallback-dest"
 title = "fix(auxiliary): preserve configured fallback destinations"
 branch = "topic/159-aux-codex-dest-live-20260820"
-head = "7a698b7b4edb41ad2ef3548b640f412447fdb148"
-tree = "60baed7b2ebad3d996f23de70f5609a546e76e8f"
+head = "06b03cd399df8f7737422e47e87d927b18e4e9e5"
+tree = "8a0368eb9f4398cfc4653f57e14475221c3b7ed8"
 base_ref = "topic/163-aux-concurrency-20260821"
 base_sha = "36dfee0b7cc1cc331d35eda79b96d0124db613c6"
-parent = "36dfee0b7cc1cc331d35eda79b96d0124db613c6"
+parent = "7a698b7b4edb41ad2ef3548b640f412447fdb148"
 depends_on = [165]
 required = true
 supersedes = []
 overlay = false
 unique_on_pin = false
-unique_count = 1
-vs_pin_count = 2
+unique_count = 2
+vs_pin_count = 3
 stacked_prereq_count = 1
-owned_diffsha_vs_base = "61c9ff5766397cf4cbf15c6112c4dbfa2b44e01939109df083aafe016842166b"
-owned_diff_bytes_vs_base = 37588
-full_diffsha_vs_pin = "1332303e235ef559926e12c84473ffb99aeb5c3d0a6391d1422d5944f014c2b1"
-full_diff_bytes_vs_pin = 68801
+owned_diffsha_vs_base = "6d4eb9e573b96c06f05d194f54c45c7452cc86d2387fa1ee552de138f24d0f89"
+owned_diff_bytes_vs_base = 43095
+full_diffsha_vs_pin = "18f4eb9b1b1b2ce49baa1e1336dd25961f1418c466cfee848a67089cfbf7959b"
+full_diff_bytes_vs_pin = 74308
 owned_commits = [
   "7a698b7b4edb41ad2ef3548b640f412447fdb148",
+  "06b03cd399df8f7737422e47e87d927b18e4e9e5",
 ]
 owned_subjects = [
   "fix(auxiliary): keep configured fallback destinations on Codex",
+  "test(auxiliary): keep Codex-only billing cache isolation",
 ]
-notes = "stacked on #165; owned 1 excludes #165 prefix; keep configured fallback destinations on Codex; published exact on 9516ac13"
+notes = "stacked on #165; owned 2 excludes #165 prefix; test adaptation adds Codex billing cache isolation; product Codex-only unchanged; rejected 7b3b8faf never included; published exact on 9516ac13"
 
 [[patch]]
 order = 11

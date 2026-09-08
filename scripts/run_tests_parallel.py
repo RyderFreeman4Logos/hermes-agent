@@ -181,6 +181,31 @@ def _linux_watch_lost(poller, stdin_fd: int) -> bool:
         return True
 
 
+def _linux_payload_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Drop user-session bus coordinates from the contained pytest env."""
+    return {
+        key: value
+        for key, value in environment.items()
+        if key not in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+    }
+
+
+def _linux_isolated_pytest_cmd(cmd: List[str], path: str | None) -> List[str] | None:
+    """Hide /run (default session bus) using the existing stage2 bwrap shape."""
+    bwrap = shutil.which("bwrap", path=path) or shutil.which("bwrap")
+    if not bwrap:
+        return None
+    return [
+        bwrap,
+        "--die-with-parent",
+        "--bind", "/", "/",
+        "--dev-bind", "/dev", "/dev",
+        "--tmpfs", "/run",
+        "--",
+        *cmd,
+    ]
+
+
 def _linux_supervise(repo_root: str, completion_path: str, cmd: List[str]) -> int:
     """Run one test and let its systemd cgroup die with this supervisor."""
     import select
@@ -196,8 +221,12 @@ def _linux_supervise(repo_root: str, completion_path: str, cmd: List[str]) -> in
         return 1
     if not _linux_enable_subreaper():
         return 1
+    payload_env = _linux_payload_environment(environment)
+    isolated = _linux_isolated_pytest_cmd(cmd, payload_env.get("PATH") or environment.get("PATH"))
+    if isolated is None:
+        return 1
     before_events = _read_linux_resource_events()
-    child = subprocess.Popen(cmd, cwd=repo_root, env=environment, stdin=subprocess.DEVNULL)
+    child = subprocess.Popen(isolated, cwd=repo_root, env=payload_env, stdin=subprocess.DEVNULL)
     stdin_fd = sys.stdin.fileno()
     poller = select.poll()
     poller.register(stdin_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
@@ -335,7 +364,7 @@ def _spawn_test_process(
         raise
     os.close(watch_r)
     try:
-        payload = json.dumps(env).encode("utf-8") + b"\n"
+        payload = json.dumps(_linux_payload_environment(env)).encode("utf-8") + b"\n"
         deadline = deadline or time.monotonic() + _LINUX_CLEANUP_SECONDS
         os.set_blocking(watch_w, False)
         import select

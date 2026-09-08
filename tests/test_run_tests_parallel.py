@@ -1256,6 +1256,102 @@ def test_direct_linux_runner_keeps_secrets_out_of_launcher_argv(tmp_path: Path) 
     assert secret not in proc.stdout
 
 
+def test_payload_env_omits_session_bus_and_wraps_bwrap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Launcher keeps bus coords; pytest env and default /run socket do not."""
+    runner = _load_runner_module()
+    captured: dict[str, object] = {}
+
+    class ImmediateChild:
+        def poll(self) -> int:
+            return 0
+
+        returncode = 0
+
+    def popen(cmd: object, **kwargs: object) -> ImmediateChild:
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        return ImmediateChild()
+
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(runner, "_linux_enable_subreaper", lambda: True)
+    monkeypatch.setattr(
+        runner,
+        "_read_linux_resource_events",
+        lambda: {field: 0 for field in runner._LINUX_RESOURCE_EVENT_FIELDS},
+    )
+    monkeypatch.setattr(runner, "_linux_terminate_and_reap_descendants", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        runner.shutil,
+        "which",
+        lambda name, path=None: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    payload = json.dumps({
+        "PATH": "/usr/bin:/bin",
+        "XDG_RUNTIME_DIR": "/run/user/1001",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1001/bus",
+        "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
+    }) + "\n"
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, payload.encode())
+    os.close(write_fd)
+    stdin_file = os.fdopen(read_fd)
+    monkeypatch.setattr(sys, "stdin", stdin_file)
+    completion = tmp_path / "completion.json"
+    try:
+        rc = runner._linux_supervise(str(tmp_path), str(completion), [sys.executable, "-c", "pass"])
+    finally:
+        stdin_file.close()
+    env = captured["env"]
+    cmd = captured["cmd"]
+    assert rc == 0
+    assert isinstance(env, dict)
+    assert "DBUS_SESSION_BUS_ADDRESS" not in env
+    assert "XDG_RUNTIME_DIR" not in env
+    assert isinstance(cmd, list)
+    assert cmd[0] == "/usr/bin/bwrap"
+    assert "--tmpfs" in cmd and "/run" in cmd
+    assert cmd[-3:] == [sys.executable, "-c", "pass"]
+
+
+def test_missing_bwrap_fails_closed_without_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Isolation setup failure must not start pytest or write a green receipt."""
+    runner = _load_runner_module()
+    spawned: list[object] = []
+
+    class ImmediateChild:
+        def poll(self) -> int:
+            return 0
+
+        returncode = 0
+
+    def popen(*args: object, **kwargs: object) -> ImmediateChild:
+        spawned.append(args)
+        return ImmediateChild()
+
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(runner, "_linux_enable_subreaper", lambda: True)
+    monkeypatch.setattr(runner.shutil, "which", lambda name, path=None: None)
+    payload = json.dumps({"PATH": str(tmp_path / "empty")}) + "\n"
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, payload.encode())
+    os.close(write_fd)
+    stdin_file = os.fdopen(read_fd)
+    monkeypatch.setattr(sys, "stdin", stdin_file)
+    completion = tmp_path / "completion.json"
+    try:
+        rc = runner._linux_supervise(str(tmp_path), str(completion), [sys.executable, "-c", "pass"])
+    finally:
+        stdin_file.close()
+    assert rc == 1
+    assert spawned == []
+    assert not completion.exists()
+
+
 def test_typed_exit4_for_existing_file_can_retry_to_green(tmp_path: Path) -> None:
     """Preserve the intentional loaded-runner exit-4 retry contract."""
     proc, attempts = _run_fake_systemd_retry(tmp_path, "typed-exit4")

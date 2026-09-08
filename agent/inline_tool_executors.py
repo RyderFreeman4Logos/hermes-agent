@@ -111,6 +111,23 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
 
 
 def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
+    if getattr(agent, "_memory_provider_mode", "hybrid") == "authoritative":
+        if agent._memory_manager:
+            result = agent._memory_manager.authoritative_memory_write(
+                args,
+                metadata=agent._build_memory_write_metadata(
+                    task_id=ctx.effective_task_id,
+                    tool_call_id=ctx.tool_call_id,
+                ),
+            )
+        else:
+            result = json.dumps({
+                "success": False,
+                "error": "Authoritative memory provider is unavailable.",
+                "error_class": "provider_unavailable",
+                "provider_mode": "authoritative",
+            })
+        return result
     result = _call_tool(
         "tools.memory_tool", "memory_tool", args,
         (
@@ -120,8 +137,8 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
         store=agent._memory_store,
     )
     # Mirror built-in memory writes to external providers; gating lives in
-    # MemoryManager.notify_memory_tool_write.
-    if agent._memory_manager:
+    # MemoryManager.notify_memory_tool_write. Authoritative mode never mirrors.
+    if getattr(agent, "_memory_provider_mode", "hybrid") != "authoritative" and agent._memory_manager:
         agent._memory_manager.notify_memory_tool_write(
             result,
             args,

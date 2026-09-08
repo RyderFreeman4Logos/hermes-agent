@@ -230,6 +230,14 @@ def _workdir_row_model_config(session: dict) -> tuple[str, dict]:
     # Same ``_branched_from`` marker the TUI /branch uses (list_sessions_rich + sidebar nesting).
     if parent_session_id := session.get("parent_session_id"):
         model_config["_branched_from"] = parent_session_id
+    try:
+        from tools.memory_tool import get_memory_provider_mode
+        memory_config = _load_cfg().get("memory", {})
+        mode = get_memory_provider_mode(memory_config if isinstance(memory_config, dict) else {})
+        if mode in {"authoritative", "hybrid"}:
+            model_config["memory_provider_mode"] = mode
+    except Exception:
+        logger.debug("memory provider mode stamp failed", exc_info=True)
     # Bot-Mode canonical chats / room plumbing are plugin-owned scratch conversations whose runtime must ALWAYS follow
     # the member profile's CURRENT config, never the provider pinned at first write (see _stored_session_runtime_overrides).
     for flag in ("room_plumbing", "follow_profile_config"):

@@ -625,8 +625,9 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
-    if evt_type == "completion":
-        # Buffer completions off the shared queue; flush coalesces to one ingest.
+    if evt_type == "completion" and deferred is None:
+        # Live poller only: buffer off the shared queue; flush coalesces to one ingest.
+        # Post-turn/shutdown drains pass deferred=[] and keep the official batch path.
         with session["history_lock"]:
             session.setdefault("_completion_pending", []).append(evt)
         return True

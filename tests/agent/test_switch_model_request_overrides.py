@@ -115,3 +115,163 @@ def test_switch_endpoint_mismatch_does_not_inherit():
     )
     arh._apply_switched_provider_request_overrides(a, "custom:main-think")
     assert "extra_body" not in a.request_overrides  # base_url mismatch -> cleared
+
+
+def test_failed_switch_restores_original_request_overrides_deeply():
+    """Failed client rebuild must restore the nested override graph, not an alias."""
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "openrouter"
+    agent.model = "x-ai/grok-4"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.api_key = "or-key-original"
+    agent.api_mode = "chat_completions"
+    agent.client = MagicMock(name="OriginalOpenRouterClient")
+    agent._client_kwargs = {
+        "api_key": "or-key-original",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    agent.context_compressor = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = None
+    agent._anthropic_client = None
+    agent._is_anthropic_oauth = False
+    agent._cached_system_prompt = "cached"
+    agent._primary_runtime = {}
+    agent._fallback_activated = False
+    agent._fallback_index = 0
+    agent._fallback_chain = []
+    agent._fallback_model = None
+    agent._config_context_length = None
+    agent.runtime_capabilities = {"native_compaction": False}
+    original = {"extra_body": {"nested": {"value": "primary"}}}
+    agent.request_overrides = original
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("simulated client build failure")
+
+    agent._create_openai_client = boom
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        with pytest.raises(RuntimeError, match="simulated client build failure"):
+            agent.switch_model(
+                new_model="openai/gpt-5",
+                new_provider="openai-codex",
+                api_key="codex-key-new",
+                base_url="https://chatgpt.com/backend-api/codex/responses",
+                api_mode="chat_completions",
+            )
+
+    assert agent.request_overrides == original
+    agent.request_overrides["extra_body"]["nested"]["value"] = "mutated"
+    assert original["extra_body"]["nested"]["value"] == "primary"
+
+
+def test_copy_request_overrides_hostile_deepcopy_does_not_poison_snapshot():
+    """Hostile __deepcopy__ must not leave rollback without a usable override dict."""
+    class HostileCopy:
+        def __deepcopy__(self, _memo):
+            raise ValueError("hostile")
+
+        def __repr__(self):
+            return "PAYLOAD-SENTINEL-41"
+
+    nested = {"owned": True, "hostile": HostileCopy()}
+    copied = arh._copy_request_overrides(nested)
+    assert copied is not nested
+    assert copied["owned"] is True
+    copied["owned"] = False
+    assert nested["owned"] is True
+
+
+def test_primary_runtime_snapshot_deep_copies_request_overrides():
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    agent.model = "m"
+    agent.provider = "p"
+    agent.requested_provider = "p"
+    agent.base_url = "https://example.invalid/v1"
+    agent.api_mode = "chat_completions"
+    agent.api_key = "k"
+    agent._client_kwargs = {"api_key": "k"}
+    agent._use_prompt_caching = False
+    agent._use_native_cache_layout = False
+    agent.reasoning_config = None
+    agent._reasoning_echo_flag = False
+    original = {"extra_body": {"nested": {"value": 1}}}
+    agent.request_overrides = original
+    agent.runtime_capabilities = {}
+    agent.context_compressor = None
+    rt = arh._build_primary_runtime_snapshot(agent, "chat_completions")
+    assert rt["request_overrides"] == original
+    rt["request_overrides"]["extra_body"]["nested"]["value"] = 2
+    assert original["extra_body"]["nested"]["value"] == 1
+
+
+def test_failed_fallback_restores_original_request_overrides_deeply():
+    """Failed fallback after extra_body rescope must restore the nested graph."""
+    from unittest.mock import MagicMock, patch
+
+    from agent.chat_completion_helpers import try_activate_fallback
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "openrouter"
+    agent.model = "x-ai/grok-4"
+    agent.requested_provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.api_mode = "chat_completions"
+    agent.api_key = "or-key"
+    agent.client = MagicMock(name="OriginalClient")
+    agent._client_kwargs = {"api_key": "or-key", "base_url": agent.base_url}
+    agent.context_compressor = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = None
+    agent._anthropic_client = None
+    agent._is_anthropic_oauth = False
+    agent._config_context_length = None
+    agent._reasoning_echo_flag = False
+    agent._transport_cache = {}
+    agent._fallback_activated = False
+    agent._fallback_index = 0
+    agent._fallback_chain = [{"provider": "xai", "model": "grok-4.5", "base_url": "https://api.x.ai/v1"}]
+    agent._fallback_model = None
+    agent._unavailable_fallback_keys = set()
+    agent._primary_runtime = {
+        "provider": "openrouter",
+        "request_overrides": {"extra_body": {"nested": {"value": "primary"}}},
+    }
+    original = {"extra_body": {"nested": {"value": "primary"}}}
+    agent.request_overrides = original
+    agent._custom_providers = []
+    agent._print_fn = lambda *_a, **_k: None
+    agent._buffer_status = lambda *_a, **_k: None
+    agent._anthropic_prompt_cache_policy = lambda **_k: (False, False)
+    agent._ensure_lmstudio_runtime_loaded = lambda: None
+    agent.runtime_capabilities = {}
+    fb_client = MagicMock()
+    fb_client.base_url = "https://api.x.ai/v1"
+    fb_client.api_key = "fb-key"
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(fb_client, "grok-4.5"),
+    ), patch(
+        "hermes_cli.model_normalize.normalize_model_for_provider",
+        side_effect=lambda m, p: m,
+    ), patch(
+        "agent.chat_completion_helpers._rescope_fallback_extra_body",
+        side_effect=RuntimeError("simulated fallback extra_body failure"),
+    ):
+        assert try_activate_fallback(agent) is False
+
+    assert agent.request_overrides == original
+    agent.request_overrides["extra_body"]["nested"]["value"] = "mutated"
+    assert original["extra_body"]["nested"]["value"] == "primary"
+    assert agent._primary_runtime["request_overrides"]["extra_body"]["nested"]["value"] == "primary"
+    agent._primary_runtime["request_overrides"]["extra_body"]["nested"]["value"] = "poison"
+    assert original["extra_body"]["nested"]["value"] == "primary"

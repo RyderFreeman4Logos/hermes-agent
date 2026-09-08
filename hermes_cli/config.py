@@ -1231,6 +1231,19 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                    f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                    f"Move '{key}' under the appropriate section")
 
+    delegation_cfg = config.get("delegation")
+    if isinstance(delegation_cfg, dict):
+        pool = delegation_cfg.get("model_pool")
+        if isinstance(pool, dict) and pool:
+            names = [str(name) for name in pool if str(name).strip()]
+            if "standard" not in names:
+                _issue(
+                    issues, "error",
+                    "delegation.model_pool is non-empty but has no 'standard' profile",
+                    "Add an explicit standard profile, or remove model_pool. "
+                    "YAML key order is not a routing default.",
+                )
+
     _validate_web_backends(config, issues)
     return issues
 

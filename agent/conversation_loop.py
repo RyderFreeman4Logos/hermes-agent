@@ -478,12 +478,8 @@ def _is_standard_profile_child(agent) -> bool:
     return getattr(agent, "_delegate_model_profile", None) == "standard"
 
 
-def _standard_child_has_successful_llm_request(agent) -> bool:
-    return bool(getattr(agent, "_delegate_has_successful_llm_request", False))
-
-
 def _standard_child_can_fallback(agent, *, reason=None) -> bool:
-    """Permit a pre-success standard child to advance after any provider execution error.
+    """Permit a standard child to advance after the current provider execution error.
 
     Content-policy rejections are deliberate safety denials for this exact prompt, not
     provider availability failures, so they remain terminal. Cancellation and shutdown
@@ -492,10 +488,7 @@ def _standard_child_can_fallback(agent, *, reason=None) -> bool:
     if not _is_standard_profile_child(agent):
         return True
     from agent.error_classifier import FailoverReason
-    return (
-        reason != FailoverReason.content_policy_blocked
-        and not _standard_child_has_successful_llm_request(agent)
-    )
+    return reason != FailoverReason.content_policy_blocked
 
 
 def _billing_or_entitlement_message(

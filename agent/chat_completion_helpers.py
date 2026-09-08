@@ -1826,8 +1826,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     if getattr(agent, "_delegate_model_profile", None) == "standard":
-        if getattr(agent, "_delegate_has_successful_llm_request", False):
-            return False
         if reason == FailoverReason.content_policy_blocked:
             return False
         saved_until = getattr(agent, "_rate_limited_until", 0)

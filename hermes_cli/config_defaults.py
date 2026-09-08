@@ -46,6 +46,11 @@ DEFAULT_CONFIG = {
         # terminal's session (tmux/kitty/wezterm pane, tty). false = resume globally most-recent.
         "terminal_continue": True,
     },
+    # Opt-in HMAC digests of adjacent physical attempts. Default off: no observability dir,
+    # no raw payloads/headers/cookies/URLs. See agent/physical_attempt_diagnostics.py.
+    "observability": {
+        "physical_attempt_digests": {"enabled": False},
+    },
     "agent": {
         # Turn cap. null = unlimited (default; caps caused silent mid-task truncation). Positive int
         # caps; "none"/"unlimited"/"inf"/0/-1 also mean unlimited (resolve_turn_limit).
@@ -54,6 +59,8 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Include previous/current loop timestamps in the API-only context.
+        "loop_timing_context": True,
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
@@ -271,6 +278,7 @@ DEFAULT_CONFIG = {
         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.
         "font_family": "",
         "timeout": 180,
+        "auto_background_timeout_threshold": 200,
         # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons). 0
         # = SIGTERM only.
         "daemon_term_grace_seconds": 2.0,

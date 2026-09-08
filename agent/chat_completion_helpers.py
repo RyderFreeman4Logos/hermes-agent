@@ -27,6 +27,7 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (FailoverReason, PROVIDER_STREAM_NON_JSON_ERROR_CODE)
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
@@ -2043,6 +2044,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    if getattr(agent, "_delegate_model_profile", None) == "standard":
+        if getattr(agent, "_delegate_has_successful_llm_request", False):
+            return False
+        if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+            return False
+        saved_until = getattr(agent, "_rate_limited_until", 0)
+        saved_backoff = getattr(agent, "_rate_limit_backoff_count", 0)
+        try:
+            activated = _try_activate_fallback_unlocked(agent, reason)
+        finally:
+            agent._rate_limited_until = saved_until
+            agent._rate_limit_backoff_count = saved_backoff
+        return activated
+    return _try_activate_fallback_unlocked(agent, reason)
+
+
+def _try_activate_fallback_unlocked(agent, reason: "FailoverReason | None" = None) -> bool:
     _arm_rate_limit_cooldown(agent, reason)
     if agent._fallback_index >= len(agent._fallback_chain):
         return _fallback_chain_exhausted(agent, reason)
@@ -2057,6 +2075,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
         return agent._try_activate_fallback(reason)
 
+    override_snapshot = None
     try:
         from agent.auxiliary_client import resolve_provider_client
         from hermes_cli.fallback_config import resolve_entry_api_key
@@ -2088,6 +2107,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
         old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+        from agent.agent_runtime_helpers import _copy_request_overrides
+        live_overrides = getattr(agent, "request_overrides", {}) or {}
+        override_snapshot = _copy_request_overrides(live_overrides)
+        if not getattr(agent, "_fallback_activated", False):
+            primary_runtime = getattr(agent, "_primary_runtime", None)
+            if isinstance(primary_runtime, dict):
+                # First fallback must freeze the pre-rescope graph so restore_primary_runtime
+                # cannot pick up extra_body mutated by _rescope_fallback_extra_body.
+                primary_runtime["request_overrides"] = _copy_request_overrides(live_overrides)
 
         # Clear the per-config context_length override so the fallback model's own context
         # window is resolved instead of the previous model's stale value.
@@ -2131,6 +2159,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
         return True
     except Exception as e:
+        if override_snapshot is not None:
+            with contextlib.suppress(Exception):
+                agent.request_overrides = override_snapshot
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
@@ -3348,6 +3379,9 @@ class _StreamingCall:
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    self.result["error"] = e
+                    return
                 except Exception as e:
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
@@ -3560,6 +3594,8 @@ class _StreamingCall:
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
         if self.result["error"] is not None:
+            if isinstance(self.result["error"], StreamPayloadBoundExceeded):
+                raise self.result["error"]
             if self.deltas_were_sent["yes"]:
                 return self._partial_stream_stub()
             raise self.result["error"]

@@ -118,6 +118,16 @@ class MemoryProvider(ABC):
         """Handle one of this provider's tools; must return a JSON string."""
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
 
+    def authoritative_memory_write(self, request: Dict[str, Any], **kwargs) -> str:
+        """Apply the core memory write atomically in the provider backend.
+
+        Providers must opt into authoritative CRUD explicitly. The generic
+        tool dispatcher is intentionally not a fallback.
+        """
+        raise NotImplementedError(
+            f"Provider {self.name} does not implement authoritative memory writes"
+        )
+
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""
 

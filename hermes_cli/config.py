@@ -1096,7 +1096,7 @@ _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 # runtime_provider.py and auxiliary_client.py).
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
-    "context_length", "rate_limit_delay", "extra_body",
+    "context_length", "rate_limit_delay", "extra_body", "send_session_id",
     "ssl_ca_cert", "ssl_verify", "key_env"}
 
 # Fields that look like they should be inside custom_providers, not at root
@@ -1251,6 +1251,19 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             _issue(issues, "warning",
                    f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                    f"Move '{key}' under the appropriate section")
+
+    delegation_cfg = config.get("delegation")
+    if isinstance(delegation_cfg, dict):
+        pool = delegation_cfg.get("model_pool")
+        if isinstance(pool, dict) and pool:
+            names = [str(name) for name in pool if str(name).strip()]
+            if "standard" not in names:
+                _issue(
+                    issues, "error",
+                    "delegation.model_pool is non-empty but has no 'standard' profile",
+                    "Add an explicit standard profile, or remove model_pool. "
+                    "YAML key order is not a routing default.",
+                )
 
     _validate_web_backends(config, issues)
     return issues

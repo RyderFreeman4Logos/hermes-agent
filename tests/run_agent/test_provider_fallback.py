@@ -505,3 +505,23 @@ class TestFallbackExtraBodyReResolution:
         agent.request_overrides["temperature"] = 0.2
         self._activate(agent)
         assert agent.request_overrides.get("temperature") == 0.2
+
+    def test_first_fallback_freezes_pre_rescope_primary_overrides(self):
+        """Live contract: failed/restored fallback keeps original nested overrides."""
+        agent = self._agent_with_custom_providers()
+        original = agent.request_overrides
+        original["extra_body"] = dict(original["extra_body"])
+        original["extra_body"]["nested"] = {"value": "primary"}
+        agent._primary_runtime = {
+            "provider": agent.provider,
+            "request_overrides": original,
+        }
+        self._activate(agent)
+        frozen = agent._primary_runtime["request_overrides"]
+        assert frozen["extra_body"]["nested"]["value"] == "primary"
+        assert "old_only" in frozen["extra_body"]
+        assert frozen is not original
+        frozen["extra_body"]["nested"]["value"] = "poison"
+        assert original["extra_body"]["nested"]["value"] == "primary"
+        live = agent.request_overrides.get("extra_body") or {}
+        assert "old_only" not in live

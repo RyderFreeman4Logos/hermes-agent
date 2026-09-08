@@ -31,7 +31,7 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
 )
-from hermes_state import SessionDB
+from hermes_state import SessionDB, _default_db_path
 
 
 def _make_mock_parent(depth=0):
@@ -110,9 +110,14 @@ class TestDelegateRequirements(unittest.TestCase):
             "respond in Chinese",  # language example (weak models regress without it)
             "SELF-REPORTS",        # verification contract
             "clarify",             # child blocked-tool list
-            "delegation.provider", # model inheritance / pinning
+            "model_profile",       # pool routing (omitted uses standard)
+            "standard",            # required pool profile
+            "fail closed",         # unknown names / pool without standard
         ):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
+        # Runtime provider pinning still lives in delegate_tool_config/docs;
+        # the compact top-level text now carries the model_pool contract.
+        self.assertNotIn("delegation.provider", desc)
         # send_message must NOT be named: gateway-internal vocabulary most
         # sessions never see (still enforced via DELEGATE_BLOCKED_TOOLS).
         self.assertNotIn("send_message", desc)
@@ -413,8 +418,18 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
-                self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                # acquire() resolves; SessionDB stores the given path. Same FILE,
+                # not lexical str() equality (TMPDIR may be a symlink).
+                child_path = Path(child_db.db_path).resolve()
+                parent_path = Path(parent_db.db_path).resolve()
+                self.assertTrue(
+                    child_path.samefile(parent_path),
+                    f"child {child_db.db_path} is not the same file as parent {parent_db.db_path}",
+                )
+                self.assertNotEqual(
+                    child_path,
+                    Path(_default_db_path()).resolve(),
+                    "child dedicated handle must not target the launch-profile default state.db",
                 )
             finally:
                 if child_db is not None:
@@ -537,6 +552,7 @@ class TestDelegateObservability(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.model = "claude-sonnet-4-6"
+            mock_child._delegate_has_successful_llm_request = True
             mock_child.session_prompt_tokens = 5000
             mock_child.session_completion_tokens = 1200
             mock_child.run_conversation.return_value = {
@@ -1362,6 +1378,63 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
+
+    def test_non_xai_child_drops_xai_billing_terminal(self):
+        """A DeepSeek child must not relay an xAI billing terminal from its parent (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "deepseek-v4-flash"
+        child.provider = "deepseek"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Billing or credits exhausted: xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+
+    def test_standard_child_hides_unverified_xai_fallback_terminal(self):
+        """A standard child must not relay an xAI fallback's unverified terminal (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "grok-4.6"
+        child.provider = "xai-oauth"
+        child._delegate_model_profile = "standard"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Provider reported usage/credit exhaustion (unverified): xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "billing_unverified": True,
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertIsNone(result["model"])
 
 
 class TestDelegateHeartbeat(unittest.TestCase):
@@ -2236,6 +2309,29 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _resolve_delegation_credentials(cfg, parent)
         self.assertIn("missing-acp-binary", str(ctx.exception))
+
+
+class TestStandardProfileAttached(unittest.TestCase):
+    """Standard-tier runtime policy flags must ride on delegate children."""
+
+    def test_standard_profile_is_attached_to_child_runtime(self):
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test standard profile attach",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                model_profile="standard",
+            )
+        child = MockAgent.return_value
+        self.assertEqual(child._delegate_model_profile, "standard")
+        self.assertIs(child._delegate_has_successful_llm_request, False)
 
 
 if __name__ == "__main__":

@@ -2412,12 +2412,17 @@ def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode
 
 
 def _record_route_info(
-    route_info: Optional[Dict[str, str]], provider: Optional[str], model: Optional[str]
+    route_info: Optional[Dict[str, Any]],
+    provider: Optional[str],
+    model: Optional[str],
+    fallback_label: Optional[str] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
         route_info["provider"] = provider or "auto"
         route_info["model"] = model or "default"
+        if fallback_label and str(fallback_label).startswith("fallback_chain["):
+            route_info["fallback_label"] = fallback_label
 
 
 def _relay_auxiliary_metadata(
@@ -2843,7 +2848,9 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
 
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider", "session_id", "cache_scope",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3365,12 +3372,7 @@ def _prepare_same_provider_retry(
         base_url=retry_base or resolved_base_url, task=task,
     )
     # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
-    if extra_headers:
-        # Copilot's ``x-initiator: user``) across the rebuilt-client retry — dropping them here would let a
-        # recovery retry silently lose capability gating (#60293).
-        # Preserve per-request attribution headers across the rebuilt-client retry — see the sync variant
-        # above (#60293).
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+    _merge_auxiliary_extra_headers(retry_kwargs, extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return retry_client, retry_kwargs
@@ -3523,6 +3525,26 @@ def _fallback_provider_from_label(label: str) -> str:
     """Recover the provider identifier from a fallback display label."""
     match = re.match(r"(?:fallback_chain\[\d+\]|fallback_providers\[\d+\]|main-agent)\(([^)]+)\)$", label or "")
     return match.group(1).strip() if match else str(label or "").strip()
+
+
+def _is_codex_provider(provider: Optional[str]) -> bool:
+    return _normalize_aux_provider(provider) == "openai-codex"
+
+
+def _record_codex_skip(route_info: Optional[Dict[str, Any]], reason: str) -> None:
+    """Keep one scalar reason when a configured Codex candidate is skipped."""
+    if route_info is not None and "codex_skip_reason" not in route_info:
+        route_info["codex_skip_reason"] = reason
+
+
+def _next_configured_fallback_index(label: str) -> Optional[int]:
+    """Return the entry after a configured-chain label, if it has one."""
+    if not str(label).startswith("fallback_chain["):
+        return None
+    try:
+        return int(label.split("[", 1)[1].split("]", 1)[0]) + 1
+    except (IndexError, ValueError):
+        return None
 
 
 class _FallbackDestination(NamedTuple):
@@ -3755,10 +3777,11 @@ async def _call_fallback_candidate_async(
 
 
 def _try_payment_fallback(
-    failed_provider: str, task: str = None, reason: str = "payment error"
+    failed_provider: str, task: str = None, reason: str = "payment error",
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try the auto-detection chain after a payment/credit or connection error, skipping the failed
-    provider (and the main-provider path when it maps to the same backend). Returns (client, model, label) or (None, None, "")."""
+    """Try remaining Codex providers after a payment/credit or connection error.
+    Non-Codex destinations are skipped (#160). Returns (client, model, label) or (None, None, "")."""
     skip = failed_provider.lower().strip()
     main_provider = _read_main_provider()
     skip_labels = {skip}
@@ -3768,6 +3791,10 @@ def _try_payment_fallback(
     tried = []
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
+            continue
+        if not _is_codex_provider(label):
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
             continue
         if _is_provider_unhealthy(label):
             _log_skip_unhealthy(label, task)
@@ -3802,7 +3829,7 @@ def _failed_backend_skip(failed_provider: str, failed_model: Optional[str]) -> C
 
 def _try_main_agent_model_fallback(
     failed_provider: str, task: str = None, reason: str = "error",
-    failed_model: Optional[str] = None,
+    failed_model: Optional[str] = None, route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the main agent provider + model after the configured chain is exhausted.
     ``failed_model`` scoping per ``_failed_backend_skip``; same-URL custom endpoints serve many models,
@@ -3816,6 +3843,9 @@ def _try_main_agent_model_fallback(
             return None, None, ""
         main_provider, main_model = _agg_provider, _agg_model
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
+        return None, None, ""
+    if not _is_codex_provider(main_provider):
+        _record_codex_skip(route_info, "unavailable")
         return None, None, ""
     if _failed_backend_skip(failed_provider, failed_model)(main_provider, main_model):
         return None, None, ""
@@ -3887,11 +3917,12 @@ def _context_too_small(
 
 
 def _try_configured_fallback_chain(
-    task: str, failed_provider: str, reason: str = "error", failed_model: Optional[str] = None
+    task: str, failed_provider: str, reason: str = "error", failed_model: Optional[str] = None,
+    start_index: int = 0, route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
-    ``failed_model`` scoping per ``_failed_backend_skip`` (sibling models on the same provider still
-    run after a model-scoped failure). Returns (client, model, provider_label) or (None, None, "")."""
+    """Try remaining Codex entries on auxiliary.<task>.fallback_chain.
+    Non-Codex destinations fail closed (#160). ``failed_model`` scoping per
+    ``_failed_backend_skip``. Returns (client, model, provider_label) or (None, None, "")."""
     if not task:
         return None, None, ""
     chain = _get_auxiliary_task_config(task).get("fallback_chain")
@@ -3900,9 +3931,15 @@ def _try_configured_fallback_chain(
     skip = _failed_backend_skip(failed_provider, failed_model)
     tried = []
     min_ctx = _task_minimum_context_length(task)
-    for i, entry in enumerate(chain):
-        if not isinstance(entry, dict):
-            continue
+    candidate_indices = [
+        i for i in range(start_index, len(chain))
+        if isinstance(chain[i], dict) and _is_codex_provider(chain[i].get("provider"))
+    ]
+    if not candidate_indices:
+        _record_codex_skip(route_info, "unavailable")
+        return None, None, ""
+    for i in candidate_indices:
+        entry = chain[i]
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
             continue
@@ -3921,25 +3958,30 @@ def _try_configured_fallback_chain(
             ) if resolved_model else None
             if too_small:
                 tried.append(too_small)
+                _record_codex_skip(route_info, "too_small")
                 continue
             logger.info("Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                         task, reason, failed_provider, label, resolved_model or fb_model or "default")
+            _record_route_info(route_info, fb_provider, resolved_model or fb_model, fallback_label=label)
             return fb_client, resolved_model or fb_model, label
         tried.append(label)
+        _record_codex_skip(route_info, "unavailable")
     if tried:
         logger.debug("Auxiliary %s: configured fallback_chain exhausted (tried: %s)", task, ", ".join(tried))
     return None, None, ""
 
 
 def _try_configured_fallback_for_unavailable_client(
-    task: Optional[str], failed_provider: str
+    task: Optional[str], failed_provider: str, route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Task fallback_chain when an explicit aux provider cannot build a client (no key/OAuth/pool creds);
     stops at the per-task chain — the main-agent model stays the runtime last resort."""
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
-    return _try_configured_fallback_chain(task, explicit, reason="provider unavailable")
+    return _try_configured_fallback_chain(
+        task, explicit, reason="provider unavailable", route_info=route_info,
+    )
 
 
 def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
@@ -3966,7 +4008,8 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
 
 
 def _try_main_fallback_chain(
-    task: Optional[str], failed_provider: str = "", reason: str = "error"
+    task: Optional[str], failed_provider: str = "", reason: str = "error",
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Top-level main-agent fallback chain for a ``provider: auto`` auxiliary call: auto tasks honour the
     user's main fallback policy before the built-in discovery chain; read via ``get_fallback_chain`` so
@@ -3992,6 +4035,10 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
+        if not _is_codex_provider(fb_provider):
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         if fb_norm in skip:
             tried.append(f"{label} (skipped)")
             continue
@@ -4113,21 +4160,28 @@ def _try_main_provider_route(
 
 
 def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
-    """Step 3: hardcoded aggregator/fallback chain, skipping unhealthy providers."""
+    """Step 3: Codex-only discovery, skipping unhealthy and non-Codex destinations (#160)."""
     tried = []
     for label, try_fn in _get_provider_chain():
+        if not _is_codex_provider(label) and label != "local/custom":
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         if _is_provider_unhealthy(label):
             _log_skip_unhealthy(label)
             tried.append(f"{label} (unhealthy)")
             continue
         client, model = try_fn()
         if client is not None:
+            if not _is_codex_provider(label) and not isinstance(client, CodexAuxiliaryClient):
+                tried.append(f"{label} (non-Codex destination)")
+                continue
+            effective_label = "openai-codex" if isinstance(client, CodexAuxiliaryClient) else label
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
-                            label, model or "default", ", ".join(tried))
+                            effective_label, model or "default", ", ".join(tried))
             else:
-                logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
-            return client, model, label
+                logger.info("Auxiliary auto-detect: using %s (%s)", effective_label, model or "default")
+            return client, model, effective_label
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
@@ -4860,7 +4914,7 @@ def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str
     )
 
 
-_VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
+_VISION_AUTO_PROVIDER_ORDER = ("openai-codex",)
 
 
 def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
@@ -4910,7 +4964,7 @@ def _resolve_strict_vision_backend(provider: str, model: Optional[str] = None) -
 
 
 def get_available_vision_backends() -> List[str]:
-    """Available vision backends in auto-selection order (active provider → OpenRouter → Nous → DeepInfra).
+    """Available vision backends in auto-selection order (active provider → OpenAI Codex).
 
     Single source of truth for setup, tool gating, and runtime auto-routing.
     """
@@ -4995,7 +5049,7 @@ def _vision_auto_route(
     runtime: Dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
     async_mode: bool,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Auto-detect order: 1. main provider + model, 2. OpenRouter, 3. Nous Portal, 4. DeepInfra, 5. stop."""
+    """Auto-detect order: 1. main provider + model when it supports vision, 2. OpenAI Codex, 3. stop."""
     main_provider = str(runtime.get("provider") or _read_main_provider())
     main_model = str(runtime.get("model") or _read_main_model())
     if main_provider.strip().lower() == "moa":
@@ -5686,14 +5740,19 @@ _aux_sem_lock = threading.Lock()
 
 def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
     """``auxiliary.<task>.max_concurrency`` as a positive int, or None. Vision uses this key for
-    its encode/resize CPU pool; its LLM calls stay concurrent."""
+    its encode/resize CPU pool; its LLM calls stay concurrent. Unset compression defaults to 2
+    so lean digest harvest cannot fan out unbounded (#165)."""
     if not task or task == "vision":
         return None
+    default = 2 if task == "compression" else None
+    raw = _get_auxiliary_task_config(task).get("max_concurrency")
+    if raw is None:
+        return default
     try:
-        value = int(_get_auxiliary_task_config(task).get("max_concurrency"))
-    except (TypeError, ValueError):  # missing (None) or malformed
-        return None
-    return value if value > 0 else None
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 def _cached_semaphore(store: dict, key: Any, limit: int, factory: Callable[[int], Any]) -> Any:
@@ -5971,7 +6030,44 @@ def _build_call_kwargs(
     # OpenCode relay session affinity — same key as the main turn so compression/title/vision
     # calls stay on the conversation's warm backend.
     from agent.opencode_affinity import merge_opencode_session_headers
-    return merge_opencode_session_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
+    kwargs = merge_opencode_session_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
+    session_id = _configured_auxiliary_session_id(provider)
+    if session_id:
+        request_headers = kwargs.get("extra_headers")
+        request_headers = dict(request_headers) if isinstance(request_headers, dict) else {}
+        request_headers.setdefault("session_id", session_id)
+        kwargs["extra_headers"] = request_headers
+    return kwargs
+
+
+def _configured_auxiliary_session_id(provider: str) -> str:
+    """Return the stable session root for an opted-in named custom provider."""
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        entry = _get_named_custom_provider(str(provider or "").strip())
+    except Exception:
+        return ""
+    if not isinstance(entry, dict) or entry.get("send_session_id") is not True:
+        return ""
+    return str(
+        _runtime_main_value("cache_scope")
+        or _runtime_main_value("session_id")
+        or ""
+    ).strip()
+
+
+def _merge_auxiliary_extra_headers(
+    kwargs: Dict[str, Any], caller_headers: Optional[Dict[str, str]],
+) -> None:
+    """Merge per-call headers over generated headers without dropping either."""
+    if not caller_headers:
+        return
+    generated = kwargs.get("extra_headers")
+    merged = dict(generated) if isinstance(generated, dict) else {}
+    # Caller values intentionally win, including an explicit session_id.
+    merged.update(caller_headers)
+    kwargs["extra_headers"] = merged
 
 
 def _validate_llm_response(
@@ -6575,8 +6671,7 @@ def _prepare_aux_request(
         # The compression route is certified non-reasoning, so a bounded summary is
         # intentional; explicit caller caps pass through untouched.
         kwargs.update(auxiliary_max_tokens_param(fast_compression_cap, model=final_model))
-    if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+    _merge_auxiliary_extra_headers(kwargs, extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(request_provider, client_base):
@@ -6818,27 +6913,52 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     # keep skipping the whole provider.
     _chain_failed_model = None if reason in ("auth error", "payment error") else route.final_model
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-        task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model)
+        task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
+        route_info=route.route_info)
+    attempted = {fb_label} if fb_label else set()
+    while fb_client is not None:
+        _record_route_info(
+            route.route_info, _fallback_provider_from_label(fb_label), fb_model, fallback_label=fb_label,
+        )
+        fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
+        if fb_resp is not None:
+            return fb_resp
+        if _is_codex_provider(_fallback_provider_from_label(fb_label)):
+            _record_codex_skip(route.route_info, "rejected")
+        next_index = _next_configured_fallback_index(fb_label)
+        if next_index is None:
+            break
+        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+            task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
+            start_index=next_index, route_info=route.route_info)
+        if not fb_label or fb_label in attempted:
+            fb_client = None
+            break
+        attempted.add(fb_label)
     if fb_client is None and is_auto:
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
-            task, resolved_provider or "auto", reason=reason)
+            task, resolved_provider or "auto", reason=reason, route_info=route.route_info)
         if fb_client is None:
             fb_client, fb_model, fb_label = _try_payment_fallback(
-                resolved_provider, task, reason=reason)
+                resolved_provider, task, reason=reason, route_info=route.route_info)
     elif fb_client is None:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-            resolved_provider, task, reason=reason, failed_model=_chain_failed_model)
+            resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
+            route_info=route.route_info)
     if fb_client is not None:
         # Second pass: the candidate credential was stale and quarantined — walk the discovery
         # chain once more (unhealthy entries are skipped).
         for _pass in range(2):
-            _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
+            _record_route_info(
+                route.route_info, _fallback_provider_from_label(fb_label), fb_model, fallback_label=fb_label,
+            )
             fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
             if fb_resp is not None:
                 return fb_resp
             if _pass == 0:
                 fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
+                    resolved_provider, task, reason="stale fallback credential",
+                    route_info=route.route_info)
                 if fb_client is None:
                     break
     # All fallback layers exhausted — one user-visible warning, then re-raise.
@@ -7084,6 +7204,25 @@ def _call_llm_impl(
     overrides task config; timeout=None reads auxiliary.{task}.timeout; extra_headers override
     client defaults. stream=True returns the raw SDK stream (caller consumes/falls back)
     instead of a validated response. RuntimeError if no provider is configured."""
+    with scoped_runtime_main(main_runtime):
+        return _call_llm_impl_unscoped(
+            task=task, provider=provider, model=model, base_url=base_url,
+            api_key=api_key, main_runtime=main_runtime, messages=messages,
+            temperature=temperature, max_tokens=max_tokens, tools=tools,
+            timeout=timeout, extra_body=extra_body, reasoning_config=reasoning_config,
+            extra_headers=extra_headers, api_mode=api_mode, stream=stream,
+            stream_options=stream_options, route_info=route_info,
+        )
+
+
+def _call_llm_impl_unscoped(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
+    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+) -> Any:
     req, retry_kwargs, candidate_kwargs = _plan_aux_call(
         task, async_mode=False, provider=provider, model=model, base_url=base_url,
         api_key=api_key, main_runtime=main_runtime, messages=messages,
@@ -7269,6 +7408,23 @@ async def _async_call_llm_impl(
 ) -> Any:
     """Centralized asynchronous LLM call; see call_llm() for full documentation.
     No per-request header / api_mode override on the async entry point."""
+    with scoped_runtime_main(main_runtime):
+        return await _async_call_llm_impl_unscoped(
+            task=task, provider=provider, model=model, base_url=base_url,
+            api_key=api_key, main_runtime=main_runtime, messages=messages,
+            temperature=temperature, max_tokens=max_tokens, tools=tools,
+            timeout=timeout, extra_body=extra_body, reasoning_config=reasoning_config,
+            route_info=route_info,
+        )
+
+
+async def _async_call_llm_impl_unscoped(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    route_info: Optional[Dict[str, str]] = None,
+) -> Any:
     req, retry_kwargs, candidate_kwargs = _plan_aux_call(
         task, async_mode=True, provider=provider, model=model, base_url=base_url,
         api_key=api_key, main_runtime=main_runtime, messages=messages,

@@ -1,0 +1,974 @@
+# Candidate mutable ledger for 83467c28 live-needed source PRs.
+# NONFROZEN. Not frozen-v11. Do not embed this file's SHA or the metadata commit SHA (no self-SHA cycle).
+# #188 is generated integration (consumes this); stays a5bc92d7 until later replay/gates.
+# #213 is foreign excluded. Closed user-drop 14/40/151/150/204/252/267 excluded; not upstream-equivalent.
+# Old #265 remote 518972eb on 3340bbbd is preserved immutable; this WT is a NEW local metadata candidate.
+# v19: admit published canonical test-only source PRs #278/#279. 26 KEEP live-behavior rows unchanged.
+# v20: retarget published #179/#186/#253 successors. 26 KEEP live-behavior rows unchanged. #278/#279 test-only unchanged.
+# v21: retarget published #253 nested-runner successor 1fe23a87. 26 KEEP live-behavior rows unchanged. #278/#279 test-only unchanged.
+# Counts: 26 KEEP live-behavior (product owned computed below) vs 2 test-only sources (owned 2) vs metadata (not in this file).
+# Do not relabel #278/#279 as live-behavior KEEP / product_prs.
+schema_version = 1
+name = "docker-freeman-hermes"
+kind = "candidate-mutable-ledger"
+fork = "RyderFreeman4Logos/hermes-agent"
+upstream = "NousResearch/hermes-agent"
+upstream_remote = "upstream"
+upstream_ref = "refs/remotes/upstream/main"
+upstream_base = "83467c28f78987acdeb55636fb625946ec572a30"
+generated_pr = 188
+close_phase_allowed = false
+campaign_green = false
+replay_ready = false
+immutable = false
+historical_frozen_v11 = "hermes-final-manifest-20260906-frozen-v11.toml"
+historical_frozen_v11_sha256 = "afb1c561b5968db19251638d608535ddc18b739d9c183f6164f5681b7183850a"
+product_prs = 26
+test_only_prs = 2
+product_owned_unique_commits = 48
+test_only_owned_unique_commits = 2
+owned_unique_commits = 50
+stacked_deps = 5
+head_overlay_prs = []
+unpublished_heads_adopted = false
+
+[pins]
+official = "83467c28f78987acdeb55636fb625946ec572a30"
+official_tree = "8b23f46b86d088b5ed2b0342258468a9be04070f"
+official_ref = "pin/official-main-83467c28-20260906"
+live = "4b8b71098fcd1e9431bc3fc76423b44550f8bff0"
+live_tree = "aea818cb8d3142a782bc111ffd44a837cde5081a"
+live_scope = "containment-only; readonly"
+pr188 = "a5bc92d7c97bef30f41808d1883794d555cce1be"
+pr188_tree = "11897798637baa984b4609f560bfaa52023b432c"
+pr188_status = "unchanged-generated-sentinel-old-pin-3340bbbd; no rebuild this task"
+pr213 = "47bd529b7cba482ac2f119d348c3fdb0f7f5bb59"
+pr265_old_remote = "518972ebfadea25f747a453945f1679bcf0fba08"
+pr265_old_status = "preserved-immutable-on-3340bbbd; not overwritten"
+
+[exclusions]
+pr188_reason = "generated integration; consumes ledger; not a source owner; no replay this task"
+pr213_reason = "foreign; never replay from this ledger"
+user_drop = "14/40/151/150/204/252/267 closed user-drop; not live-needed; not upstream-equivalent claims"
+pr179_empty_omit = "6d5b14356f599f82bbd35fb5b434240481878dd2 zero-diff retained not replayed"
+
+[composition_notes]
+pr227 = "HMAC-only; no v11 HTTPX"
+pr180 = "CanonUsage cache_telemetry field; composition with #227 requires actual replay later"
+pr278 = "test-only canonical source of #276; not live-behavior KEEP; 1 owned commit; no deps"
+pr279 = "test-only canonical source of #277; not live-behavior KEEP; 1 owned commit; no deps"
+no_blind_v11_superset = true
+
+[[patch]]
+order = 1
+pr = 41
+name = "fix-agent-preserve-request-override-provenance"
+title = "fix(agent): preserve request override provenance"
+branch = "fix/request-overrides-runtime-provenance"
+head = "e63d33577104e7b5a04540f57036a73fffcb0e1a"
+tree = "659c88d17fd127d726eb84d9a08246f10eef7b24"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "ffff6621368a123b2e9b863d9b733ada7168aa2d"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 2
+vs_pin_count = 2
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "e2585bee9ad40ae781985395befea75dd2b3c0ed889022e666af0f4f4166163a"
+owned_diff_bytes_vs_base = 15956
+full_diffsha_vs_pin = "e2585bee9ad40ae781985395befea75dd2b3c0ed889022e666af0f4f4166163a"
+full_diff_bytes_vs_pin = 15956
+owned_commits = [
+  "ffff6621368a123b2e9b863d9b733ada7168aa2d",
+  "e63d33577104e7b5a04540f57036a73fffcb0e1a",
+]
+owned_subjects = [
+  "fix(agent): preserve nested request-override provenance on switch rollback",
+  "fix(agent): snapshot request_overrides before fallback rescope",
+]
+notes = "unique-on-pin 2; fallback snapshot/rollback nested override; official extra_body matcher reused; not a full LIVE port"
+
+[[patch]]
+order = 2
+pr = 42
+name = "fix-runtime-keep-managed-heartbeats-invisible-t"
+title = "fix(runtime): keep managed heartbeats invisible to user automation"
+branch = "fix/runtime-heartbeat-managed-targets"
+head = "9d16bdab80a2933be39f3d6a8aa164e4967f51fb"
+tree = "a60a3dd45f90537587598d720f09481214ba8b57"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "e88a51003ae0a6225a8dd25838855e423906c83de89ea9c4d9f64afb4c9fbc01"
+owned_diff_bytes_vs_base = 8665
+full_diffsha_vs_pin = "e88a51003ae0a6225a8dd25838855e423906c83de89ea9c4d9f64afb4c9fbc01"
+full_diff_bytes_vs_pin = 8665
+owned_commits = [
+  "9d16bdab80a2933be39f3d6a8aa164e4967f51fb",
+]
+owned_subjects = [
+  "fix(heartbeat): arm bodyless cache-warm purpose without queued admission",
+]
+notes = "unique-on-pin 1 after unwind from #40; CLI purpose/arm_cache_warm kept; TUI cache-warm callers owned by #180; composition later"
+
+[[patch]]
+order = 3
+pr = 62
+name = "fix-tui-batch-busy-completion-backlog-into-one"
+title = "fix(tui): batch busy completion backlog into one idle turn"
+branch = "fix/issue61-completion-backlog-batching"
+head = "2af1183cc01227b6ac4dbc34bd3a1f102f990872"
+tree = "ffbd8bb994c6d63debb241d08478aa70632e5972"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "8669cf77195f21b4ac4415d1609479c7843bb4fadd44be155c0f14cd23cdcbe2"
+owned_diff_bytes_vs_base = 39276
+full_diffsha_vs_pin = "8669cf77195f21b4ac4415d1609479c7843bb4fadd44be155c0f14cd23cdcbe2"
+full_diff_bytes_vs_pin = 39276
+owned_commits = [
+  "2af1183cc01227b6ac4dbc34bd3a1f102f990872",
+]
+owned_subjects = [
+  "fix(tui): coalesce busy completions and ACK steered ingest",
+]
+notes = "unique-on-pin 1 after unwind from #151; steer/ACK coalesce kept; child-silence owned by #149"
+
+[[patch]]
+order = 4
+pr = 148
+name = "fix-tui-dedupe-commentary-and-final-emissions"
+title = "fix(tui): dedupe commentary and final emissions"
+branch = "topic/142-tui-commentary-final-dedupe-20260820"
+head = "6672baec866cc8236640d52a926c4c155b38e7f8"
+tree = "c52a52bfa767478a9034063f4cf92100ff807a1e"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "99b6ea9d7efe78d72e031c2be14e758c388463ccf1f6a3a9b49f5fcb2de94617"
+owned_diff_bytes_vs_base = 7471
+full_diffsha_vs_pin = "99b6ea9d7efe78d72e031c2be14e758c388463ccf1f6a3a9b49f5fcb2de94617"
+full_diff_bytes_vs_pin = 7471
+owned_commits = [
+  "6672baec866cc8236640d52a926c4c155b38e7f8",
+]
+owned_subjects = [
+  "fix(tui): dedupe identical commentary and final emissions",
+]
+notes = "unique-on-pin 1; byte-identical commentary/final collapse; ported published finalTextProjection, not live split.text"
+
+[[patch]]
+order = 5
+pr = 149
+name = "fix-delegate-silence-routine-child-command-tail"
+title = "fix(delegate): silence routine child command-tail completions"
+branch = "topic/141-child-tail-silence-20260819"
+head = "a5d4c4f5bc89195b74272dd430d990579b636459"
+tree = "fdfd80498850e9947cdacc0c8340398742e8a161"
+base_ref = "fix/issue61-completion-backlog-batching"
+base_sha = "2af1183cc01227b6ac4dbc34bd3a1f102f990872"
+parent = "2af1183cc01227b6ac4dbc34bd3a1f102f990872"
+depends_on = [62]
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = false
+unique_count = 1
+vs_pin_count = 2
+stacked_prereq_count = 1
+owned_diffsha_vs_base = "9803f3bc9403742939a4b524d93bee2422a05751689a815b47a980556a06c166"
+owned_diff_bytes_vs_base = 21753
+full_diffsha_vs_pin = "d7f21ed657bd6d7c28c397d603d4f040877e7138a765a0526667dbdd90c07924"
+full_diff_bytes_vs_pin = 59361
+owned_commits = [
+  "a5d4c4f5bc89195b74272dd430d990579b636459",
+]
+owned_subjects = [
+  "fix(delegate): silence routine child command-tail completions",
+]
+notes = "stacked on #62; owned 1 excludes #62 prefix; silence routine child success before #62 fan-in; fail-open otherwise"
+
+[[patch]]
+order = 6
+pr = 161
+name = "fix-delegate-standard-tier-429-immediate-chain"
+title = "fix(delegate): standard-tier 429 immediate chain advance without mid-run fallback"
+branch = "topic/154-std-fallback-live-20260820"
+head = "06e079a9c740fed613eab4af51a9cac10de87a0b"
+tree = "2b9a5f31f4b5382c54f21b0c841e0ae432eb8513"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "b0defc3ff1d49681c41b240e398ee57bf162f648c10edd8bdd0b906bffde31df"
+owned_diff_bytes_vs_base = 29251
+full_diffsha_vs_pin = "b0defc3ff1d49681c41b240e398ee57bf162f648c10edd8bdd0b906bffde31df"
+full_diff_bytes_vs_pin = 29251
+owned_commits = [
+  "06e079a9c740fed613eab4af51a9cac10de87a0b",
+]
+owned_subjects = [
+  "fix(delegate): standard-tier 429 immediate chain advance without mid-run fallback",
+]
+notes = "unique-on-pin 1; standard-profile child terminal quota 429 advances chain without pool retry/cooldown"
+
+[[patch]]
+order = 7
+pr = 162
+name = "feat-memory-carry-authoritative-external-provid"
+title = "feat(memory): carry authoritative external provider backend"
+branch = "topic/143-auth-mem-live-20260820"
+head = "23a7005febecde13b3da97de0f3e15a025349971"
+tree = "3c8e2750371a907299fbb3de8400e93c9ef85b36"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "13db93cfce20363a8fdc97dca7fca717976a4274"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 3
+vs_pin_count = 3
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "83e6692492a180d8f2fda8d2da27387b3672f43a03400826e9925df0f9804b07"
+owned_diff_bytes_vs_base = 80056
+full_diffsha_vs_pin = "83e6692492a180d8f2fda8d2da27387b3672f43a03400826e9925df0f9804b07"
+full_diff_bytes_vs_pin = 80056
+owned_commits = [
+  "cd2c84a7269f4dcc8e5b29d861831b469fbac92d",
+  "13db93cfce20363a8fdc97dca7fca717976a4274",
+  "23a7005febecde13b3da97de0f3e15a025349971",
+]
+owned_subjects = [
+  "fix(memory): persist authoritative provider mode across sessions",
+  "fix(cli): freeze memory_provider_mode on resume rebuild",
+  "test(tui): expect hybrid memory_provider_mode on session rows",
+]
+notes = "unique-on-pin 3; CLI resume retains frozen memory mode; official memory split reused; tests-only successor 23a7005f; independent GREEN 6; campaign_green=false"
+
+[[patch]]
+order = 8
+pr = 212
+name = "fix-xai-hedge-spending-limit-403-and-stop-leaki"
+title = "fix(xai): hedge spending-limit 403 and stop leaking it onto non-xAI children"
+branch = "topic/iss209-xai-billing-unverified-085c062d-20260826"
+head = "9f6a0877fdaf71e0b397d76d3f810814d8dfb7ee"
+tree = "2b7f3d0fe0940b485d6cdb08d6d18f9263916ed5"
+base_ref = "topic/154-std-fallback-live-20260820"
+base_sha = "06e079a9c740fed613eab4af51a9cac10de87a0b"
+parent = "06e079a9c740fed613eab4af51a9cac10de87a0b"
+depends_on = [161]
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = false
+unique_count = 1
+vs_pin_count = 2
+stacked_prereq_count = 1
+owned_diffsha_vs_base = "386e93996f46cbfdaedc57ed5e376512b39b6c4bd29801a10bd4be03e5386f41"
+owned_diff_bytes_vs_base = 8685
+full_diffsha_vs_pin = "e2dec540ca142e34f7c42a3e0bdbf3e73e3e91ee95f5860b5c621f08725d982c"
+full_diff_bytes_vs_pin = 36678
+owned_commits = [
+  "9f6a0877fdaf71e0b397d76d3f810814d8dfb7ee",
+]
+owned_subjects = [
+  "fix(delegate): stop leaking xAI spending-limit terminals onto non-xAI children",
+]
+notes = "stacked on #161; owned 1 excludes #161 prefix; stop leaking xAI spending-limit terminals onto non-xAI children"
+
+[[patch]]
+order = 9
+pr = 165
+name = "fix-compression-bound-lean-digest-concurrency-a"
+title = "fix(compression): bound lean digest concurrency and retries"
+branch = "topic/163-aux-concurrency-20260821"
+head = "38d1c2fcae06fffd11c7fb5b0074b10e9413ace5"
+tree = "770b61567501319c925572299350922153acf149"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "afa44152f9f23c685e32d5289359253d8f697bf00da404d4ab3ef68f4edd0680"
+owned_diff_bytes_vs_base = 31440
+full_diffsha_vs_pin = "afa44152f9f23c685e32d5289359253d8f697bf00da404d4ab3ef68f4edd0680"
+full_diff_bytes_vs_pin = 31440
+owned_commits = [
+  "38d1c2fcae06fffd11c7fb5b0074b10e9413ace5",
+]
+owned_subjects = [
+  "fix(compression): restore cancellable lean digest harvest on 83467c28",
+]
+notes = "unique-on-pin 1; cancellable lean digest harvest; #267 userinfo is USER_DROP not this owner; historical security FAIL retained on old pin"
+
+[[patch]]
+order = 10
+pr = 160
+name = "fix-auxiliary-preserve-configured-fallback-dest"
+title = "fix(auxiliary): preserve configured fallback destinations"
+branch = "topic/159-aux-codex-dest-live-20260820"
+head = "04f85351ab04b5cb99004c57549a9eb25d4e6a90"
+tree = "058fa4756fb90aefac0d506197695a5f767599de"
+base_ref = "topic/163-aux-concurrency-20260821"
+base_sha = "38d1c2fcae06fffd11c7fb5b0074b10e9413ace5"
+parent = "efc415a3f8d21705a68395bad53a83063038ee94"
+depends_on = [165]
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = false
+unique_count = 2
+vs_pin_count = 3
+stacked_prereq_count = 1
+owned_diffsha_vs_base = "15f162ede80fef839021d3442ff0faf87f4bdc425c2b23e7f9702b24c841f660"
+owned_diff_bytes_vs_base = 36927
+full_diffsha_vs_pin = "0f7bf149c6a6f1ba41cb4681b1b960d4af55423f2899ff4187b8c8574f6fe8f4"
+full_diff_bytes_vs_pin = 68140
+owned_commits = [
+  "efc415a3f8d21705a68395bad53a83063038ee94",
+  "04f85351ab04b5cb99004c57549a9eb25d4e6a90",
+]
+owned_subjects = [
+  "fix(auxiliary): keep configured fallback destinations on Codex",
+  "test(auxiliary): align Codex-only fail-closed aux contracts",
+]
+notes = "stacked on #165; owned 2 excludes #165 prefix; keep configured fallback destinations on Codex; tests-only successor 04f85351; independent GREEN 20; campaign_green=false; pin residual #276 FAIL not this owner"
+
+[[patch]]
+order = 11
+pr = 227
+name = "fix-observability-capture-sanitized-cache-reque"
+title = "fix(observability): capture sanitized cache request pairs"
+branch = "topic/cache-pair-dump-224-20260826"
+head = "0bb04e83819906239157b7da370f87a4299bc79e"
+tree = "a8850ede795043dfc6d29377edd81ac19f71071a"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "2d37a27710096955e874ae7a41e716a2bdb52d16"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 2
+vs_pin_count = 2
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "aa3d66ee296bf8e540c5ee0f5be9e5a5deb95f168f0ea6dd7dc17a318c5d27a5"
+owned_diff_bytes_vs_base = 48158
+full_diffsha_vs_pin = "aa3d66ee296bf8e540c5ee0f5be9e5a5deb95f168f0ea6dd7dc17a318c5d27a5"
+full_diff_bytes_vs_pin = 48158
+owned_commits = [
+  "2d37a27710096955e874ae7a41e716a2bdb52d16",
+  "0bb04e83819906239157b7da370f87a4299bc79e",
+]
+owned_subjects = [
+  "fix(observability): port LIVE physical-attempt diagnostics and cache low-hit dumps",
+  "fix(observability): do not mint digest key when default-off",
+]
+notes = "unique-on-pin 2; HMAC-only default-off relay; NO v11 HTTPX; no #252/#267 reintroduced; composition with #180 CanonUsage requires actual replay later"
+
+[[patch]]
+order = 12
+pr = 180
+name = "fix-tui-repair-cache-telemetry-on-f293"
+title = "fix(tui): repair cache telemetry on f293"
+branch = "topic/upgrade-pr13-07-tui-cache-completion-20260821"
+head = "97d89c2d3530159bc194a9f567b4d701dd63e5ea"
+tree = "734e0bb0001b578dcdca5c1e58c43079d8b2b306"
+base_ref = "fix/runtime-heartbeat-managed-targets"
+base_sha = "9d16bdab80a2933be39f3d6a8aa164e4967f51fb"
+parent = "b435c6a2d7e5ff1ed55e48a5ee7482eef74ec6b0"
+depends_on = [42]
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = false
+unique_count = 4
+vs_pin_count = 5
+stacked_prereq_count = 1
+owned_diffsha_vs_base = "0c584027a0fed7fe8c169409b8b2f0c288bea7d144d836d1d7f009b0af269d4b"
+owned_diff_bytes_vs_base = 69826
+full_diffsha_vs_pin = "cf0a9cda8468e44cbf2b528ce64658e4a0b6172184897281b079c382077e3976"
+full_diff_bytes_vs_pin = 78491
+owned_commits = [
+  "74c4d45b91892738ec96cc6f0bf6ab31a09fa63c",
+  "db76f8fb190e53434a630effcb811457ddb558c7",
+  "b435c6a2d7e5ff1ed55e48a5ee7482eef74ec6b0",
+  "97d89c2d3530159bc194a9f567b4d701dd63e5ea",
+]
+owned_subjects = [
+  "feat(tui): stamp cache-warm telemetry on official split seams",
+  "fix(codex): keep cache telemetry off session usage accounting",
+  "fix(tui): restore miss vs no_field and error-complete cache stamps",
+  "test(tui): accept explicit turn_origin on notification fake",
+]
+notes = "stacked on #42; owned 4 excludes #42 prefix; CanonUsage cache_telemetry field integrates separately from #227 HMAC dump; miss vs no_field + error-complete stamps; tests-only successor 97d89c2d; independent GREEN 4; campaign_green=false"
+
+[[patch]]
+order = 13
+pr = 178
+name = "fix-cache-preserve-stable-prefix-routing-after"
+title = "fix(cache): preserve stable-prefix routing after compression"
+branch = "topic/176-short-gap-cache-20260821"
+head = "c050a05041c699684cd28a9d428402ed79560101"
+tree = "fffd8c32cf3a4be122a02f28d77235e29c7623ff"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "dda1754cea1c9ffd532c836f5949b15f4ca7c4a3"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 2
+vs_pin_count = 2
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "302206d5280771a77bc34b3d6832e0574eafd3cee1931154c993ea0c145e6272"
+owned_diff_bytes_vs_base = 7248
+full_diffsha_vs_pin = "302206d5280771a77bc34b3d6832e0574eafd3cee1931154c993ea0c145e6272"
+full_diff_bytes_vs_pin = 7248
+owned_commits = [
+  "dda1754cea1c9ffd532c836f5949b15f4ca7c4a3",
+  "c050a05041c699684cd28a9d428402ed79560101",
+]
+owned_subjects = [
+  "test(tui): cover compression-bound cache explanation",
+  "fix(tui): explain compression-bound cache misses",
+]
+notes = "unique-on-pin 2; TUI footnote because of compression; official find_stable_prefix untouched"
+
+[[patch]]
+order = 14
+pr = 185
+name = "fix-delegate-require-standard-model-pool-profil"
+title = "fix(delegate): require standard model pool profile"
+branch = "topic/upgrade-pr13-04-lineage-cache-delegate-20260821"
+head = "a2893025feb9845180a1db9db1cc395c921391a9"
+tree = "9519bc85a38947180b4de6ac988529d29b632f4b"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "5e627f7d39f5daf013658f6094ef33bfe0f41228"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 2
+vs_pin_count = 2
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "54aaa687199574b86cbc0a4300045d54e8dfc4285aa3f3d8f3598da5114601b3"
+owned_diff_bytes_vs_base = 40063
+full_diffsha_vs_pin = "54aaa687199574b86cbc0a4300045d54e8dfc4285aa3f3d8f3598da5114601b3"
+full_diff_bytes_vs_pin = 40063
+owned_commits = [
+  "5e627f7d39f5daf013658f6094ef33bfe0f41228",
+  "a2893025feb9845180a1db9db1cc395c921391a9",
+]
+owned_subjects = [
+  "fix(delegate): require standard model pool profile",
+  "test(delegate): assert model_pool standard fail-closed description",
+]
+notes = "unique-on-pin 2; replay-safe successor; non-empty delegation.model_pool requires explicit standard; tests-only successor a2893025; independent GREEN 4; pin residual #276 FAIL not this owner; campaign_green=false"
+
+[[patch]]
+order = 15
+pr = 186
+name = "fix-compression-protect-fallback-and-oversized"
+title = "fix(compression): protect fallback and oversized active turns"
+branch = "topic/upgrade-pr13-05-compression-active-turn-20260821"
+head = "7611db409f7b0a71e8fa9d83ba73858f87ec5817"
+tree = "5cb8a0218a75d8c0586c22c471acc64799bc8574"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "17d17e5aa402e16f6c348c93afef416ecf18a4d5"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 3
+vs_pin_count = 3
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "ab871d0a0e57542e348b1f31b0ae75ba7857ff008d48f528de62c30de815d42e"
+owned_diff_bytes_vs_base = 60017
+full_diffsha_vs_pin = "ab871d0a0e57542e348b1f31b0ae75ba7857ff008d48f528de62c30de815d42e"
+full_diff_bytes_vs_pin = 60017
+owned_commits = [
+  "ed67e2fccc37999b1210660a6d2b1d483eb9e957",
+  "17d17e5aa402e16f6c348c93afef416ecf18a4d5",
+  "7611db409f7b0a71e8fa9d83ba73858f87ec5817",
+]
+owned_subjects = [
+  "fix(compression): protect fallback and oversized active turns on 83467c28",
+  "fix(context): restore Unit B insertion-time payload caps on 83467c28",
+  "test(context): prove combined 32K/8K/16K insertion seam at commit",
+]
+notes = "unique-on-pin 3; published parent 17d17e5a; test-only successor 7611db40 (product blobs unchanged vs published parent); insertion-time payload caps retained; campaign_green=false"
+
+[[patch]]
+order = 16
+pr = 179
+name = "fix-model-after-compression-switch-and-deferred"
+title = "fix(model): after-compression switch and deferred --reasoning"
+branch = "topic/upgrade-after-compression-model-and-reasoning-20260821"
+head = "75b9f39a5bc68b54a7065b38013236d91ab92cbe"
+tree = "96cd2c3da5a54611dbd70973e7338d90e029bcdd"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "b022d89f5ab41ad62d7df2dff0a3a0d68c07dc35"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 2
+vs_pin_count = 2
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "05bfdb001b06efbf0cad4f4d00bdaa53ab849866c5668b43c3fd2c4067e5fc04"
+owned_diff_bytes_vs_base = 82017
+full_diffsha_vs_pin = "05bfdb001b06efbf0cad4f4d00bdaa53ab849866c5668b43c3fd2c4067e5fc04"
+full_diff_bytes_vs_pin = 82017
+owned_commits = [
+  "b022d89f5ab41ad62d7df2dff0a3a0d68c07dc35",
+  "75b9f39a5bc68b54a7065b38013236d91ab92cbe",
+]
+owned_subjects = [
+  "feat(model-switch): defer route changes until compression commits",
+  "fix(test): drop extra blank line at EOF in model-once CLI test",
+]
+notes = "unique-on-pin 2; published parent b022d89f; test-only successor 75b9f39a (product blobs unchanged vs published parent); historical empty omission 6d5b14356f599f82bbd35fb5b434240481878dd2 (zero-diff) retained not replayed; campaign_green=false"
+
+[[patch]]
+order = 17
+pr = 181
+name = "fix-auxiliary-preserve-session-identity-across"
+title = "fix(auxiliary): preserve session identity across fallback"
+branch = "topic/upgrade-pr13-08-session-identity-20260821"
+head = "597bab468d7693a43e87d9c5110a3dbe19c0ff53"
+tree = "2aab5521c494173d6be548370021b4b74caa3619"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "bec0e114cbd0490ca8bdfe921bf3f65d4e89c772d9216076f4c97d4148964916"
+owned_diff_bytes_vs_base = 29400
+full_diffsha_vs_pin = "bec0e114cbd0490ca8bdfe921bf3f65d4e89c772d9216076f4c97d4148964916"
+full_diff_bytes_vs_pin = 29400
+owned_commits = [
+  "597bab468d7693a43e87d9c5110a3dbe19c0ff53",
+]
+owned_subjects = [
+  "fix(auxiliary): preserve session identity across fallback",
+]
+notes = "unique-on-pin 1; opt-in send_session_id survives sync/async fallback; caller headers win"
+
+[[patch]]
+order = 18
+pr = 182
+name = "fix-terminal-harden-long-task-launch-and-comple"
+title = "fix(terminal): harden long-task launch and completion lifecycle"
+branch = "topic/upgrade-pr13-01-terminal-20260821"
+head = "2cd7e0fecaac225f8814f734c8a022ea4fbfabdd"
+tree = "14913128908049b3f8b9c1a4ba8dd145c7cc9d5c"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "6892c1fe55aa7af46eb499e96130ab61774aff9a9d0dae413ab730132317a29f"
+owned_diff_bytes_vs_base = 26477
+full_diffsha_vs_pin = "6892c1fe55aa7af46eb499e96130ab61774aff9a9d0dae413ab730132317a29f"
+full_diff_bytes_vs_pin = 26477
+owned_commits = [
+  "2cd7e0fecaac225f8814f734c8a022ea4fbfabdd",
+]
+owned_subjects = [
+  "fix(terminal): harden long-task launch and completion lifecycle",
+]
+notes = "unique-on-pin 1; replay-safe successor; omitted timeout stays FOREGROUND; omitted background auto-promotes only above threshold; product unchanged; 8 tests migrated; source 28 + composition 55; prefix 24+1 not full 45 green"
+
+[[patch]]
+order = 19
+pr = 183
+name = "fix-state-coordinate-sessiondb-writes-across-pr"
+title = "fix(state): coordinate SessionDB writes across processes"
+branch = "topic/upgrade-pr13-02-sessiondb-20260821"
+head = "d522d20c3fcb164910b9342b3f7c3522bf2c30ed"
+tree = "2cb1e34cd3344ddc636d3effc0523419b7df3e4f"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "6e9ded1b23fb38d8f87555576a29e6e18bf7ddbec8b5fff29d5f7597d1954ccb"
+owned_diff_bytes_vs_base = 21306
+full_diffsha_vs_pin = "6e9ded1b23fb38d8f87555576a29e6e18bf7ddbec8b5fff29d5f7597d1954ccb"
+full_diff_bytes_vs_pin = 21306
+owned_commits = [
+  "d522d20c3fcb164910b9342b3f7c3522bf2c30ed",
+]
+owned_subjects = [
+  "fix(state): coordinate SessionDB writes across processes",
+]
+notes = "unique-on-pin 1 after unwind from #14; sidecar flock kept; #14 15-cap omitted"
+
+[[patch]]
+order = 20
+pr = 184
+name = "fix-compression-guard-watermarks-and-process-no"
+title = "fix(compression): guard watermarks and process notifications"
+branch = "topic/upgrade-pr13-03-watermark-security-20260821"
+head = "107345391c1f59b6e8182553d4a4273e3fae5811"
+tree = "056840c4dc41fa12dd9c88491daf4f2eb46f8405"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "88cf9b15debabbf87023ab160ef8f67fcdb03f8b403cea0281a4fc74df45da5f"
+owned_diff_bytes_vs_base = 16490
+full_diffsha_vs_pin = "88cf9b15debabbf87023ab160ef8f67fcdb03f8b403cea0281a4fc74df45da5f"
+full_diff_bytes_vs_pin = 16490
+owned_commits = [
+  "107345391c1f59b6e8182553d4a4273e3fae5811",
+]
+owned_subjects = [
+  "fix(compression): guard durable watermark source rewrite before publication",
+]
+notes = "unique-on-pin 1; reject pre-watermark source mutation; allow append-only foreign tail"
+
+[[patch]]
+order = 21
+pr = 187
+name = "fix-compression-bound-fallback-deadlines-and-ho"
+title = "fix(compression): bound fallback deadlines and host budgets"
+branch = "topic/upgrade-pr13-06-fallback-digest-status-20260821"
+head = "bd748d4cab37db2c395713f0e306f4a2b04f2dbf"
+tree = "4ee1fb5203a5c98d57d3713b82fe863cd6eeeca0"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "daaf7869b04be443535cf11c330a3dc32e76dc80f467e04d7aa59a9bac2dd2ea"
+owned_diff_bytes_vs_base = 7033
+full_diffsha_vs_pin = "daaf7869b04be443535cf11c330a3dc32e76dc80f467e04d7aa59a9bac2dd2ea"
+full_diff_bytes_vs_pin = 7033
+owned_commits = [
+  "bd748d4cab37db2c395713f0e306f4a2b04f2dbf",
+]
+owned_subjects = [
+  "fix(compression): honor configured compression candidate budgets",
+]
+notes = "unique-on-pin 1; honor configured compression candidate budgets; ignore unrepresentable timeouts"
+
+[[patch]]
+order = 22
+pr = 210
+name = "fix-cache-persist-loop-timing-in-history-for-mo"
+title = "fix(cache): persist loop timing in history for monotonic prefix"
+branch = "topic/iss206-persist-timing-af8870f7-20260826"
+head = "dd3679cb19ee7b13a6f304fbda32d3a3fa3a2af1"
+tree = "39ead62a4df9ab6c1f790e39051a5e1b723bcc92"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "c6c191376c452a878e82877095ec53b9144b5cdb8518af994fdebdf3fbe8a074"
+owned_diff_bytes_vs_base = 25467
+full_diffsha_vs_pin = "c6c191376c452a878e82877095ec53b9144b5cdb8518af994fdebdf3fbe8a074"
+full_diff_bytes_vs_pin = 25467
+owned_commits = [
+  "dd3679cb19ee7b13a6f304fbda32d3a3fa3a2af1",
+]
+owned_subjects = [
+  "fix(cache): persist loop timing in history for monotonic prefix",
+]
+notes = "unique-on-pin 1; KEEP loop timing (#190); inject after last cache breakpoint; no cache_control"
+
+[[patch]]
+order = 23
+pr = 199
+name = "fix-agent-refresh-xai-oauth-on-bad-credentials"
+title = "fix(agent): refresh xAI OAuth on bad-credentials 403"
+branch = "topic/ledger-xai403-refresh-20260823"
+head = "220f9ee621db255c2a046d3c4e53f3ed3dce4a2d"
+tree = "6498af26c905501c6c89bab05b92f3174a8dda30"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "da1677e6d0ebd624f4483f1ef38b238e432dfcee4dd1dc237915fb54ca489a44"
+owned_diff_bytes_vs_base = 8725
+full_diffsha_vs_pin = "da1677e6d0ebd624f4483f1ef38b238e432dfcee4dd1dc237915fb54ca489a44"
+full_diff_bytes_vs_pin = 8725
+owned_commits = [
+  "220f9ee621db255c2a046d3c4e53f3ed3dce4a2d",
+]
+owned_subjects = [
+  "fix(agent): refresh xAI OAuth on bad-credentials 403",
+]
+notes = "unique-on-pin 1; xAI OAuth HTTP 403 unauthenticated:bad-credentials shares one-shot refresh with 401"
+
+[[patch]]
+order = 24
+pr = 173
+name = "fix-defer-notified-process-waits"
+title = "fix: defer notified process waits"
+branch = "topic/172-wait-tool-20260821"
+head = "6456050daa7d6d8b9a73adf4a1502b0c7b568812"
+tree = "1b38289ef89372dbe7086be7466cb4208bf21375"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "9eb942dbe3d982952c5f7c934f27c18bf7068112aec09d3c70bcf167ef700f1b"
+owned_diff_bytes_vs_base = 7822
+full_diffsha_vs_pin = "9eb942dbe3d982952c5f7c934f27c18bf7068112aec09d3c70bcf167ef700f1b"
+full_diff_bytes_vs_pin = 7822
+owned_commits = [
+  "6456050daa7d6d8b9a73adf4a1502b0c7b568812",
+]
+owned_subjects = [
+  "fix(process): defer notified process waits",
+]
+notes = "unique-on-pin 1; wait_deferred parent; delegated child still blocks"
+
+[[patch]]
+order = 25
+pr = 251
+name = "fix-cap-parallel-test-runner-workers"
+title = "fix: cap parallel test runner workers"
+branch = "topic/test-runner-pid-cap-20260831"
+head = "a690235fd0490d4769e96eb9f7d0d0e210372261"
+tree = "6e3c926b1cf936bf619f8c9fa341500ea14c24fa"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "3ec71c885b4367c10d93cbcfff495dabfa8c3fdad516b6b71dd4228942f580fe"
+owned_diff_bytes_vs_base = 8450
+full_diffsha_vs_pin = "3ec71c885b4367c10d93cbcfff495dabfa8c3fdad516b6b71dd4228942f580fe"
+full_diff_bytes_vs_pin = 8450
+owned_commits = [
+  "a690235fd0490d4769e96eb9f7d0d0e210372261",
+]
+owned_subjects = [
+  "fix: cap parallel test runner workers",
+]
+notes = "unique-on-pin 1; clamp max(1, min(requested, cpu_count or 1, 8)); official pin is (cpu_count or 4)*2"
+
+[[patch]]
+order = 26
+pr = 253
+name = "fix-contain-linux-test-runner-process-trees"
+title = "fix: contain Linux test-runner process trees"
+branch = "topic/test-runner-tree-containment-20260901"
+head = "1fe23a87b3d9bc48c6b190f0bdd6d6e20ca562af"
+tree = "8fa6135f604f6736dab8c7adc155dc76c894a930"
+base_ref = "topic/test-runner-pid-cap-20260831"
+base_sha = "a690235fd0490d4769e96eb9f7d0d0e210372261"
+parent = "6dd88cc2895e8b3650778dddd04deb4c0a67a88e"
+depends_on = [251]
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = false
+unique_count = 10
+vs_pin_count = 11
+stacked_prereq_count = 1
+owned_diffsha_vs_base = "d9c298124885faaa98dddbb331a47eec58b0879299412413797d5355070bc708"
+owned_diff_bytes_vs_base = 87618
+full_diffsha_vs_pin = "6a9b87a7d448209029ea5736f20b077a9adaf63973ceac0f324f721646800a8a"
+full_diff_bytes_vs_pin = 89640
+owned_commits = [
+  "16a2fa1e412e47057f3f6341a5ca28efb66e3053",
+  "c7aaad1acff9a8a02a5c4d3201c72f4e3853aebd",
+  "4f6231f1a85f35b830b8c403da6f043284aef4ea",
+  "9aff68bf4466696ebd6ab1752f5630352e9a04f1",
+  "bb866869fe9333900350ee2f653bd8dec2ace41c",
+  "9cb9f6979028d6058b1d9b1d139f8d0a592f3d23",
+  "426161ad9c250a7fd4811c08c0bc81510665bbcc",
+  "00ff14168c9e16166a9925bf80f3c9712da139cb",
+  "6dd88cc2895e8b3650778dddd04deb4c0a67a88e",
+  "1fe23a87b3d9bc48c6b190f0bdd6d6e20ca562af",
+]
+owned_subjects = [
+  "fix: contain parallel test worker trees",
+  "fix: preserve runner failure authority",
+  "fix: fail closed on runner containment events",
+  "fix: close runner containment receipt gaps",
+  "fix: bound runner containment cleanup",
+  "fix: bound runner watch pipe transport",
+  "fix: bound nested pytest collection for out-of-tree probes",
+  "fix: pair out-of-tree pytest argv with collection bounds",
+  "fix: hide live session bus from contained pytest",
+  "fix: keep host systemd-run for nested runner harness",
+]
+notes = "stacked on #251; owned 10 excludes #251 prefix; pin..HEAD 11 includes #251 — do not publish vs-pin as 253-only; 6 live-identical + 2 harness/isolation repairs + 1 ordinary-bus successor 6dd88cc2 + 1 nested-runner successor 1fe23a87 (source+composition PASS not integration); do not claim 10 live-identical"
+
+[[patch]]
+order = 27
+pr = 278
+name = "test-delegate-compare-child-db-path-by-file-ide"
+title = "test(delegate): compare child db path by file identity"
+branch = "topic/issue276-test-repair-v18-20260906"
+head = "902390a3746016485651d0e532f8cc6a8b614c0b"
+tree = "8d7b62f6624be5e143d91c8b7c3b2949ad707f72"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+role = "test-only"
+owned_diffsha_vs_base = "9f0da20fbcef63f6471734fdb81627141d6c1abb4ffe9cdb54162ef75b184382"
+owned_diff_bytes_vs_base = 1629
+full_diffsha_vs_pin = "9f0da20fbcef63f6471734fdb81627141d6c1abb4ffe9cdb54162ef75b184382"
+full_diff_bytes_vs_pin = 1629
+owned_commits = [
+  "902390a3746016485651d0e532f8cc6a8b614c0b",
+]
+owned_subjects = [
+  "test(delegate): compare child db path by file identity",
+]
+notes = "canonical test-only source of issue #276; 1 owned commit; no invented deps; not live-behavior KEEP; product blobs unchanged; independent review PASS 0; OPEN non-draft unmerged on official pin"
+
+[[patch]]
+order = 28
+pr = 279
+name = "test-tui-handshake-entered-phase-events-instead"
+title = "test(tui): handshake entered-phase Events instead of 1s waits"
+branch = "topic/issue277-test-repair-v18-20260906"
+head = "a78558b6bc29aa67d394a834bccf699ffb107046"
+tree = "3c2219a95e11fbe66445f624677a4e0640ecabc2"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "83467c28f78987acdeb55636fb625946ec572a30"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 1
+vs_pin_count = 1
+stacked_prereq_count = 0
+role = "test-only"
+owned_diffsha_vs_base = "2a8cb79947fdce20ff0697284ab28365a1a64fd4862cf52e272d89eaafda41be"
+owned_diff_bytes_vs_base = 3994
+full_diffsha_vs_pin = "2a8cb79947fdce20ff0697284ab28365a1a64fd4862cf52e272d89eaafda41be"
+full_diff_bytes_vs_pin = 3994
+owned_commits = [
+  "a78558b6bc29aa67d394a834bccf699ffb107046",
+]
+owned_subjects = [
+  "test(tui): handshake entered-phase Events instead of 1s waits",
+]
+notes = "canonical test-only source of issue #277; 1 owned commit; no invented deps; not live-behavior KEEP; product blobs unchanged; independent review PASS 0; OPEN non-draft unmerged on official pin"

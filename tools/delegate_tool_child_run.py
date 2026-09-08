@@ -466,6 +466,26 @@ def _build_result_entry(
     ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
     wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
     summary = result.get("final_response") or ""
+    _result_billing = result.get("billing_block")
+    _child_model = getattr(child, "model", "")
+    _xai_billing_leak = (
+        isinstance(_result_billing, dict)
+        and _result_billing.get("provider") in {"xai", "xai-oauth"}
+        and (
+            "grok" not in str(_child_model).lower()
+            or (
+                getattr(child, "_delegate_model_profile", None) == "standard"
+                and result.get("billing_unverified", False)
+            )
+        )
+    )
+    if _xai_billing_leak:
+        # Do not attach a parent xAI terminal to a child routed elsewhere (#209).
+        summary = (
+            "Subagent failed after an unverified provider billing error."
+            if result.get("billing_unverified", False)
+            else "Subagent failed with a provider error unrelated to its effective model."
+        )
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
@@ -492,7 +512,19 @@ def _build_result_entry(
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
-        "model": _str_or_none(getattr(child, "model", None)),
+        "model": None if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and result.get("billing_unverified", False)
+            and getattr(child, "_delegate_model_profile", None) == "standard"
+        ) else (
+            _str_or_none(getattr(child, "model", None)) if (
+                result.get("completed", False) or getattr(child, "_delegate_has_successful_llm_request", False)
+            ) else None
+        ),
+        "provider": _str_or_none(getattr(child, "provider", None)) if (
+            result.get("completed", False) or getattr(child, "_delegate_has_successful_llm_request", False)
+        ) else None,
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.

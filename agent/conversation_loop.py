@@ -13,6 +13,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -32,7 +33,12 @@ from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.stream_payload_bound import (
+    DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+    StreamPayloadBoundExceeded,
+    persist_interrupted_stream_partial,
+)
+from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call, stop_thinking_spinner
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_final_response import finish_text_response
@@ -51,7 +57,7 @@ from agent.turn_response_intake import normalize_model_response
 from agent.turn_tool_round import run_tool_round
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
-from utils import base_url_host_matches
+from utils import base_url_host_matches, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,67 @@ _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 
 # Shared by _apply_active_turn_redirect and the api_messages ghost-row filter so both sites cannot drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+
+
+def _loop_timing_context(
+    agent: Any,
+    *,
+    now: Optional[datetime] = None,
+    stop: bool = False,
+) -> Optional[str]:
+    """Record a loop boundary or return its API-only timing context."""
+    current = now or datetime.now().astimezone()
+    if stop:
+        agent._loop_timing_last_stop = current
+        return None
+
+    previous_start = getattr(agent, "_loop_timing_last_start", None)
+    previous_stop = getattr(agent, "_loop_timing_last_stop", None)
+    agent._loop_timing_last_start = current
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
+        enabled = is_truthy_value(
+            agent_config.get("loop_timing_context")
+            if isinstance(agent_config, dict)
+            else None,
+            default=True,
+        )
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+
+    lines = ["[Agent loop timing]"]
+    if previous_start is not None:
+        lines.append(f"Previous loop start: {previous_start.isoformat(timespec='seconds')}")
+    if previous_stop is not None:
+        lines.append(f"Previous loop stop: {previous_stop.isoformat(timespec='seconds')}")
+    lines.append(f"Current loop start: {current.isoformat(timespec='seconds')}")
+    return "\n".join(lines)
+
+
+def _drop_redundant_previous_loop_start(text: str, history) -> str:
+    """Drop Previous loop start when history already has that Current stamp."""
+    if not text or not history:
+        return text
+    lines = text.splitlines()
+    previous = next(
+        (line for line in lines if line.startswith("Previous loop start: ")), None
+    )
+    if previous is None:
+        return text
+    needle = f"Current loop start: {previous[len('Previous loop start: '):]}"
+    if any(
+        isinstance(message, dict)
+        and "[Agent loop timing]" in str(message.get("content", ""))
+        and needle in str(message.get("content", ""))
+        for message in history
+    ):
+        return "\n".join(line for line in lines if line != previous)
+    return text
 
 
 # One-time wrap-up notice appended when a wall-clock run budget (--run-budget) crosses 80%.
@@ -311,6 +378,41 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._stream_needs_break = True
 
 
+def _is_xai_bad_credentials_403(
+    provider: str,
+    status_code: Any,
+    api_error: Any,
+    error_context: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """xAI reports an expired or invalid OAuth access token as HTTP 403 with
+    body code ``unauthenticated:bad-credentials`` rather than 401, so the
+    401-only refresh trigger never fires and a long-lived worker keeps its
+    dead in-memory token (#82052). Scoped to xai-oauth: other providers'
+    403s remain non-retryable authorization failures.
+    """
+    if provider != "xai-oauth" or status_code != 403:
+        return False
+    if error_context is None:
+        from agent.agent_runtime_helpers import extract_api_error_context
+
+        error_context = extract_api_error_context(api_error)
+    reason = str((error_context or {}).get("reason") or "").strip().casefold()
+    if reason == "unauthenticated:bad-credentials":
+        return True
+    exact_messages = {
+        "oauth2 access token could not be validated",
+        "the oauth2 access token could not be validated",
+    }
+    for value in (
+        (error_context or {}).get("message"),
+        getattr(api_error, "message", None),
+    ):
+        message = str(value or "").strip().casefold().removesuffix(".")
+        if message in exact_messages:
+            return True
+    return False
+
+
 def _is_copilot_provider(agent: Any) -> bool:
     """Delegate to ``AIAgent._is_copilot_provider``; the fallback keeps the ``github-copilot`` /
     ``github`` aliases so credential recovery is not skipped for them."""
@@ -470,6 +572,30 @@ def _system_prompt_for_hooks(api_kwargs: Any, request_messages: Any) -> Any:
 def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     return (provider or "").strip().lower() == "nous" or base_url_host_matches(
         str(base_url or ""), "inference-api.nousresearch.com"
+    )
+
+
+def _is_standard_profile_child(agent) -> bool:
+    return getattr(agent, "_delegate_model_profile", None) == "standard"
+
+
+def _standard_child_has_successful_llm_request(agent) -> bool:
+    return bool(getattr(agent, "_delegate_has_successful_llm_request", False))
+
+
+def _standard_child_can_fallback(
+    agent,
+    *,
+    rate_limited: bool = False,
+    terminal_quota: bool = False,
+    billing: bool = False,
+) -> bool:
+    """Permit pre-success 429 or billing fallback for standard children."""
+    if not _is_standard_profile_child(agent):
+        return True
+    return (
+        (rate_limited or terminal_quota or billing)
+        and not _standard_child_has_successful_llm_request(agent)
     )
 
 
@@ -1378,6 +1504,21 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
         except InterruptedError:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
+        except StreamPayloadBoundExceeded as api_error:
+            s.thinking_spinner = stop_thinking_spinner(agent, s.thinking_spinner)
+            s.interrupted = True
+            s._turn_exit_reason = "stream_payload_bound_exceeded"
+            s.final_response = persist_interrupted_stream_partial(
+                agent,
+                s.messages,
+                elapsed=time.time() - (s.api_start_time or time.time()),
+                exceeded=True,
+                size=getattr(api_error, "size", 0),
+                bound=getattr(api_error, "bound", None) or DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+            )
+            agent._vprint(f"{agent.log_prefix}⚠ {s.final_response}", force=True)
+            agent._persist_session(s.messages, s.conversation_history)
+            return None
         except Exception as api_error:
             _ae = _run_phase(handle_api_error, agent, s, api_error=api_error)
             if _ae.action == "return":
@@ -1400,6 +1541,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_origin: str = "user",
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1461,6 +1603,9 @@ def run_conversation(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    agent._first_turn_usage = None
+    agent._tui_provider_response_index = 0
+    agent._cache_turn_origin = turn_origin
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,

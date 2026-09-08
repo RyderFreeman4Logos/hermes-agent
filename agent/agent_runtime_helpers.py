@@ -879,6 +879,20 @@ def recover_with_credential_pool(
     return False, has_retried_429
 
 
+_MISSING = object()
+
+
+def _copy_request_overrides(value: Any) -> Any:
+    """Deep-copy override graphs for rollback/restore. Hostile ``__deepcopy__`` falls back to a
+    shallow dict so a failed switch cannot poison the successor."""
+    if value is _MISSING:
+        return value
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return dict(value) if isinstance(value, dict) else value
+
+
 def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
     """Copy the identity/transport fields of a ``_primary_runtime`` snapshot onto ``agent``
     (shared by transport recovery and turn-start restore; the caller rebuilds the client)."""
@@ -891,7 +905,7 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]
     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
-    agent.request_overrides = dict(rt.get("request_overrides") or {})
+    agent.request_overrides = _copy_request_overrides(rt.get("request_overrides") or {})
     agent._client_kwargs = dict(rt["client_kwargs"])
 
 
@@ -1779,7 +1793,7 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     overrides = dict(getattr(agent, "request_overrides", {}) or {})
     overrides.pop("extra_body", None)  # always drop the previous provider's extra_body
     if new_extra_body:
-        overrides["extra_body"] = dict(new_extra_body)
+        overrides["extra_body"] = _copy_request_overrides(new_extra_body)
     agent.request_overrides = overrides
 
 
@@ -1790,7 +1804,6 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id",
 )
-_MISSING = object()
 
 
 def _snapshot_switch_state(agent) -> Dict[str, Any]:
@@ -1800,6 +1813,11 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
     snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
     # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
     snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    # Override provenance is not in _SWITCH_SNAPSHOT_FIELDS: official re-derives extra_body on
+    # success, but a failed swap must restore the original nested graph, not an aliased dict.
+    snapshot["request_overrides"] = _copy_request_overrides(
+        getattr(agent, "request_overrides", _MISSING)
+    )
     return snapshot
 
 
@@ -1960,6 +1978,10 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
 
 def _resolve_switch_context_length(agent, snapshot):
     """Resolve the destination context length (LM Studio preload first); returns ``(custom_providers, effective_len)``."""
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        intent = getattr(agent, "_deferred_model_switch_context_length", None)
+        agent._config_context_length = intent
+        return None, intent
     custom_providers = None
     try:
         from hermes_cli.config import (
@@ -1993,6 +2015,17 @@ def _resolve_switch_context_length(agent, snapshot):
 
 def _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot) -> None:
     """Point the context compressor at the new model (rolls back the switch on failure)."""
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        new_context_length = effective_context_length or getattr(
+            agent.context_compressor, "context_length", None)
+        try:
+            agent.context_compressor.update_model(
+                model=agent.model, context_length=new_context_length, base_url=agent.base_url,
+                api_key=agent.api_key, provider=agent.provider, api_mode=agent.api_mode)
+        except Exception:
+            _restore_switch_snapshot(agent, snapshot)
+            raise
+        return
     from agent.model_metadata import get_model_context_length
     if custom_providers is None:
         try:
@@ -2038,8 +2071,10 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         # Overrides must travel with the switched-to identity or a later recovery/restore resurrects
         # PRE-switch overrides from the stale init snapshot.
-        # See #75091.
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        # See #75091. Deep-copy so later mutation of agent.request_overrides cannot poison restore.
+        "request_overrides": _copy_request_overrides(
+            getattr(agent, "request_overrides", {}) or {}
+        ),
         "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
         "compressor_model": getattr(cc, "model", agent.model),
         "compressor_base_url": getattr(cc, "base_url", agent.base_url),
@@ -2103,7 +2138,23 @@ def switch_model(
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
     the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
-    snapshot and re-raises (callers catch)."""
+    snapshot and re-raises (callers catch). Immediate swaps cancel a pending deferred switch."""
+    from hermes_cli.model_switch import (
+        _emit_deferred_model_switch_status, clear_model_switch_after_compression,
+        model_switch_transaction_lock)
+    with model_switch_transaction_lock(agent):
+        _switch_model_unlocked(
+            agent, new_model, new_provider, api_key, base_url, api_mode, capabilities)
+        if not getattr(agent, "_applying_model_switch_after_compression", False):
+            cancelled = clear_model_switch_after_compression(agent)
+            if cancelled is not None:
+                _emit_deferred_model_switch_status(
+                    agent, "Pending after-compression model switch cancelled by the immediate model switch.")
+
+
+def _switch_model_unlocked(
+    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None
+):
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
@@ -2136,16 +2187,21 @@ def switch_model(
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot)
     # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
-    # YAML False = disabled).
-    try:
-        from hermes_constants import resolve_reasoning_config
-        from hermes_cli.config import load_config as _sm_load_config
-        agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
-        logger.info(
-            "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
-        )
-    except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+    # YAML False = disabled). A deferred compression-boundary switch keeps the already-resolved
+    # destination config and must not probe config.yaml again.
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        agent.reasoning_config = copy.deepcopy(
+            getattr(agent, "_deferred_model_switch_reasoning_config", None))
+    else:
+        try:
+            from hermes_constants import resolve_reasoning_config
+            from hermes_cli.config import load_config as _sm_load_config
+            agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+            logger.info(
+                "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
+            )
+        except Exception as _reasoning_err:
+            logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
     # Invalidate the cached system prompt so it rebuilds next turn.
     agent._cached_system_prompt = None
     # Publish the destination capability map only after every runtime setup above has succeeded.

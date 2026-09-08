@@ -110,8 +110,11 @@ def _admit_prompt_turn(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
-        with contextlib.suppress(Exception):
-            agent.clear_interrupt()
+    # clear_interrupt() can be wrapped by completion-steer bookkeeping. Keep it
+    # outside history_lock: the wrapper may need that same non-reentrant lock.
+    _bind_completion_steer_guards(session, agent)
+    with contextlib.suppress(Exception):
+        agent.clear_interrupt()
     return images, agent
 
 
@@ -370,10 +373,18 @@ def _run_post_turn_followups(
     prompt wins over every auto follow-up (drain it, skip the rest); a leftover /steer is
     requeued first so it isn't dropped; then goal continuation, then completion
     notifications.  Each nested submit re-checks ``running`` under the lock."""
-    steer = result.get("pending_steer") if isinstance(result, dict) else None
-    if isinstance(steer, str) and steer.strip():
+    leftover = result.get("pending_steer") if isinstance(result, dict) else None
+    if not (isinstance(leftover, str) and leftover.strip()):
+        drain = getattr(session.get("agent"), "_drain_pending_steer", None)
+        if callable(drain):
+            with contextlib.suppress(Exception):
+                leftover = drain()
+    if isinstance(leftover, str) and leftover.strip():
         with session["history_lock"]:
-            _enqueue_prompt(session, steer, session.get("transport"))
+            _enqueue_prompt(session, leftover, session.get("transport"))
+        _ack_steered_completion_ingest(session)
+    elif not getattr(session.get("agent"), "_pending_steer", None):
+        _ack_steered_completion_ingest(session)
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
@@ -542,6 +553,8 @@ def _invoke_agent(
     if display_kind and "persist_user_display_kind" in run_params:
         run_kwargs["persist_user_display_kind"] = display_kind
         run_kwargs["persist_user_display_metadata"] = display_metadata
+    if "turn_origin" in run_params:
+        run_kwargs["turn_origin"] = getattr(agent, "_cache_turn_origin", "user")
     # Live-rename hook: auto-titling fires inside the turn prologue.
     _title_key = session.get("session_key") or sid
     agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
@@ -673,6 +686,13 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         st.receipt_committed = True
     if st.receipt_committed:
         _retire_turn_marker(session, st.marker_key)
+    first_usage = getattr(agent, "_first_turn_usage", None) or getattr(agent, "_last_turn_usage", None)
+    if first_usage:
+        payload["cache_info"] = _cache_info_from_usage(first_usage)
+    elif not getattr(agent, "_tui_first_provider_response_recorded", False):
+        emit_cache = getattr(agent, "_tui_cache_callback", None)
+        if callable(emit_cache):
+            emit_cache("no_field", 0, 0, 0)
     return payload, raw, status
 
 
@@ -754,11 +774,20 @@ def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
-    terminal_callback: Callable[[dict[str, Any]], None] | None = None) -> bool:
+    terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+    turn_origin: str = "user") -> bool:
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
     images, agent = admitted
+    # Cache-warm retain/first-usage after admit so the ownership gate stays pin-identical.
+    with session["history_lock"]:
+        if turn_origin == "user":
+            _cancel_tui_cache_warm(session, retain_arm=True)
+        agent._tui_first_provider_response_record_enabled = True
+        agent._tui_first_provider_response_recorded = False
+        session.pop("first_provider_response", None)
+        agent._cache_turn_origin = turn_origin
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
     # session_key and the agent's live session_id together.  No prompt content is logged.
     _turn_started_monotonic = time.monotonic()
@@ -814,6 +843,11 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+                if (
+                    getattr(st.agent, "_cache_turn_origin", "user") == "user"
+                    and not getattr(st.agent, "_tui_first_provider_response_recorded", False)
+                ):
+                    session.pop("_cache_warm_previous_arm", None)
                 if not st.error_retained:
                     _clear_inflight_turn(session)
             # Closing bookend of "tui prompt accepted" — exactly one per accepted prompt.

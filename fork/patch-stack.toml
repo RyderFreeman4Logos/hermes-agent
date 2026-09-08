@@ -4,7 +4,8 @@
 # #213 is foreign excluded. Closed user-drop 14/40/151/150/204/252/267 excluded; not upstream-equivalent.
 # Old #265 remote 518972eb on 3340bbbd is preserved immutable; this WT is a NEW local metadata candidate.
 # v19: admit published canonical test-only source PRs #278/#279. 26 KEEP live-behavior rows unchanged.
-# Counts: 26 KEEP live-behavior (product owned 44) vs 2 test-only sources (owned 2) vs metadata (not in this file).
+# v20: retarget published #179/#186/#253 successors. 26 KEEP live-behavior rows unchanged. #278/#279 test-only unchanged.
+# Counts: 26 KEEP live-behavior (product owned computed below) vs 2 test-only sources (owned 2) vs metadata (not in this file).
 # Do not relabel #278/#279 as live-behavior KEEP / product_prs.
 schema_version = 1
 name = "docker-freeman-hermes"
@@ -23,9 +24,9 @@ historical_frozen_v11 = "hermes-final-manifest-20260906-frozen-v11.toml"
 historical_frozen_v11_sha256 = "afb1c561b5968db19251638d608535ddc18b739d9c183f6164f5681b7183850a"
 product_prs = 26
 test_only_prs = 2
-product_owned_unique_commits = 44
+product_owned_unique_commits = 47
 test_only_owned_unique_commits = 2
-owned_unique_commits = 46
+owned_unique_commits = 49
 stacked_deps = 5
 head_overlay_prs = []
 unpublished_heads_adopted = false
@@ -517,11 +518,46 @@ pr = 186
 name = "fix-compression-protect-fallback-and-oversized"
 title = "fix(compression): protect fallback and oversized active turns"
 branch = "topic/upgrade-pr13-05-compression-active-turn-20260821"
-head = "17d17e5aa402e16f6c348c93afef416ecf18a4d5"
-tree = "e27abbe3cd01c7bd5af6d9541bf0708af9ddb619"
+head = "7611db409f7b0a71e8fa9d83ba73858f87ec5817"
+tree = "5cb8a0218a75d8c0586c22c471acc64799bc8574"
 base_ref = "pin/official-main-83467c28-20260906"
 base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
-parent = "ed67e2fccc37999b1210660a6d2b1d483eb9e957"
+parent = "17d17e5aa402e16f6c348c93afef416ecf18a4d5"
+depends_on = []
+required = true
+supersedes = []
+overlay = false
+unique_on_pin = true
+unique_count = 3
+vs_pin_count = 3
+stacked_prereq_count = 0
+owned_diffsha_vs_base = "ab871d0a0e57542e348b1f31b0ae75ba7857ff008d48f528de62c30de815d42e"
+owned_diff_bytes_vs_base = 60017
+full_diffsha_vs_pin = "ab871d0a0e57542e348b1f31b0ae75ba7857ff008d48f528de62c30de815d42e"
+full_diff_bytes_vs_pin = 60017
+owned_commits = [
+  "ed67e2fccc37999b1210660a6d2b1d483eb9e957",
+  "17d17e5aa402e16f6c348c93afef416ecf18a4d5",
+  "7611db409f7b0a71e8fa9d83ba73858f87ec5817",
+]
+owned_subjects = [
+  "fix(compression): protect fallback and oversized active turns on 83467c28",
+  "fix(context): restore Unit B insertion-time payload caps on 83467c28",
+  "test(context): prove combined 32K/8K/16K insertion seam at commit",
+]
+notes = "unique-on-pin 3; published parent 17d17e5a; test-only successor 7611db40 (product blobs unchanged vs published parent); insertion-time payload caps retained; campaign_green=false"
+
+[[patch]]
+order = 16
+pr = 179
+name = "fix-model-after-compression-switch-and-deferred"
+title = "fix(model): after-compression switch and deferred --reasoning"
+branch = "topic/upgrade-after-compression-model-and-reasoning-20260821"
+head = "75b9f39a5bc68b54a7065b38013236d91ab92cbe"
+tree = "96cd2c3da5a54611dbd70973e7338d90e029bcdd"
+base_ref = "pin/official-main-83467c28-20260906"
+base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
+parent = "b022d89f5ab41ad62d7df2dff0a3a0d68c07dc35"
 depends_on = []
 required = true
 supersedes = []
@@ -530,50 +566,19 @@ unique_on_pin = true
 unique_count = 2
 vs_pin_count = 2
 stacked_prereq_count = 0
-owned_diffsha_vs_base = "4be0b6cb36af97010f256dfe17572c8e4965df237170336a64c90fbbfb501079"
-owned_diff_bytes_vs_base = 55834
-full_diffsha_vs_pin = "4be0b6cb36af97010f256dfe17572c8e4965df237170336a64c90fbbfb501079"
-full_diff_bytes_vs_pin = 55834
-owned_commits = [
-  "ed67e2fccc37999b1210660a6d2b1d483eb9e957",
-  "17d17e5aa402e16f6c348c93afef416ecf18a4d5",
-]
-owned_subjects = [
-  "fix(compression): protect fallback and oversized active turns on 83467c28",
-  "fix(context): restore Unit B insertion-time payload caps on 83467c28",
-]
-notes = "unique-on-pin 2 after Unit B repair; insertion-time payload caps; independent of batchD FAIL head ed67e2fc"
-
-[[patch]]
-order = 16
-pr = 179
-name = "fix-model-after-compression-switch-and-deferred"
-title = "fix(model): after-compression switch and deferred --reasoning"
-branch = "topic/upgrade-after-compression-model-and-reasoning-20260821"
-head = "b022d89f5ab41ad62d7df2dff0a3a0d68c07dc35"
-tree = "a292a3b357b98581b9831536749f9b2bbeba1525"
-base_ref = "pin/official-main-83467c28-20260906"
-base_sha = "83467c28f78987acdeb55636fb625946ec572a30"
-parent = "83467c28f78987acdeb55636fb625946ec572a30"
-depends_on = []
-required = true
-supersedes = []
-overlay = false
-unique_on_pin = true
-unique_count = 1
-vs_pin_count = 1
-stacked_prereq_count = 0
-owned_diffsha_vs_base = "55ce4de235bef31b43f016ff63aeebc31f1ca64e87f64c40ab76e6e64e3885ab"
-owned_diff_bytes_vs_base = 82019
-full_diffsha_vs_pin = "55ce4de235bef31b43f016ff63aeebc31f1ca64e87f64c40ab76e6e64e3885ab"
-full_diff_bytes_vs_pin = 82019
+owned_diffsha_vs_base = "05bfdb001b06efbf0cad4f4d00bdaa53ab849866c5668b43c3fd2c4067e5fc04"
+owned_diff_bytes_vs_base = 82017
+full_diffsha_vs_pin = "05bfdb001b06efbf0cad4f4d00bdaa53ab849866c5668b43c3fd2c4067e5fc04"
+full_diff_bytes_vs_pin = 82017
 owned_commits = [
   "b022d89f5ab41ad62d7df2dff0a3a0d68c07dc35",
+  "75b9f39a5bc68b54a7065b38013236d91ab92cbe",
 ]
 owned_subjects = [
   "feat(model-switch): defer route changes until compression commits",
+  "fix(test): drop extra blank line at EOF in model-once CLI test",
 ]
-notes = "unique-on-pin 1; replay-safe successor; defer until committed compaction; historical empty omission 6d5b14356f599f82bbd35fb5b434240481878dd2 (zero-diff) retained not replayed; not ancestor of this HEAD; prefix 22+1 not full 44 green"
+notes = "unique-on-pin 2; published parent b022d89f; test-only successor 75b9f39a (product blobs unchanged vs published parent); historical empty omission 6d5b14356f599f82bbd35fb5b434240481878dd2 (zero-diff) retained not replayed; campaign_green=false"
 
 [[patch]]
 order = 17
@@ -860,23 +865,23 @@ pr = 253
 name = "fix-contain-linux-test-runner-process-trees"
 title = "fix: contain Linux test-runner process trees"
 branch = "topic/test-runner-tree-containment-20260901"
-head = "00ff14168c9e16166a9925bf80f3c9712da139cb"
-tree = "49b7376a5aeae9e671bfde57af546060014531d7"
+head = "6dd88cc2895e8b3650778dddd04deb4c0a67a88e"
+tree = "44e37000a529acb89f57122bf2b2e4ebde746912"
 base_ref = "topic/test-runner-pid-cap-20260831"
 base_sha = "a690235fd0490d4769e96eb9f7d0d0e210372261"
-parent = "426161ad9c250a7fd4811c08c0bc81510665bbcc"
+parent = "00ff14168c9e16166a9925bf80f3c9712da139cb"
 depends_on = [251]
 required = true
 supersedes = []
 overlay = false
 unique_on_pin = false
-unique_count = 8
-vs_pin_count = 9
+unique_count = 9
+vs_pin_count = 10
 stacked_prereq_count = 1
-owned_diffsha_vs_base = "c672affb84bf79aa57ff69d79b785d8c0b22a7c119026cc8556b00d8759a96c5"
-owned_diff_bytes_vs_base = 77037
-full_diffsha_vs_pin = "ad3211f9042c2ad48931386181c9a7e24bd5f1b333f58c462ee51d57a8da4fff"
-full_diff_bytes_vs_pin = 79059
+owned_diffsha_vs_base = "acacc185eb0e9679dfffe76d6f21223c29323dc54e83d785997cc17eb9d99d4c"
+owned_diff_bytes_vs_base = 81466
+full_diffsha_vs_pin = "df6a0bac02caabb7cb774e121924e23b34038550e1fccfdef1fcd81c08fa4704"
+full_diff_bytes_vs_pin = 83488
 owned_commits = [
   "16a2fa1e412e47057f3f6341a5ca28efb66e3053",
   "c7aaad1acff9a8a02a5c4d3201c72f4e3853aebd",
@@ -886,6 +891,7 @@ owned_commits = [
   "9cb9f6979028d6058b1d9b1d139f8d0a592f3d23",
   "426161ad9c250a7fd4811c08c0bc81510665bbcc",
   "00ff14168c9e16166a9925bf80f3c9712da139cb",
+  "6dd88cc2895e8b3650778dddd04deb4c0a67a88e",
 ]
 owned_subjects = [
   "fix: contain parallel test worker trees",
@@ -896,8 +902,9 @@ owned_subjects = [
   "fix: bound runner watch pipe transport",
   "fix: bound nested pytest collection for out-of-tree probes",
   "fix: pair out-of-tree pytest argv with collection bounds",
+  "fix: hide live session bus from contained pytest",
 ]
-notes = "stacked on #251; owned 8 excludes #251 prefix; 6 live-identical + 2 harness/isolation repairs — NOT all live patch-ids; do not claim 8 live-identical"
+notes = "stacked on #251; owned 9 excludes #251 prefix; pin..HEAD 10 includes #251 — do not publish vs-pin as 253-only; 6 live-identical + 2 harness/isolation repairs + 1 ordinary-bus successor 6dd88cc2 (not full sandbox; source PASS not integration); do not claim 9 live-identical"
 
 [[patch]]
 order = 27

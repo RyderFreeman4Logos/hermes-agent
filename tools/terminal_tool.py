@@ -77,6 +77,22 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env("TERMINAL_DISK_WARNING_GB", 500.0, float, "number")
 
 
+def _auto_background_timeout_threshold() -> int:
+    """Seconds above which an omitted-background call is auto-promoted."""
+    threshold = 200
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        terminal_config = load_config_readonly().get("terminal") or {}
+        threshold = max(1, int(terminal_config.get("auto_background_timeout_threshold", 200)))
+    except (AttributeError, TypeError, ValueError):
+        logger.warning("Invalid terminal.auto_background_timeout_threshold; using 200s")
+        threshold = 200
+    except Exception:
+        logger.debug("Could not load terminal auto-background threshold", exc_info=True)
+    return threshold
+
+
 # Approval / sudo-prompt UI callbacks (CLI registers prompt_toolkit-aware
 # ones). Thread-local so overlapping ACP sessions, each on its own executor
 # thread, can't stomp on each other (GHSA-qg5c-hvr5-hjgr). Gateway mode
@@ -635,6 +651,7 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "auto_background_timeout_threshold": _auto_background_timeout_threshold(),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": _tenv("TERMINAL_SSH_HOST", ""),
@@ -879,6 +896,7 @@ class _ExecPlan:
     cwd: str
     host_cwd: Optional[str]
     effective_timeout: int
+    auto_promoted: bool = False
     # Set when an omitted-background call asked for more than FOREGROUND_MAX_TIMEOUT
     # and was promoted to a tracked background process instead of being refused
     # (the requested seconds, for the note). Explicit background=false still rejects.
@@ -954,9 +972,12 @@ def _plan_execution(
     # value is truthy and would fire an immediate "-Ns" timeout.
     if timeout is not None and timeout <= 0:
         raise _Rejected(tool_error(f"timeout must be a positive number of seconds (got {timeout})."))
+    effective_timeout = timeout or config["timeout"]
     background_was_omitted = background is None
     background = False if background_was_omitted else bool(background)
+    auto_background_threshold = int(config.get("auto_background_timeout_threshold", 200))
     promoted = None
+    auto_promoted = False
     if not background:
         # An over-cap foreground timeout is a bounded job the caller wants to wait for (test suites,
         # builds). Refusing it only bought a mechanical retry: 454 refusals in one run, every one
@@ -977,10 +998,13 @@ def _plan_execution(
                     f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true for long-running commands."
                 ))
             promoted = timeout
+        elif background_was_omitted and timeout is not None and timeout > auto_background_threshold:
+            auto_promoted = True
 
     return _ExecPlan(
         config=config, env_type=env_type, effective_task_id=effective_task_id,
-        image=image, cwd=cwd, host_cwd=host_cwd, effective_timeout=timeout or config["timeout"],
+        image=image, cwd=cwd, host_cwd=host_cwd, effective_timeout=effective_timeout,
+        auto_promoted=auto_promoted,
         promoted_from_foreground_timeout=promoted,
     )
 
@@ -1223,7 +1247,7 @@ def terminal_tool(
         verdict = _run_approval_guards(command, env_type, plan.config, force=force)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
-        if plan.promoted_from_foreground_timeout is not None:
+        if plan.promoted_from_foreground_timeout is not None or plan.auto_promoted:
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
@@ -1276,11 +1300,11 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. When omitted, Hermes keeps the command in the foreground unless the timeout exceeds the foreground cap; then it uses managed background execution with completion notification. Explicit background=false always keeps the command in the foreground (subject to the foreground timeout cap). Pair background=true with notify=true for bounded work; leave notifications off only for servers, watchers, and daemons.",
+                "description": "Run in the background, returning a session_id. When omitted, Hermes keeps the command in the foreground unless its effective timeout exceeds terminal.auto_background_timeout_threshold; then it uses managed background execution with completion notification. Explicit background=false always keeps the command in the foreground (subject to the foreground timeout cap). Pair background=true with notify=true for bounded work; leave notifications off only for servers, watchers, and daemons.",
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When background is omitted, a timeout above {FOREGROUND_MAX_TIMEOUT}s runs the command as a tracked background process with notify_on_complete=true instead (the result says so; do not re-run it). Explicit background=false still rejects a foreground timeout above {FOREGROUND_MAX_TIMEOUT}s; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When background is omitted, Hermes promotes the call to managed background execution with completion notification only when the effective timeout exceeds terminal.auto_background_timeout_threshold. A timeout above {FOREGROUND_MAX_TIMEOUT}s also runs as a tracked background process with notify_on_complete=true instead (the result says so; do not re-run it). Explicit background=false still rejects a foreground timeout above {FOREGROUND_MAX_TIMEOUT}s; use background=true for longer commands.",
                 "minimum": 1
             },
             "workdir": {

@@ -1964,6 +1964,10 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
 
 def _resolve_switch_context_length(agent, snapshot):
     """Resolve the destination context length (LM Studio preload first); returns ``(custom_providers, effective_len)``."""
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        intent = getattr(agent, "_deferred_model_switch_context_length", None)
+        agent._config_context_length = intent
+        return None, intent
     custom_providers = None
     try:
         from hermes_cli.config import (
@@ -1997,6 +2001,17 @@ def _resolve_switch_context_length(agent, snapshot):
 
 def _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot) -> None:
     """Point the context compressor at the new model (rolls back the switch on failure)."""
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        new_context_length = effective_context_length or getattr(
+            agent.context_compressor, "context_length", None)
+        try:
+            agent.context_compressor.update_model(
+                model=agent.model, context_length=new_context_length, base_url=agent.base_url,
+                api_key=agent.api_key, provider=agent.provider, api_mode=agent.api_mode)
+        except Exception:
+            _restore_switch_snapshot(agent, snapshot)
+            raise
+        return
     from agent.model_metadata import get_model_context_length
     if custom_providers is None:
         try:
@@ -2107,7 +2122,23 @@ def switch_model(
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
     the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
-    snapshot and re-raises (callers catch)."""
+    snapshot and re-raises (callers catch). Immediate swaps cancel a pending deferred switch."""
+    from hermes_cli.model_switch import (
+        _emit_deferred_model_switch_status, clear_model_switch_after_compression,
+        model_switch_transaction_lock)
+    with model_switch_transaction_lock(agent):
+        _switch_model_unlocked(
+            agent, new_model, new_provider, api_key, base_url, api_mode, capabilities)
+        if not getattr(agent, "_applying_model_switch_after_compression", False):
+            cancelled = clear_model_switch_after_compression(agent)
+            if cancelled is not None:
+                _emit_deferred_model_switch_status(
+                    agent, "Pending after-compression model switch cancelled by the immediate model switch.")
+
+
+def _switch_model_unlocked(
+    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None
+):
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
@@ -2140,16 +2171,21 @@ def switch_model(
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot)
     # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
-    # YAML False = disabled).
-    try:
-        from hermes_constants import resolve_reasoning_config
-        from hermes_cli.config import load_config as _sm_load_config
-        agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
-        logger.info(
-            "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
-        )
-    except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+    # YAML False = disabled). A deferred compression-boundary switch keeps the already-resolved
+    # destination config and must not probe config.yaml again.
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        agent.reasoning_config = copy.deepcopy(
+            getattr(agent, "_deferred_model_switch_reasoning_config", None))
+    else:
+        try:
+            from hermes_constants import resolve_reasoning_config
+            from hermes_cli.config import load_config as _sm_load_config
+            agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+            logger.info(
+                "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
+            )
+        except Exception as _reasoning_err:
+            logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
     # Invalidate the cached system prompt so it rebuilds next turn.
     agent._cached_system_prompt = None
     # Publish the destination capability map only after every runtime setup above has succeeded.

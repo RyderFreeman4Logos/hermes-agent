@@ -1,5 +1,6 @@
 """#160 Codex-only auxiliary fallback destinations on official resolver APIs."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +30,38 @@ def _client(text, base_url):
                 )
             )
         ),
+    )
+
+
+def _response(text):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+
+
+def _configure_classifier_fallbacks(monkeypatch, tmp_path, count=1):
+    from hermes_cli import config as config_mod
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    fallback_chain = "\n".join(
+        f"      - provider: openai-codex\n        model: codex-{index}"
+        for index in range(count)
+    )
+    (hermes_home / "config.yaml").write_text(
+        "\n".join((
+            "auxiliary:", "  classifier:", "    provider: primary-provider",
+            "    model: primary-model", "    fallback_chain:", fallback_chain,
+        )),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(config_mod, "_LOAD_CONFIG_CACHE", {})
+    monkeypatch.setattr(config_mod, "_RAW_CONFIG_CACHE", {})
+
+
+def _chat_client(create, base_url):
+    return SimpleNamespace(
+        base_url=base_url,
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
     )
 
 
@@ -269,50 +302,154 @@ def test_lean_digest_workers_reuse_selected_codex_route_settings():
         }
 
 
-def test_generic_aux_error_advances_across_configured_codex_hops():
+def test_public_sync_generic_error_advances_failed_candidate_to_later_codex_hop(monkeypatch, tmp_path):
+    _configure_classifier_fallbacks(monkeypatch, tmp_path, count=2)
+    calls = []
+    tool = {"type": "function", "function": {"name": "once", "description": "once", "parameters": {"type": "object"}}}
+
+    def primary(**kwargs):
+        calls.append(("primary", kwargs))
+        raise ValueError("upstream transport: safety filter cache unavailable")
+
+    def failed_candidate(**kwargs):
+        calls.append(("codex-0", kwargs))
+        raise ValueError("approval denied cache unavailable")
+
+    def successful_candidate(**kwargs):
+        calls.append(("codex-1", kwargs))
+        return _response("later hop")
+
+    primary_client = _chat_client(primary, "https://primary.invalid/v1")
+    fallback_clients = iter((
+        _chat_client(failed_candidate, "https://codex-0.invalid/v1"),
+        _chat_client(successful_candidate, "https://codex-1.invalid/v1"),
+    ))
+    monkeypatch.setattr(aux, "_get_cached_client", lambda _provider, model, **_kwargs: (primary_client, model))
+    monkeypatch.setattr(aux, "resolve_provider_client", lambda _provider, model, **_kwargs: (next(fallback_clients), model))
+    monkeypatch.setattr(aux, "_try_main_agent_model_fallback", lambda *_args, **_kwargs: (None, None, ""))
+
     route_info = {}
-    route = aux._LadderRoute(
-        MagicMock(), "classifier", "", False, "https://primary.invalid/v1",
-        "explicit-provider", "primary-model", None, None, None, "primary-model", None, route_info,
+    result = aux.call_llm(task="classifier", messages=[{"role": "user", "content": "hi"}], tools=[tool], route_info=route_info)
+
+    assert result.choices[0].message.content == "later hop"
+    assert [name for name, _ in calls] == ["primary", "codex-0", "codex-1"]
+    assert all(kwargs["tools"] == [tool] for _, kwargs in calls)
+    assert route_info["fallback_label"].startswith("fallback_chain[1]")
+
+
+def test_public_async_generic_error_advances_to_codex(monkeypatch, tmp_path):
+    _configure_classifier_fallbacks(monkeypatch, tmp_path)
+    calls = []
+
+    async def primary(**_kwargs):
+        calls.append("primary")
+        raise ValueError("approval denied cache unavailable")
+
+    async def fallback(**_kwargs):
+        calls.append("codex")
+        return _response("async fallback")
+
+    primary_client = _chat_client(primary, "https://primary.invalid/v1")
+    fallback_client = _chat_client(fallback, "https://codex.invalid/v1")
+    monkeypatch.setattr(aux, "_get_cached_client", lambda _provider, model, **_kwargs: (primary_client, model))
+    monkeypatch.setattr(aux, "resolve_provider_client", lambda _provider, model, **_kwargs: (fallback_client, model))
+    monkeypatch.setattr(aux, "_to_async_client", lambda client, model, **_kwargs: (client, model))
+
+    result = asyncio.run(aux.async_call_llm(task="classifier", messages=[{"role": "user", "content": "hi"}]))
+
+    assert result.choices[0].message.content == "async fallback"
+    assert calls == ["primary", "codex"]
+
+
+def test_public_forced_stream_generic_error_advances_to_codex(monkeypatch, tmp_path):
+    _configure_classifier_fallbacks(monkeypatch, tmp_path)
+    calls = []
+
+    def primary(**kwargs):
+        calls.append(("primary", kwargs))
+        assert kwargs["stream"] is True
+        raise ValueError("content policy cache unavailable")
+
+    def fallback(**kwargs):
+        calls.append(("codex", kwargs))
+        assert kwargs["stream"] is True
+        chunk = SimpleNamespace(
+            id="stream-1", model="codex-0", usage=None,
+            choices=[SimpleNamespace(
+                delta=SimpleNamespace(content="stream fallback", reasoning=None, reasoning_content=None, reasoning_details=None, tool_calls=None),
+                finish_reason="stop",
+            )],
+        )
+        return iter((chunk,))
+
+    primary_client = _chat_client(primary, "https://primary.invalid/v1")
+    fallback_client = _chat_client(fallback, "https://codex.invalid/v1")
+    monkeypatch.setattr(aux, "_get_cached_client", lambda _provider, model, **_kwargs: (primary_client, model))
+    monkeypatch.setattr(aux, "resolve_provider_client", lambda _provider, model, **_kwargs: (fallback_client, model))
+    monkeypatch.setattr(aux, "_provider_requires_stream", lambda *_args: True)
+
+    result = aux.call_llm(task="classifier", messages=[{"role": "user", "content": "hi"}])
+
+    assert result.choices[0].message.content == "stream fallback"
+    assert [name for name, _ in calls] == ["primary", "codex"]
+
+
+def test_public_exhaustion_reraises_original_after_admitted_candidate(monkeypatch, tmp_path):
+    _configure_classifier_fallbacks(monkeypatch, tmp_path)
+    attempts = []
+    original = ValueError("safety filter cache unavailable")
+
+    def primary(**_kwargs):
+        attempts.append("primary")
+        raise original
+
+    def fallback(**_kwargs):
+        attempts.append("codex")
+        raise ValueError("candidate unavailable")
+
+    primary_client = _chat_client(primary, "https://primary.invalid/v1")
+    fallback_client = _chat_client(fallback, "https://codex.invalid/v1")
+    monkeypatch.setattr(aux, "_get_cached_client", lambda _provider, model, **_kwargs: (primary_client, model))
+    monkeypatch.setattr(aux, "resolve_provider_client", lambda _provider, model, **_kwargs: (fallback_client, model))
+    monkeypatch.setattr(aux, "_try_main_agent_model_fallback", lambda *_args, **_kwargs: (None, None, ""))
+
+    with pytest.raises(ValueError) as raised:
+        aux.call_llm(task="classifier", messages=[{"role": "user", "content": "hi"}])
+
+    assert raised.value is original
+    assert attempts == ["primary", "codex"]
+
+
+def test_public_explicit_cancellation_does_not_activate_fallback(monkeypatch, tmp_path):
+    _configure_classifier_fallbacks(monkeypatch, tmp_path)
+    primary_client = _chat_client(
+        lambda **_kwargs: (_ for _ in ()).throw(aux.AuxiliaryExplicitCancellation()),
+        "https://primary.invalid/v1",
     )
-    first = (MagicMock(), "codex-one", "fallback_chain[0](openai-codex)")
-    second = (MagicMock(), "codex-two", "fallback_chain[1](openai-codex)")
+    resolve = MagicMock()
+    monkeypatch.setattr(aux, "_get_cached_client", lambda _provider, model, **_kwargs: (primary_client, model))
+    monkeypatch.setattr(aux, "resolve_provider_client", resolve)
 
-    with patch.object(aux, "_try_configured_fallback_chain", side_effect=[first, second]):
-        ladder = aux._ladder_provider_fallback(ValueError("provider runtime failed"), route)
-        step = next(ladder)
-        assert step.args[2] == first[2]
-        step = ladder.throw(ValueError("first fallback candidate failed"))
-        assert step.args[2] == second[2]
-        with pytest.raises(StopIteration) as completed:
-            ladder.send("served by second codex hop")
+    with pytest.raises(aux.AuxiliaryExplicitCancellation):
+        aux.call_llm(task="classifier", messages=[{"role": "user", "content": "hi"}])
 
-    assert completed.value.value == "served by second codex hop"
+    resolve.assert_not_called()
 
 
-def test_generic_aux_error_never_admits_non_codex_destination():
-    route = aux._LadderRoute(
-        MagicMock(), "classifier", "", False, "https://primary.invalid/v1",
-        "explicit-provider", "primary-model", None, None, None, "primary-model", None, {},
-    )
-    with patch.object(aux, "_try_configured_fallback_chain", return_value=(None, None, "")) as chain, \
-         patch.object(aux, "_try_main_agent_model_fallback", return_value=(None, None, "")):
-        ladder = aux._ladder_provider_fallback(ValueError("provider runtime failed"), route)
-        with pytest.raises(StopIteration) as completed:
-            next(ladder)
+def test_public_structured_policy_denial_does_not_fallback(monkeypatch, tmp_path):
+    _configure_classifier_fallbacks(monkeypatch, tmp_path)
 
-    assert completed.value.value is None
-    chain.assert_called_once()
+    class ExplicitPolicyError(ValueError):
+        body = {"error": {"code": "content_policy_violation"}}
 
+    original = ExplicitPolicyError("provider rejected request")
+    primary_client = _chat_client(lambda **_kwargs: (_ for _ in ()).throw(original), "https://primary.invalid/v1")
+    resolve = MagicMock()
+    monkeypatch.setattr(aux, "_get_cached_client", lambda _provider, model, **_kwargs: (primary_client, model))
+    monkeypatch.setattr(aux, "resolve_provider_client", resolve)
 
-def test_auxiliary_safety_or_approval_denial_does_not_fallback():
-    route = aux._LadderRoute(
-        MagicMock(), "classifier", "", False, "https://primary.invalid/v1",
-        "explicit-provider", "primary-model", None, None, None, "primary-model", None, {},
-    )
-    for message in ("content policy blocked this request", "approval denied by operator"):
-        with patch.object(aux, "_try_configured_fallback_chain") as chain:
-            ladder = aux._ladder_provider_fallback(ValueError(message), route)
-            with pytest.raises(StopIteration):
-                next(ladder)
-        chain.assert_not_called()
+    with pytest.raises(ExplicitPolicyError) as raised:
+        aux.call_llm(task="classifier", messages=[{"role": "user", "content": "hi"}])
+
+    assert raised.value is original
+    resolve.assert_not_called()

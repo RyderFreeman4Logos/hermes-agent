@@ -6895,6 +6895,14 @@ def _ladder_credential_rungs(
     return None, first_err
 
 
+def _is_explicit_auxiliary_control_denial(error: Exception) -> bool:
+    """Only typed provider controls stop an otherwise recoverable auxiliary request."""
+    from agent.error_classifier import _extract_error_body, _extract_error_code
+    return _extract_error_code(_extract_error_body(error)).lower() in {
+        "approval_denied", "content_policy_violation",
+    }
+
+
 def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     """Last rung: other providers (per-task chain; then auto: main fallback chain + discovery
     chain, explicit: main-agent-model net). Returns the response or None.
@@ -6908,8 +6916,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     # (429 + "too many tokens per day") must fall back just like a 402 credit error.
     # Rate limits are included: after retries are exhausted, a 429 means the provider is at capacity. See
     # #52228. See #26803: daily token quota must fall back like a 402 credit error.
-    error_text = str(first_err).lower()
-    if any(marker in error_text for marker in ("content policy", "safety filter", "approval denied")):
+    if _is_explicit_auxiliary_control_denial(first_err):
         return None
     is_auto = resolved_provider in {"auto", "", None}
     reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), "provider execution error")
@@ -6941,8 +6948,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         try:
             return (yield step)
         except Exception as candidate_error:
-            candidate_text = str(candidate_error).lower()
-            if any(marker in candidate_text for marker in ("content policy", "safety filter", "approval denied")):
+            if _is_explicit_auxiliary_control_denial(candidate_error):
                 raise
             logger.warning(
                 "Auxiliary %s%s: fallback candidate failed (%s); advancing the configured chain",

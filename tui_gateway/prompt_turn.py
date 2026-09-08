@@ -767,6 +767,7 @@ def _run_prompt_submit(
         return False
     images, agent = admitted
     # Cache-warm retain/first-usage after admit so the ownership gate stays pin-identical.
+    from tui_gateway.cache_telemetry import _cancel_tui_cache_warm
     with session["history_lock"]:
         if turn_origin == "user":
             _cancel_tui_cache_warm(session, retain_arm=True)

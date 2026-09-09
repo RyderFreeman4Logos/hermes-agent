@@ -1014,6 +1014,7 @@ class TurnRunner:
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
+        runner._attach_model_switch_after_compression(ctx.session_key, agent)
         return agent, found.reused
 
     # ── per-turn agent wiring ───────────────────────────────────────────────────────────────

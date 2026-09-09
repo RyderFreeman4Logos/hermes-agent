@@ -9,7 +9,7 @@ import json
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _chat_content_to_responses_parts, _chat_messages_to_responses_input, _normalize_codex_response, _preflight_codex_input_items
@@ -760,26 +760,23 @@ class TestBuildAssistantMessage:
 class TestAuxiliaryClientProviderPriority:
     """Verify auxiliary client resolution doesn't break for any provider."""
 
-    def test_openrouter_always_wins(self, monkeypatch):
-        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-        from agent.auxiliary_client import _OPENROUTER_MODEL, get_text_auxiliary_client
-        with patch("agent.auxiliary_client.OpenAI") as mock:
-            client, model = get_text_auxiliary_client()
-        assert model == _OPENROUTER_MODEL
-        assert "openrouter" in str(mock.call_args.kwargs["base_url"]).lower()
+    def test_openrouter_is_not_an_auxiliary_auto_destination(self, monkeypatch):
+        from agent.auxiliary_client import _try_discovery_chain
+        client = MagicMock()
+        with patch("agent.auxiliary_client._get_provider_chain", return_value=[
+            ("openrouter", lambda: (client, "openrouter-model")),
+        ]):
+            resolved, model, provider = _try_discovery_chain()
+        assert (resolved, model, provider) == (None, None, "")
 
-    def test_nous_when_no_openrouter(self, monkeypatch):
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        from agent.auxiliary_client import _NOUS_MODEL, get_text_auxiliary_client
-        nous_auth = {
-            "access_token": _fake_invoke_jwt(),
-            "scope": "inference:invoke",
-        }
-        with patch("agent.auxiliary_client._read_nous_auth", return_value=nous_auth), \
-             patch("agent.auxiliary_client.OpenAI") as mock, \
-             patch("hermes_cli.models.get_nous_recommended_aux_model", return_value=None):
-            client, model = get_text_auxiliary_client()
-        assert model == _NOUS_MODEL
+    def test_nous_is_not_an_auxiliary_auto_destination(self, monkeypatch):
+        from agent.auxiliary_client import _try_discovery_chain
+        client = MagicMock()
+        with patch("agent.auxiliary_client._get_provider_chain", return_value=[
+            ("nous", lambda: (client, "nous-model")),
+        ]):
+            resolved, model, provider = _try_discovery_chain()
+        assert (resolved, model, provider) == (None, None, "")
 
     def test_custom_endpoint_when_no_nous(self, monkeypatch):
         """Custom endpoint is used when no OpenRouter/Nous keys are available.

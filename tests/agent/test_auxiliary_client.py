@@ -1806,11 +1806,12 @@ class TestStaleFallbackCandidateSkip:
         assert stale_fb.chat.completions.create.call_count == 1
         assert healthy_fb.chat.completions.create.call_count == 1
 
-    def test_non_auth_fallback_error_still_raises(self, monkeypatch):
-        """A non-auth error from the fallback candidate propagates unchanged."""
+    def test_non_auth_fallback_error_reraises_original_after_finite_exhaustion(self, monkeypatch):
+        """Ordinary candidate errors advance; exhaustion preserves the primary error."""
+        original = self._timeout_err()
         primary_client = MagicMock()
         primary_client.base_url = "https://chatgpt.com/backend-api/codex"
-        primary_client.chat.completions.create.side_effect = self._timeout_err()
+        primary_client.chat.completions.create.side_effect = original
 
         broken_fb = MagicMock()
         broken_fb.base_url = "https://api.anthropic.com"
@@ -1825,12 +1826,54 @@ class TestStaleFallbackCandidateSkip:
              patch("agent.auxiliary_client._try_main_fallback_chain",
                    return_value=(None, None, "")), \
              patch("agent.auxiliary_client._try_payment_fallback",
-                   return_value=(broken_fb, "claude-haiku-4-5-20251001", "anthropic")):
-            with pytest.raises(ValueError, match="malformed response"):
+                   side_effect=[
+                       (broken_fb, "claude-haiku-4-5-20251001", "anthropic"),
+                       (None, None, ""),
+                   ]) as mock_fb:
+            with pytest.raises(type(original)) as raised:
                 call_llm(
                     task="compression",
                     messages=[{"role": "user", "content": "summarize"}],
                 )
+
+        assert raised.value is original
+        assert broken_fb.chat.completions.create.call_count == 1
+        assert mock_fb.call_count == 2
+
+    @pytest.mark.parametrize("code", ("approval_denied", "content_policy_violation"))
+    def test_explicit_candidate_denial_is_terminal(self, monkeypatch, code):
+        """Typed candidate controls never advance the fallback chain."""
+        class _ExplicitDenial(ValueError):
+            body = {"error": {"code": code}}
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://chatgpt.com/backend-api/codex"
+        primary_client.chat.completions.create.side_effect = self._timeout_err()
+
+        denied_fb = MagicMock()
+        denied_fb.base_url = "https://api.anthropic.com"
+        denial = _ExplicitDenial("provider rejected request")
+        denied_fb.chat.completions.create.side_effect = denial
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", None, None, None, None)), \
+             patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gpt-5.5")), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   return_value=(denied_fb, "claude-haiku-4-5-20251001", "anthropic")) as mock_fb:
+            with pytest.raises(_ExplicitDenial) as raised:
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+
+        assert raised.value is denial
+        assert denied_fb.chat.completions.create.call_count == 1
+        mock_fb.assert_called_once()
 
 
 class TestAuxiliaryFallbackLayering:

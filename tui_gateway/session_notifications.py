@@ -147,6 +147,209 @@ def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwa
         raise
 
 
+def _mark_completion_events_consumed(events: list) -> None:
+    from tools.process_registry import process_registry
+
+    for evt in events:
+        if evt.get("type") != "completion":
+            continue
+        sid = evt.get("session_id")
+        if sid:
+            process_registry._completion_consumed.add(sid)
+
+
+def _ack_steered_completion_ingest(session: dict) -> None:
+    """ACK staged completions only after leftover enqueue or equivalent ingest."""
+    with session["history_lock"]:
+        live = str(getattr(session.get("agent"), "_pending_steer", None) or "")
+        pending = list(session.get("_completion_pending") or [])
+        accepted = []
+        keep = []
+        for evt in pending:
+            sid = evt.get("session_id")
+            # Still only on the live steer rail — not in this ingest snapshot.
+            if evt.get("_steer_accepted") and sid and live and f" {sid} " in f" {live} ":
+                keep.append(evt)
+            elif evt.get("_steer_accepted"):
+                accepted.append(evt)
+            else:
+                keep.append(evt)
+        session["_completion_pending"] = keep
+    if accepted:
+        _mark_completion_events_consumed(accepted)
+
+
+def _bind_completion_steer_guards(session: dict, agent) -> None:
+    """ACK on drain (ingest); unmark on interrupt wipe so pending can replay."""
+    if agent is None or getattr(agent, "_completion_steer_guards", False):
+        return
+    orig_clear = getattr(agent, "clear_interrupt", None)
+    if callable(orig_clear):
+        def _clear(*args, **kwargs):
+            had = bool(getattr(agent, "_pending_steer", None))
+            result = orig_clear(*args, **kwargs)
+            if had and not getattr(agent, "_pending_steer", None):
+                with session["history_lock"]:
+                    for evt in session.get("_completion_pending") or []:
+                        evt.pop("_steer_accepted", None)
+            return result
+
+        agent.clear_interrupt = _clear
+    orig_apply = getattr(agent, "_apply_pending_steer_to_tool_results", None)
+    if callable(orig_apply):
+        def _apply(*args, **kwargs):
+            orig_apply(*args, **kwargs)
+            if not getattr(agent, "_pending_steer", None):
+                _ack_steered_completion_ingest(session)
+
+        agent._apply_pending_steer_to_tool_results = _apply
+    agent._completion_steer_guards = True
+
+
+def _format_completion_batch(events: list) -> str | None:
+    """Reuse official ProcessNotificationBatch text for one idle/steer ingest."""
+    from tools.process_registry import process_registry
+    from tools.process_registry_notifications import ProcessNotificationBatch, format_process_notification
+
+    notifications = []
+    for evt in events:
+        text = format_process_notification(evt)
+        if text:
+            notifications.append((evt, text))
+    if not notifications:
+        return None
+    return ProcessNotificationBatch(tuple(notifications)).render(process_registry)
+
+
+def _session_can_steer_completions(session: dict) -> bool:
+    """True when the live turn can ingest via AIAgent.steer (never a drop path)."""
+    if not session.get("running"):
+        return False
+    return callable(getattr(session.get("agent"), "steer", None))
+
+
+def _deliver_completions_via_steer(sid: str, session: dict, events: list, emitted: set) -> bool:
+    """Insert one completion (or one N-event batch) into the current loop.
+
+    Uses the existing ``AIAgent.steer`` / ``_pending_steer`` rail so the next
+    tool-result or pre-API drain sees the text. Never starts a new idle turn.
+    False means the caller must keep the events (never drop).
+    """
+    if not events:
+        return False
+    steer = getattr(session.get("agent"), "steer", None)
+    if not callable(steer):
+        return False
+    text = _format_completion_batch(events)
+    if not text:
+        return False
+    if len(events) == 1:
+        batch_key = _notification_event_dedup_key(events[0])
+    else:
+        batch_key = ("completion-batch",) + tuple(
+            _notification_event_dedup_key(evt) for evt in events
+        )
+    if batch_key not in emitted:
+        _emit("status.update", sid, {"kind": "process", "text": text})
+        emitted.add(batch_key)
+    try:
+        if not steer(text):
+            return False
+    except Exception:
+        return False
+    # steer() True is staging only — ACK at leftover/tool-result ingest.
+    _bind_completion_steer_guards(session, session.get("agent"))
+    with session["history_lock"]:
+        pending = session.setdefault("_completion_pending", [])
+        have = {evt.get("session_id") for evt in pending}
+        for evt in events:
+            sid_evt = evt.get("session_id")
+            if sid_evt in have:
+                for item in pending:
+                    if item.get("session_id") == sid_evt:
+                        item["_steer_accepted"] = True
+            else:
+                staged = dict(evt)
+                staged["_steer_accepted"] = True
+                pending.append(staged)
+    return True
+
+
+def _idle_completion_turn(sid: str, session: dict, claim_evt: dict, text: str) -> bool:
+    """Claim + one agent turn for a process notification (single or batch text)."""
+    from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
+
+    claim = claim_event_delivery(claim_evt, "tui-poller")
+    if claim is None:
+        _notif_release_turn(session)
+        return False
+    try:
+        _notif_submit(
+            f"__notif__{int(time.time() * 1000)}", sid, session, text,
+            "notification poller dispatch failed")
+    except Exception:
+        release_event_delivery(claim_evt, claim)
+        return False
+    complete_event_delivery(claim_evt, claim)
+    return True
+
+
+def _deliver_completion_notifications(sid: str, session: dict, events: list, emitted: set) -> None:
+    """Idle ingest: one item, or one official batch when N>1. Never emit N updates."""
+    if not events:
+        return
+    text = _format_completion_batch(events)
+    if not text:
+        return
+    with session["history_lock"]:
+        if session.get("running"):
+            pending = session.setdefault("_completion_pending", [])
+            session["_completion_pending"] = list(events) + list(pending)
+            return
+        session["running"] = True
+    if len(events) == 1:
+        batch_key = _notification_event_dedup_key(events[0])
+    else:
+        batch_key = ("completion-batch",) + tuple(
+            _notification_event_dedup_key(evt) for evt in events
+        )
+    if batch_key not in emitted:
+        _emit("status.update", sid, {"kind": "process", "text": text})
+        emitted.add(batch_key)
+    if _idle_completion_turn(sid, session, events[0], text):
+        _mark_completion_events_consumed(events)
+    else:
+        with session["history_lock"]:
+            pending = session.setdefault("_completion_pending", [])
+            session["_completion_pending"] = list(events) + list(pending)
+
+
+def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) -> None:
+    with session["history_lock"]:
+        pending = list(session.get("_completion_pending") or [])
+        if not pending:
+            return
+        running = bool(session.get("running"))
+        if running and not _session_can_steer_completions(session):
+            return
+        accepted = [evt for evt in pending if evt.get("_steer_accepted")]
+        fresh = [evt for evt in pending if not evt.get("_steer_accepted")]
+        # Already staged on _pending_steer: do not re-steer or idle-dump.
+        session["_completion_pending"] = list(accepted)
+        if not fresh:
+            return
+        pending = fresh
+    if not pending:
+        return
+    if running:
+        if not _deliver_completions_via_steer(sid, session, pending, emitted):
+            with session["history_lock"]:
+                leftover = session.setdefault("_completion_pending", [])
+                session["_completion_pending"] = list(pending) + list(leftover)
+        return
+    _deliver_completion_notifications(sid, session, pending, emitted)
+
+
 def _notif_loop_status(sid: str, text: str) -> None:
     _emit("status.update", sid, {"kind": "loop", "text": text})
 
@@ -422,6 +625,17 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
+    if evt_type == "completion":
+        with session["history_lock"]:
+            if deferred is None:
+                # Live poller: buffer off the shared queue; flush coalesces.
+                session.setdefault("_completion_pending", []).append(evt)
+                return True
+            if session.get("running"):
+                # Official drain (post-turn/shutdown deferred=[]) while busy:
+                # requeue, do not emit. Post-turn has no leftover pending drain.
+                deferred.append(evt)
+                return True
     text = fmt(evt)
     if not text:
         return True
@@ -574,9 +788,21 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
             last_kanban_poll = now
             _notif_poll_kanban(sid, session)
+        with session["history_lock"]:
+            pending = list(session.get("_completion_pending") or [])
+        timeout = 0.5
+        if pending:
+            timeout = 0.1
+            _active = getattr(session.get("agent"), "_model_request_active", None)
+            if _session_can_steer_completions(session) and _active is not None and getattr(
+                    _active, "is_set", lambda: False)():
+                timeout = 2.0
         try:
-            evt = queue.get(timeout=0.5)
+            evt = queue.get(timeout=timeout)
         except Exception:
+            if stop_event.is_set() or session.get("_finalized"):
+                break
+            _flush_pending_completions_if_idle(sid, session, emitted)
             continue
         ready = [evt]
         for _ in range(queue.qsize()):
@@ -595,6 +821,15 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
         except Exception:
             break
     handle(ready, deferred)
+    _flush_pending_completions_if_idle(sid, session, emitted)
+    with session["history_lock"]:
+        pending = list(session.get("_completion_pending") or [])
+        leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
+        session["_completion_pending"] = [
+            evt for evt in pending if evt.get("_steer_accepted")
+        ]
+    for evt in leftover:
+        queue.put(evt)
     for evt in deferred:
         queue.put(evt)
 

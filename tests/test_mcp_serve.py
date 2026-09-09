@@ -1334,14 +1334,14 @@ class TestEventBridgePollE2E:
         assert result["events"][0]["session_key"] == "agent:main:telegram:dm:late"
         assert result["events"][0]["content"].startswith("Hello from a freshly")
 
-    def test_startup_baseline_suppresses_historical_replay(self, tmp_path, monkeypatch):
+    def test_startup_baseline_suppresses_historical_replay(self, monkeypatch):
         """start()'s baseline records existing history without emitting it, so a
         fresh EventBridge does not replay stored messages on startup; only
         messages written after the baseline are delivered."""
         import mcp_serve
 
-        db_path = tmp_path / "state.db"
-        db_path.write_text("placeholder")
+        db_mtimes = iter((1.0, 2.0))
+        monkeypatch.setattr(mcp_serve, "_read_state_db_mtime", lambda: next(db_mtimes))
         session_id = "20260329_150000_history"
         monkeypatch.setattr(
             mcp_serve, "_load_sessions_index",
@@ -1374,20 +1374,19 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
         assert events[0]["content"] == "arrived after start"
 
-    def test_new_conversation_after_baseline_is_delivered(self, tmp_path, monkeypatch):
+    def test_new_conversation_after_baseline_is_delivered(self, monkeypatch):
         """A conversation that first appears AFTER the startup baseline is still
         delivered on its state.db-change tick — sessions absent from the
         baseline default to last_seen=0.0."""
         import mcp_serve
 
-        db_path = tmp_path / "state.db"
-        db_path.write_text("placeholder")
+        db_mtimes = iter((1.0, 2.0))
+        monkeypatch.setattr(mcp_serve, "_read_state_db_mtime", lambda: next(db_mtimes))
         index: dict = {}
         messages: dict = {}
         monkeypatch.setattr(mcp_serve, "_load_sessions_index", lambda: dict(index))
@@ -1412,7 +1411,6 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

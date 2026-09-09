@@ -27,6 +27,7 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (FailoverReason, PROVIDER_STREAM_NON_JSON_ERROR_CODE)
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -3151,6 +3152,9 @@ class _StreamingCall(StreamingWaitMonitor):
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    self.result["error"] = e
+                    return
                 except Exception as e:
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
@@ -3306,6 +3310,8 @@ class _StreamingCall(StreamingWaitMonitor):
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
         if self.result["error"] is not None:
+            if isinstance(self.result["error"], StreamPayloadBoundExceeded):
+                raise self.result["error"]
             if self.deltas_were_sent["yes"]:
                 return self._partial_stream_stub()
             raise self.result["error"]

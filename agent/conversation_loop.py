@@ -474,6 +474,23 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     )
 
 
+def _is_standard_profile_child(agent) -> bool:
+    return getattr(agent, "_delegate_model_profile", None) == "standard"
+
+
+def _standard_child_can_fallback(agent, *, reason=None) -> bool:
+    """Permit a standard child to advance after the current provider execution error.
+
+    Content-policy rejections are deliberate safety denials for this exact prompt, not
+    provider availability failures, so they remain terminal. Cancellation and shutdown
+    use ``BaseException`` and never reach this guard.
+    """
+    if not _is_standard_profile_child(agent):
+        return True
+    from agent.error_classifier import FailoverReason
+    return reason != FailoverReason.content_policy_blocked
+
+
 def _billing_or_entitlement_message(
     *, capability: str, provider: str, base_url: str, model: str, unverified: bool = False
 ) -> str:

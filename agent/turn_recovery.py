@@ -1387,8 +1387,9 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
-    _should_fallback = _standard_child_can_fallback(agent, reason=classified.reason) or (
-        (is_rate_limited and _wrapped_output_cap_budget is None)
+    _should_fallback = _wrapped_output_cap_budget is None and (
+        _standard_child_can_fallback(agent, reason=classified.reason)
+        or is_rate_limited
         or (_is_transport_failure and retry_count >= 2)
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):

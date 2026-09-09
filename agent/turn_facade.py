@@ -119,6 +119,9 @@ class TurnFacadeMixin:
                 try:
                     if lease is not None:
                         lease.start()
+                    from agent.conversation_loop import _loop_timing_context
+                    self._loop_timing_persisted_text = ""
+                    self._loop_timing_context_text = _loop_timing_context(self) or ""
                     result = run_conversation(
                         self, user_message, system_message, conversation_history, effective_task_id,
                         stream_callback, persist_user_message,
@@ -130,6 +133,10 @@ class TurnFacadeMixin:
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
                     # the interrupt clear itself waits for the thread join in the outer finally.
+                    from agent.conversation_loop import _loop_timing_context
+                    _loop_timing_context(self, stop=True)
+                    self._loop_timing_context_text = ""
+                    self._loop_timing_persisted_text = ""
                     if lease is not None:
                         lease.stop_refresher()
             terminal = result if isinstance(result, dict) else {}

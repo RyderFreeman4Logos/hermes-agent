@@ -276,6 +276,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "reasoning_config": g("reasoning_config") or _load_reasoning_config(str(g("model", "") or "")),
         "service_tier": g("service_tier") or _load_service_tier(),
         "request_overrides": dict(g("request_overrides", {}) or {}),
+        "memory_provider_mode_override": g("_memory_provider_mode"),
         "platform": "tui", "session_db": _get_db(), "fallback_model": fallback}
 
 
@@ -417,6 +418,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session))
     finally:
         _clear_session_context(tokens)
+    session["agent"] = new_agent
+    _persist_live_session_runtime(session)
     session.update(updates)
     session.pop("queued_prompts", None)
     with session["history_lock"]:

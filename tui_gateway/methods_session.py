@@ -228,13 +228,21 @@ def _billing_pending_change(result: dict) -> dict:
 
 # ── session.create / list / most_recent / facts ──────────────────────
 def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list, *, source, cwd, profile_name,
-                    copy_fields=(), compensate: bool = False) -> None:
+                    copy_fields=(), compensate: bool = False, memory_provider_mode: str | None = None) -> None:
     """Branch child row + parent transcript (bounded-chunk transactions) + title. ``_branched_from`` keeps the
     row visible in list_sessions_rich() (the live parent never matches the legacy end_reason='branched'
     heuristic); NULL ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate``
     deletes a committed row whose transcript/title failed (a durable-but-empty row would defeat the INSERT OR
     IGNORE first-prompt seed) — except on disk-full, where the delete cannot land."""
-    db.create_session(new_key, source=source, model=_resolve_model(), model_config={"_branched_from": parent_key},
+    parent_row = {}
+    with contextlib.suppress(Exception):
+        parent_row = db.get_session(parent_key) or {}
+    parent_config = _parse_model_config(parent_row.get("model_config"), quiet=True) if parent_row else {}
+    branch_config = {"_branched_from": parent_key}
+    mode = memory_provider_mode or parent_config.get("memory_provider_mode")
+    if mode in {"authoritative", "hybrid"}:
+        branch_config["memory_provider_mode"] = mode
+    db.create_session(new_key, source=source, model=_resolve_model(), model_config=branch_config,
                       parent_session_id=parent_key, cwd=cwd, profile_name=profile_name)
     try:
         # Compensation guard (#93959 review): if the transcript copy or title write fails AFTER the row
@@ -1857,6 +1865,17 @@ def _visible_branch_history(messages) -> list:
             and _coerce_message_text(message.get("content")).strip()]
 
 
+def _session_frozen_memory_provider_mode(session: dict | None) -> str | None:
+    agent = (session or {}).get("agent")
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        mode = init_config.get("memory_provider_mode")
+        if mode in {"authoritative", "hybrid"}:
+            return mode
+    mode = getattr(agent, "_memory_provider_mode", None)
+    return mode if mode in {"authoritative", "hybrid"} else None
+
+
 def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list, source: str):
     """Build + register the branched agent in the parent's profile; the DEDICATED db handle is ours until
     ``_transfer_db_to_agent`` (released here on failure)."""
@@ -1864,8 +1883,10 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
     branch_db, branch_owns_db = _profile_session_db(parent_home) if parent_home else (None, False)
     try:
         with _profile_build_scope(parent_home):
-            agent = _make_agent_in_context(new_sid, new_key, session_db=branch_db, platform_override=source,
-                                           context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session))
+            agent = _make_agent_in_context(
+                new_sid, new_key, session_db=branch_db, platform_override=source,
+                context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
+                memory_provider_mode_override=_session_frozen_memory_provider_mode(session))
             _init_session(new_sid, new_key, agent, list(history), cols=session.get("cols", 80),
                           cwd=_session_cwd(session), session_db=branch_db, source=source, profile_home=parent_home,
                           explicit_cwd=bool(session.get("explicit_cwd")))
@@ -1923,7 +1944,8 @@ def _(rid, params: dict, session: dict) -> dict:
             home = session.get("profile_home")
             _persist_branch(db, new_key, old_key, title, history, source=source, cwd=_session_cwd(session),
                             profile_name=Path(home).name if home else _current_profile_name(),
-                            copy_fields=_BRANCH_COPY_FIELDS)
+                            copy_fields=_BRANCH_COPY_FIELDS,
+                            memory_provider_mode=_session_frozen_memory_provider_mode(session))
         except Exception as e:
             return _err(rid, 5008, f"branch failed: {e}")
     try:

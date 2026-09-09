@@ -293,8 +293,13 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None, provider_mode: str = "hybrid") -> None:
         self._providers: List[MemoryProvider] = []
+        self.provider_mode = (
+            "authoritative"
+            if str(provider_mode or "hybrid").strip().lower() == "authoritative"
+            else "hybrid"
+        )
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[Dict[str, Any]] = None
         self._has_external: bool = False
@@ -583,6 +588,171 @@ class MemoryManager:
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_to_provider
 
+    _AUTHORITATIVE_RECEIPT_KEYS = {
+        "drawer_id",
+        "operation_id",
+        "operation_ids",
+        "error_class",
+    }
+
+    def authoritative_memory_write(self, args: Dict[str, Any], **kwargs) -> str:
+        """Route the core ``memory`` write shape to the external provider.
+
+        This path never touches ``MemoryStore``. Providers must implement a
+        dedicated ``authoritative_memory_write`` capability; generic tool
+        dispatch is not a fallback. Receipts are reduced to scalar fields so
+        backend payloads never enter the model-visible tool result.
+        """
+        if self.provider_mode != "authoritative":
+            return tool_error(
+                "Authoritative memory routing is not enabled.",
+                success=False,
+                error_class="invalid_provider_mode",
+            )
+        request = dict(args or {})
+        target = request.get("target") or "memory"
+        if target not in {"memory", "user"}:
+            return tool_error(
+                "Invalid target. Use 'memory' or 'user'.",
+                success=False,
+                error_class="invalid_target",
+            )
+        request["target"] = target
+        if request.get("content") is None and request.get("new_text") is not None:
+            request["content"] = request["new_text"]
+        operations = request.get("operations")
+        if operations is not None:
+            if not isinstance(operations, list) or not operations:
+                return tool_error(
+                    "operations must be a non-empty list.",
+                    success=False,
+                    error_class="invalid_operations",
+                )
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    return tool_error(
+                        "Each operation must be an object.",
+                        success=False,
+                        error_class="invalid_operations",
+                    )
+                operation_action = operation.get("action")
+                if operation_action not in {"add", "replace", "remove"}:
+                    return tool_error(
+                        "Each operation must use add, replace, or remove.",
+                        success=False,
+                        error_class="invalid_action",
+                    )
+                if operation.get("content") is None and operation.get("new_text") is not None:
+                    operation["content"] = operation["new_text"]
+                if operation_action in {"replace", "remove"} and not operation.get("old_text"):
+                    return tool_error(
+                        "old_text is required for replace/remove.",
+                        success=False,
+                        error_class="missing_old_text",
+                    )
+                if operation_action in {"add", "replace"} and not operation.get("content"):
+                    return tool_error(
+                        "content is required for add/replace.",
+                        success=False,
+                        error_class="missing_content",
+                    )
+        else:
+            action = request.get("action")
+            if action not in {"add", "replace", "remove"}:
+                return tool_error(
+                    "Use add, replace, or remove.",
+                    success=False,
+                    error_class="invalid_action",
+                )
+            if action in {"replace", "remove"} and not request.get("old_text"):
+                return tool_error(
+                    "old_text is required for replace/remove.",
+                    success=False,
+                    error_class="missing_old_text",
+                )
+            if action in {"add", "replace"} and not request.get("content"):
+                return tool_error(
+                    "content is required for add/replace.",
+                    success=False,
+                    error_class="missing_content",
+                )
+        provider = next((c for c in self._providers if c.name != "builtin"), None)
+        if provider is None:
+            return tool_error(
+                "Authoritative memory provider is unavailable.",
+                success=False,
+                error_class="provider_unavailable",
+            )
+        try:
+            capability = getattr(provider, "authoritative_memory_write", None)
+            if not callable(capability):
+                return tool_error(
+                    "Authoritative memory provider lacks core write capability.",
+                    success=False,
+                    error_class="provider_capability_missing",
+                )
+            raw_result = capability(request, **kwargs)
+        except NotImplementedError:
+            return tool_error(
+                "Authoritative memory provider lacks core write capability.",
+                success=False,
+                error_class="provider_capability_missing",
+            )
+        except Exception:
+            logger.warning(
+                "Authoritative memory provider '%s' rejected a core write",
+                provider.name,
+                exc_info=True,
+            )
+            return tool_error(
+                "Authoritative memory provider failed.",
+                success=False,
+                error_class="provider_error",
+            )
+        return self._authoritative_receipt(provider.name, raw_result, request)
+
+    @classmethod
+    def _authoritative_receipt(cls, provider_name: str, raw_result: Any, request: Dict[str, Any]) -> str:
+        """Return a content-free provider receipt or truthful protocol error."""
+        if isinstance(raw_result, str):
+            try:
+                raw_result = json.loads(raw_result)
+            except (TypeError, ValueError):
+                raw_result = None
+        if not isinstance(raw_result, dict) or not isinstance(raw_result.get("success"), bool):
+            return tool_error(
+                "Authoritative memory provider returned an invalid receipt.",
+                success=False,
+                error_class="provider_protocol_error",
+            )
+        success = raw_result["success"] is True
+        partial_write = bool(raw_result.get("partial_write"))
+        receipt: Dict[str, Any] = {
+            "success": success and not partial_write,
+            "provider": provider_name,
+            "provider_mode": "authoritative",
+            "target": request.get("target", "memory"),
+        }
+        if request.get("action"):
+            receipt["action"] = request["action"]
+        if isinstance(request.get("operations"), list):
+            receipt["operation_count"] = len(request["operations"])
+        scalar_types = (str, int, float, bool)
+        for key in cls._AUTHORITATIVE_RECEIPT_KEYS:
+            value = raw_result.get(key)
+            if key == "operation_ids":
+                if isinstance(value, list) and all(isinstance(item, scalar_types) for item in value):
+                    receipt[key] = value
+            elif isinstance(value, scalar_types):
+                receipt[key] = value
+        if partial_write:
+            receipt["success"] = False
+            receipt["error_class"] = "partial_write"
+        if not receipt["success"]:
+            receipt.setdefault("error_class", "provider_rejected")
+            receipt["error"] = "Authoritative memory provider rejected the operation."
+        return json.dumps(receipt, ensure_ascii=False)
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
         provider = self._tool_to_provider.get(tool_name)
@@ -746,6 +916,8 @@ class MemoryManager:
         mutating actions, and forwards ``old_text`` plus provenance from ``build_metadata`` (the loop
         knows session/task/tool-call identity; we do not).
         """
+        if self.provider_mode == "authoritative":
+            return
         if not self._memory_tool_result_succeeded(tool_result):
             return
         target = str(tool_args.get("target") or "memory")

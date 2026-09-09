@@ -1312,9 +1312,7 @@ class CLICommandsMixin:
         # -c`/`--resume`. The startup resume paths already call this; without it, the terminal/code-exec
         # tools and relative-path resolution keep operating in the wrong repo. Idempotent and a no-op when
         # the session recorded no cwd. See #38562.
-        self._restore_session_cwd(session_meta)
-        self._restore_session_yolo(session_meta)
-        self._restore_session_model(session_meta)
+        self._restore_session_state(session_meta)
 
     def _resolve_resume_target(self, target: str):
         """``(session_id, meta)`` for a numbered selection, title, or id; None after printing why
@@ -1375,11 +1373,18 @@ class CLICommandsMixin:
         _end_current_session(self, "branched")
         # The stable ``_branched_from`` marker keeps the branch visible in /resume + /sessions
         # even after the parent is re-ended with a different end_reason.
+        init_config = getattr(self.agent, "_session_init_model_config", None)
+        memory_provider_mode = (
+            init_config.get("memory_provider_mode") if isinstance(init_config, dict) else None
+        ) or getattr(self.agent, "_memory_provider_mode", None)
+        if not isinstance(memory_provider_mode, (str, type(None))):
+            memory_provider_mode = None
         try:
             self._session_db.create_session(
                 session_id=new_session_id, source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model, parent_session_id=parent_session_id,
                 model_config={"max_iterations": self.max_turns, "reasoning_config": self.reasoning_config,
+                              "memory_provider_mode": memory_provider_mode,
                               "_branched_from": parent_session_id})
         except Exception as e:
             return _cp(f"  Failed to create branch session: {e}")

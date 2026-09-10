@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -47,13 +48,6 @@ def _hermes_home() -> Path:
 
 def _get_sessions_dir() -> Path:
     return _hermes_home() / "sessions"
-
-
-def _read_state_db_mtime() -> float:
-    try:
-        return (_hermes_home() / "state.db").stat().st_mtime
-    except OSError:  # missing file included
-        return 0.0
 
 
 def _read_json(path: Path):
@@ -276,6 +270,12 @@ class EventBridge:
         self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
         self._pending_approvals: Dict[str, dict] = {}  # populated from events
         self._state_db_mtime: float = 0.0  # skip polling work when state.db is unchanged
+        # PRAGMA data_version watermark, sampled on the long-lived read-only
+        # connection below. Only comparable across samples from that ONE
+        # connection, so it is reset whenever the connection is reopened.
+        self._state_db_version: Optional[int] = None
+        self._state_watch_conn: Optional[sqlite3.Connection] = None
+        self._state_watch_identity: Optional[tuple[int, int]] = None
         self._cached_sessions_index: dict = {}
 
     def start(self):
@@ -299,6 +299,18 @@ class EventBridge:
         self._new_event.set()
         if self._thread:
             self._thread.join(timeout=5)
+        # The polling thread is the only user of the watcher connection once it
+        # is running, so close it only when that thread has actually finished.
+        # A thread that outlived the join may still be inside _poll_once, and
+        # leaking a read-only descriptor until the process exits is cheaper
+        # than closing a connection out from under a live statement.
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning(
+                "EventBridge: poll thread still running after stop(); "
+                "leaving the state.db watcher open"
+            )
+        else:
+            self._close_state_watch_conn()
         logger.debug("EventBridge stopped")
 
     def _matching(self, after_cursor: int, session_key: Optional[str], limit: int) -> List[dict]:
@@ -357,13 +369,14 @@ class EventBridge:
         db = _get_session_db()
         if not db:
             return
+        db_file = _hermes_home() / "state.db"
         try:
-            self._state_db_mtime = _read_state_db_mtime()
             try:
-                self._cached_sessions_index = _load_sessions_index()
+                entries = self._refresh_index_and_watermark(db_file)
             except Exception:
-                self._cached_sessions_index = {}
-            for session_key, entry in self._cached_sessions_index.items():
+                self._cached_sessions_index = entries = {}
+                self._state_db_mtime, self._state_db_version = self._sample_state_watermark(db_file)
+            for session_key, entry in entries.items():
                 session_id = entry.get("session_id", "")
                 if not session_id:
                     continue
@@ -375,6 +388,116 @@ class EventBridge:
                     self._last_poll_timestamps[session_key] = latest
         finally:
             _close_quietly(db, "baseline")
+
+    def _refresh_index_and_watermark(self, db_file: Path) -> dict:
+        """Refresh the routing index and record the watermark it has observed.
+
+        The stored watermark is sampled AFTER an index refresh, because that
+        refresh opens SessionDB, whose schema initialisation commits the first
+        time it runs against a database. A watermark taken before it would
+        record the bridge's own write as a peer's change and force a redundant
+        scan on the next tick.
+
+        Only one skew is dangerous: a watermark ahead of the index. A session
+        registered after the index query but before the sample would be absent
+        from the entries below AND already counted in the watermark, so every
+        later poll would take the confirmed-quiet skip and its first message
+        would wait for an unrelated commit — the dropped-new-conversation
+        shape (#8925) this poller exists to avoid. So when anything at all
+        committed while the index was being read, the index is read once more,
+        now that the watermark is fixed: that read sees everything committed
+        through it, and a commit landing afterwards moves the version again
+        and is picked up on the next poll. The opposite skew — index ahead of
+        the watermark — only ever costs one redundant scan.
+        """
+        before = self._sample_state_watermark(db_file)
+        entries = _load_sessions_index()
+        self._state_db_mtime, self._state_db_version = self._sample_state_watermark(db_file)
+        if (self._state_db_mtime, self._state_db_version) != before:
+            entries = _load_sessions_index()
+        self._cached_sessions_index = entries
+        return entries
+
+    def _close_state_watch_conn(self) -> None:
+        """Drop the watcher connection; the next sample reopens it."""
+        conn, self._state_watch_conn = self._state_watch_conn, None
+        self._state_watch_identity = None
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            logger.debug("EventBridge: closing state.db watcher failed: %s", exc)
+
+    def _sample_state_watermark(self, db_file: Path) -> tuple[float, Optional[int]]:
+        """Return the (mtime, data_version) pair state.db shows right now.
+
+        Both halves are taken at the same instant so the gate in _poll_once
+        compares like with like on the next tick; a missing file yields the
+        (0.0, None) "nothing to watch" pair.
+        """
+        try:
+            db_stat = db_file.stat()
+        except OSError:
+            self._close_state_watch_conn()
+            return 0.0, None
+        return db_stat.st_mtime, self._sample_state_db_version(db_file, db_stat)
+
+    def _sample_state_db_version(self, db_file: Path, db_stat) -> Optional[int]:
+        """Return state.db's PRAGMA data_version, or None when it can't be read.
+
+        data_version changes whenever ANOTHER connection commits, including WAL
+        commits that never touch the main file's mtime, so it answers the
+        question mtime cannot: has anything landed since the last sample?
+
+        The counter is per-connection, so samples are only comparable while the
+        same connection stays open. A replaced file (different st_dev/st_ino)
+        therefore closes the old connection and clears the watermark, which
+        makes the caller treat the database as changed.
+
+        None means "unknown" — the file is not a readable SQLite database, the
+        open failed, or the read raced a writer. Callers must scan on None
+        rather than assume the database is quiet.
+        """
+        identity = (db_stat.st_dev, db_stat.st_ino)
+        if self._state_watch_conn is not None and identity != self._state_watch_identity:
+            self._close_state_watch_conn()
+
+        if self._state_watch_conn is None:
+            try:
+                from hermes_cli.sqlite_safe_read import (
+                    UntrackableConnectionError,
+                    connect_tracked,
+                )
+            except ImportError as exc:
+                logger.debug("EventBridge: sqlite_safe_read unavailable: %s", exc)
+                return None
+            try:
+                # Tracked, so the byte-probe guard in sqlite_safe_read still
+                # holds; read-only and isolation_level=None, so watching takes
+                # no lock the gateway's writers could contend with.
+                conn = connect_tracked(
+                    f"file:{db_file}?mode=ro",
+                    tracking_path=db_file,
+                    uri=True,
+                    check_same_thread=False,
+                    isolation_level=None,
+                    timeout=1.0,
+                )
+            except (UntrackableConnectionError, sqlite3.Error, OSError) as exc:
+                logger.debug("EventBridge: state.db watcher open failed: %s", exc)
+                return None
+            self._state_watch_conn = conn
+            self._state_watch_identity = identity
+            self._state_db_version = None
+
+        try:
+            row = self._state_watch_conn.execute("PRAGMA data_version").fetchone()
+        except (sqlite3.Error, OSError) as exc:
+            logger.debug("EventBridge: state.db data_version unreadable: %s", exc)
+            self._close_state_watch_conn()
+            return None
+        return row[0] if row else None
 
     def _poll_loop(self):
         """Background loop: poll SessionDB for new messages."""
@@ -395,21 +518,47 @@ class EventBridge:
     def _poll_once(self, db):
         """Check for new messages across all sessions.
 
-        One state.db mtime check gates all work, making 200ms polling nearly free.
-        The routing index lives in the same file as the messages, so a new
-        conversation and its first message land under a single mtime change (no
-        dual-file race that could drop brand-new conversations).
+        A cheap mtime check on state.db carries the common case — it makes
+        200ms polling essentially free. The routing index lives in the same
+        file as the messages, so a new conversation and its first message land
+        under a single check (no dual-file race that could drop brand-new
+        conversations). See #8925, #9006.
 
-        See #8925, #9006.
+        An unchanged mtime is not proof of an unchanged database: filesystem
+        timestamps tick on the coarse clock, so a commit landing in the same
+        tick as the previous stat leaves the mtime identical, and under WAL a
+        commit does not touch the main file at all until checkpoint. So the
+        database itself is asked, via PRAGMA data_version, before any poll is
+        skipped.
         """
-        db_mtime = _read_state_db_mtime()
-        if db_mtime == self._state_db_mtime:
-            return
-        self._state_db_mtime = db_mtime
-        # Refresh the index on every change tick: one indexed query, never lags messages.
-        self._cached_sessions_index = _load_sessions_index()
+        db_file = _hermes_home() / "state.db"
+        try:
+            db_stat = db_file.stat()
+        except OSError:
+            db_stat = None
 
-        for session_key, entry in self._cached_sessions_index.items():
+        db_mtime = db_stat.st_mtime if db_stat is not None else 0.0
+
+        if db_stat is None:
+            # Nothing to watch: drop the connection and the watermark so a
+            # recreated state.db is sampled from scratch.
+            self._close_state_watch_conn()
+            self._state_db_version = None
+            if db_mtime == self._state_db_mtime:
+                return  # Still absent since last poll — skip entirely
+        elif db_mtime == self._state_db_mtime:
+            version = self._sample_state_db_version(db_file, db_stat)
+            # An unreadable version (None) leaves quiescence unconfirmed, so
+            # the scan below runs rather than risk dropping events.
+            if version is not None and version == self._state_db_version:
+                return  # Confirmed quiet since last poll — skip entirely
+
+        # Refresh the index on every change tick: one indexed query, never lags
+        # messages. The watermark is taken with it, so the index can never
+        # trail what the skip gate treats as already seen.
+        entries = self._refresh_index_and_watermark(db_file)
+
+        for session_key, entry in entries.items():
             session_id = entry.get("session_id", "")
             if not session_id:
                 continue

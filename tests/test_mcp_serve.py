@@ -9,6 +9,7 @@ Three layers of tests:
 """
 
 import asyncio
+import contextlib
 import inspect
 import json
 import os
@@ -1094,6 +1095,111 @@ class TestEdgeCases:
 # 7. EVENT BRIDGE POLL LOOP E2E — real SQLite DB, mtime optimization
 # ---------------------------------------------------------------------------
 
+_POLL_SESSION_KEY = "agent:main:telegram:dm:poll_regression"
+
+
+@contextlib.contextmanager
+def _baselined_bridge(tmp_path, monkeypatch, session_id):
+    """Yield (bridge, db, db_path) for a bridge baselined over a real state.db.
+
+    The database holds one message and the routing index names one session, so
+    the bridge has recorded that session's latest timestamp and state.db's
+    watermark: anything committed afterwards is a genuinely new event.
+
+    Baselining opens the bridge's read-only watcher connection, so the whole
+    test body runs inside this manager and stop() closes it however the test
+    ends.
+    """
+    import mcp_serve
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+    (sessions_dir / "sessions.json").write_text(json.dumps({
+        _POLL_SESSION_KEY: {
+            "session_key": _POLL_SESSION_KEY,
+            "session_id": session_id,
+            "platform": "telegram",
+            "updated_at": "2026-03-29T15:00:01",
+            "origin": {"platform": "telegram", "chat_id": "poll_regression"},
+        }
+    }))
+
+    db_path = tmp_path / "state.db"
+    _create_test_db(db_path, session_id, [
+        {"role": "user", "content": "baselined", "timestamp": "2026-03-29T15:00:01"},
+    ])
+
+    class CountingDB:
+        def __init__(self):
+            self.call_count = 0
+
+        def get_messages(self, sid):
+            self.call_count += 1
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+                (sid,),
+            ).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+
+    db = CountingDB()
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: db)
+
+    bridge = mcp_serve.EventBridge()
+    bridge._establish_baseline()
+    try:
+        yield bridge, db, db_path
+    finally:
+        bridge.stop()
+
+
+def _commit_reply(db_path, session_id, content, conn=None):
+    """Commit one message through a connection other than the bridge's."""
+    writer = conn if conn is not None else sqlite3.connect(str(db_path))
+    try:
+        writer.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (session_id, "assistant", content, "2026-03-29T15:00:09"),
+        )
+        writer.commit()
+    finally:
+        if conn is None:
+            writer.close()
+
+
+def _messages_in_main_db_file(db_path, tmp_path, session_id):
+    """Return the message contents readable from state.db's main file alone.
+
+    The file is copied WITHOUT its -wal sidecar, so a commit still parked in
+    the write-ahead log is invisible here while the live database still
+    serves it — which is what makes "not yet checkpointed" an assertion rather
+    than an assumption.
+    """
+    main_only = tmp_path / "state-main-file-only.db"
+    main_only.write_bytes(db_path.read_bytes())
+    conn = sqlite3.connect(str(main_only))
+    try:
+        return [row[0] for row in conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        )]
+    finally:
+        conn.close()
+
+
+def _pin_mtime(db_path, stat_result):
+    """Restore db_path's timestamps to stat_result, to the nanosecond.
+
+    Reproduces what a coarse filesystem clock does on its own — leave the mtime
+    byte-identical across a commit — without depending on the granularity of
+    the clock the tests happen to run on.
+    """
+    os.utime(db_path, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns))
+
+
 class TestEventBridgePollE2E:
     """End-to-end tests for the EventBridge polling loop with real files."""
 
@@ -1419,6 +1525,94 @@ class TestEventBridgePollE2E:
         assert len(events) == 1
         assert events[0]["session_key"] == "agent:main:telegram:dm:fresh"
         assert events[0]["content"] == "hello after baseline"
+
+    def test_poll_delivers_commit_landing_within_one_mtime_tick(self, tmp_path, monkeypatch):
+        """A commit whose mtime is indistinguishable from the previous poll's
+        must still be delivered.
+
+        File timestamps tick on the coarse clock, so a commit landing in the
+        same tick as the last stat leaves state.db's mtime byte-identical. The
+        mtime is restored to the baselined value so that condition holds on any
+        clock granularity instead of by timing luck.
+        """
+        session_id = "20260329_150000_same_tick"
+        with _baselined_bridge(tmp_path, monkeypatch, session_id) as (bridge, db, db_path):
+            baseline_stat = db_path.stat()
+            assert bridge._state_db_mtime == baseline_stat.st_mtime
+
+            _commit_reply(db_path, session_id, "same-tick reply")
+            _pin_mtime(db_path, baseline_stat)
+            assert db_path.stat().st_mtime == bridge._state_db_mtime
+
+            bridge._poll_once(db)
+            events = bridge.poll_events(after_cursor=0)["events"]
+
+        assert [e["content"] for e in events] == ["same-tick reply"]
+
+    def test_poll_delivers_wal_commit_parked_before_checkpoint(self, tmp_path, monkeypatch):
+        """A WAL commit must be delivered before anything checkpoints it.
+
+        In WAL mode the commit lands in state.db-wal and the main file is left
+        alone until checkpoint, so its mtime cannot report the write.
+        Autocheckpointing is off and the writer connection stays open across
+        the poll, and the test proves the commit is still parked rather than
+        assuming it: the row is readable from the live database and absent from
+        the main file on its own.
+        """
+        session_id = "20260329_150000_wal_commit"
+        with _baselined_bridge(tmp_path, monkeypatch, session_id) as (bridge, db, db_path):
+            baseline_stat = db_path.stat()
+
+            writer = sqlite3.connect(str(db_path))
+            try:
+                # Switching journal mode rewrites the main file's header; the
+                # pin below puts its mtime back to the value the bridge
+                # baselined, so only the WAL commit is left for the poll to
+                # notice.
+                assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                _commit_reply(db_path, session_id, "wal reply", conn=writer)
+
+                assert "wal reply" in [m["content"] for m in db.get_messages(session_id)]
+                assert "wal reply" not in _messages_in_main_db_file(
+                    db_path, tmp_path, session_id)
+
+                _pin_mtime(db_path, baseline_stat)
+                assert db_path.stat().st_mtime == bridge._state_db_mtime
+
+                bridge._poll_once(db)
+                events = bridge.poll_events(after_cursor=0)["events"]
+            finally:
+                writer.close()
+
+        assert [e["content"] for e in events] == ["wal reply"]
+
+    def test_poll_after_delivery_skips_when_nothing_committed(self, tmp_path, monkeypatch):
+        """Confirming quiescence must stay as cheap as the old mtime check.
+
+        Both polls see the same pinned mtime, so the skip can only come from
+        the database itself reporting no commit — not from a timestamp that
+        happened to move.
+        """
+        session_id = "20260329_150000_quiet_after"
+        with _baselined_bridge(tmp_path, monkeypatch, session_id) as (bridge, db, db_path):
+            baseline_stat = db_path.stat()
+
+            _commit_reply(db_path, session_id, "delivered reply")
+            _pin_mtime(db_path, baseline_stat)
+
+            bridge._poll_once(db)
+            assert bridge.poll_events(after_cursor=0)["events"]
+            delivered_calls = db.call_count
+            assert delivered_calls >= 1
+
+            # Nothing commits between the two polls.
+            _pin_mtime(db_path, baseline_stat)
+            assert db_path.stat().st_mtime == bridge._state_db_mtime
+            bridge._poll_once(db)
+
+        assert db.call_count == delivered_calls, \
+            "A poll over a confirmed-quiet state.db must not read messages"
 
     def test_poll_interval_is_200ms(self):
         """Verify the poll interval constant."""

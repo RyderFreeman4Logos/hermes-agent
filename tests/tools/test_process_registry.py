@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -1267,6 +1269,153 @@ class TestKillProcess:
             assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
+
+    def _bind_real_child(self, registry, sid: str):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        s = _make_session(sid=sid, command="sleep 60")
+        s.process = proc
+        s.pid = proc.pid
+        s.host_start_time = ProcessRegistry._safe_host_start_time(proc.pid)
+        registry._running[s.id] = s
+        return s, proc
+
+    @staticmethod
+    def _reap_child(proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            with suppress(Exception):
+                proc.wait(timeout=2)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-child kill/liveness matrix")
+    def test_kill_process_pre_signal_exception_keeps_child_running(self, registry):
+        """A raise before any signal must not mark the OS child killed."""
+        s, proc = self._bind_real_child(registry, "proc_pre_signal")
+        pid = proc.pid
+        orig = registry._signal_kill
+
+        def boom(_session, _session_id, _consume_output):
+            raise PermissionError("EPERM before signal")
+
+        try:
+            registry._signal_kill = boom
+            result = registry.kill_process(s.id, source="test", consume_output=True)
+            still = ProcessRegistry._is_host_pid_alive(pid)
+            poll = registry.poll(s.id)
+            listed = [p for p in registry.list_sessions() if p["session_id"] == s.id]
+            assert result["status"] == "error"
+            assert s.exited is False
+            assert still is True
+            assert proc.poll() is None
+            assert poll["status"] == "running"
+            assert s.id in registry._running
+            assert s.id not in registry._completion_consumed
+            assert listed and listed[0]["status"] == "running"
+        finally:
+            registry._signal_kill = orig
+            self._reap_child(proc)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-child kill/liveness matrix")
+    def test_kill_process_failed_kill_still_alive_stays_retryable(self, registry):
+        """Failed signal with a living child must remain running so close/kill_all retry."""
+        s, proc = self._bind_real_child(registry, "proc_failed_kill")
+        pid = proc.pid
+        orig = registry._signal_kill
+
+        def fail_without_death(_session, _session_id, _consume_output):
+            raise OSError("kill failed; child still alive")
+
+        try:
+            registry._signal_kill = fail_without_death
+            counted = registry.kill_all(source="test", consume_output=False)
+            still = ProcessRegistry._is_host_pid_alive(pid)
+            poll = registry.poll(s.id)
+            would_retry = any(
+                p["session_id"] == s.id and p["status"] == "running"
+                for p in registry.list_sessions()
+            )
+            assert counted == 0
+            assert still is True
+            assert proc.poll() is None
+            assert s.exited is False
+            assert poll["status"] == "running"
+            assert s.id not in registry._completion_consumed
+            assert would_retry is True
+        finally:
+            registry._signal_kill = orig
+            self._reap_child(proc)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-child kill/liveness matrix")
+    def test_kill_process_post_death_exception_marks_waitable_exit(self, registry):
+        """After a waitable child is dead, a later exception may finish metadata.
+
+        Does not treat a mock RuntimeError as proof of a historic race. The child
+        must be reaped via the Popen handle (or matching host identity gone).
+        """
+        s, proc = self._bind_real_child(registry, "proc_post_death")
+        pid = proc.pid
+        orig = registry._signal_kill
+
+        def kill_then_raise(session, _session_id, _consume_output):
+            os.kill(session.process.pid, signal.SIGKILL)
+            session.process.wait(timeout=2)
+            raise RuntimeError("psutil after SIGKILL")
+
+        try:
+            registry._signal_kill = kill_then_raise
+            result = registry.kill_process(s.id, source="test", consume_output=True)
+            marked_on_kill_return = s.exited
+            still = ProcessRegistry._is_host_pid_alive(pid)
+            poll = registry.poll(s.id)
+            assert result["status"] == "error"
+            assert still is False
+            assert proc.poll() is not None
+            assert marked_on_kill_return is True
+            assert s.exited is True
+            assert poll["status"] != "running"
+            assert s.exit_code == proc.poll()
+            assert s.exit_code != -15
+        finally:
+            registry._signal_kill = orig
+            self._reap_child(proc)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-child kill/liveness matrix")
+    def test_kill_process_post_death_identity_gone_without_waitable_handle(self, registry):
+        """Matching host identity gone (PID reuse-safe) may finish even without Popen.wait."""
+        s, proc = self._bind_real_child(registry, "proc_identity_gone")
+        pid = proc.pid
+        start = s.host_start_time
+        orig = registry._signal_kill
+
+        def kill_reap_then_drop_handle(session, _session_id, _consume_output):
+            os.kill(session.process.pid, signal.SIGKILL)
+            session.process.wait(timeout=2)
+            session.process = None
+            raise OSError("checkpoint after death")
+
+        try:
+            registry._signal_kill = kill_reap_then_drop_handle
+            result = registry.kill_process(s.id, source="test", consume_output=True)
+            marked_on_kill_return = s.exited
+            still = ProcessRegistry._host_pid_is_ours(pid, start)
+            assert result["status"] == "error"
+            assert still is False
+            assert marked_on_kill_return is True
+            assert s.exited is True
+            assert registry.poll(s.id)["status"] != "running"
+        finally:
+            registry._signal_kill = orig
+            self._reap_child(proc)
 
 
 # =========================================================================

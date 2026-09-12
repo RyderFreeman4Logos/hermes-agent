@@ -1745,6 +1745,34 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source, "output": output}
         except Exception as e:
+            # Pre-signal / failed kill: leave running so close()/kill_all can retry.
+            # Post-death: reconcile only with a waitable handle rc or matching host
+            # identity gone. Do not invent -15. PTY/remote/Windows keep the same
+            # waitable-handle / host-identity rules — never treat a sandbox PID as host.
+            if not session.exited:
+                waitable = getattr(session, "process", None)
+                wait_rc = None
+                if waitable is not None:
+                    with suppress(Exception):
+                        wait_rc = waitable.poll()
+                identity_gone = (
+                    session.pid_scope == "host"
+                    and session.pid
+                    and session.host_start_time is not None
+                    and not self._host_pid_is_ours(session.pid, session.host_start_time)
+                )
+                if wait_rc is not None or identity_gone:
+                    with session._lock:
+                        if consume_output:
+                            self._completion_consumed.add(session_id)
+                        session.mark_exited(
+                            wait_rc if wait_rc is not None else None,
+                            reason="killed",
+                            source=source,
+                        )
+                    with suppress(Exception):
+                        self._move_to_finished(session)
+                        self._write_checkpoint()
             return {"status": "error", "error": str(e)}
 
     def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:

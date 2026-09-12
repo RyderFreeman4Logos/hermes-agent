@@ -57,7 +57,7 @@ def _response(text: str):
     )
 
 
-def _make_standard_child(*, max_retries: int = 2, route=PRIMARY):
+def _make_child(*, max_retries: int = 2, route=PRIMARY, profile=None):
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
         patch("model_tools.check_toolset_requirements", return_value={}),
@@ -75,9 +75,14 @@ def _make_standard_child(*, max_retries: int = 2, route=PRIMARY):
         )
     agent.client = MagicMock()
     agent._api_max_retries = max_retries
-    agent._delegate_model_profile = "standard"
+    if profile is not None:
+        agent._delegate_model_profile = profile
     agent._delegate_has_successful_llm_request = False
     return agent
+
+
+def _make_standard_child(*, max_retries: int = 2, route=PRIMARY):
+    return _make_child(max_retries=max_retries, route=route, profile="standard")
 
 
 def _common_patches(agent):
@@ -230,6 +235,48 @@ def test_standard_child_any_execution_error_advances_without_retrying_same_hop(e
     assert calls == [
         (PRIMARY["provider"], PRIMARY["model"]),
         (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]),
+    ]
+
+
+def test_main_agent_first_transport_error_retries_same_hop():
+    """Main-agent eager fallback stays rate-limit or transport-after-2-retries."""
+    agent = _make_child(max_retries=3)
+    calls = []
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise ConnectionError("network connection failed")
+        return _response("same hop result")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, FALLBACK_CHAIN[0]["model"]),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, _provider: model,
+            )
+        )
+        stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200000))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [
+        (PRIMARY["provider"], PRIMARY["model"]),
+        (PRIMARY["provider"], PRIMARY["model"]),
     ]
 
 

@@ -1408,7 +1408,10 @@ def route_classified_error(
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
     _should_fallback = _wrapped_output_cap_budget is None and (
-        _standard_child_can_fallback(agent, reason=classified.reason)
+        (
+            _is_standard_profile_child(agent)
+            and _standard_child_can_fallback(agent, reason=classified.reason)
+        )
         or is_rate_limited
         or (_is_transport_failure and retry_count >= 2)
     )

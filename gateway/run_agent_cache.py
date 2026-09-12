@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import logging
 import threading
@@ -44,15 +45,16 @@ class GatewayAgentCacheMixin:
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime; all-None when unavailable."""
+        """Extract Honcho identity keys, memoized by honcho.json content digest; all-None when unavailable."""
         try:
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                # Digest, not mtime/size/inode: same-tick same-size in-place rewrites keep those.
+                digest = hashlib.sha256(path.read_bytes()).digest()
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                digest = None
+            memo_key = (str(path), digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)

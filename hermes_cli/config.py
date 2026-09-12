@@ -3,6 +3,7 @@ validation, migration, and the ``hermes config`` command."""
 
 import copy
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -184,8 +185,9 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # atomic_yaml_write which produces a fresh inode, so stat() sees a new mtime_ns and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
 _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
-# path -> (mtime_ns, size, raw yaml dict) for read_raw_config() (no defaults merged in).
-_RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+# path -> (sha256 digest, raw yaml dict) for read_raw_config() (no defaults merged in).
+# Digest, not (mtime_ns, size): same-tick same-size in-place rewrites keep those.
+_RAW_CONFIG_CACHE: Dict[str, Tuple[bytes, Dict[str, Any]]] = {}
 
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
 # flows directly). Also the set reload_env() may remove from os.environ.
@@ -1860,19 +1862,18 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
-            st = config_path.stat()
-            cache_key = (st.st_mtime_ns, st.st_size)
+            raw = config_path.read_bytes()
         except (FileNotFoundError, OSError):
             return {}
 
+        digest = hashlib.sha256(raw).digest()
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
-            return copy.deepcopy(cached[2]) if want_deepcopy else cached[2]
+        if cached is not None and cached[0] == digest:
+            return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
 
         try:
-            with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
+            data = fast_safe_load(raw.decode("utf-8")) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return {}
@@ -1882,13 +1883,13 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # The cache stores its own deepcopy. The readonly path returns THAT object (identity
         # invariant: later cache hits return the same dict); the mutable path returns the parse.
         cached_copy = copy.deepcopy(data)
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], cached_copy)
+        _RAW_CONFIG_CACHE[path_key] = (digest, cached_copy)
         return data if want_deepcopy else cached_copy
 
 
 def read_raw_config() -> Dict[str, Any]:
     """Read config.yaml as-is (no defaults merged, no migration); ``{}`` if missing/unparseable.
-    Cached on (mtime_ns, size); returns a deepcopy since callers mutate before ``save_config()``."""
+    Cached on content digest; returns a deepcopy since callers mutate before ``save_config()``."""
     return _read_raw_config_impl(want_deepcopy=True)
 
 

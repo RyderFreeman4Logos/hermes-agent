@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
+
 import pytest
 from unittest.mock import MagicMock, patch
 

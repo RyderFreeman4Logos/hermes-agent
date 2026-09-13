@@ -979,23 +979,26 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     # Live poller stop (session still owns the turn): keep accepted-unacked on
     # the session. Dying finalize: reuse ingest ACK's split, drain live steer
     # under the same lock, and return unacked one-shots to the shared queue.
-    with session["history_lock"]:
-        dying = bool(session.get("_finalized") or session.get("_closing"))
-        if dying:
-            accepted, leftover = _partition_steered_completion_pending(session)
-            session["_completion_pending"] = []
-            if any(evt.get("_steer_accepted") for evt in leftover):
-                drain = getattr(session.get("agent"), "_drain_pending_steer", None)
-                if callable(drain):
-                    with contextlib.suppress(Exception):
-                        drain()
-        else:
-            accepted = []
-            pending = list(session.get("_completion_pending") or [])
-            leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
-            session["_completion_pending"] = [
-                evt for evt in pending if evt.get("_steer_accepted")
-            ]
+    # Serialize rail ownership before completion bookkeeping. Steer/drain release
+    # this lock before taking history_lock, so this order has no inversion.
+    agent = session.get("agent")
+    steer_lock = getattr(agent, "_pending_steer_lock", None)
+    steer_guard = steer_lock if steer_lock is not None else contextlib.nullcontext()
+    with steer_guard:
+        with session["history_lock"]:
+            dying = bool(session.get("_finalized") or session.get("_closing"))
+            if dying:
+                accepted, leftover = _partition_steered_completion_pending(session)
+                session["_completion_pending"] = []
+                if any(evt.get("_steer_accepted") for evt in leftover) and agent is not None:
+                    agent._pending_steer = None
+            else:
+                accepted = []
+                pending = list(session.get("_completion_pending") or [])
+                leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
+                session["_completion_pending"] = [
+                    evt for evt in pending if evt.get("_steer_accepted")
+                ]
     if accepted:
         _mark_completion_events_consumed(accepted)
     for evt in leftover:

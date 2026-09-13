@@ -787,15 +787,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
         except gone:
             targets = []
         targets.append(parent)
+        # Isolate non-gone errors to descendants only. Owner SIGTERM/SIGKILL
+        # failures must propagate so kill_process can leave a live Popen
+        # running/unconsumed. A denied descendant is not retried via SIGKILL.
+        denied_descendant_pids = set()
         for proc in targets:
             try:
                 proc.terminate()
             except gone:
                 continue
             except Exception as exc:
-                # A reparented/foreign descendant can raise outside ``gone``
-                # (tests/conftest.py _guarded_kill RuntimeError). Continue so
-                # the owner PID still receives SIGTERM/SIGKILL.
+                if proc is parent:
+                    raise
+                denied_descendant_pids.add(getattr(proc, "pid", None))
                 logger.debug(
                     "Skipping terminate for pid %s while killing tree of %s: %s",
                     getattr(proc, "pid", None), pid, type(exc).__name__,
@@ -812,6 +816,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         while time.monotonic() < deadline and any(cls._proc_alive(_p) for _p in targets):
             time.sleep(0.05)
         for proc in targets:
+            if getattr(proc, "pid", None) in denied_descendant_pids:
+                continue
             try:
                 if cls._proc_alive(proc):
                     proc.kill()  # SIGKILL on POSIX
@@ -819,6 +825,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             except gone:
                 continue
             except Exception as exc:
+                if proc is parent:
+                    raise
                 logger.debug(
                     "Skipping kill for pid %s while killing tree of %s: %s",
                     getattr(proc, "pid", None), pid, type(exc).__name__,

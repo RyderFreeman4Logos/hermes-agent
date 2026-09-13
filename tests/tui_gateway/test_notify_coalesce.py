@@ -784,3 +784,90 @@ def test_ack_before_shutdown_split_does_not_duplicate(monkeypatch):
         process_registry._completion_consumed.discard("proc_f1_ack_race")
         while not isolated.empty():
             isolated.get_nowait()
+
+
+def test_shutdown_reclaim_excludes_real_tool_result_ingest(monkeypatch):
+    """Reclaim owns a staged completion before a concurrent real ingest can drain it."""
+    isolated = queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    snapshot_seen = threading.Event()
+    ingested = threading.Event()
+    state = {"armed": False, "snapshotted": False, "apply_tid": None}
+
+    def _get_pending(agent):
+        value = agent.__dict__.get("_pending_steer_raw")
+        if (
+            state["armed"]
+            and not state["snapshotted"]
+            and threading.get_ident() != state["apply_tid"]
+        ):
+            state["snapshotted"] = True
+            snapshot_seen.set()
+        return value
+
+    def _set_pending(agent, value):
+        agent.__dict__["_pending_steer_raw"] = value
+
+    monkeypatch.setattr(
+        AIAgent, "_pending_steer", property(_get_pending, _set_pending), raising=False
+    )
+    agent = _bare_aiagent()
+    sid = "sid_atomic_reclaim"
+    evt_id = "proc_atomic_reclaim"
+    sess = _session(running=True, agent=agent, _finalized=True, _closing=True)
+    server._sessions[sid] = sess
+    process_registry._completion_consumed.discard(evt_id)
+
+    class _IngestMessages(list):
+        def append(self, item):
+            super().append(item)
+            if isinstance(item, dict) and item.get("role") == "user":
+                ingested.set()
+
+    messages = _IngestMessages(
+        [{"role": "tool", "content": "ok", "tool_call_id": "t1"}]
+    )
+    apply_errors: list[BaseException] = []
+    try:
+        assert server._deliver_completions_via_steer(
+            sid, sess, [_completion(evt_id, 0, "echo atomic")], set()
+        )
+        original_drain = agent._drain_pending_steer
+
+        def _gated_drain():
+            if threading.get_ident() != state["apply_tid"]:
+                assert ingested.wait(timeout=2.0)
+            return original_drain()
+
+        agent._drain_pending_steer = _gated_drain
+
+        def _apply():
+            state["apply_tid"] = threading.get_ident()
+            assert snapshot_seen.wait(timeout=2.0)
+            try:
+                agent._apply_pending_steer_to_tool_results(messages, 1)
+            except BaseException as exc:
+                apply_errors.append(exc)
+
+        state["armed"] = True
+        apply_thread = threading.Thread(target=_apply, daemon=True)
+        apply_thread.start()
+        stop = threading.Event()
+        stop.set()
+        server._notification_poller_loop(stop, sid, sess)
+        apply_thread.join(timeout=2.0)
+
+        assert not apply_thread.is_alive()
+        assert apply_errors == []
+        assert snapshot_seen.is_set()
+        assert _queued_completion_ids(isolated) == [evt_id]
+        assert [row for row in messages if row.get("role") == "user"] == []
+        assert process_registry.is_completion_consumed(evt_id) is False
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard(evt_id)
+        while not isolated.empty():
+            isolated.get_nowait()

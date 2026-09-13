@@ -165,7 +165,8 @@ def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwa
         with _session_profile_runtime_scope(session):
             render_notification(lambda: _emit("message.start", sid), platform="tui",
                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        if _run_prompt_submit(rid, sid, session, text, **kwargs) is False:
+            raise RuntimeError("prompt admission refused")
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -183,21 +184,31 @@ def _mark_completion_events_consumed(events: list) -> None:
             process_registry._completion_consumed.add(sid)
 
 
-def _partition_steered_completion_pending(session: dict) -> tuple[list, list]:
+def _completion_ownership_lock(session: dict):
+    """Serialize the completion-specific transitions layered onto AIAgent's steer rail."""
+    return session.setdefault("_completion_ownership_lock", threading.RLock())
+
+
+def _partition_steered_completion_pending(
+        session: dict, fallback_accepted: set[int] | None = None) -> tuple[list, list]:
     """Split pending into ingested-accepted vs leftover. Caller holds history_lock.
 
     steer() True is staging, not ACK. Events still on the live rail stay leftover
     so a dying session cannot keep accepted-unacked one-shots as its only owner.
     """
-    live = str(getattr(session.get("agent"), "_pending_steer", None) or "")
+    pending = list(session.get("_completion_pending") or [])
+    has_drain_receipt = any("_steer_drained" in evt for evt in pending)
+    live = bool(getattr(session.get("agent"), "_pending_steer", None))
     accepted = []
     leftover = []
-    for evt in list(session.get("_completion_pending") or []):
-        sid = evt.get("session_id")
-        # Still only on the live steer rail — not in this ingest snapshot.
-        if evt.get("_steer_accepted") and sid and live and f" {sid} " in f" {live} ":
-            leftover.append(evt)
-        elif evt.get("_steer_accepted"):
+    for evt in pending:
+        # Real AIAgent drains carry event identities. The fallback preserves
+        # pre-existing test/third-party agents that only expose the text slot.
+        fallback_match = (
+            id(evt) in fallback_accepted if fallback_accepted is not None
+            else not has_drain_receipt and not live
+        )
+        if evt.get("_steer_accepted") and (evt.get("_steer_drained") or fallback_match):
             accepted.append(evt)
         else:
             leftover.append(evt)
@@ -206,8 +217,17 @@ def _partition_steered_completion_pending(session: dict) -> tuple[list, list]:
 
 def _ack_steered_completion_ingest(session: dict) -> None:
     """ACK staged completions only after leftover enqueue or equivalent ingest."""
+    # Legacy agents can clear the text slot without the structured drain guard.
+    # Snapshot only the event objects present at that boundary; a concurrent
+    # later steer must not inherit their ACK.
+    fallback_accepted = set()
+    if not getattr(session.get("agent"), "_pending_steer", None):
+        fallback_accepted = {
+            id(evt) for evt in session.get("_completion_pending") or []
+            if evt.get("_steer_accepted") and "_steer_drained" not in evt
+        }
     with session["history_lock"]:
-        accepted, leftover = _partition_steered_completion_pending(session)
+        accepted, leftover = _partition_steered_completion_pending(session, fallback_accepted)
         session["_completion_pending"] = leftover
     if accepted:
         _mark_completion_events_consumed(accepted)
@@ -217,26 +237,49 @@ def _bind_completion_steer_guards(session: dict, agent) -> None:
     """ACK on drain (ingest); unmark on interrupt wipe so pending can replay."""
     if agent is None or getattr(agent, "_completion_steer_guards", False):
         return
+    ownership_lock = _completion_ownership_lock(session)
     orig_clear = getattr(agent, "clear_interrupt", None)
     if callable(orig_clear):
         def _clear(*args, **kwargs):
-            had = bool(getattr(agent, "_pending_steer", None))
-            result = orig_clear(*args, **kwargs)
-            if had and not getattr(agent, "_pending_steer", None):
-                with session["history_lock"]:
-                    for evt in session.get("_completion_pending") or []:
-                        evt.pop("_steer_accepted", None)
-            return result
+            with ownership_lock:
+                had = bool(getattr(agent, "_pending_steer", None))
+                result = orig_clear(*args, **kwargs)
+                if had and not getattr(agent, "_pending_steer", None):
+                    with session["history_lock"]:
+                        for evt in session.get("_completion_pending") or []:
+                            evt.pop("_steer_accepted", None)
+                            evt.pop("_steer_drained", None)
+                return result
 
         agent.clear_interrupt = _clear
+    orig_drain = getattr(agent, "_drain_pending_steer", None)
+    if callable(orig_drain):
+        def _drain(*args, **kwargs):
+            with ownership_lock:
+                result = orig_drain(*args, **kwargs)
+                if result:
+                    with session["history_lock"]:
+                        for evt in session.get("_completion_pending") or []:
+                            if evt.get("_steer_accepted"):
+                                evt["_steer_drained"] = True
+                return result
+
+        agent._drain_pending_steer = _drain
     orig_apply = getattr(agent, "_apply_pending_steer_to_tool_results", None)
     if callable(orig_apply):
         def _apply(*args, **kwargs):
             orig_apply(*args, **kwargs)
-            if not getattr(agent, "_pending_steer", None):
-                _ack_steered_completion_ingest(session)
+            _ack_steered_completion_ingest(session)
 
         agent._apply_pending_steer_to_tool_results = _apply
+
+    def _requeued():
+        with ownership_lock:
+            with session["history_lock"]:
+                for evt in session.get("_completion_pending") or []:
+                    evt.pop("_steer_drained", None)
+
+    agent._completion_steer_requeued = _requeued
     agent._completion_steer_guards = True
 
 
@@ -286,26 +329,28 @@ def _deliver_completions_via_steer(sid: str, session: dict, events: list, emitte
     if batch_key not in emitted:
         _emit("status.update", sid, {"kind": "process", "text": text})
         emitted.add(batch_key)
-    try:
-        if not steer(text):
+    ownership_lock = _completion_ownership_lock(session)
+    with ownership_lock:
+        _bind_completion_steer_guards(session, session.get("agent"))
+        try:
+            if not steer(text):
+                return False
+        except Exception:
             return False
-    except Exception:
-        return False
-    # steer() True is staging only — ACK at leftover/tool-result ingest.
-    _bind_completion_steer_guards(session, session.get("agent"))
-    with session["history_lock"]:
-        pending = session.setdefault("_completion_pending", [])
-        have = {evt.get("session_id") for evt in pending}
-        for evt in events:
-            sid_evt = evt.get("session_id")
-            if sid_evt in have:
-                for item in pending:
-                    if item.get("session_id") == sid_evt:
-                        item["_steer_accepted"] = True
-            else:
-                staged = dict(evt)
-                staged["_steer_accepted"] = True
-                pending.append(staged)
+        # steer() True is staging only — ACK at leftover/tool-result ingest.
+        with session["history_lock"]:
+            pending = session.setdefault("_completion_pending", [])
+            have = {evt.get("session_id") for evt in pending}
+            for evt in events:
+                sid_evt = evt.get("session_id")
+                if sid_evt in have:
+                    for item in pending:
+                        if item.get("session_id") == sid_evt:
+                            item["_steer_accepted"] = True
+                else:
+                    staged = dict(evt)
+                    staged["_steer_accepted"] = True
+                    pending.append(staged)
     return True
 
 
@@ -984,21 +1029,22 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     agent = session.get("agent")
     steer_lock = getattr(agent, "_pending_steer_lock", None)
     steer_guard = steer_lock if steer_lock is not None else contextlib.nullcontext()
-    with steer_guard:
-        with session["history_lock"]:
-            dying = bool(session.get("_finalized") or session.get("_closing"))
-            if dying:
-                accepted, leftover = _partition_steered_completion_pending(session)
-                session["_completion_pending"] = []
-                if any(evt.get("_steer_accepted") for evt in leftover) and agent is not None:
-                    agent._pending_steer = None
-            else:
-                accepted = []
-                pending = list(session.get("_completion_pending") or [])
-                leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
-                session["_completion_pending"] = [
-                    evt for evt in pending if evt.get("_steer_accepted")
-                ]
+    with _completion_ownership_lock(session):
+        with steer_guard:
+            with session["history_lock"]:
+                dying = bool(session.get("_finalized") or session.get("_closing"))
+                if dying:
+                    accepted, leftover = _partition_steered_completion_pending(session)
+                    session["_completion_pending"] = []
+                    if any(evt.get("_steer_accepted") for evt in leftover) and agent is not None:
+                        agent._pending_steer = None
+                else:
+                    accepted = []
+                    pending = list(session.get("_completion_pending") or [])
+                    leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
+                    session["_completion_pending"] = [
+                        evt for evt in pending if evt.get("_steer_accepted")
+                    ]
     if accepted:
         _mark_completion_events_consumed(accepted)
     for evt in leftover:

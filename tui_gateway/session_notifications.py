@@ -183,23 +183,32 @@ def _mark_completion_events_consumed(events: list) -> None:
             process_registry._completion_consumed.add(sid)
 
 
+def _partition_steered_completion_pending(session: dict) -> tuple[list, list]:
+    """Split pending into ingested-accepted vs leftover. Caller holds history_lock.
+
+    steer() True is staging, not ACK. Events still on the live rail stay leftover
+    so a dying session cannot keep accepted-unacked one-shots as its only owner.
+    """
+    live = str(getattr(session.get("agent"), "_pending_steer", None) or "")
+    accepted = []
+    leftover = []
+    for evt in list(session.get("_completion_pending") or []):
+        sid = evt.get("session_id")
+        # Still only on the live steer rail — not in this ingest snapshot.
+        if evt.get("_steer_accepted") and sid and live and f" {sid} " in f" {live} ":
+            leftover.append(evt)
+        elif evt.get("_steer_accepted"):
+            accepted.append(evt)
+        else:
+            leftover.append(evt)
+    return accepted, leftover
+
+
 def _ack_steered_completion_ingest(session: dict) -> None:
     """ACK staged completions only after leftover enqueue or equivalent ingest."""
     with session["history_lock"]:
-        live = str(getattr(session.get("agent"), "_pending_steer", None) or "")
-        pending = list(session.get("_completion_pending") or [])
-        accepted = []
-        keep = []
-        for evt in pending:
-            sid = evt.get("session_id")
-            # Still only on the live steer rail — not in this ingest snapshot.
-            if evt.get("_steer_accepted") and sid and live and f" {sid} " in f" {live} ":
-                keep.append(evt)
-            elif evt.get("_steer_accepted"):
-                accepted.append(evt)
-            else:
-                keep.append(evt)
-        session["_completion_pending"] = keep
+        accepted, leftover = _partition_steered_completion_pending(session)
+        session["_completion_pending"] = leftover
     if accepted:
         _mark_completion_events_consumed(accepted)
 
@@ -967,13 +976,34 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
             break
     handle(ready, deferred)
     _flush_pending_completions_if_idle(sid, session, emitted)
+    # Live poller stop (session still owns the turn): keep accepted-unacked on
+    # the session. Dying finalize: reuse ingest ACK's split, drain live steer
+    # under the same lock, and return unacked one-shots to the shared queue.
     with session["history_lock"]:
-        pending = list(session.get("_completion_pending") or [])
-        leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
-        session["_completion_pending"] = [
-            evt for evt in pending if evt.get("_steer_accepted")
-        ]
+        dying = bool(session.get("_finalized") or session.get("_closing"))
+        if dying:
+            accepted, leftover = _partition_steered_completion_pending(session)
+            session["_completion_pending"] = []
+            if any(evt.get("_steer_accepted") for evt in leftover):
+                drain = getattr(session.get("agent"), "_drain_pending_steer", None)
+                if callable(drain):
+                    with contextlib.suppress(Exception):
+                        drain()
+        else:
+            accepted = []
+            pending = list(session.get("_completion_pending") or [])
+            leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
+            session["_completion_pending"] = [
+                evt for evt in pending if evt.get("_steer_accepted")
+            ]
+    if accepted:
+        _mark_completion_events_consumed(accepted)
     for evt in leftover:
+        if dying:
+            evt.pop("_steer_accepted", None)
+            if evt.get("type") == "completion" and process_registry.is_completion_consumed(
+                    evt.get("session_id") or ""):
+                continue
         queue.put(evt)
     for evt in deferred:
         queue.put(evt)

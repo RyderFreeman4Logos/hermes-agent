@@ -7,9 +7,11 @@ import threading
 import time
 import types
 from collections.abc import Callable
+from unittest.mock import patch
 
 import pytest
 
+from run_agent import AIAgent
 from tools.process_registry import process_registry
 from tui_gateway import server
 
@@ -578,3 +580,207 @@ def test_leftover_ack_toctou_does_not_consume_later_steer():
     finally:
         process_registry._completion_consumed.discard("proc_race_a")
         process_registry._completion_consumed.discard("proc_race_b")
+
+
+def _bare_aiagent():
+    """Real AIAgent.steer rail without init_agent / paid client / live data."""
+    with patch("run_agent.AIAgent.__init__", return_value=None):
+        agent = AIAgent.__new__(AIAgent)
+    agent._pending_steer = None
+    agent._pending_steer_lock = threading.Lock()
+    agent._model_request_active = threading.Event()
+    agent._executing_tools = True
+    agent.session_id = "agent-sid"
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent.client = None
+    agent._session_messages = None
+    return agent
+
+
+class _HookLock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.hook: Callable[[], None] | None = None
+
+    def __enter__(self):
+        if self.hook:
+            fn, self.hook = self.hook, None
+            fn()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        return False
+
+
+def _queued_completion_ids(q: queue_mod.Queue) -> list[str]:
+    items = []
+    while not q.empty():
+        items.append(q.get_nowait())
+    return [evt.get("session_id") for evt in items]
+
+
+def _watch_steer(agent) -> threading.Event:
+    steered = threading.Event()
+    orig = agent.steer
+
+    def _steer(text: str) -> bool:
+        ok = orig(text)
+        if ok:
+            steered.set()
+        return ok
+
+    agent.steer = _steer
+    return steered
+
+
+class _SignalQueue(queue_mod.Queue):
+    def __init__(self):
+        super().__init__()
+        self.dequeued = threading.Event()
+
+    def get(self, *args, **kwargs):
+        item = super().get(*args, **kwargs)
+        self.dequeued.set()
+        return item
+
+
+def test_steered_unacked_completion_survives_real_finalize(monkeypatch):
+    """Accepted-unacked steer must be recoverable after real poller shutdown + teardown."""
+    isolated = _SignalQueue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    agent = _bare_aiagent()
+    steered = _watch_steer(agent)
+    sid = "sid_f1_unacked"
+    sess = _session(running=True, agent=agent)
+    server._sessions[sid] = sess
+    evt = _completion("proc_f1_unacked", 0, "echo unacked")
+    process_registry._completion_consumed.discard("proc_f1_unacked")
+    isolated.put(evt)
+    sess["_notif_stop"] = server._start_notification_poller(sid, sess)
+    try:
+        assert steered.wait(timeout=2.0)
+        assert agent._pending_steer and "proc_f1_unacked" in agent._pending_steer
+        assert "proc_f1_unacked" not in process_registry._completion_consumed
+        assert isolated.empty()
+
+        closed = server._close_session_by_id(sid, end_reason="tui_close")
+        assert closed is True
+        assert sid not in server._sessions
+        assert "proc_f1_unacked" not in process_registry._completion_consumed
+        assert _queued_completion_ids(isolated) == ["proc_f1_unacked"]
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard("proc_f1_unacked")
+        while not isolated.empty():
+            isolated.get_nowait()
+
+
+def test_acked_steer_is_not_requeued_on_finalize(monkeypatch):
+    """Already-ACKed ingest must not duplicate onto the shared queue at teardown."""
+    isolated = _SignalQueue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    agent = _bare_aiagent()
+    steered = _watch_steer(agent)
+    sid = "sid_f1_acked"
+    sess = _session(running=True, agent=agent)
+    server._sessions[sid] = sess
+    evt = _completion("proc_f1_acked", 0, "echo acked")
+    process_registry._completion_consumed.discard("proc_f1_acked")
+    isolated.put(evt)
+    sess["_notif_stop"] = server._start_notification_poller(sid, sess)
+    try:
+        assert steered.wait(timeout=2.0)
+        leftover = agent._drain_pending_steer()
+        assert leftover and "proc_f1_acked" in leftover
+        with sess["history_lock"]:
+            server._enqueue_prompt(sess, leftover, sess.get("transport"))
+        server._ack_steered_completion_ingest(sess)
+        assert "proc_f1_acked" in process_registry._completion_consumed
+        assert isolated.empty()
+
+        closed = server._close_session_by_id(sid, end_reason="tui_close")
+        assert closed is True
+        assert "proc_f1_acked" in process_registry._completion_consumed
+        assert _queued_completion_ids(isolated) == []
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard("proc_f1_acked")
+        while not isolated.empty():
+            isolated.get_nowait()
+
+
+def test_unsteerable_busy_completion_requeues_through_finalize(monkeypatch):
+    """Existing busy recovery: no steer callable, shutdown still returns the event."""
+    isolated = _SignalQueue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    emitted: list = []
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kw: emitted.append(args))
+
+    sid = "sid_f1_busy"
+    sess = _session(running=True)
+    server._sessions[sid] = sess
+    evt = _completion("proc_f1_busy", 0, "echo busy")
+    process_registry._completion_consumed.discard("proc_f1_busy")
+    isolated.put(evt)
+    sess["_notif_stop"] = server._start_notification_poller(sid, sess)
+    try:
+        assert isolated.dequeued.wait(timeout=2.0)
+        closed = server._close_session_by_id(sid, end_reason="tui_close")
+        assert closed is True
+        assert [args for args in emitted if args and args[0] == "status.update"] == []
+        assert "proc_f1_busy" not in process_registry._completion_consumed
+        assert _queued_completion_ids(isolated) == ["proc_f1_busy"]
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard("proc_f1_busy")
+        while not isolated.empty():
+            isolated.get_nowait()
+
+
+def test_ack_before_shutdown_split_does_not_duplicate(monkeypatch):
+    """ACK winning the history lock before leftover split must not requeue a consumed id."""
+    isolated = _SignalQueue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    agent = _bare_aiagent()
+    steered = _watch_steer(agent)
+    lock = _HookLock()
+    sid = "sid_f1_ack_race"
+    sess = _session(running=True, agent=agent, history_lock=lock)
+    server._sessions[sid] = sess
+    evt = _completion("proc_f1_ack_race", 0, "echo race")
+    process_registry._completion_consumed.discard("proc_f1_ack_race")
+    isolated.put(evt)
+    sess["_notif_stop"] = server._start_notification_poller(sid, sess)
+    try:
+        assert steered.wait(timeout=2.0)
+        leftover = agent._drain_pending_steer()
+        assert leftover and "proc_f1_ack_race" in leftover
+        with lock._lock:
+            server._enqueue_prompt(sess, leftover, sess.get("transport"))
+
+        def _ack_first():
+            server._ack_steered_completion_ingest(sess)
+
+        lock.hook = _ack_first
+        closed = server._close_session_by_id(sid, end_reason="tui_close")
+        assert closed is True
+        assert "proc_f1_ack_race" in process_registry._completion_consumed
+        assert _queued_completion_ids(isolated) == []
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard("proc_f1_ack_race")
+        while not isolated.empty():
+            isolated.get_nowait()

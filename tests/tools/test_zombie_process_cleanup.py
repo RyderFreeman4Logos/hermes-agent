@@ -461,6 +461,7 @@ class TestDelegationCleanup:
             reset_hermes_home_override,
             set_hermes_home_override,
         )
+        from tools.daemon_pool import DaemonThreadPoolExecutor
         from tools.delegate_tool import _run_single_child
 
         relay_runtime._reset_for_tests()
@@ -480,6 +481,23 @@ class TestDelegationCleanup:
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
         monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+        orig_submit = DaemonThreadPoolExecutor.submit
+
+        def submit_then_time_in_flight(self, fn, /, *args, **kwargs):
+            future = orig_submit(self, fn, *args, **kwargs)
+            orig_result = future.result
+
+            def result(timeout=None):
+                if timeout == 0.1:
+                    assert child_started.wait(timeout=5), (
+                        "child never reached begin_turn before in-flight timeout"
+                    )
+                return orig_result(timeout=timeout)
+
+            future.result = result
+            return future
+
+        monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit_then_time_in_flight)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
@@ -520,6 +538,7 @@ class TestDelegationCleanup:
             )
 
             assert child_started.is_set()
+            assert not child_finished.is_set()
             assert result["status"] == "timeout"
             assert relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),

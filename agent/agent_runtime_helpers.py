@@ -3527,6 +3527,8 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
     else:
         existing = getattr(agent, "_pending_steer", None)
         agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+    if callable(requeued := getattr(agent, "_completion_steer_requeued", None)):
+        requeued()
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:

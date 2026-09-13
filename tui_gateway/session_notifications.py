@@ -190,11 +190,15 @@ def _completion_ownership_lock(session: dict):
 
 
 def _partition_steered_completion_pending(
-        session: dict, fallback_accepted: set[int] | None = None) -> tuple[list, list]:
+        session: dict, fallback_accepted: set[int] | None = None,
+        *, consume_drained: bool = False) -> tuple[list, list]:
     """Split pending into ingested-accepted vs leftover. Caller holds history_lock.
 
-    steer() True is staging, not ACK. Events still on the live rail stay leftover
-    so a dying session cannot keep accepted-unacked one-shots as its only owner.
+    steer() True is staging, not ACK. A drain receipt means the rail transferred
+    the text; only the leftover/tool ingest ACK may consume that receipt. Dying
+    reclaim must not treat drain-in-flight as settlement. Events still on the
+    live rail stay leftover so a dying session cannot keep accepted-unacked
+    one-shots as its only owner.
     """
     pending = list(session.get("_completion_pending") or [])
     has_drain_receipt = any("_steer_drained" in evt for evt in pending)
@@ -208,7 +212,8 @@ def _partition_steered_completion_pending(
             id(evt) in fallback_accepted if fallback_accepted is not None
             else not has_drain_receipt and not live
         )
-        if evt.get("_steer_accepted") and (evt.get("_steer_drained") or fallback_match):
+        drained = bool(consume_drained and evt.get("_steer_drained"))
+        if evt.get("_steer_accepted") and (drained or fallback_match):
             accepted.append(evt)
         else:
             leftover.append(evt)
@@ -227,7 +232,8 @@ def _ack_steered_completion_ingest(session: dict) -> None:
             if evt.get("_steer_accepted") and "_steer_drained" not in evt
         }
     with session["history_lock"]:
-        accepted, leftover = _partition_steered_completion_pending(session, fallback_accepted)
+        accepted, leftover = _partition_steered_completion_pending(
+            session, fallback_accepted, consume_drained=True)
         session["_completion_pending"] = leftover
     if accepted:
         _mark_completion_events_consumed(accepted)
@@ -247,6 +253,8 @@ def _bind_completion_steer_guards(session: dict, agent) -> None:
                 if had and not getattr(agent, "_pending_steer", None):
                     with session["history_lock"]:
                         for evt in session.get("_completion_pending") or []:
+                            if evt.get("_steer_drained"):
+                                continue
                             evt.pop("_steer_accepted", None)
                             evt.pop("_steer_drained", None)
                 return result

@@ -1767,6 +1767,54 @@ class TestTerminateHostPidPosix:
             if parent.poll() is None:
                 parent.kill()
             parent.wait()
+    def test_posix_grandchild_signal_error_still_terminates_owner(self, monkeypatch):
+        """A reparented/foreign grandchild must not abort the owner SIGTERM.
+
+        Official close-reclaim: psutil.Process.terminate() calls os.kill;
+        tests/conftest.py _guarded_kill raises RuntimeError for a PID outside
+        the pytest subtree. suppress(NoSuchProcess, AccessDenied, OSError)
+        does not catch RuntimeError, so the owner Popen was never signaled
+        and poll() stayed running.
+        """
+        from tools import process_registry as pr
+        import psutil
+
+        terminate_order = []
+
+        class _FakeChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                terminate_order.append(self.pid)
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                raise AssertionError("grace=0 must not SIGKILL")
+
+        class _FakeParent:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [_FakeChild(101)]
+
+            def terminate(self):
+                terminate_order.append(self.pid)
+
+            def kill(self):
+                raise AssertionError("grace=0 must not SIGKILL")
+
+        monkeypatch.setattr(psutil, "Process", _FakeParent)
+        monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                            staticmethod(lambda: 0.0))
+        pr.ProcessRegistry._terminate_host_pid(12345)
+        assert terminate_order == [12345, 101], (
+            "Parent receives SIGTERM first; a grandchild signal error must not abort it"
+        )
 
     def test_posix_oserror_falls_back_to_os_kill(self, monkeypatch):
         from tools import process_registry as pr

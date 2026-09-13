@@ -1417,6 +1417,173 @@ class TestKillProcess:
             registry._signal_kill = orig
             self._reap_child(proc)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-child kill/liveness matrix")
+    def test_kill_process_unknown_start_time_keeps_live_host_child_running(self, registry):
+        """Alive host PID + unreadable start time is UNKNOWN, not proven identity-gone."""
+        s, proc = self._bind_real_child(registry, "proc_unknown_start")
+        pid = proc.pid
+        orig = registry._signal_kill
+        assert s.host_start_time is not None
+        assert ProcessRegistry._is_host_pid_alive(pid) is True
+
+        def boom(_session, _session_id, _consume_output):
+            raise OSError("failed kill; start-time unreadable")
+
+        try:
+            registry._signal_kill = boom
+            with patch.object(
+                ProcessRegistry, "_safe_host_start_time", staticmethod(lambda _pid=None: None)
+            ):
+                result = registry.kill_process(s.id, source="test", consume_output=True)
+            still = ProcessRegistry._is_host_pid_alive(pid)
+            poll = registry.poll(s.id)
+            listed = [p for p in registry.list_sessions() if p["session_id"] == s.id]
+            assert result["status"] == "error"
+            assert still is True
+            assert proc.poll() is None
+            assert s.exited is False
+            assert poll["status"] == "running"
+            assert s.id not in registry._completion_consumed
+            assert listed and listed[0]["status"] == "running"
+        finally:
+            registry._signal_kill = orig
+            self._reap_child(proc)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-child kill/liveness matrix")
+    def test_kill_process_pty_unknown_start_time_keeps_live_child_running(self, registry):
+        """PTY / dropped handle + UNKNOWN start time must not mark a live host PID."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        s = _make_session(sid="proc_pty_unknown", command="pty")
+        s.process = None
+        s.pid = proc.pid
+        s.pid_scope = "host"
+        s.host_start_time = ProcessRegistry._safe_host_start_time(proc.pid)
+        s._pty = object()
+        registry._running[s.id] = s
+        pid = proc.pid
+        orig = registry._signal_kill
+        assert s.host_start_time is not None
+
+        def boom(_session, _session_id, _consume_output):
+            raise OSError("pty terminate failed")
+
+        try:
+            registry._signal_kill = boom
+            with patch.object(
+                ProcessRegistry, "_safe_host_start_time", staticmethod(lambda _pid=None: None)
+            ):
+                result = registry.kill_process(s.id, source="test", consume_output=True)
+            still = ProcessRegistry._is_host_pid_alive(pid)
+            poll = registry.poll(s.id)
+            listed = [p for p in registry.list_sessions() if p["session_id"] == s.id]
+            assert result["status"] == "error"
+            assert still is True
+            assert proc.poll() is None
+            assert s.exited is False
+            assert poll["status"] == "running"
+            assert s.id not in registry._completion_consumed
+            assert listed and listed[0]["status"] == "running"
+        finally:
+            registry._signal_kill = orig
+            self._reap_child(proc)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-child kill/liveness matrix")
+    def test_kill_process_waitable_zero_exit_marks_zero_not_minus15(self, registry):
+        """A waitable poll() of 0 is authoritative; do not invent -15."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "raise SystemExit(0)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.wait(timeout=2)
+        s = _make_session(sid="proc_waitable_zero", command="true")
+        s.process = proc
+        s.pid = proc.pid
+        s.pid_scope = "host"
+        s.host_start_time = 1
+        registry._running[s.id] = s
+        orig = registry._signal_kill
+
+        def boom(_session, _session_id, _consume_output):
+            raise RuntimeError("after natural zero exit")
+
+        try:
+            registry._signal_kill = boom
+            result = registry.kill_process(s.id, source="test", consume_output=True)
+            assert result["status"] == "error"
+            assert s.exited is True
+            assert s.exit_code == 0
+            assert s.exit_code == proc.poll()
+            assert s.exit_code != -15
+        finally:
+            registry._signal_kill = orig
+
+    def test_kill_process_sandbox_pid_not_host_identity_gone(self, registry):
+        """Sandbox PIDs must not be host-checked even if host_start_time is set."""
+        s = _make_session(sid="proc_sandbox_scope", command="sandbox")
+        s.process = None
+        s.pid = 1
+        s.pid_scope = "sandbox"
+        s.host_start_time = 1
+        s.env_ref = MagicMock()
+        registry._running[s.id] = s
+        orig = registry._signal_kill
+
+        def boom(_session, _session_id, _consume_output):
+            raise OSError("remote kill failed")
+
+        try:
+            registry._signal_kill = boom
+            result = registry.kill_process(s.id, source="test", consume_output=True)
+            listed = [p for p in registry.list_sessions() if p["session_id"] == s.id]
+            assert result["status"] == "error"
+            assert s.exited is False
+            assert registry.poll(s.id)["status"] == "running"
+            assert s.id not in registry._completion_consumed
+            assert listed and listed[0]["status"] == "running"
+        finally:
+            registry._signal_kill = orig
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-child kill/liveness matrix")
+    def test_kill_process_pid_reuse_mismatch_marks_without_killing_stranger(self, registry):
+        """Live stranger with mismatched start time: mark ours gone, do not signal the stranger."""
+        stranger = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        s = _make_session(sid="proc_pid_reuse", command="old")
+        s.process = None
+        s.pid = stranger.pid
+        s.pid_scope = "host"
+        s.host_start_time = 1
+        registry._running[s.id] = s
+        pid = stranger.pid
+        orig = registry._signal_kill
+        assert ProcessRegistry._is_host_pid_alive(pid) is True
+
+        def boom(_session, _session_id, _consume_output):
+            raise OSError("checkpoint after original death")
+
+        try:
+            registry._signal_kill = boom
+            result = registry.kill_process(s.id, source="test", consume_output=True)
+            stranger_alive = ProcessRegistry._is_host_pid_alive(pid)
+            assert result["status"] == "error"
+            assert s.exited is True
+            assert s.exit_code != -15
+            assert stranger_alive is True
+            assert stranger.poll() is None
+        finally:
+            registry._signal_kill = orig
+            self._reap_child(stranger)
+
 
 # =========================================================================
 # Tool handler

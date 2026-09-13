@@ -1746,21 +1746,31 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "termination_source": session.termination_source, "output": output}
         except Exception as e:
             # Pre-signal / failed kill: leave running so close()/kill_all can retry.
-            # Post-death: reconcile only with a waitable handle rc or matching host
-            # identity gone. Do not invent -15. PTY/remote/Windows keep the same
-            # waitable-handle / host-identity rules — never treat a sandbox PID as host.
+            # Post-death: waitable poll() (including 0) is authoritative. Host
+            # identity is gone only when positively known: ESRCH/not-alive, or a
+            # live start-time mismatch. Do not invent -15. EPERM/unreadable start
+            # while the PID still answers liveness is UNKNOWN — not death.
+            # Never treat a sandbox PID as host.
             if not session.exited:
                 waitable = getattr(session, "process", None)
                 wait_rc = None
                 if waitable is not None:
                     with suppress(Exception):
                         wait_rc = waitable.poll()
-                identity_gone = (
-                    session.pid_scope == "host"
+                identity_gone = False
+                if (
+                    wait_rc is None
+                    and session.pid_scope == "host"
                     and session.pid
                     and session.host_start_time is not None
-                    and not self._host_pid_is_ours(session.pid, session.host_start_time)
-                )
+                ):
+                    # _is_host_pid_alive: EPERM/unknown → True; ESRCH/absent → False.
+                    if not self._is_host_pid_alive(session.pid):
+                        identity_gone = True
+                    else:
+                        live_start = self._safe_host_start_time(session.pid)
+                        if live_start is not None:
+                            identity_gone = live_start != session.host_start_time
                 if wait_rc is not None or identity_gone:
                     with session._lock:
                         if consume_output:

@@ -1,0 +1,239 @@
+"""Completion ownership regressions at real TUI admission and steer-drain boundaries."""
+from __future__ import annotations
+
+import contextlib
+import queue
+import threading
+import types
+from unittest.mock import patch
+
+from run_agent import AIAgent
+from tools.process_registry import process_registry
+from tui_gateway import server
+
+
+class _InlineThread:
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+def _completion(session_id: str, *, output: str | None = None) -> dict:
+    return {
+        "type": "completion",
+        "session_id": session_id,
+        "command": f"echo {session_id}",
+        "exit_code": 0,
+        "output": output if output is not None else f"out-{session_id}",
+    }
+
+
+def _session(agent=None, **extra) -> dict:
+    return {
+        "agent": agent if agent is not None else types.SimpleNamespace(),
+        "session_key": "owner-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+        "attached_images": [],
+        "image_counter": 0,
+        "cols": 80,
+        "slash_worker": None,
+        "show_reasoning": False,
+        "tool_progress_mode": "all",
+        "inflight_turn": None,
+        **extra,
+    }
+
+
+def _bare_agent() -> AIAgent:
+    with patch("run_agent.AIAgent.__init__", return_value=None):
+        agent = AIAgent.__new__(AIAgent)
+    agent._pending_steer = None
+    agent._pending_steer_lock = threading.Lock()
+    agent._pending_redirect = None
+    agent._pending_redirect_lock = threading.Lock()
+    agent._model_request_active = threading.Event()
+    agent._executing_tools = True
+    agent._interrupt_requested = False
+    agent._interrupt_message = None
+    agent._tool_interrupt_reason = None
+    agent._hard_interrupt_requested = threading.Event()
+    agent._interrupt_thread_signal_pending = False
+    agent._execution_thread_id = None
+    agent.session_id = "owner-agent"
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent.client = None
+    agent._session_messages = None
+    return agent
+
+
+@contextlib.contextmanager
+def _isolated_queue(monkeypatch):
+    isolated = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a, **_k: None)
+    yield isolated
+
+
+def _queued_ids(items: queue.Queue) -> list[str]:
+    return [item.get("session_id", "") for item in list(items.queue)]
+
+
+def _clear_ids(*session_ids: str) -> None:
+    process_registry._completion_consumed.difference_update(session_ids)
+
+
+def _patch_inline_turn(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda _sid, _session: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+
+
+def test_refused_idle_admission_requeues_once_and_normal_admission_settles_once(
+    monkeypatch, tmp_path
+):
+    refused_id = "proc_refused_idle"
+    admitted_id = "proc_admitted_idle"
+    _clear_ids(refused_id, admitted_id)
+    try:
+        with _isolated_queue(monkeypatch) as isolated:
+            refused = _session(
+                running=False,
+                _closing=True,
+                _finalized=True,
+                _completion_pending=[_completion(refused_id)],
+            )
+            stop = threading.Event()
+            stop.set()
+            server._notification_poller_loop(stop, "refused-ui", refused)
+
+            assert process_registry.is_completion_consumed(refused_id) is False
+            assert _queued_ids(isolated) == [refused_id]
+            assert refused.get("_completion_pending") == []
+
+            isolated.get_nowait()
+            _patch_inline_turn(monkeypatch, tmp_path)
+            agent = types.SimpleNamespace(
+                session_id="owner-agent",
+                run_conversation=lambda *_a, **_k: {"final_response": "done"},
+                clear_interrupt=lambda: None,
+            )
+            admitted = _session(agent=agent, running=False)
+            settlements: list[list[str]] = []
+            real_settle = server._mark_completion_events_consumed
+
+            def settle(events):
+                settlements.append([event["session_id"] for event in events])
+                real_settle(events)
+
+            monkeypatch.setattr(server, "_mark_completion_events_consumed", settle)
+            server._deliver_completion_notifications(
+                "admitted-ui", admitted, [_completion(admitted_id)], set()
+            )
+
+            assert process_registry.is_completion_consumed(admitted_id) is True
+            assert settlements == [[admitted_id]]
+            assert admitted["running"] is False
+    finally:
+        _clear_ids(refused_id, admitted_id)
+
+
+class _BlockingMessages(list):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.user_appended = threading.Event()
+        self.release = threading.Event()
+
+    def append(self, item):
+        super().append(item)
+        if isinstance(item, dict) and item.get("role") == "user":
+            self.user_appended.set()
+            assert self.release.wait(2), "user-row release timed out"
+
+
+def test_ack_uses_drained_event_identity_not_formatted_text(monkeypatch):
+    first_id = "proc_identity_a"
+    staged_id = "proc_identity_b"
+    restaged_id = "proc_identity_c"
+    _clear_ids(first_id, staged_id, restaged_id)
+    errors: list[BaseException] = []
+    try:
+        with _isolated_queue(monkeypatch) as isolated:
+            agent = _bare_agent()
+            session = _session(agent=agent)
+            assert server._deliver_completions_via_steer(
+                "owner-ui", session, [_completion(first_id)], set()
+            )
+            assert agent.steer(f"operator note also mentions {first_id}")
+            messages = _BlockingMessages(
+                [{"role": "tool", "content": "ok", "tool_call_id": "tool-1"}]
+            )
+
+            def apply():
+                try:
+                    agent._apply_pending_steer_to_tool_results(messages, 1)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            apply_thread = threading.Thread(target=apply, daemon=True)
+            apply_thread.start()
+            assert messages.user_appended.wait(2), "first completion was not ingested"
+            assert session["_completion_pending"][0].get("_steer_drained") is True
+            assert server._deliver_completions_via_steer(
+                "owner-ui",
+                session,
+                [_completion(staged_id, output=f"ordinary output mentions {first_id} token")],
+                set(),
+            )
+            messages.release.set()
+            apply_thread.join(2)
+            assert not apply_thread.is_alive()
+            assert errors == []
+
+            assert process_registry.is_completion_consumed(first_id) is True
+            assert process_registry.is_completion_consumed(staged_id) is False
+            assert [
+                event["session_id"] for event in session.get("_completion_pending") or []
+            ] == [staged_id]
+
+            agent.clear_interrupt()
+            assert server._deliver_completions_via_steer(
+                "owner-ui", session, [_completion(restaged_id)], set()
+            )
+            leftover = agent._drain_pending_steer()
+            assert leftover and restaged_id in leftover
+            monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
+            server._run_post_turn_followups(
+                "rid", "owner-ui", session, {"pending_steer": leftover}, None
+            )
+
+            assert process_registry.is_completion_consumed(staged_id) is False
+            assert process_registry.is_completion_consumed(restaged_id) is True
+            session.update(_closing=True, _finalized=True)
+            stop = threading.Event()
+            stop.set()
+            server._notification_poller_loop(stop, "owner-ui", session)
+            assert _queued_ids(isolated) == [staged_id]
+    finally:
+        _clear_ids(first_id, staged_id, restaged_id)

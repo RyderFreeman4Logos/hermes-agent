@@ -113,7 +113,7 @@ def test_warm_nonmissing_read_failure_keeps_explicit_selection(
 def test_warm_read_hashes_bounded_chunks_outside_config_lock(
     isolated_hermes_home, monkeypatch
 ):
-    """Warm freshness hashing must not retain whole comment-heavy files under the lock."""
+    """W11: raw warm hashes and miss parsing use bounded reads at their lock boundary."""
     from hermes_cli import config as config_mod
 
     cfg = isolated_hermes_home / "config.yaml"
@@ -146,9 +146,18 @@ def test_warm_read_hashes_bounded_chunks_outside_config_lock(
 
     monkeypatch.setattr(Path, "open", track_open)
     assert config_mod.read_raw_config_readonly() is first
-    assert reads
+    warm_reads = list(reads)
+    assert warm_reads
     assert all(0 < size <= 64 * 1024 and not locked
-               for size, locked in reads)
+               for size, locked in warm_reads)
+
+    reads.clear()
+    cfg.write_text("display: {}\n" + "# revised comment\n" * 20000, encoding="utf-8")
+    assert config_mod.read_raw_config_readonly() == first
+    assert reads
+    assert all(0 < size <= 64 * 1024 for size, _locked in reads)
+    assert any(not locked for _size, locked in reads)  # digest before lock
+    assert any(locked for _size, locked in reads)  # bounded parser read under RLock
 
 
 def test_validated_raw_recovery_retires_same_metadata_failure(isolated_hermes_home):

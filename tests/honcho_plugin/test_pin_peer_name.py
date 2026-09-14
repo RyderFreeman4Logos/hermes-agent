@@ -616,7 +616,8 @@ class TestProfilePeerUniqueness:
 
 
 def test_cache_busting_oversized_honcho_snapshot_tracks_content(tmp_path, monkeypatch):
-    """Readable large Honcho files remain accepted and still invalidate agents."""
+    """W11: oversized Honcho observer is bounded, fully hashed, and never parses retained bytes."""
+    from gateway import run_agent_cache as agent_cache
     from gateway.run import GatewayRunner
     from plugins.memory.honcho.client import HonchoClientConfig
 
@@ -624,19 +625,54 @@ def test_cache_busting_oversized_honcho_snapshot_tracks_content(tmp_path, monkey
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
 
-    def write(peer: str) -> None:
+    def write(peer: str, extra_padding: int = 0) -> None:
         path.write_text(json.dumps({"apiKey": "k", "peerName": peer, "pinPeerName": True,
-                                    "padding": " " * (1024 * 1024 + 32)}))
+                                    "padding": " " * (1024 * 1024 + 32 + extra_padding)}))
 
     write("Alice")
+    assert HonchoClientConfig.from_global_config(config_path=path).peer_name == "Alice"
+    reads = []
+    original_open = Path.open
+
+    class TrackedReader:
+        def __init__(self, fileobj):
+            self._fileobj = fileobj
+
+        def read(self, size=-1):
+            reads.append(size)
+            return self._fileobj.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._fileobj.close()
+
+        def __getattr__(self, name):
+            return getattr(self._fileobj, name)
+
+    def track_open(self, *args, **kwargs):
+        fileobj = original_open(self, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        return TrackedReader(fileobj) if self == path and mode == "rb" else fileobj
+
+    def forbid_full_parser(*_args, **_kwargs):
+        raise AssertionError("oversized observer invoked full JSON parser")
+
+    monkeypatch.setattr(Path, "open", track_open)
+    monkeypatch.setattr(agent_cache.json, "loads", forbid_full_parser)
     first = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
     again = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
-    assert HonchoClientConfig.from_global_config(config_path=path).peer_name == "Alice"
     write("Blice")
     second = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+    write("Blice", extra_padding=1)
+    whitespace_changed = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+    assert reads
+    assert all(0 < size <= 64 * 1024 for size in reads)
     assert first["honcho.overflow_content"] is not None
     assert first == again
     assert first["honcho.overflow_content"] != second["honcho.overflow_content"]
+    assert second["honcho.overflow_content"] != whitespace_changed["honcho.overflow_content"]
     assert second["honcho.peer_name"] is None
 
 

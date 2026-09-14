@@ -611,3 +611,28 @@ class TestProfilePeerUniqueness:
             "Profiles pinned to distinct peer names must not collapse to "
             "the same Honcho peer — otherwise profile isolation is fictional."
         )
+
+
+def test_cache_busting_oversized_honcho_snapshot_tracks_content(tmp_path, monkeypatch):
+    """Readable large Honcho files remain accepted and still invalidate agents."""
+    from gateway.run import GatewayRunner
+    from plugins.memory.honcho.client import HonchoClientConfig
+
+    path = tmp_path / "honcho.json"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+    def write(peer: str) -> None:
+        path.write_text(json.dumps({"apiKey": "k", "peerName": peer, "pinPeerName": True,
+                                    "padding": " " * (1024 * 1024 + 32)}))
+
+    write("Alice")
+    first = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+    again = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+    assert HonchoClientConfig.from_global_config(config_path=path).peer_name == "Alice"
+    write("Blice")
+    second = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+    assert first["honcho.overflow_content"] is not None
+    assert first == again
+    assert first["honcho.overflow_content"] != second["honcho.overflow_content"]
+    assert second["honcho.peer_name"] is None

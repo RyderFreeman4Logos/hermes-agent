@@ -29,22 +29,35 @@ _HONCHO_READ_CHUNK_BYTES = 64 * 1024
 _HONCHO_SNAPSHOT_MAX_BYTES = 1024 * 1024
 
 
-def _digest_file(path) -> bytes:
-    """Hash a configuration file without materializing it on warm memo hits."""
+_HONCHO_UNAVAILABLE = object()
+
+
+def _read_honcho_snapshot(path) -> tuple[bytes, object, bool]:
+    """Observe one Honcho file once: digest, mapping-or-unavailable, and overflow.
+
+    The retained JSON prefix is bounded; an oversized file is still fully hashed
+    so its cache signature is content-sensitive without changing live admission.
+    """
     digest = hashlib.sha256()
+    retained = bytearray()
+    overflow = False
     with path.open("rb") as source:
         while chunk := source.read(_HONCHO_READ_CHUNK_BYTES):
             digest.update(chunk)
-    return digest.digest()
-
-
-def _read_honcho_snapshot(path) -> tuple[bytes, dict]:
-    """Return one bounded JSON snapshot and the digest of those exact bytes."""
-    with path.open("rb") as source:
-        raw = source.read(_HONCHO_SNAPSHOT_MAX_BYTES + 1)
-    if len(raw) > _HONCHO_SNAPSHOT_MAX_BYTES:
-        raise ValueError("honcho.json exceeds the supported snapshot size")
-    return hashlib.sha256(raw).digest(), json.loads(raw)
+            if not overflow:
+                remaining = _HONCHO_SNAPSHOT_MAX_BYTES - len(retained)
+                if len(chunk) <= remaining:
+                    retained.extend(chunk)
+                else:
+                    overflow = True
+                    retained.clear()
+    if overflow:
+        return digest.digest(), _HONCHO_UNAVAILABLE, True
+    try:
+        parsed = json.loads(retained)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return digest.digest(), _HONCHO_UNAVAILABLE, False
+    return digest.digest(), parsed if isinstance(parsed, dict) else _HONCHO_UNAVAILABLE, False
 
 # Override fields layered onto runtime kwargs when non-None (partial overrides don't clobber defaults).
 _OVERRIDE_APPLY_KEYS = (
@@ -67,46 +80,48 @@ class GatewayAgentCacheMixin:
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json content digest; all-None when unavailable."""
+        """Extract a bounded same-stream Honcho snapshot for agent cache keys."""
+        empty = dict.fromkeys(cls._HONCHO_CACHE_BUSTING_KEYS)
         try:
-            from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
+            from plugins.memory.honcho.client import HonchoClientConfig, resolve_active_host, resolve_config_path
+            from hermes_constants import get_hermes_home
             path = resolve_config_path()
             try:
-                # A known path can stream-hash before consulting its memo. A
-                # first observation instead takes one bounded snapshot so the
-                # digest and parser cannot observe different revisions.
-                path_key = str(path)
-                has_path_memo = any(key[0] == path_key for key in cls._HONCHO_CACHE_BUSTING_MEMO)
-                if has_path_memo:
-                    digest = _digest_file(path)
-                    cached = cls._HONCHO_CACHE_BUSTING_MEMO.get((path_key, digest))
-                    if cached is not None:
-                        return dict(cached)
-                    digest, raw_config = _read_honcho_snapshot(path)
-                else:
-                    digest, raw_config = _read_honcho_snapshot(path)
+                digest, raw_config, overflow = _read_honcho_snapshot(path)
             except OSError:
-                digest = None
-                raw_config = None
-            memo_key = (str(path), digest)
+                return empty
+            path_key = str(path)
+            memo_key = (path_key, digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
-                return dict(cached)
-            hcfg = HonchoClientConfig.from_global_config(
-                config_path=path, raw_config=raw_config) if raw_config is not None \
-                else HonchoClientConfig.from_global_config(config_path=path)
-            aliases = hcfg.user_peer_aliases or {}
-            values = {
-                "honcho.peer_name": hcfg.peer_name,
-                "honcho.ai_peer": hcfg.ai_peer,
-                "honcho.pin_peer_name": bool(hcfg.pin_peer_name),
-                "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
-                "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
-            }
-            cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
-            return dict(values)
+                values = dict(cached)
+            elif overflow:
+                values = dict(empty)
+                values["honcho.overflow_content"] = hashlib.sha256(
+                    f"{path_key}:{digest.hex()}".encode()
+                ).hexdigest()
+                cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: dict(values)}
+            elif raw_config is _HONCHO_UNAVAILABLE:
+                return empty
+            else:
+                hcfg = HonchoClientConfig.from_global_config(config_path=path, raw_config=raw_config)
+                aliases = hcfg.user_peer_aliases or {}
+                values = {
+                    "honcho.peer_name": hcfg.peer_name,
+                    "honcho.ai_peer": hcfg.ai_peer,
+                    "honcho.pin_peer_name": bool(hcfg.pin_peer_name),
+                    "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
+                    "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
+                    "honcho.overflow_content": None,
+                }
+                cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: dict(values)}
+            if values.get("honcho.overflow_content") is not None:
+                values["honcho.overflow_content"] = hashlib.sha256(
+                    f"{values['honcho.overflow_content']}:{get_hermes_home()}:{resolve_active_host({})}".encode()
+                ).hexdigest()
+            return values
         except Exception:
-            return dict.fromkeys(cls._HONCHO_CACHE_BUSTING_KEYS)
+            return empty
 
     @classmethod
     def _extract_cache_busting_config(cls, user_config: dict | None) -> dict:

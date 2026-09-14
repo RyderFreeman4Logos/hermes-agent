@@ -512,6 +512,132 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
             self.assertIn("owner-1", owners)
             self.assertIn("owner-2", owners)
 
+    def test_equal_age_eviction_preserves_registry_insertion_order(self):
+        """W13: equal-age idle victims use the registry's stable order."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        with patch("tools.code_kernel._lifecycle_limits", return_value=(3, 1800)):
+            self.assertEqual(_run(env, task="equal-first")["status"], "success")
+            self.assertEqual(_run(env, task="equal-second")["status"], "success")
+        with _REGISTRY.lock:
+            equal_time = time.monotonic() - 10
+            for kernel in _REMOTE_KERNELS.values():
+                kernel.last_used = equal_time
+        with patch("tools.code_kernel._lifecycle_limits", return_value=(2, 1800)):
+            self.assertEqual(_run(env, task="equal-trigger")["status"], "success")
+
+        with _REGISTRY.lock:
+            owners = [key[0] for key in _REMOTE_KERNELS]
+        self.assertEqual(owners, ["equal-second", "equal-trigger"])
+        self.assertTrue(any("7001" in command for command in env.killed))
+        self.assertFalse(any("7002" in command for command in env.killed))
+
+    def test_all_attached_kernels_may_exceed_cap_until_next_acquire(self):
+        """W13: no eligible victim never kills active work or a waiter."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        entered = {name: threading.Event() for name in ("attached-a", "attached-b")}
+        release = {name: threading.Event() for name in entered}
+
+        def hold_submitted_cell():
+            name = threading.current_thread().name
+            if name in entered:
+                entered[name].set()
+                release[name].wait(5)
+
+        env.before_submit = hold_submitted_cell
+        results = {}
+        errors = []
+
+        def invoke(name):
+            try:
+                results[name] = _run(env, code=name, task=name)
+            except BaseException as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=invoke, args=(name,), name=name) for name in entered]
+        with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
+            for worker in workers:
+                worker.start()
+            self.assertTrue(all(event.wait(5) for event in entered.values()))
+            with _REGISTRY.lock:
+                self.assertEqual(len(_REMOTE_KERNELS), 2)
+                self.assertEqual([kernel.attached for kernel in _REMOTE_KERNELS.values()], [1, 1])
+            self.assertEqual(env.killed, [])
+            for event in release.values():
+                event.set()
+            for worker in workers:
+                worker.join(5)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            self.assertTrue(all(result["status"] == "success" for result in results.values()))
+            with _REGISTRY.lock:
+                self.assertEqual(len(_REMOTE_KERNELS), 2, "detach alone must not trim")
+            env.before_submit = None
+            self.assertEqual(_run(env, task="trim-trigger")["status"], "success")
+
+        with _REGISTRY.lock:
+            self.assertEqual([key[0] for key in _REMOTE_KERNELS], ["trim-trigger"])
+        self.assertTrue(any("7001" in command for command in env.killed))
+        self.assertTrue(any("7002" in command for command in env.killed))
+
+    def test_mutex_queue_time_does_not_consume_cell_timeout(self):
+        """W13: the per-cell timeout begins after an attached waiter owns K."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        first_submitted = threading.Event()
+        release_first = threading.Event()
+
+        def hold_first_cell():
+            if threading.current_thread().name == "w13-first":
+                first_submitted.set()
+                release_first.wait(5)
+
+        env.before_submit = hold_first_cell
+        results = {}
+        errors = []
+
+        def invoke(label, timeout):
+            try:
+                results[label] = _run(
+                    env, code=label, task="w13-timeout-owner", timeout=timeout
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=invoke, args=("first", 10), name="w13-first")
+        waiter = threading.Thread(target=invoke, args=("waiter", 1), name="w13-waiter")
+        first.start()
+        try:
+            self.assertTrue(first_submitted.wait(5))
+            waiter.start()
+            deadline = time.monotonic() + 5
+            while True:
+                with _REGISTRY.lock:
+                    attached = sum(kernel.attached for kernel in _REMOTE_KERNELS.values())
+                if attached == 2:
+                    break
+                self.assertLess(time.monotonic(), deadline, "waiter did not reserve the active kernel")
+                time.sleep(0.01)
+            queue_started = time.monotonic()
+            waiter.join(1.2)
+            self.assertTrue(waiter.is_alive(), "waiter ran before the cell owner released K")
+            self.assertGreaterEqual(time.monotonic() - queue_started, 1.0)
+            self.assertEqual(env.cell_submissions, [])
+        finally:
+            release_first.set()
+            first.join(5)
+            if waiter.ident is not None:
+                waiter.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["first"]["status"], "success")
+        self.assertEqual(results["waiter"]["status"], "success")
+        self.assertEqual(results["waiter"]["stdout"], "waiter")
+        self.assertEqual([request["code"] for request in env.cell_submissions], ["first", "waiter"])
+
     def test_eviction_skips_kernels_with_a_running_cell(self):
         """Cap eviction must never kill a kernel mid-cell (the local-kernel
         race from hermes-agent#101861): a busy kernel stays put and a

@@ -125,7 +125,8 @@ def _ac_inflight_original(session: dict) -> str:
     return str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None) -> None:
+def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
+                    *, structured_completion: bool = False) -> None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing ones stay separate envelopes so attachment
     chronology survives. ``transport`` is pinned so the drained turn streams to its sender."""
@@ -138,10 +139,16 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     # Never queue a text-only self-copy of the live prompt: draining it would restart it.
     if text_only and text.strip() == _ac_inflight_original(session) != "":
         return
-    queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {})}
+    queued = {
+        "text": text,
+        "transport": transport,
+        **({"image_paths": image_paths} if image_paths else {}),
+        **({"structured_completion": True} if structured_completion else {}),
+    }
     existing = session.get("queued_prompt")
     if (existing and text_only and isinstance(existing.get("text"), str)
-            and not existing.get("image_paths") and not session.get("queued_prompts")):
+            and not existing.get("image_paths") and not existing.get("structured_completion")
+            and not structured_completion and not session.get("queued_prompts")):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
     elif existing:

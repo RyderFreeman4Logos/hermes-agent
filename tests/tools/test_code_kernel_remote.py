@@ -75,6 +75,7 @@ class FileAwareEnv:
         self.result_cleanup_error = None
         self.submit_error_after_apply = None
         self.result_payload = None
+        self.cell_submissions = []
         self.emit_rpc = False
         self.rpc_done = threading.Event()
         self.hold_stage = None
@@ -159,6 +160,7 @@ class FileAwareEnv:
             source, target = shlex.split(command)[1:3]
             with self._lock:
                 request = json.loads(self.files.pop(source))
+                self.cell_submissions.append(request)
                 self.files[target] = json.dumps(request)
                 if self.emit_rpc:
                     rpc_dir = target.split("/cells/", 1)[0] + "/rpc"
@@ -169,6 +171,8 @@ class FileAwareEnv:
                     })
                 result_path = target.replace("cell_req_", "cell_res_")
                 payload = self.result_payload
+                if callable(payload):
+                    payload = payload(request)
                 if payload is None:
                     payload = _cell(stdout=request["code"], execution_count=int(request["id"]))
                 self.files[result_path] = json.dumps(payload)
@@ -1153,6 +1157,111 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
                     self.assertEqual(result["error"], "ValueError: bad")
                 else:
                     self.assertEqual(result["stdout"], "bye")
+
+    def _assert_waiter_revalidates_after_terminal_outcome(self, outcome):
+        """W08: one named terminal shape retires or retains K before its waiter runs."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        first_code = f"first-{outcome}"
+
+        def payload(request):
+            if request["code"] != first_code:
+                return _cell(stdout=request["code"], execution_count=int(request["id"]))
+            if outcome == "protocol":
+                return ["not", "an", "object"]
+            if outcome == "error":
+                return _cell(status="error", traceback="ValueError: bad")
+            if outcome == "exit":
+                return _cell(status="exit", stdout="bye")
+            return _cell(stdout="ignored-by-zero-timeout")
+
+        env.result_payload = payload
+        env.hold_stage = "before_cell_submit" if outcome == "timeout" else "cell_result_read"
+        first_held = threading.Event()
+        release_first = threading.Event()
+        original_before_submit = env.before_submit
+
+        if outcome == "timeout":
+            def hold_timeout_submit():
+                if not first_held.is_set():
+                    first_held.set()
+                    release_first.wait(5)
+            env.before_submit = hold_timeout_submit
+        else:
+            env.hold_stage = "cell_result_read"
+
+        results = {}
+        errors = []
+
+        def invoke(label, timeout):
+            try:
+                results[label] = _run(env, code=label, task="w08-owner", timeout=timeout)
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(
+            target=invoke, args=(first_code, 0 if outcome == "timeout" else 10)
+        )
+        second = threading.Thread(target=invoke, args=("waiting-second", 10))
+        first.start()
+        if outcome == "timeout":
+            self.assertTrue(first_held.wait(5), "timeout call did not hold before submission")
+        else:
+            self.assertTrue(env.stage_entered.wait(5), f"{outcome} call did not hold its result read")
+        second.start()
+        deadline = time.monotonic() + 5
+        while True:
+            with _REGISTRY.lock:
+                attached = sum(kernel.attached for kernel in _REMOTE_KERNELS.values())
+            if attached == 2:
+                break
+            self.assertLess(time.monotonic(), deadline, "same-key waiter did not reserve K")
+            time.sleep(0.01)
+        if outcome == "timeout":
+            release_first.set()
+        else:
+            env.stage_release.set()
+        first.join(5)
+        second.join(5)
+        env.before_submit = original_before_submit
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        first_result = results[first_code]
+        second_result = results["waiting-second"]
+        if outcome == "timeout":
+            self.assertEqual(first_result["status"], "timeout")
+            self.assertTrue(first_result["kernel"]["state_lost"])
+        elif outcome == "protocol":
+            self.assertEqual(first_result["status"], "error")
+            self.assertTrue(first_result["kernel"]["state_lost"])
+        elif outcome == "error":
+            self.assertEqual(first_result["status"], "error")
+            self.assertEqual(first_result["error"], "ValueError: bad")
+            self.assertFalse(first_result["kernel"].get("state_lost", False))
+        else:
+            self.assertEqual(first_result["status"], "success")
+            self.assertEqual(first_result["stdout"], "bye")
+            self.assertTrue(first_result["kernel"]["ended"])
+        self.assertEqual(second_result["status"], "success")
+        self.assertEqual(second_result["stdout"], "waiting-second")
+        submitted_codes = [request["code"] for request in env.cell_submissions]
+        self.assertEqual(submitted_codes.count(first_code), 1)
+        self.assertEqual(submitted_codes.count("waiting-second"), 1)
+        self.assertEqual(env.spawn_count, 1 if outcome == "error" else 2)
+
+    def test_timeout_retires_before_waiting_same_key_call(self):
+        self._assert_waiter_revalidates_after_terminal_outcome("timeout")
+
+    def test_protocol_failure_retires_before_waiting_same_key_call(self):
+        self._assert_waiter_revalidates_after_terminal_outcome("protocol")
+
+    def test_ordinary_error_retains_kernel_for_waiting_same_key_call(self):
+        self._assert_waiter_revalidates_after_terminal_outcome("error")
+
+    def test_exit_retires_before_waiting_same_key_call(self):
+        self._assert_waiter_revalidates_after_terminal_outcome("exit")
 
     def test_live_poller_forces_permanent_retirement_before_handoff(self):
         """W10: join timeout cannot expose K to the next caller."""

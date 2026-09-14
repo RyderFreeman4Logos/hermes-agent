@@ -4968,7 +4968,7 @@ class TestRunConversation:
             "You are helpful.",
         ))
         with (
-            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_persist_session") as mock_persist,
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch.object(agent.context_compressor, "update_model"),
@@ -4984,6 +4984,21 @@ class TestRunConversation:
         # The retry honored the reduced max_tokens (available_out - 64).
         second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
         assert second_call["max_tokens"] <= 936
+        wire_timing = [
+            message
+            for message in second_call.get("messages", [])
+            if "[Agent loop timing]" in str(message.get("content", ""))
+        ]
+        assert len(wire_timing) == 1
+        assert wire_timing[0]["role"] == "user"
+        history_timing = [
+            message
+            for message in mock_persist.call_args_list[-1].args[0]
+            if "[Agent loop timing]" in str(message.get("content", ""))
+        ]
+        assert len(history_timing) == 1
+        assert history_timing[0]["role"] == "system"
+        assert history_timing[0]["display_kind"] == "hidden"
         # LOCK IN THE FIX: the retry must actually SEND the compressed history
         # (the 1-message payload from _compress_context + its new system
         # prompt), not the original multi-message window. Without this, the
@@ -4992,10 +5007,7 @@ class TestRunConversation:
         second_messages = [
             message
             for message in second_call.get("messages", [])
-            if not (
-                message.get("role") == "system"
-                and "[Agent loop timing]" in str(message.get("content", ""))
-            )
+            if "[Agent loop timing]" not in str(message.get("content", ""))
         ]
         assert second_messages[-1].get("content") == "hello"
         assert len(second_messages) == 2

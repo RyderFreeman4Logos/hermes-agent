@@ -310,17 +310,6 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
                     tool_name, tool_use_id, len(content), path, host_suffix)
         return _build_persisted_message(preview, has_more, len(content), path) + history_suffix
 
-    # Insertion-time high-volume payloads must be recoverable in the active env
-    # before they enter history; host spillover remains the fallback for other
-    # oversized results.
-    if insertion:
-        remote_path = f"{_resolve_storage_dir(env)}/{filename}"
-        try:
-            if _write_to_sandbox(content, remote_path, env):
-                return _persisted(remote_path)
-        except Exception as exc:
-            logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
-
     # Always persist host-side first: cache/spillover is the single canonical home.
     host_path = _write_to_spillover(content, filename)
     host_side = _is_host_side_env(env)
@@ -332,6 +321,12 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
         visible = _sandbox_visible_spillover_path(host_path, env) if host_path else None
         if visible is not None:
             return _persisted(visible, f" [host: {host_path}]")
+        if insertion:
+            logger.warning(
+                "Keeping recoverable %s result inline because canonical spillover is not readable",
+                tool_name,
+            )
+            return content + history_suffix
         remote_path = f"{_resolve_storage_dir(env)}/{filename}"
         try:
             if _write_to_sandbox(content, remote_path, env):

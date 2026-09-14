@@ -126,10 +126,10 @@ def _admit_prompt_turn(
             "Refusing turn for session %s at _run_prompt_submit: %s",
             session.get("session_key") or sid,
             getattr(ownership_refusal, "reason", None) or "refused")
+        _emit("error", sid, {"message": str(ownership_refusal)})
         with session["history_lock"]:
             session["running"] = False
             session.pop("_submit_user_row", None)  # no turn runs: the submit-time row stays as the send
-        _emit("error", sid, {"message": str(ownership_refusal)})
         return None
     with session["history_lock"]:
         if session.get("_closing") or (
@@ -430,18 +430,17 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
 
 
 def _run_post_turn_followups(
-    rid, sid: str, session: dict, result: Any, goal_followup: str | None) -> None:
+    rid, sid: str, session: dict, result: Any, goal_followup: str | None,
+    pending_steer: str | None = None,
+) -> None:
     """Chain whatever should run after ``running`` was released.  Order: a mid-turn user
     prompt wins over every auto follow-up (drain it, skip the rest); a leftover /steer is
     requeued first so it isn't dropped; then goal continuation, then completion
     notifications.  Each nested submit re-checks ``running`` under the lock."""
     agent = session.get("agent")
-    leftover = result.get("pending_steer") if isinstance(result, dict) else None
-    if not (isinstance(leftover, str) and leftover.strip()):
-        drain = getattr(agent, "_drain_pending_steer", None)
-        if callable(drain):
-            with contextlib.suppress(Exception):
-                leftover = drain()
+    leftover = pending_steer
+    if leftover is None and isinstance(result, dict):
+        leftover = result.get("pending_steer")
     user_text = leftover if isinstance(leftover, str) and leftover.strip() else ""
 
     def insert(completion_text: str) -> bool:
@@ -1054,6 +1053,7 @@ def _run_prompt_submit(
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
+        followup_steer = None
         try:
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
@@ -1086,6 +1086,17 @@ def _run_prompt_submit(
             # A stale interim closure must not fire during a later turn.
             st.agent.interim_assistant_callback = None
             with session["history_lock"]:
+                steer_parts = []
+                result_steer = st.result.get("pending_steer") if isinstance(st.result, dict) else None
+                if isinstance(result_steer, str) and result_steer.strip():
+                    steer_parts.append(result_steer)
+                drain = getattr(st.agent, "_drain_pending_steer", None)
+                if callable(drain):
+                    with contextlib.suppress(Exception):
+                        late_steer = drain()
+                        if isinstance(late_steer, str) and late_steer.strip():
+                            steer_parts.append(late_steer)
+                followup_steer = "\n".join(steer_parts) or None
                 session["running"] = False
                 session["last_active"] = time.time()
                 if not st.error_retained:
@@ -1113,7 +1124,7 @@ def _run_prompt_submit(
                     session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
-        return st.result, goal_followup
+        return st.result, goal_followup, followup_steer
     def run():
         from agent.notification_presentation import notification_turn
         # _prepare_turn_input owns profile binding for the worker. The context

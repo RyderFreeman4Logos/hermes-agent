@@ -314,6 +314,126 @@ def test_refused_idle_admission_requeues_once_and_normal_admission_settles_once(
         _clear_ids(refused_id, admitted_id)
 
 
+def test_idle_completion_claim_keeps_receipt_pending_when_prompt_submit_claims_after_status(
+    monkeypatch,
+):
+    """The real submit claim between status output and idle receipt wins exactly once."""
+    event = _completion("proc_idle_claim_race")
+    session = _session(running=False)
+    submitted: list[tuple] = []
+
+    def emit(kind, sid, payload=None):
+        if kind == "status.update":
+            # This is the same history-lock transaction used by prompt.submit,
+            # after its normal busy observation has seen the session idle.
+            err, _fields = server._lock_in_submit_turn(
+                "user-rid", sid, session, "actual user prompt", {}, False, None, None
+            )
+            assert err is None
+
+    monkeypatch.setattr(server, "_emit", emit)
+    monkeypatch.setattr(server, "_idle_completion_turn", lambda *args: submitted.append(args) or True)
+
+    server._deliver_completion_notifications("owner-ui", session, [event], set())
+
+    assert submitted == []
+    assert session["running"] is True
+    assert session.get("_completion_active_receipt") is None
+    assert [item["session_id"] for item in session["_completion_pending"]] == ["proc_idle_claim_race"]
+
+
+def test_idle_flush_keeps_suffix_pending_until_real_noncompletion_barrier_starts(monkeypatch):
+    """C1/W/C2 must not merge C2 into C1 while W has not claimed its route."""
+    c1, c2 = _completion("proc_barrier_first"), _completion("proc_barrier_later")
+    session = _session(
+        running=False,
+        _completion_transfer=[c1],
+        _completion_pending=[c2],
+        _completion_transfer_barrier={"type": "watch_match", "session_id": "watch-boundary"},
+    )
+    reservations: list[list[str]] = []
+
+    def enqueue(_session, _text, _transport, **kwargs):
+        reservations.append([event["session_id"] for event in kwargs["completion_events"]])
+
+    monkeypatch.setattr(server, "_enqueue_prompt", enqueue)
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    server._flush_pending_completions_if_idle("owner-ui", session, set())
+
+    assert reservations == [["proc_barrier_first"]]
+    assert [event["session_id"] for event in session["_completion_pending"]] == ["proc_barrier_later"]
+
+
+def test_structured_queued_receipt_uses_local_ingestion_when_compute_host_is_active(monkeypatch):
+    """A compute-host flag cannot strand a local receipt on an incompatible bridge."""
+    event = _completion("proc_local_receipt")
+    session = _session(
+        running=False,
+        queued_prompt={
+            "text": "completion text", "transport": None,
+            "structured_completion": True, "completion_events": [event],
+        },
+        _compute_host_active=True,
+    )
+    local: list[dict] = []
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", lambda *_a, **_k: pytest.fail("receipt reached host"))
+
+    def submit(*_args, **kwargs):
+        local.append(kwargs["completion_receipt"])
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    assert server._drain_queued_prompt("rid", "owner-ui", session)
+    assert local and local[0] is session["_completion_active_receipt"]
+
+
+def test_receipt_callback_binds_to_agent_selected_by_preparation(monkeypatch):
+    """Capability preparation may replace the agent; only that final agent may consume."""
+    original, replacement = types.SimpleNamespace(), types.SimpleNamespace()
+    event = _completion("proc_rebuilt_agent")
+    receipt = {"events": [event]}
+    session = _session(agent=original, running=True)
+    session["_completion_active_receipt"] = receipt
+    consumed: list[bool] = []
+
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_admit_prompt_turn", lambda *_a: ([], original))
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *_a, **_k: "marker")
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_finish_turn", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_clear_inflight_turn", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_run_post_turn_followups", lambda *_a, **_k: None)
+
+    def prepare(_sid, current, st, *_args, **_kwargs):
+        current["agent"] = replacement
+        st.agent = replacement
+        return "completion", "completion", 80, None
+
+    def invoke(_sid, _session, st, *_args):
+        consumed.append(st.agent._completion_queue_ingest())
+        st.result = {"final_response": "done", "messages": []}
+
+    monkeypatch.setattr(server, "_prepare_turn_input", prepare)
+    monkeypatch.setattr(server, "_invoke_agent", invoke)
+    monkeypatch.setattr(server, "_absorb_turn_result", lambda *_a: None)
+    monkeypatch.setattr(server, "_complete_turn_payload", lambda *_a: ({"text": "done"}, "done", "complete"))
+    monkeypatch.setattr(server, "_goal_followup_after_turn", lambda *_a: None)
+    monkeypatch.setattr(server, "_after_complete_turn", lambda *_a: None)
+    monkeypatch.setattr(server, "_publish_session_control_snapshot", lambda *_a, **_k: None)
+
+    assert server._run_prompt_submit("rid", "owner-ui", session, "completion", completion_receipt=receipt)
+    assert consumed == [True]
+    assert session.get("_completion_active_receipt") is None
+    assert getattr(original, "_completion_queue_ingest", None) is None
+    assert getattr(replacement, "_completion_queue_ingest", None) is None
+
+
 class _BlockingMessages(list):
     def __init__(self, rows):
         super().__init__(rows)

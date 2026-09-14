@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.error_classifier import ClassifiedError, FailoverReason
+from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 from run_agent import AIAgent
 from tools.delegate_tool import _build_child_agent, _run_single_child, delegate_task
 from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
@@ -911,3 +912,120 @@ def test_app_server_failure_keeps_last_known_success_identity():
         0, 0.1, _SchemaOutcome(None, None, [], 0),
     )
     assert (entry["model"], entry["provider"]) == (PRIMARY["model"], PRIMARY["provider"])
+
+
+def _delegate_parent(events):
+    return SimpleNamespace(
+        base_url=PRIMARY["base_url"], api_key="primary-key", provider=PRIMARY["provider"],
+        api_mode="chat_completions", model=PRIMARY["model"], platform="cli",
+        enabled_toolsets=[], disabled_toolsets=[], request_overrides={}, _fallback_chain=[],
+        _delegate_depth=0, _active_children=[], _active_children_lock=threading.Lock(),
+        _print_fn=None, _session_db=None, session_id=None,
+        tool_progress_callback=lambda *args, **kwargs: events.append(kwargs),
+    )
+
+
+def _codex_delegate_credentials():
+    return {
+        "provider": "openai", "model": "stub-model", "base_url": "https://stub.invalid/v1",
+        "api_key": "stub-key", "api_mode": "codex_app_server", "command": None, "args": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("turn", "expected_status"),
+    [
+        (TurnResult(final_text="unknown app-server success", projected_messages=[], turn_id="u", thread_id="t"), "completed"),
+        (TurnResult(final_text="", projected_messages=[], error="unknown app-server failure", turn_id="f", thread_id="t"), "failed"),
+    ],
+    ids=("fresh-unknown-success", "fresh-unknown-then-failure"),
+)
+def test_delegate_task_app_server_unknown_identity_uses_real_child_path(monkeypatch, turn, expected_status):
+    """The public delegation path cannot infer an app-server selected route."""
+    import tools.delegate_tool as delegate_mod
+
+    events = []
+    monkeypatch.setattr(delegate_mod, "_resolve_delegation_credentials", lambda *_args, **_kwargs: _codex_delegate_credentials())
+    monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda _self: "t")
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", lambda _self, **_kwargs: turn)
+
+    result = json.loads(delegate_task(
+        tasks=[{"goal": "return the fake app-server turn"}], parent_agent=_delegate_parent(events),
+        credentials_cfg={"provider": "openai", "api_mode": "codex_app_server"}, background=False,
+    ))
+
+    entry = result["results"][0]
+    assert entry["status"] == expected_status
+    assert (entry["model"], entry["provider"]) == (None, None)
+    complete = [event for event in events if event.get("status") in {"completed", "failed"}]
+    assert complete
+    assert (complete[-1]["model"], complete[-1]["provider"]) == (None, None)
+
+
+def test_delegate_task_background_preserves_unknown_app_server_identity_in_durable_batch(monkeypatch, tmp_path):
+    """The detached public path must retain a child's explicit null route."""
+    import time
+
+    from tools import async_delegation as async_delegation
+    from tools.process_registry import process_registry
+    import tools.delegate_tool as delegate_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(delegate_mod, "_resolve_delegation_credentials", lambda *_args, **_kwargs: _codex_delegate_credentials())
+    monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda _self: "t")
+    monkeypatch.setattr(
+        CodexAppServerSession, "run_turn",
+        lambda _self, **_kwargs: TurnResult(final_text="unknown", projected_messages=[], turn_id="u", thread_id="t"),
+    )
+
+    handle = json.loads(delegate_task(
+        tasks=[{"goal": "persist a fake app-server turn"}], parent_agent=_delegate_parent([]),
+        credentials_cfg={"provider": "openai", "api_mode": "codex_app_server"}, background=True,
+    ))
+    deadline = time.monotonic() + 5
+    event = None
+    while time.monotonic() < deadline:
+        if not process_registry.completion_queue.empty():
+            candidate = process_registry.completion_queue.get_nowait()
+            if candidate.get("delegation_id") == handle["delegation_id"]:
+                event = candidate
+                break
+        time.sleep(0.02)
+    assert event is not None
+    assert (event["results"][0]["model"], event["results"][0]["provider"]) == (None, None)
+    with async_delegation._connect() as conn:
+        event_json, result_json = conn.execute(
+            "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?", (handle["delegation_id"],)
+        ).fetchone()
+    persisted_event, persisted_result = json.loads(event_json), json.loads(result_json)
+    assert (persisted_event["results"][0]["model"], persisted_event["results"][0]["provider"]) == (None, None)
+    assert (persisted_result["results"][0]["model"], persisted_result["results"][0]["provider"]) == (None, None)
+
+
+def test_real_child_known_unknown_known_sequence_replaces_only_with_later_normal_success(monkeypatch):
+    """A→U→C retains A across U and replaces it only at normal C admission."""
+    child = _make_child()
+    later = {"provider": "later-provider", "model": "later-model", "base_url": "https://later.invalid/v1"}
+    monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda _self: "t")
+    monkeypatch.setattr(
+        CodexAppServerSession, "run_turn",
+        lambda _self, **_kwargs: TurnResult(final_text="unknown", projected_messages=[], turn_id="u", thread_id="t"),
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(child, "_interruptible_api_call", return_value=_response("known A")))
+        for context in _common_patches(child):
+            stack.enter_context(context)
+        assert child.run_conversation("known A")["completed"] is True
+        assert child._delegate_successful_llm_route == (PRIMARY["model"], PRIMARY["provider"])
+
+        child.api_mode = "codex_app_server"
+        unknown = child.run_conversation("unknown U")
+        unknown_entry = _build_result_entry(child, unknown, 0, 0.1, _SchemaOutcome(None, None, [], 0))
+        assert (unknown_entry["model"], unknown_entry["provider"]) == (None, None)
+        assert child._delegate_successful_llm_route == (PRIMARY["model"], PRIMARY["provider"])
+
+        child.api_mode, child.provider, child.model, child.base_url = (
+            "chat_completions", later["provider"], later["model"], later["base_url"]
+        )
+        assert child.run_conversation("known C")["completed"] is True
+    assert child._delegate_successful_llm_route == (later["model"], later["provider"])

@@ -77,6 +77,7 @@ def test_runtime_status_running_pid_validates_live_gateway_record(monkeypatch):
     monkeypatch.setattr(status_mod, "_pid_exists", lambda pid: pid == 12345)
     monkeypatch.setattr(status_mod, "_get_process_start_time", lambda pid: None)
     monkeypatch.setattr(status_mod, "_looks_like_gateway_process", lambda pid: False)
+    monkeypatch.setattr(status_mod, "_read_process_cmdline", lambda pid: None)
 
     assert status_mod.get_runtime_status_running_pid(runtime) == 12345
 

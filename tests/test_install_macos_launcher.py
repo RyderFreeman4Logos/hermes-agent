@@ -36,8 +36,10 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
     command_dir = tmp_path / "command"
     minimal_path = tmp_path / "minimal-path"
     result = tmp_path / "launch-result"
+    home = tmp_path / "home"
     venv_bin.mkdir(parents=True)
     minimal_path.mkdir()
+    home.mkdir()
 
     dirname = shutil.which("dirname")
     assert dirname is not None
@@ -62,6 +64,7 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
             'get_command_link_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             'get_command_link_display_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             "log_info() { :; }",
+            "log_warn() { :; }",
             "log_success() { :; }",
             _setup_path_function(),
             "setup_path",
@@ -72,6 +75,9 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
         "INSTALL_DIR": str(install_dir),
         "DISTRO": "macos",
         "COMMAND_LINK_DIR": str(command_dir),
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin",
+        "SHELL": "/bin/bash",
     }
     subprocess.run(["/bin/bash", "-c", harness], env=env, check=True)
 

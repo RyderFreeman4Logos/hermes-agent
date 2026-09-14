@@ -1408,7 +1408,7 @@ class TestEventBridgePollE2E:
         # conversation, simulating the gateway having just written the
         # session row + first message in one state.db transaction.
         monkeypatch.setattr(
-            mcp_serve, "_load_sessions_index",
+            mcp_serve, "_load_sessions_index_strict",
             lambda: {
                 "agent:main:telegram:dm:late": {
                     "session_id": session_id,
@@ -1450,7 +1450,7 @@ class TestEventBridgePollE2E:
         db_path.write_text("placeholder")
         session_id = "20260329_150000_history"
         monkeypatch.setattr(
-            mcp_serve, "_load_sessions_index",
+            mcp_serve, "_load_sessions_index_strict",
             lambda: {
                 "agent:main:telegram:dm:hist": {
                     "session_id": session_id,
@@ -1496,7 +1496,7 @@ class TestEventBridgePollE2E:
         db_path.write_text("placeholder")
         index: dict = {}
         messages: dict = {}
-        monkeypatch.setattr(mcp_serve, "_load_sessions_index", lambda: dict(index))
+        monkeypatch.setattr(mcp_serve, "_load_sessions_index_strict", lambda: dict(index))
 
         class DB:
             def get_messages(self, sid):
@@ -1683,3 +1683,261 @@ class TestEventBridgePollE2E:
         """Verify the poll interval constant."""
         from mcp_serve import POLL_INTERVAL
         assert POLL_INTERVAL == 0.2
+
+
+def test_event_bridge_keeps_pending_index_when_second_index_read_fails(monkeypatch, tmp_path):
+    """A failed post-watermark routing refresh cannot masquerade as empty."""
+    import mcp_serve
+
+    db_path = tmp_path / "state.db"
+    db_path.write_text("placeholder")
+    calls = 0
+
+    class IndexDB:
+        def list_gateway_sessions(self, *, active_only):
+            nonlocal calls
+            assert active_only is True
+            calls += 1
+            if calls == 1:
+                return [{
+                    "id": "session-a", "session_key": "agent:main:test:a",
+                    "source": "test", "origin_json": "{}", "started_at": 1,
+                }]
+            raise sqlite3.OperationalError("second protected index read failed")
+
+        def close(self):
+            pass
+
+    bridge = mcp_serve.EventBridge()
+    bridge._cached_sessions_index = {"previous": {"session_id": "old"}}
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: IndexDB())
+    watermarks = iter([(1.0, 1), (2.0, 2)])
+    monkeypatch.setattr(
+        bridge, "_sample_state_watermark", lambda _path: next(watermarks)
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        bridge._refresh_index_and_watermark(db_path)
+    assert bridge._cached_sessions_index == {"previous": {"session_id": "old"}}
+
+
+def test_event_bridge_does_not_publish_session_prefix_before_conversion_succeeds(monkeypatch, tmp_path):
+    """A conversion error leaves a whole session retryable and invisible."""
+    import mcp_serve
+
+    db_path = tmp_path / "state.db"
+    db_path.write_text("placeholder")
+    session_key = "agent:main:test:prefix"
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+
+    class DB:
+        def get_messages(self, session_id):
+            assert session_id == "session-prefix"
+            return [
+                {"id": 1, "role": "assistant", "content": "first", "timestamp": 1},
+                {"id": 2, "role": "assistant", "content": [{"type": "text", "text": None}], "timestamp": 2},
+            ]
+
+    bridge = mcp_serve.EventBridge()
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_index_and_watermark",
+        lambda _path: ({session_key: {"session_id": "session-prefix"}}, (1.0, 1)),
+    )
+
+    bridge._poll_once(DB())
+    assert bridge.poll_events()["events"] == []
+
+
+def test_event_bridge_failed_baseline_read_does_not_replay_prestart_history(monkeypatch, tmp_path):
+    """A later retry retains the failed baseline's fixed history cutoff."""
+    import mcp_serve
+
+    tmp_path.joinpath("state.db").write_text("placeholder")
+    session_key = "agent:main:test:baseline"
+    reads = 0
+
+    class DB:
+        def get_active_message_watermark(self, session_id):
+            assert session_id == "session-baseline"
+            return 1
+
+        def get_messages(self, session_id):
+            nonlocal reads
+            assert session_id == "session-baseline"
+            reads += 1
+            if reads == 1:
+                raise sqlite3.OperationalError("baseline read interrupted")
+            return [{"id": 1, "role": "assistant", "content": "old", "timestamp": 1}]
+
+        def close(self):
+            pass
+
+    bridge = mcp_serve.EventBridge()
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_index_and_watermark",
+        lambda _path: ({session_key: {"session_id": "session-baseline"}}, (1.0, 1)),
+    )
+
+    bridge._establish_baseline()
+    bridge._poll_once(DB())
+    assert bridge.poll_events()["events"] == []
+
+
+def test_event_bridge_start_closes_watcher_when_worker_cannot_acquire_db(monkeypatch):
+    """Public start hands a baseline watcher to cleanup even on early worker exit."""
+    import mcp_serve
+
+    class Watcher:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    bridge = mcp_serve.EventBridge()
+    watcher = Watcher()
+    bridge._state_watch_conn = watcher
+    bridge._state_watch_identity = (1, 1)
+    monkeypatch.setattr(bridge, "_establish_baseline", lambda: True)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: None)
+
+    bridge.start()
+    assert bridge._thread is not None
+    bridge._thread.join(timeout=1)
+    assert not bridge._thread.is_alive()
+    assert watcher.closed
+    assert not bridge._running
+
+
+def test_event_bridge_rejects_restart_until_timed_out_worker_exits(monkeypatch, tmp_path):
+    """A stop timeout retains the old worker's watcher ownership."""
+    import mcp_serve
+
+    entered = threading.Event()
+    release = threading.Event()
+    tmp_path.joinpath("state.db").write_text("placeholder")
+
+    class DB:
+        def get_messages(self, _session_id):
+            entered.set()
+            assert release.wait(timeout=8)
+            return []
+
+        def close(self):
+            pass
+
+    bridge = mcp_serve.EventBridge()
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(bridge, "_establish_baseline", lambda: True)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_index_and_watermark",
+        lambda _path: ({"agent:main:test:timeout": {"session_id": "session-timeout"}}, (1.0, 1)),
+    )
+
+    assert bridge.start() is not False
+    assert entered.wait(timeout=1)
+    bridge.stop()
+    assert bridge._thread is not None and bridge._thread.is_alive()
+    assert bridge.start() is False
+
+    release.set()
+    bridge._thread.join(timeout=1)
+    assert not bridge._thread.is_alive()
+    assert bridge.start() is not False
+    bridge.stop()
+
+
+def test_event_bridge_wake_failure_keeps_committed_progress(monkeypatch, tmp_path):
+    """A post-commit wake failure cannot replay an already queued message."""
+    import mcp_serve
+
+    tmp_path.joinpath("state.db").write_text("placeholder")
+    session_key = "agent:main:test:wake"
+
+    class FlakyWake:
+        def __init__(self):
+            self.calls = 0
+
+        def set(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("wake failed after queue commit")
+
+    class DB:
+        def get_messages(self, _session_id):
+            return [{"id": 1, "role": "assistant", "content": "once", "timestamp": 1}]
+
+    bridge = mcp_serve.EventBridge()
+    bridge._new_event = FlakyWake()
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_index_and_watermark",
+        lambda _path: ({session_key: {"session_id": "session-wake"}}, (1.0, 1)),
+    )
+
+    with pytest.raises(RuntimeError, match="wake failed"):
+        bridge._poll_once(DB())
+    bridge._poll_once(DB())
+    assert [event["content"] for event in bridge.poll_events()["events"]] == ["once"]
+
+
+def test_event_bridge_failed_baseline_read_delivers_only_later_message(monkeypatch, tmp_path):
+    """A retained startup cutoff filters old history while admitting later rows."""
+    import mcp_serve
+
+    tmp_path.joinpath("state.db").write_text("placeholder")
+    session_key = "agent:main:test:baseline-later"
+    reads = 0
+
+    class DB:
+        def get_active_message_watermark(self, _session_id):
+            return 1
+
+        def get_messages(self, _session_id):
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise sqlite3.OperationalError("baseline read interrupted")
+            return [
+                {"id": 1, "role": "assistant", "content": "old", "timestamp": 1},
+                {"id": 2, "role": "assistant", "content": "new", "timestamp": 2},
+            ]
+
+        def close(self):
+            pass
+
+    bridge = mcp_serve.EventBridge()
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_index_and_watermark",
+        lambda _path: ({session_key: {"session_id": "session-baseline-later"}}, (1.0, 1)),
+    )
+
+    bridge._establish_baseline()
+    bridge._poll_once(DB())
+    assert [event["content"] for event in bridge.poll_events()["events"]] == ["new"]
+
+
+def test_run_mcp_server_stops_bridge_when_server_construction_fails(monkeypatch):
+    """The public process wrapper releases a started bridge on setup failure."""
+    import mcp_serve
+
+    bridge = MagicMock()
+    bridge.start.return_value = True
+    monkeypatch.setattr(mcp_serve, "EventBridge", lambda: bridge)
+    monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+    monkeypatch.setattr(
+        mcp_serve, "create_mcp_server", MagicMock(side_effect=RuntimeError("server setup failed"))
+    )
+
+    with pytest.raises(RuntimeError, match="server setup failed"):
+        mcp_serve.run_mcp_server()
+    bridge.stop.assert_called_once_with()

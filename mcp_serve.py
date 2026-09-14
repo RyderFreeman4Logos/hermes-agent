@@ -109,6 +109,47 @@ def _load_sessions_index() -> dict:
     return _load_sessions_index_from_db() or _load_sessions_index_from_json()
 
 
+def _load_sessions_index_strict() -> dict:
+    """Read the EventBridge index without converting a failed read to empty.
+
+    The ordinary MCP listing tools keep their tolerant loaders. Event delivery
+    needs to retain a pending database change when either authoritative index
+    read fails, so only this poller path exposes an error to its caller.
+    """
+    db = _get_session_db()
+    if db is None:
+        raise RuntimeError("Session database unavailable for EventBridge index")
+    try:
+        lister = getattr(db, "list_gateway_sessions", None)
+        if not callable(lister):
+            # Legacy/test databases without routing rows retain the JSON
+            # fallback; a callable loader that fails is never treated as empty.
+            return _load_sessions_index_from_json_strict()
+        entries = {
+            row["session_key"]: _row_to_index_entry(row)
+            for row in lister(active_only=True)
+            if row.get("session_key")
+        }
+    finally:
+        _close_quietly(db, "EventBridge index")
+    return entries or _load_sessions_index_from_json_strict()
+
+
+def _load_sessions_index_from_json_strict() -> dict:
+    """Read the legacy index, preserving malformed/read-error outcomes."""
+    path = _get_sessions_dir() / "sessions.json"
+    try:
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("Failed to read EventBridge legacy index") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("EventBridge legacy index is not an object")
+    return {key: value for key, value in data.items() if not str(key).startswith("_")}
+
+
 def _iso(ts) -> str:
     try:
         return datetime.fromtimestamp(float(ts)).isoformat() if ts else ""
@@ -264,10 +305,16 @@ class EventBridge:
         self._queue: List[QueueEvent] = []
         self._cursor = 0
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._new_event = threading.Event()
         self._running = False
+        self._starting = False
+        self._stop_requested = False
         self._thread: Optional[threading.Thread] = None
         self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
+        # A body-read failure after baseline has observed a session must not
+        # turn its existing history into a later event on recovery.
+        self._baseline_cutoffs: Dict[str, int] = {}
         self._pending_approvals: Dict[str, dict] = {}  # populated from events
         self._state_db_mtime: float = 0.0  # skip polling work when state.db is unchanged
         # PRAGMA data_version watermark, sampled on the long-lived read-only
@@ -279,39 +326,58 @@ class EventBridge:
         self._cached_sessions_index: dict = {}
 
     def start(self):
-        """Start the background polling thread."""
-        if self._running:
-            return
-        # Baseline existing history BEFORE polling so startup never replays old
-        # messages as events; sessions appearing later default to last_seen=0.0
-        # in _poll_once, so new-conversation delivery is preserved.
-        # Unit tests that drive _poll_once directly bypass start() and still observe first-poll delivery.
-        # See #13414.
-        self._establish_baseline()
-        self._running = True
-        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._thread.start()
-        logger.debug("EventBridge started")
+        """Start one polling owner after a successful baseline reservation."""
+        with self._lifecycle_lock:
+            if self._starting or self._running or (
+                self._thread is not None and self._thread.is_alive()
+            ):
+                return False
+            self._starting = True
+            self._stop_requested = False
+        try:
+            if not self._establish_baseline():
+                self._close_state_watch_conn()
+                return False
+            with self._lifecycle_lock:
+                if self._stop_requested:
+                    self._close_state_watch_conn()
+                    return False
+                thread = threading.Thread(target=self._poll_loop, daemon=True)
+                self._thread = thread
+                self._running = True
+                try:
+                    thread.start()
+                except Exception:
+                    self._running = False
+                    self._thread = None
+                    self._close_state_watch_conn()
+                    raise
+            logger.debug("EventBridge started")
+            return True
+        finally:
+            with self._lifecycle_lock:
+                self._starting = False
 
     def stop(self):
-        """Stop the background polling thread and wake any waiters."""
-        self._running = False
-        self._new_event.set()
-        if self._thread:
-            self._thread.join(timeout=5)
-        # The polling thread is the only user of the watcher connection once it
-        # is running, so close it only when that thread has actually finished.
-        # A thread that outlived the join may still be inside _poll_once, and
-        # leaking a read-only descriptor until the process exits is cheaper
-        # than closing a connection out from under a live statement.
-        if self._thread is not None and self._thread.is_alive():
+        """Request the current owner stop without replacing a live owner."""
+        with self._lifecycle_lock:
+            self._stop_requested = True
+            self._running = False
+            thread = self._thread
+            starting = self._starting
+            self._new_event.set()
+        if thread is not None:
+            thread.join(timeout=5)
+        elif not starting:
+            # No worker acquired ownership; this is starter-owned residue.
+            self._close_state_watch_conn()
+        if thread is not None and thread.is_alive():
             logger.warning(
                 "EventBridge: poll thread still running after stop(); "
-                "leaving the state.db watcher open"
+                "retaining its state.db watcher until worker cleanup"
             )
-        else:
-            self._close_state_watch_conn()
         logger.debug("EventBridge stopped")
+
 
     def _matching(self, after_cursor: int, session_key: Optional[str], limit: int) -> List[dict]:
         with self._lock:
@@ -353,30 +419,82 @@ class EventBridge:
         return {"resolved": True, "approval_id": approval_id, "decision": decision}
 
     def _enqueue(self, event: QueueEvent) -> None:
-        """Add an event to the queue (trimmed to QUEUE_LIMIT) and wake any waiters."""
-        with self._lock:
-            self._cursor += 1
-            event.cursor = self._cursor
-            self._queue.append(event)
-            while len(self._queue) > QUEUE_LIMIT:
-                self._queue.pop(0)
-        self._new_event.set()
+        """Add one event through the shared queue/progress commit boundary."""
+        self._commit_session_events((event,))
 
-    def _establish_baseline(self) -> None:
-        """Record per-session latest timestamps and the state.db mtime WITHOUT
-        emitting events. Only sessions existing now are baselined; later ones
-        default to last_seen=0.0 in _poll_once, so their first message is delivered."""
+    def _commit_session_events(
+        self, events: tuple[QueueEvent, ...] | list[QueueEvent], *,
+        session_key: Optional[str] = None, latest: Optional[float] = None,
+    ) -> None:
+        """Commit one prepared session's events and progress before waking waiters."""
+        with self._lock:
+            for event in events:
+                self._cursor += 1
+                event.cursor = self._cursor
+                self._queue.append(event)
+                while len(self._queue) > QUEUE_LIMIT:
+                    self._queue.pop(0)
+            if session_key is not None and latest is not None:
+                last_seen = self._last_poll_timestamps.get(session_key, 0.0)
+                if latest > last_seen:
+                    self._last_poll_timestamps[session_key] = latest
+        if events:
+            # A wake failure occurs after the queue/progress commit. A later
+            # changed scan therefore cannot republish this session's events.
+            self._new_event.set()
+
+    def _prepare_session_events(
+        self, session_key: str, messages: list[dict], last_seen: float,
+        baseline_cutoff: Optional[int] = None,
+    ) -> tuple[list[QueueEvent], float]:
+        """Build a session's events before making any of them visible."""
+        events = []
+        for msg in messages:
+            try:
+                message_id = int(msg.get("id", 0) or 0)
+            except (TypeError, ValueError):
+                message_id = 0
+            if (
+                msg.get("role", "") not in {"user", "assistant"}
+                or _ts_float(msg.get("timestamp", 0)) <= last_seen
+                or (baseline_cutoff is not None and message_id <= baseline_cutoff)
+            ):
+                continue
+            content = _extract_message_content(msg)
+            if not content:
+                continue
+            events.append(QueueEvent(0, "message", session_key, {
+                "role": msg.get("role", ""), "content": content[:500],
+                "timestamp": str(msg.get("timestamp", "")), "message_id": str(msg.get("id", "")),
+            }))
+        return events, _latest_ts(messages)
+
+    def _establish_baseline(self) -> bool:
+        """Record startup history without replaying an incomplete baseline later."""
         db = _get_session_db()
         if not db:
-            return
+            return False
         db_file = _hermes_home() / "state.db"
         try:
             try:
                 entries, watermark = self._refresh_index_and_watermark(db_file)
             except Exception:
-                # A failed index read is not an empty index and must not
-                # acknowledge its change as quiet.
-                return
+                # A failed index read is not an empty index and cannot define a
+                # safe startup cohort.
+                return False
+            cutoffs = {}
+            try:
+                for session_key, entry in entries.items():
+                    session_id = entry.get("session_id", "")
+                    if not session_id:
+                        continue
+                    getter = getattr(db, "get_active_message_watermark", None)
+                    cutoffs[session_key] = getter(session_id) if callable(getter) else None
+            except Exception:
+                # Never invent a zero cutoff when the real active-row query
+                # cannot establish the startup boundary.
+                return False
+
             reads_succeeded = True
             for session_key, entry in entries.items():
                 session_id = entry.get("session_id", "")
@@ -386,11 +504,15 @@ class EventBridge:
                     latest = _latest_ts(db.get_messages(session_id))
                 except Exception:
                     reads_succeeded = False
+                    cutoff = cutoffs.get(session_key)
+                    if cutoff is not None:
+                        self._baseline_cutoffs[session_key] = cutoff
                     continue
                 if latest > 0.0:
                     self._last_poll_timestamps[session_key] = latest
             if reads_succeeded:
                 self._state_db_mtime, self._state_db_version = watermark
+            return True
         finally:
             _close_quietly(db, "baseline")
 
@@ -416,10 +538,10 @@ class EventBridge:
         the watermark — only ever costs one redundant scan.
         """
         before = self._sample_state_watermark(db_file)
-        entries = _load_sessions_index()
+        entries = _load_sessions_index_strict()
         watermark = self._sample_state_watermark(db_file)
         if watermark != before:
-            entries = _load_sessions_index()
+            entries = _load_sessions_index_strict()
         self._cached_sessions_index = entries
         return entries, watermark
 
@@ -505,12 +627,13 @@ class EventBridge:
         return row[0] if row else None
 
     def _poll_loop(self):
-        """Background loop: poll SessionDB for new messages."""
-        db = _get_session_db()
-        if not db:
-            logger.warning("EventBridge: SessionDB unavailable, event polling disabled")
-            return
+        """Background loop; this worker owns release and watcher cleanup."""
+        db = None
         try:
+            db = _get_session_db()
+            if not db:
+                logger.warning("EventBridge: SessionDB unavailable, event polling disabled")
+                return
             while self._running:
                 try:
                     self._poll_once(db)
@@ -518,8 +641,13 @@ class EventBridge:
                     logger.debug("EventBridge poll error: %s", e)
                 time.sleep(POLL_INTERVAL)
         finally:
-            _close_quietly(db, "polling")
+            if db is not None:
+                _close_quietly(db, "polling")
             self._close_state_watch_conn()
+            with self._lifecycle_lock:
+                if self._thread is threading.current_thread():
+                    self._running = False
+
 
     def _poll_once(self, db):
         """Check for new messages across all sessions.
@@ -578,24 +706,19 @@ class EventBridge:
             last_seen = self._last_poll_timestamps.get(session_key, 0.0)
             try:
                 messages = db.get_messages(session_id)
+                events, latest = self._prepare_session_events(
+                    session_key, messages, last_seen,
+                    self._baseline_cutoffs.get(session_key),
+                )
             except Exception:
+                # A failed required read or conversion leaves the complete
+                # session pending; an already committed sibling stays intact.
                 reads_succeeded = False
                 continue
-            if not messages:
-                continue
-            for msg in messages:
-                if msg.get("role", "") not in {"user", "assistant"} or _ts_float(msg.get("timestamp", 0)) <= last_seen:
-                    continue
-                content = _extract_message_content(msg)
-                if not content:
-                    continue
-                self._enqueue(QueueEvent(0, "message", session_key, {
-                    "role": msg.get("role", ""), "content": content[:500],
-                    "timestamp": str(msg.get("timestamp", "")), "message_id": str(msg.get("id", "")),
-                }))
-            latest = _latest_ts(messages)
-            if latest > last_seen:
-                self._last_poll_timestamps[session_key] = latest
+            self._commit_session_events(
+                events, session_key=session_key, latest=latest
+            )
+            self._baseline_cutoffs.pop(session_key, None)
         if reads_succeeded:
             self._state_db_mtime, self._state_db_version = watermark
 
@@ -877,17 +1000,13 @@ def run_mcp_server(verbose: bool = False) -> None:
         sys.exit(1)
     logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING, stream=sys.stderr)
     bridge = EventBridge()
-    bridge.start()
-    server = create_mcp_server(event_bridge=bridge)
-    import asyncio
-
-    async def _run():
-        try:
-            await server.run_stdio_async()
-        finally:
-            bridge.stop()
-
     try:
-        asyncio.run(_run())
+        if not bridge.start():
+            raise RuntimeError("EventBridge could not establish its startup baseline")
+        server = create_mcp_server(event_bridge=bridge)
+        import asyncio
+        asyncio.run(server.run_stdio_async())
     except KeyboardInterrupt:
+        pass
+    finally:
         bridge.stop()

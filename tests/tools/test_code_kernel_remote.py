@@ -68,7 +68,9 @@ class FileAwareEnv:
         self.killed = []
         self.before_submit = None
         self.before_liveness = None
+        self.before_liveness_command = None
         self.before_spawn = None
+        self.before_kill = None
         self.cleanup_returncode = 0
         self.result_cleanup_error = None
         self.submit_error_after_apply = None
@@ -114,6 +116,8 @@ class FileAwareEnv:
         if "kill -0" in command:
             if self.before_liveness is not None:
                 self.before_liveness()
+            if self.before_liveness_command is not None:
+                self.before_liveness_command(command)
             return {"output": "ALIVE\n", "returncode": 0}
         if "command -v python3" in command:
             return {"output": "OK\n", "returncode": 0}
@@ -137,6 +141,8 @@ class FileAwareEnv:
             self.rpc_done.set()
             return {"output": "", "returncode": 0}
         if command.startswith("pkill -TERM"):
+            if self.before_kill is not None:
+                self.before_kill(command)
             with self._lock:
                 self.killed.append(command)
             return {"output": "", "returncode": 0}
@@ -882,6 +888,98 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
         env.before_spawn = None
         self.assertEqual(_run(env, code="other-after", task="other-owner")["stdout"], "other-after")
         self.assertEqual(_run(env, code="new-after", task="old-owner")["stdout"], "new-after")
+
+    def _assert_owner_shutdown_cancels_cold_loser_adoption(self, held_stage):
+        """W06: bind cleanup to one of the loser's two adoption boundaries."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        loser_at_launch = threading.Event()
+        release_loser_launch = threading.Event()
+        winner_at_submit = threading.Event()
+        release_winner = threading.Event()
+        held = threading.Event()
+        release_held = threading.Event()
+
+        def before_spawn():
+            if threading.current_thread().name == "w06-loser":
+                loser_at_launch.set()
+                release_loser_launch.wait(5)
+
+        def before_submit():
+            if threading.current_thread().name == "w06-winner":
+                winner_at_submit.set()
+                release_winner.wait(5)
+
+        def before_kill(command):
+            if held_stage == "loser_retirement" and "7002" in command:
+                held.set()
+                release_held.wait(5)
+
+        def before_liveness(command):
+            if (held_stage == "winner_liveness"
+                    and threading.current_thread().name == "w06-loser"
+                    and "7001" in command):
+                held.set()
+                release_held.wait(5)
+
+        env.before_spawn = before_spawn
+        env.before_submit = before_submit
+        env.before_kill = before_kill
+        env.before_liveness_command = before_liveness
+        results = {}
+        errors = []
+
+        def invoke(label):
+            try:
+                results[label] = _run(env, code=label, task="adoption-owner")
+            except BaseException as exc:
+                errors.append(exc)
+
+        loser = threading.Thread(target=invoke, args=("loser",), name="w06-loser")
+        winner = threading.Thread(target=invoke, args=("winner",), name="w06-winner")
+        loser.start()
+        self.assertTrue(loser_at_launch.wait(5), "loser did not hold its cold launch")
+        winner.start()
+        self.assertTrue(winner_at_submit.wait(5), "winner did not publish and reach its cell")
+        with _REGISTRY.lock:
+            winner_kernel = next(iter(_REMOTE_KERNELS.values()))
+            self.assertEqual(winner_kernel.pid, "7001")
+            self.assertEqual(winner_kernel.attached, 1)
+        release_loser_launch.set()
+        self.assertTrue(held.wait(5), f"loser did not reach {held_stage}")
+
+        shutdown_remote_kernels_for_owner("adoption-owner")
+        release_held.set()
+        release_winner.set()
+        loser.join(5)
+        winner.join(5)
+
+        self.assertFalse(loser.is_alive())
+        self.assertFalse(winner.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual({result["status"] for result in results.values()}, {"error"})
+        self.assertTrue(all("canceled by session cleanup" in result["error"]
+                            for result in results.values()))
+        self.assertEqual(env.spawn_count, 2)
+        self.assertTrue(any("7001" in command for command in env.killed))
+        self.assertTrue(any("7002" in command for command in env.killed))
+        self.assertEqual(sum(command.startswith("mv ") for command in env.commands), 1)
+        self.assertEqual(winner_kernel.attached, 0)
+        with _REGISTRY.lock:
+            self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+        env.before_spawn = None
+        env.before_submit = None
+        env.before_kill = None
+        env.before_liveness_command = None
+        self.assertEqual(_run(env, code="after", task="adoption-owner")["stdout"], "after")
+        self.assertEqual(env.spawn_count, 3)
+
+    def test_owner_shutdown_while_cold_loser_retires_cancels_adoption(self):
+        self._assert_owner_shutdown_cancels_cold_loser_adoption("loser_retirement")
+
+    def test_owner_shutdown_at_winner_liveness_cancels_cold_loser_adoption(self):
+        self._assert_owner_shutdown_cancels_cold_loser_adoption("winner_liveness")
 
     def test_failed_stale_rpc_cleanup_retires_before_submission(self):
         """W03: an unsafe old RPC namespace cannot arm a new authority window."""

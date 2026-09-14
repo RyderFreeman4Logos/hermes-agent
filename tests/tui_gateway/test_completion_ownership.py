@@ -300,9 +300,16 @@ def test_refused_idle_admission_requeues_once_and_normal_admission_settles_once(
                 "admitted-ui", admitted, [_completion(admitted_id)], set()
             )
 
-            assert process_registry.is_completion_consumed(admitted_id) is True
-            assert settlements == [[admitted_id]]
+            # Admission and the synthetic thread return are still before the
+            # real turn-context row. The receipt therefore stays recoverable
+            # until that insertion callback commits it.
+            assert process_registry.is_completion_consumed(admitted_id) is False
+            assert settlements == []
+            assert [event["session_id"] for event in admitted["_completion_pending"]] == [admitted_id]
             assert admitted["running"] is False
+            admitted.update(_closing=True, _finalized=True)
+            server._notification_poller_loop(stop, "admitted-ui", admitted)
+            assert _queued_ids(isolated) == [admitted_id]
     finally:
         _clear_ids(refused_id, admitted_id)
 
@@ -371,11 +378,13 @@ def test_ingest_uses_structured_identity_not_formatted_text(monkeypatch):
             assert staged_id not in payload
             assert restaged_id in payload
             assert process_registry.is_completion_consumed(staged_id) is True
-            assert process_registry.is_completion_consumed(restaged_id) is True
+            # Queue staging preserves the structured receipt; only the core
+            # insertion tests commit it. A lifecycle reclaim returns it once.
+            assert process_registry.is_completion_consumed(restaged_id) is False
             session.update(_closing=True, _finalized=True)
             stop = threading.Event()
             stop.set()
             server._notification_poller_loop(stop, "owner-ui", session)
-            assert _queued_ids(isolated) == []
+            assert _queued_ids(isolated) == [restaged_id]
     finally:
         _clear_ids(first_id, staged_id, restaged_id)

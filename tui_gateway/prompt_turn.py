@@ -116,9 +116,9 @@ def _admit_prompt_turn(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
-    _bind_completion_ingest(session, agent)
-    with contextlib.suppress(Exception):
-        agent.clear_interrupt()
+        _bind_completion_ingest(session, agent)
+        with contextlib.suppress(Exception):
+            agent.clear_interrupt()
     return images, agent
 
 

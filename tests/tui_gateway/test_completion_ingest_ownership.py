@@ -143,25 +143,251 @@ class _BoundaryMessages(list):
 
 
 class _ObservedRLock:
-    def __init__(self):
+    def __init__(self, signals: queue.Queue | None = None):
         self._lock = threading.RLock()
         self.attempted = {name: threading.Event() for name in ("ingest", "reclaim")}
+        self.signals = signals
         self.hold_name: str | None = None
         self.hold_acquired = threading.Event()
         self.hold_release = threading.Event()
+        self.owner: int | None = None
+        self.depth = 0
 
     def __enter__(self):
         name = threading.current_thread().name
         if event := self.attempted.get(name):
             event.set()
+            if self.signals is not None:
+                self.signals.put(name)
         self._lock.acquire()
+        self.owner = threading.get_ident()
+        self.depth += 1
         if name == self.hold_name:
             self.hold_acquired.set()
             assert self.hold_release.wait(2), "ownership boundary release timed out"
         return self
 
     def __exit__(self, *_exc):
+        self.depth -= 1
+        if self.depth == 0:
+            self.owner = None
         self._lock.release()
+
+    def held_by_current_thread(self) -> bool:
+        return self.owner == threading.get_ident()
+
+
+def _buffer_completion(sid: str, session: dict, event: dict, emitted: set) -> None:
+    assert server._notif_handle_event(
+        sid, session, event, emitted, process_registry,
+        lambda item: item.get("session_id", ""), None, owned=True,
+    )
+
+
+@pytest.mark.parametrize("scenario", ["merge", "insert_false", "late", "filter"])
+def test_idle_mixed_completion_transaction(monkeypatch, scenario: str):
+    first_id = f"proc_mixed_a_{scenario}"
+    second_id = f"proc_mixed_b_{scenario}"
+    late_id = f"proc_mixed_c_{scenario}"
+    _clear_ids(first_id, second_id, late_id)
+    errors: list[BaseException] = []
+    try:
+        with _isolated(monkeypatch):
+            agent = _agent()
+            session = _session(agent)
+            emitted: set = set()
+            assert server._deliver_completions_via_steer(
+                "owner-ui", session, [_completion(first_id)], emitted
+            )
+            _buffer_completion("owner-ui", session, _completion(second_id), emitted)
+            session["running"] = False
+            if scenario == "filter":
+                process_registry._completion_consumed.add(first_id)
+
+            ownership = _ObservedRLock()
+            session["_completion_ownership_lock"] = ownership
+            submitted: list[str] = []
+            settlements: list[list[str]] = []
+            real_settle = server._mark_completion_events_consumed
+            real_format = server._format_completion_batch
+            release_snapshot = threading.Event()
+            phase = queue.Queue()
+
+            def settle(events):
+                settlements.append([event["session_id"] for event in events])
+                real_settle(events)
+
+            def submit(_rid, _sid, target_session, text, **_kwargs):
+                submitted.append(text)
+                return True
+
+            def gated_format(events):
+                ids = [event.get("session_id") for event in events]
+                if scenario in {"insert_false", "late"} and ids == [first_id, second_id]:
+                    phase.put("snapshot")
+                    assert release_snapshot.wait(2), "mixed snapshot release timed out"
+                return real_format(events)
+
+            def emit(*_args, **_kwargs):
+                assert not ownership.held_by_current_thread(), "status emitted under ownership lock"
+                acquired = session["history_lock"].acquire(blocking=False)
+                assert acquired, "status emitted under history lock"
+                session["history_lock"].release()
+
+            monkeypatch.setattr(server, "_mark_completion_events_consumed", settle)
+            monkeypatch.setattr(server, "_run_prompt_submit", submit)
+            monkeypatch.setattr(server, "_format_completion_batch", gated_format)
+            monkeypatch.setattr(server, "_emit", emit)
+
+            def flush():
+                try:
+                    server._flush_pending_completions_if_idle("owner-ui", session, emitted)
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    phase.put("done")
+
+            worker = threading.Thread(target=flush, name="ingest")
+            worker.start()
+            if scenario in {"insert_false", "late"}:
+                reached = phase.get(timeout=2)
+                if reached == "snapshot":
+                    if scenario == "insert_false":
+                        with session["history_lock"]:
+                            session["running"] = True
+                    else:
+                        _buffer_completion(
+                            "owner-ui", session, _completion(late_id), emitted
+                        )
+                    release_snapshot.set()
+            worker.join(2)
+            release_snapshot.set()
+            assert not worker.is_alive()
+            assert errors == []
+
+            if scenario == "insert_false":
+                assert [event["session_id"] for event in session["_completion_transfer"]] == [
+                    first_id, second_id
+                ]
+                assert session.get("_completion_pending") == []
+                assert submitted == [] and settlements == []
+                assert process_registry.is_completion_consumed(first_id) is False
+                assert process_registry.is_completion_consumed(second_id) is False
+                return
+
+            assert len(submitted) == 1
+            payload = submitted[0]
+            if scenario == "filter":
+                assert first_id not in payload and payload.count(second_id) == 1
+                assert settlements == [[second_id]]
+            else:
+                assert payload.index(first_id) < payload.index(second_id)
+                assert settlements == [[first_id, second_id]]
+            assert session.get("_completion_transfer") == []
+            if scenario == "late":
+                assert [event["session_id"] for event in session["_completion_pending"]] == [late_id]
+                assert process_registry.is_completion_consumed(late_id) is False
+            else:
+                assert session.get("_completion_pending") == []
+            assert process_registry.is_completion_consumed(first_id) is True
+            assert process_registry.is_completion_consumed(second_id) is True
+    finally:
+        _clear_ids(first_id, second_id, late_id)
+
+
+@pytest.mark.parametrize("winner", ["ingest", "reclaim"])
+def test_idle_mixed_ingest_and_reclaim_have_one_winner(monkeypatch, winner: str):
+    first_id = f"proc_mixed_winner_a_{winner}"
+    second_id = f"proc_mixed_winner_b_{winner}"
+    _clear_ids(first_id, second_id)
+    errors: list[BaseException] = []
+    try:
+        with _isolated(monkeypatch) as isolated:
+            agent = _agent()
+            session = _session(agent)
+            emitted: set = set()
+            assert server._deliver_completions_via_steer(
+                "owner-ui", session, [_completion(first_id)], emitted
+            )
+            _buffer_completion("owner-ui", session, _completion(second_id), emitted)
+            session["running"] = False
+            phase = queue.Queue()
+            ownership = _ObservedRLock()
+            session["_completion_ownership_lock"] = ownership
+            boundary = _InsertionBoundary()
+            real_enqueue = server._enqueue_prompt
+            monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
+            monkeypatch.setattr(server, "_run_prompt_submit", lambda *_a, **_k: True)
+
+            def gated_enqueue(*args, **kwargs):
+                real_enqueue(*args, **kwargs)
+                phase.put("inserted")
+                boundary.hit()
+
+            monkeypatch.setattr(server, "_enqueue_prompt", gated_enqueue)
+
+            def ingest():
+                try:
+                    server._flush_pending_completions_if_idle(
+                        "owner-ui", session, emitted
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    phase.put("done")
+
+            reclaim_entered = threading.Event()
+
+            def reclaim():
+                try:
+                    reclaim_entered.set()
+                    _reclaim("owner-ui", session)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            ingest_thread = threading.Thread(target=ingest, name="ingest")
+            reclaim_thread = threading.Thread(target=reclaim, name="reclaim")
+            reclaim_started = False
+            if winner == "ingest":
+                ingest_thread.start()
+                first_phase = phase.get(timeout=2)
+                if first_phase == "inserted":
+                    reclaim_thread.start()
+                    reclaim_started = True
+                    assert reclaim_entered.wait(2), "reclaim thread did not start"
+                    boundary.release.set()
+            else:
+                ownership.hold_name = "reclaim"
+                reclaim_thread.start()
+                reclaim_started = True
+                assert ownership.hold_acquired.wait(2), "reclaim did not own completion state"
+                ingest_thread.start()
+                ingest_thread.join(2)
+                ownership.hold_release.set()
+            ingest_thread.join(2)
+            if reclaim_started:
+                reclaim_thread.join(2)
+            boundary.release.set()
+            ownership.hold_release.set()
+            assert not ingest_thread.is_alive()
+            assert not reclaim_started or not reclaim_thread.is_alive()
+            assert errors == []
+
+            if winner == "ingest":
+                payload = session["queued_prompt"]["text"]
+                assert payload.index(first_id) < payload.index(second_id)
+                assert _queued_ids(isolated) == []
+                assert process_registry.is_completion_consumed(first_id) is True
+                assert process_registry.is_completion_consumed(second_id) is True
+            else:
+                assert _queued_ids(isolated) == [first_id, second_id]
+                assert session.get("queued_prompt") is None
+                assert process_registry.is_completion_consumed(first_id) is False
+                assert process_registry.is_completion_consumed(second_id) is False
+            assert session.get("_completion_transfer") == []
+            assert session.get("_completion_pending") == []
+    finally:
+        _clear_ids(first_id, second_id)
 
 
 def _payload(

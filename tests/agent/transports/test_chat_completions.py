@@ -116,6 +116,24 @@ class TestChatCompletionsBasic:
                              "function": {"name": "t", "arguments": "{}"}}]},
         ]
 
+    def test_build_kwargs_normalizes_late_system_without_mutating_history(self, transport):
+        """Strict Chat Completions accepts the persisted loop-timing suffix."""
+        history = [
+            {"role": "system", "content": "stable instructions"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "system", "content": "[Agent loop timing] stop at 12:34:56"},
+        ]
+
+        payload = transport.build_kwargs(model="test/model", messages=history)
+
+        assert [message["role"] for message in payload["messages"]] == [
+            "system", "user", "assistant", "user",
+        ]
+        assert payload["messages"][-1]["content"] == history[-1]["content"]
+        assert history[-1]["role"] == "system"
+        assert payload["messages"] is not history
+
 
 
 

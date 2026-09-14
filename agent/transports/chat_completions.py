@@ -349,7 +349,13 @@ class ChatCompletionsTransport(ProviderTransport):
         Returns the input list unchanged when nothing needs sanitizing.
         """
         strip_extra_content = not _model_consumes_thought_signature(kwargs.get("model"))
-        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content)) for m in messages]
+        sanitized_pairs = []
+        for index, message in enumerate(messages):
+            sanitized = _sanitize_message(message, strip_extra_content)
+            if index and isinstance(message, dict) and message.get("role") == "system":
+                sanitized = dict(message) if sanitized is None else sanitized
+                sanitized["role"] = "user"
+            sanitized_pairs.append((message, sanitized))
         if all(s is None for _, s in sanitized_pairs):
             return messages
         return [m if s is None else s for m, s in sanitized_pairs]

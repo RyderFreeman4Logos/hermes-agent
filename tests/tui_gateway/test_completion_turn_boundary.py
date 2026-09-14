@@ -519,3 +519,45 @@ def test_prior_completion_keeps_order_until_next_valid_tool_boundary(tmp_path):
     finally:
         db.close()
         _clear(*event_ids)
+
+
+def test_queued_raw_completion_context_refs_stay_literal_until_core_ingest(tmp_path, monkeypatch):
+    """Queued autonomous output is data, even when it resembles two @file directives."""
+    event_id = "proc_literal_completion_refs"
+    _clear(event_id)
+    try:
+        agent = _agent()
+        agent._config_context_length = 1_000
+        session = _session(agent, running=False)
+        session["cwd"] = str(tmp_path)
+        sid = "literal-completion-ui"
+        server._sessions[sid] = session
+        for name in ("first.txt", "second.txt"):
+            (tmp_path / name).write_text("x" * 1_200, encoding="utf-8")
+        captured = {}
+        receipt = {"events": [_completion(event_id)]}
+        session["_completion_active_receipt"] = receipt
+        monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_record_turn_marker", lambda *_a, **_k: "marker")
+        monkeypatch.setattr(server, "_finish_turn", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_retire_turn_marker", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_clear_inflight_turn", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_a, **_k: None)
+
+        def stop_before_provider(_sid, _session, st, prompt, *_args):
+            captured["prompt"] = prompt
+            st.result = {"final_response": "unused"}
+
+        monkeypatch.setattr(server, "_invoke_agent", stop_before_provider)
+        assert server._run_prompt_submit(
+            "rid", sid, session, "result @file:first.txt @file:second.txt",
+            completion_receipt=receipt,
+        )
+        session["_run_thread"].join(2)
+        assert not session["_run_thread"].is_alive()
+        assert captured["prompt"] == "result @file:first.txt @file:second.txt"
+        assert process_registry.is_completion_consumed(event_id) is False
+        assert [event["session_id"] for event in session["_completion_pending"]] == [event_id]
+    finally:
+        server._sessions.pop("literal-completion-ui", None)
+        _clear(event_id)

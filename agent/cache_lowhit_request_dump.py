@@ -17,6 +17,7 @@ from agent.physical_attempt_diagnostics import (
     _later_history,
     _prefix,
     _serialized,
+    enabled,
 )
 from agent.usage_pricing import CanonicalUsage
 
@@ -42,6 +43,8 @@ def remember_sent_request(
     request: dict[str, Any], *, api_mode: str = "chat_completions"
 ) -> None:
     """Keep the last two send-time fingerprints and sizes, never raw bodies."""
+    if not enabled():
+        return
     components = {
         "prefix": _prefix(request),
         "messages": request.get("messages"),

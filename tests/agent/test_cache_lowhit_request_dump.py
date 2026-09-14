@@ -29,6 +29,15 @@ def _dump(dump, *, cache_read: int, prompt: int, telemetry: str = "reported") ->
     dump.maybe_dump_on_usage(_usage(cache_read=cache_read, prompt=prompt), cache_telemetry=telemetry)
 
 
+def _enable_remember(dump, monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(dump, "enabled", lambda: True)
+    monkeypatch.setattr(
+        "agent.physical_attempt_diagnostics.get_hermes_home",
+        lambda: tmp_path,
+    )
+
+
 def _remember_pair(dump, prefix_a: str, prefix_b: str) -> None:
     dump.remember_sent_request(
         {
@@ -92,7 +101,7 @@ def _assert_fingerprint_only(payload: dict[str, Any], *secrets: str) -> None:
 def test_near_zero_zero_read_dumps_last_two_fingerprints(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
-    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    _enable_remember(dump, monkeypatch, tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "UNREDACTED-PREFIX-A", "UNREDACTED-PREFIX-B")
 
@@ -114,7 +123,7 @@ def test_near_zero_zero_read_dumps_last_two_fingerprints(monkeypatch, tmp_path):
 def test_near_zero_sub_percent_read_dumps_last_two_fingerprints(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
-    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    _enable_remember(dump, monkeypatch, tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "UNREDACTED-PREFIX-A", "UNREDACTED-PREFIX-B")
 
@@ -127,7 +136,7 @@ def test_near_zero_sub_percent_read_dumps_last_two_fingerprints(monkeypatch, tmp
 def test_high_hit_does_not_dump(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
-    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    _enable_remember(dump, monkeypatch, tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "UNREDACTED-PREFIX-A", "UNREDACTED-PREFIX-B")
 
@@ -139,7 +148,7 @@ def test_high_hit_does_not_dump(monkeypatch, tmp_path):
 def test_unavailable_telemetry_does_not_dump(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
-    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    _enable_remember(dump, monkeypatch, tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "UNREDACTED-PREFIX-A", "UNREDACTED-PREFIX-B")
 
@@ -151,7 +160,7 @@ def test_unavailable_telemetry_does_not_dump(monkeypatch, tmp_path):
 def test_retention_overwrites_oldest(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
-    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    _enable_remember(dump, monkeypatch, tmp_path)
     dump.reset_for_tests()
     _remember_pair(dump, "OLD-0", "NEW-0")
     _dump(dump, cache_read=0, prompt=1_000)
@@ -172,3 +181,79 @@ def test_retention_overwrites_oldest(monkeypatch, tmp_path):
     assert "NEW-0" not in joined
     for path in files:
         _assert_fingerprint_only(json.loads(path.read_text(encoding="utf-8")))
+
+
+def test_remember_sent_request_default_off_creates_neither_directory_nor_key(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+    from hermes_cli import config
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "agent.physical_attempt_diagnostics.get_hermes_home",
+        lambda: tmp_path,
+    )
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": False}}},
+    )
+    dump.reset_for_tests()
+    dump.remember_sent_request(
+        {
+            "messages": [{"role": "system", "content": "ISSUE108-PRIVATE-SENTINEL"}],
+            "model": "grok-4.6",
+        }
+    )
+    assert not (tmp_path / "observability").exists()
+
+
+def test_remember_sent_request_enabled_is_digest_only(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+    from hermes_cli import config
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "agent.physical_attempt_diagnostics.get_hermes_home",
+        lambda: tmp_path,
+    )
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": True}}},
+    )
+    dump.reset_for_tests()
+    dump.remember_sent_request(
+        {
+            "messages": [{"role": "system", "content": "ISSUE108-PRIVATE-SENTINEL"}],
+            "model": "grok-4.6",
+        }
+    )
+    key_path = tmp_path / "observability" / "physical_attempt_digests.key"
+    assert key_path.is_file()
+    assert key_path.stat().st_size == 32
+    assert dump._LAST
+    text = json.dumps(list(dump._LAST))
+    assert "ISSUE108-PRIVATE-SENTINEL" not in text
+
+
+def test_relay_record_attempt_default_off_creates_neither_directory_nor_key(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from agent import relay_llm
+    from hermes_cli import config
+
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": False}}},
+    )
+    relay_llm._record_attempt(
+        {
+            "model": "grok-4.6",
+            "messages": [{"role": "user", "content": "ISSUE108-PRIVATE-SENTINEL"}],
+        },
+        name="test-provider",
+        model_name="grok-4.6",
+        metadata={"api_mode": "chat_completions"},
+    )
+    assert not (tmp_path / "observability").exists()

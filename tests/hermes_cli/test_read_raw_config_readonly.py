@@ -340,3 +340,24 @@ def test_nonmapping_raw_yaml_cannot_retire_an_outstanding_parse_refusal(
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-FAKE1234567890")
     with pytest.raises(AuthError, match="corrupt"):
         resolve_provider("auto")
+
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_same_metadata_valid_rewrite_returns_the_new_raw_literal(
+    isolated_hermes_home, reader_name
+):
+    """W6: digest freshness beats an identical size and mtime_ns for both APIs."""
+    from hermes_cli import config as config_mod
+
+    cfg = isolated_hermes_home / "config.yaml"
+    first = "image_gen:\n  provider: nous\n"
+    second = "image_gen:\n  provider: krea\n"
+    assert len(first) == len(second)
+    cfg.write_text(first, encoding="utf-8")
+    original_stat = cfg.stat()
+    reader = getattr(config_mod, reader_name)
+    assert reader()["image_gen"]["provider"] == "nous"
+
+    cfg.write_text(second, encoding="utf-8")
+    os.utime(cfg, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    assert reader()["image_gen"]["provider"] == "krea"

@@ -680,3 +680,90 @@ def test_cache_busting_null_snapshot_never_reopens_to_new_identity(tmp_path, mon
     warm = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
     assert warm["honcho.peer_name"] is None
     assert warm["honcho.overflow_content"] is None
+
+
+def test_cache_busting_same_metadata_honcho_rewrite_changes_identity_and_signature(
+    tmp_path, monkeypatch
+):
+    """W6: a small same-size/same-mtime rewrite still rebuilds Honcho identity."""
+    from gateway.run import GatewayRunner
+
+    path = tmp_path / "honcho.json"
+    first = {"apiKey": "k", "peerName": "Alice", "pinPeerName": True}
+    second = {"apiKey": "k", "peerName": "Blice", "pinPeerName": True}
+    first_bytes = json.dumps(first).encode()
+    second_bytes = json.dumps(second).encode()
+    assert len(first_bytes) == len(second_bytes)
+    path.write_bytes(first_bytes)
+    original_stat = path.stat()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+    first_values = GatewayRunner._extract_cache_busting_config(
+        {"memory": {"provider": "honcho"}}
+    )
+    first_signature = GatewayRunner._agent_config_signature(
+        "test-model", {}, [], "", cache_keys=first_values
+    )
+
+    path.write_bytes(second_bytes)
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    second_values = GatewayRunner._extract_cache_busting_config(
+        {"memory": {"provider": "honcho"}}
+    )
+    second_signature = GatewayRunner._agent_config_signature(
+        "test-model", {}, [], "", cache_keys=second_values
+    )
+
+    assert first_values["honcho.peer_name"] == "Alice"
+    assert second_values["honcho.peer_name"] == "Blice"
+    assert first_signature != second_signature
+
+
+def test_cache_busting_read_barrier_uses_the_already_read_small_snapshot(
+    tmp_path, monkeypatch
+):
+    """W6: swapping after the real stream yields bytes cannot alter that extraction."""
+    from gateway.run import GatewayRunner
+
+    path = tmp_path / "honcho.json"
+    first = {"apiKey": "k", "peerName": "Alice", "pinPeerName": True}
+    second = {"apiKey": "k", "peerName": "Bob", "pinPeerName": False}
+    path.write_text(json.dumps(first), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+    original_open = Path.open
+    swapped = False
+
+    class SwapAfterRead:
+        def __init__(self, source):
+            self._source = source
+
+        def read(self, *args, **kwargs):
+            nonlocal swapped
+            result = self._source.read(*args, **kwargs)
+            if not swapped:
+                path.write_text(json.dumps(second), encoding="utf-8")
+                swapped = True
+            return result
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._source.close()
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
+    def swap_after_target_read(self, *args, **kwargs):
+        source = original_open(self, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        return SwapAfterRead(source) if self == path and mode == "rb" else source
+
+    monkeypatch.setattr(Path, "open", swap_after_target_read)
+    values = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+
+    assert swapped
+    assert values["honcho.peer_name"] == "Alice"
+    assert values["honcho.pin_peer_name"] is True

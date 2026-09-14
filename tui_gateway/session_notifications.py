@@ -371,7 +371,12 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
         with session["history_lock"]:
             session["_completion_pending"] = []
     if pending and running:
-        if not _deliver_completions_via_steer(sid, session, pending, emitted):
+        try:
+            staged = _deliver_completions_via_steer(sid, session, pending, emitted)
+        except Exception as exc:
+            _notif_log_failure("completion staging failed", exc)
+            staged = False
+        if not staged:
             with session["history_lock"]:
                 session["_completion_pending"] = list(pending) + list(
                     session.get("_completion_pending") or []

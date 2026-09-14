@@ -559,6 +559,63 @@ def test_delegate_task_zero_iteration_summary_records_successful_route(monkeypat
     assert (complete[-1]["model"], complete[-1]["provider"]) == (PRIMARY["model"], PRIMARY["provider"])
 
 
+def test_delegate_task_background_zero_iteration_summary_persists_successful_route(monkeypatch, tmp_path):
+    """The detached public path persists the summary-producing child route."""
+    import time
+
+    from tools import async_delegation as async_delegation
+    from tools.process_registry import process_registry
+    import tools.delegate_tool as delegate_mod
+
+    summary_client = MagicMock()
+    summary_client.chat.completions.create.return_value = _response("background summary")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(delegate_mod, "_load_config", lambda: {"max_iterations": 0})
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+        patch.object(AIAgent, "_ensure_primary_openai_client", return_value=summary_client),
+        patch.object(AIAgent, "_persist_session"),
+        patch.object(AIAgent, "_save_trajectory"),
+        patch.object(AIAgent, "_cleanup_task_resources"),
+    ):
+        handle = json.loads(
+            delegate_task(
+                tasks=[{"goal": "persist the iteration-limit summary"}],
+                parent_agent=_delegate_parent([]),
+                background=True,
+            )
+        )
+        deadline = time.monotonic() + 5
+        event = None
+        while time.monotonic() < deadline:
+            if not process_registry.completion_queue.empty():
+                candidate = process_registry.completion_queue.get_nowait()
+                if candidate.get("delegation_id") == handle["delegation_id"]:
+                    event = candidate
+                    break
+            time.sleep(0.02)
+
+    assert event is not None
+    assert (event["results"][0]["model"], event["results"][0]["provider"]) == (
+        PRIMARY["model"], PRIMARY["provider"],
+    )
+    with async_delegation._connect() as conn:
+        event_json, result_json = conn.execute(
+            "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (handle["delegation_id"],),
+        ).fetchone()
+    persisted_event, persisted_result = json.loads(event_json), json.loads(result_json)
+    assert (persisted_event["results"][0]["model"], persisted_event["results"][0]["provider"]) == (
+        PRIMARY["model"], PRIMARY["provider"],
+    )
+    assert (persisted_result["results"][0]["model"], persisted_result["results"][0]["provider"]) == (
+        PRIMARY["model"], PRIMARY["provider"],
+    )
+
+
 def test_delegate_task_ordinary_child_records_fallback_success_identity():
     """The public no-profile child reports only its accepted fallback response."""
     events = []

@@ -158,15 +158,14 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
+def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
     """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
     try:
         from gateway.warning_notifications import render_notification
         with _session_profile_runtime_scope(session):
             render_notification(lambda: _emit("message.start", sid), platform="tui",
                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
-        if _run_prompt_submit(rid, sid, session, text, **kwargs) is False:
-            raise RuntimeError("prompt admission refused")
+        return _run_prompt_submit(rid, sid, session, text, **kwargs)
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -279,10 +278,13 @@ def _idle_completion_turn(sid: str, session: dict, claim_evt: dict, text: str) -
         _notif_release_turn(session)
         return False
     try:
-        _notif_submit(
+        accepted = _notif_submit(
             f"__notif__{int(time.time() * 1000)}", sid, session, text,
             "notification poller dispatch failed")
     except Exception:
+        release_event_delivery(claim_evt, claim)
+        return False
+    if accepted is False:
         release_event_delivery(claim_evt, claim)
         return False
     complete_event_delivery(claim_evt, claim)
@@ -325,29 +327,66 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
         if session.get("_closing") or session.get("_finalized"):
             return
         running = bool(session.get("running"))
-        if pending:
-            if running and not _session_can_steer_completions(session):
+        if pending and running:
+            if not _session_can_steer_completions(session):
                 return
             session["_completion_pending"] = []
-    if not pending:
-        def insert(text: str) -> bool:
-            with session["history_lock"]:
-                if session.get("running") or session.get("_closing") or session.get("_finalized"):
-                    return False
-                _enqueue_prompt(session, text, session.get("transport"))
-                return True
-
-        if _ingest_completion_transfer(session, insert):
-            _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
-        return
-    if running:
+    if pending and running:
         if not _deliver_completions_via_steer(sid, session, pending, emitted):
             with session["history_lock"]:
                 session["_completion_pending"] = list(pending) + list(
                     session.get("_completion_pending") or []
                 )
         return
-    _deliver_completion_notifications(sid, session, pending, emitted)
+
+    def insert(text: str) -> bool:
+        with session["history_lock"]:
+            if session.get("running") or session.get("_closing") or session.get("_finalized"):
+                return False
+            _enqueue_prompt(session, text, session.get("transport"))
+            return True
+
+    if not pending:
+        if _ingest_completion_transfer(session, insert):
+            _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
+        return
+
+    pending_only = False
+    with _completion_ownership_lock(session):
+        with session["history_lock"]:
+            if session.get("running") or session.get("_closing") or session.get("_finalized"):
+                return
+            pending = list(session.get("_completion_pending") or [])
+            if not pending:
+                return
+            transfer = list(session.get("_completion_transfer") or [])
+            session["_completion_pending"] = []
+            if not transfer:
+                pending_only = True
+            else:
+                have = {evt.get("session_id") for evt in transfer}
+                for evt in pending:
+                    event_id = evt.get("session_id")
+                    if event_id not in have:
+                        transfer.append(dict(evt))
+                        have.add(event_id)
+                session["_completion_transfer"] = transfer
+        inserted = not pending_only and _ingest_completion_transfer(session, insert)
+
+    if pending_only:
+        _deliver_completion_notifications(sid, session, pending, emitted)
+        return
+
+    text = _format_completion_batch(pending)
+    if text:
+        batch_key = (("completion-batch",) + tuple(
+            _notification_event_dedup_key(evt) for evt in pending
+        ) if len(pending) > 1 else _notification_event_dedup_key(pending[0]))
+        if batch_key not in emitted:
+            _emit("status.update", sid, {"kind": "process", "text": text})
+            emitted.add(batch_key)
+    if inserted:
+        _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
 
 
 def _notif_loop_status(sid: str, text: str) -> None:
@@ -654,8 +693,11 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
     try:
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
+        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
+        release_event_delivery(evt, claim)
+        return
+    if accepted is False:
         release_event_delivery(evt, claim)
         return
     complete_event_delivery(evt, claim)
@@ -755,12 +797,16 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         return
     if text is None:
         _notif_release_turn(session)
+        return
     try:
-        if text is not None:
-            _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                          "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
-                          display_metadata={"display_text": batch.display_text(registry)})
+        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                                 "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                                 display_metadata={"display_text": batch.display_text(registry)})
     except Exception:
+        for event, _text, claim in claimed:
+            release_event_delivery(event, claim)
+        return
+    if accepted is False:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
         return

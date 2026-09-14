@@ -2095,3 +2095,135 @@ def test_run_mcp_server_stops_bridge_when_server_construction_fails(monkeypatch)
     with pytest.raises(RuntimeError, match="server setup failed"):
         mcp_serve.run_mcp_server()
     bridge.stop.assert_called_once_with()
+
+
+def test_event_bridge_baseline_rewrite_does_not_replay_carried_history(monkeypatch, tmp_path):
+    """A real transcript rewrite between startup reads is still history."""
+    import mcp_serve
+    from hermes_state import SessionDB
+
+    db_path = tmp_path / "state.db"
+    session_id = "baseline-rewrite"
+    session_key = "agent:main:test:baseline-rewrite"
+    db = SessionDB(db_path)
+    close = db.close
+    try:
+        db.create_session(session_id, "test")
+        db.append_message(session_id, "user", "carried question", timestamp=1)
+        db.append_message(session_id, "assistant", "carried answer", timestamp=2)
+        bridge = mcp_serve.EventBridge()
+        entries = {session_key: {"session_id": session_id, "platform": "test", "origin": {}}}
+        monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: db)
+        monkeypatch.setattr(db, "close", lambda: None)
+        monkeypatch.setattr(bridge, "_refresh_index_and_watermark", lambda _path: (entries, (1.0, 1)))
+
+        active_watermark = db.get_active_message_watermark
+        rewritten = False
+
+        def rewrite_after_cutoff(sid):
+            nonlocal rewritten
+            cutoff = active_watermark(sid)
+            if not rewritten:
+                rewritten = True
+                db.replace_messages(sid, [
+                    {"role": "user", "content": "carried question", "timestamp": 1},
+                    {"role": "assistant", "content": "carried answer", "timestamp": 2},
+                ], active_only=True)
+            return cutoff
+
+        monkeypatch.setattr(db, "get_active_message_watermark", rewrite_after_cutoff)
+        assert bridge._establish_baseline() is True
+        assert rewritten
+        assert bridge._last_poll_timestamps[session_key] == 2
+        db.append_message(session_id, "assistant", "new after startup", timestamp=3)
+        bridge._poll_once(db)
+
+        assert [event["content"] for event in bridge.poll_events()["events"]] == ["new after startup"]
+    finally:
+        close()
+
+
+def test_event_bridge_watcher_uses_escaped_uri_for_literal_path_characters(tmp_path):
+    """The tracked watcher must open the same #/% path it records."""
+    import mcp_serve
+    from pathlib import Path
+
+    home = tmp_path / "hermes#blue%25"
+    home.mkdir()
+    db_path = home / "state.db"
+    _create_test_db(db_path, "escaped-uri", [])
+    unintended = tmp_path / "hermes"
+    sqlite3.connect(str(unintended)).close()
+
+    bridge = mcp_serve.EventBridge()
+    try:
+        assert bridge._sample_state_db_version(db_path, db_path.stat()) is not None
+        watched_path = Path(bridge._state_watch_conn.execute("PRAGMA database_list").fetchone()[2])
+        assert watched_path.resolve() == db_path.resolve()
+        assert unintended.exists()
+    finally:
+        bridge.stop()
+
+
+def test_event_bridge_start_logs_required_index_failure(monkeypatch, tmp_path, caplog):
+    """A fail-closed startup still exposes its required-read cause to operators."""
+    import logging
+
+    import mcp_serve
+
+    tmp_path.joinpath("state.db").touch()
+    bridge = mcp_serve.EventBridge()
+
+    class DB:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+
+    def unreadable_index(_path):
+        raise sqlite3.OperationalError("protected index read failed")
+
+    monkeypatch.setattr(bridge, "_refresh_index_and_watermark", unreadable_index)
+    with caplog.at_level(logging.DEBUG, logger="hermes.mcp_serve"):
+        assert bridge.start() is False
+    assert "protected index read failed" in caplog.text
+
+
+def test_event_bridge_escaped_watcher_delivers_pinned_mtime_commit(tmp_path, monkeypatch):
+    """A literal #/% home still observes a same-tick commit in its own DB."""
+    import mcp_serve
+
+    home = tmp_path / "hermes#blue%25"
+    home.mkdir()
+    sqlite3.connect(str(tmp_path / "hermes")).close()
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: home)
+    session_id = "escaped-watcher-commit"
+    with _baselined_bridge(home, monkeypatch, session_id) as (bridge, db, db_path):
+        baseline_stat = db_path.stat()
+        _commit_reply(db_path, session_id, "escaped watcher reply")
+        _pin_mtime(db_path, baseline_stat)
+        bridge._poll_once(db)
+        events = bridge.poll_events()["events"]
+
+    assert [event["content"] for event in events] == ["escaped watcher reply"]
+
+
+def test_event_bridge_poll_logs_required_index_failure(monkeypatch, tmp_path, caplog):
+    """A retried change tick keeps the required index failure diagnostic."""
+    import logging
+
+    import mcp_serve
+
+    tmp_path.joinpath("state.db").touch()
+    bridge = mcp_serve.EventBridge()
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+
+    def unreadable_index(_path):
+        raise sqlite3.OperationalError("protected poll index read failed")
+
+    monkeypatch.setattr(bridge, "_refresh_index_and_watermark", unreadable_index)
+    with caplog.at_level(logging.DEBUG, logger="hermes.mcp_serve"):
+        bridge._poll_once(object())
+    assert "protected poll index read failed" in caplog.text

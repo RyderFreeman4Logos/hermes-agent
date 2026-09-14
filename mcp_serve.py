@@ -490,6 +490,7 @@ class EventBridge:
             except Exception:
                 # A failed index read is not an empty index and cannot define a
                 # safe startup cohort.
+                logger.debug("EventBridge: startup index read failed", exc_info=True)
                 return False
             cutoffs = {}
             try:
@@ -502,6 +503,7 @@ class EventBridge:
             except Exception:
                 # Never invent a zero cutoff when the real active-row query
                 # cannot establish the startup boundary.
+                logger.debug("EventBridge: startup message watermark read failed", exc_info=True)
                 return False
 
             reads_succeeded = True
@@ -517,11 +519,20 @@ class EventBridge:
                     if cutoff is not None:
                         self._baseline_cutoffs[session_key] = cutoff
                     continue
+                snapshot_ids = [
+                    int(message["id"])
+                    for message in messages
+                    if isinstance(message.get("id"), (int, float))
+                ]
                 cutoff = cutoffs.get(session_key)
-                if cutoff is not None:
-                    # The cutoff snapshot is the startup boundary even when
-                    # this body read succeeds.  A row committed after that
-                    # snapshot belongs to the first polling tick, not history.
+                if cutoff is not None and cutoff > 0 and snapshot_ids and min(snapshot_ids) > cutoff:
+                    # A transcript rewrite retired every row from the active
+                    # watermark and inserted a carried replacement.  The one
+                    # successful body read is its coherent history snapshot.
+                    self._baseline_cutoffs[session_key] = max(snapshot_ids)
+                elif cutoff is not None:
+                    # A normal append after the active-row snapshot remains
+                    # pending for the first poll, as before.
                     self._baseline_cutoffs[session_key] = cutoff
                     messages = [
                         message for message in messages
@@ -625,7 +636,7 @@ class EventBridge:
                 # holds; read-only and isolation_level=None, so watching takes
                 # no lock the gateway's writers could contend with.
                 conn = connect_tracked(
-                    f"file:{db_file}?mode=ro",
+                    f"{db_file.resolve().as_uri()}?mode=ro",
                     tracking_path=db_file,
                     uri=True,
                     check_same_thread=False,
@@ -717,6 +728,7 @@ class EventBridge:
         except Exception:
             # Keep the prior watermark so this change is retried rather than
             # confusing a failed index load with a real empty index.
+            logger.debug("EventBridge: poll index read failed", exc_info=True)
             return
 
         reads_succeeded = True
@@ -734,6 +746,7 @@ class EventBridge:
             except Exception:
                 # A failed required read or conversion leaves the complete
                 # session pending; an already committed sibling stays intact.
+                logger.debug("EventBridge: poll session read failed", exc_info=True)
                 reads_succeeded = False
                 continue
             self._commit_session_events(

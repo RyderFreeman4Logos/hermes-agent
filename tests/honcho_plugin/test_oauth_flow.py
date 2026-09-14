@@ -449,39 +449,41 @@ def test_launcher_runs_flow_in_background_and_reports_connected(monkeypatch, res
 
 
 def test_get_flow_status_reports_stored_connection(tmp_path, monkeypatch, reset_flow):
-    from plugins.memory.honcho import client as honcho_client
-
-    cfgfile = tmp_path / "honcho.json"
-    resolved_raw = []
-
-    def active_host(raw_config=None):
-        resolved_raw.append(raw_config)
-        return "hermes"
-
-    monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: cfgfile)
-    monkeypatch.setattr(honcho_client, "resolve_active_host", active_host)
+    """W10: status reads the active local config without replacing host resolution."""
+    home = tmp_path / "custom-profile"
+    home.mkdir()
+    cfgfile = home / "honcho.json"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_HONCHO_HOST", raising=False)
     monkeypatch.delenv("HONCHO_API_KEY", raising=False)
 
     cfgfile.write_text(json.dumps({"hosts": {"hermes": {}}}))
-    assert oauth_flow.get_flow_status()["connected"] is False
+    status = oauth_flow.get_flow_status()
+    assert status == {"state": "idle", "detail": "", "connected": False, "auth": None}
 
     cfgfile.write_text(json.dumps({"hosts": {"hermes": {"apiKey": "hch-v3-static"}}}))
-    s = oauth_flow.get_flow_status()
-    assert s["connected"] is True and s["auth"] == "apikey"
+    status = oauth_flow.get_flow_status()
+    assert status == {"state": "idle", "detail": "", "connected": True, "auth": "apikey"}
 
     cfgfile.write_text(json.dumps({"hosts": {"hermes": {
         "apiKey": "hch-at-tok",
         "oauth": {"refreshToken": "hch-rt-x", "expiresAt": 9_999_999_999,
                   "clientId": "hermes-desktop", "tokenEndpoint": "http://x/oauth/token"},
     }}}))
-    s = oauth_flow.get_flow_status()
-    assert s["connected"] is True and s["auth"] == "oauth"
-    assert resolved_raw[-1] == {
-        "hosts": {"hermes": {
-            "apiKey": "hch-at-tok",
-            "oauth": {"refreshToken": "hch-rt-x", "expiresAt": 9_999_999_999,
-                      "clientId": "hermes-desktop", "tokenEndpoint": "http://x/oauth/token"},
-        }},
+    status = oauth_flow.get_flow_status()
+    assert status == {"state": "idle", "detail": "", "connected": True, "auth": "oauth"}
+
+    oauth_flow._set_status("pending", "waiting for browser consent")
+    pending = oauth_flow.get_flow_status()
+    assert pending == {
+        "state": "pending", "detail": "waiting for browser consent",
+        "connected": True, "auth": "oauth",
+    }
+    oauth_flow._set_status("error", "loopback transport failed")
+    failed = oauth_flow.get_flow_status()
+    assert failed == {
+        "state": "error", "detail": "loopback transport failed",
+        "connected": True, "auth": "oauth",
     }
 
 

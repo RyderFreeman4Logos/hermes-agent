@@ -16,6 +16,7 @@ chosen ``user_peer_id`` can be asserted without touching the network.
 
 import hashlib
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 
@@ -636,3 +637,38 @@ def test_cache_busting_oversized_honcho_snapshot_tracks_content(tmp_path, monkey
     assert first == again
     assert first["honcho.overflow_content"] != second["honcho.overflow_content"]
     assert second["honcho.peer_name"] is None
+
+
+def test_cache_busting_null_snapshot_never_reopens_to_new_identity(tmp_path, monkeypatch):
+    """A null read is invalid snapshot data, not permission to reopen a newer file."""
+    from gateway.run import GatewayRunner
+
+    path = tmp_path / "honcho.json"
+    path.write_text("null")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+    original_open = Path.open
+    swapped = False
+
+    class SwitchingReader:
+        def __init__(self, stream): self._stream = stream
+        def read(self, *args, **kwargs):
+            nonlocal swapped
+            value = self._stream.read(*args, **kwargs)
+            if not swapped:
+                path.write_text(json.dumps({"apiKey": "k", "peerName": "Bob"}))
+                swapped = True
+            return value
+        def __enter__(self): return self
+        def __exit__(self, *args): return self._stream.__exit__(*args)
+        def __getattr__(self, name): return getattr(self._stream, name)
+
+    def switching_open(self, *args, **kwargs):
+        stream = original_open(self, *args, **kwargs)
+        return SwitchingReader(stream) if self == path and (args[0] if args else kwargs.get("mode")) == "rb" else stream
+
+    monkeypatch.setattr(Path, "open", switching_open)
+    result = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+    assert swapped
+    assert result["honcho.peer_name"] is None
+    assert result["honcho.overflow_content"] is None

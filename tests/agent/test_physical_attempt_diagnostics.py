@@ -104,7 +104,7 @@ def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
         json.loads(line)
         for line in (
             tmp_path / "observability" / "physical_attempt_digests.jsonl"
-        ).read_text().splitlines()
+        ).read_text(encoding="utf-8").splitlines()
     ]
     pair = next(record for record in records if record["phase"] == "pair")
     assert [record["timestamp_ns"] for record in records] == [101, 102, 103, 104]
@@ -222,7 +222,7 @@ def test_pair_classifies_first_changed_tools_segment(monkeypatch, tmp_path):
         json.loads(line)
         for line in (
             tmp_path / "observability" / "physical_attempt_digests.jsonl"
-        ).read_text().splitlines()
+        ).read_text(encoding="utf-8").splitlines()
     ]
     pair = next(record for record in records if record["phase"] == "pair")
     assert pair["first_differing_segment"] == "tools"
@@ -272,7 +272,7 @@ def test_pair_distinguishes_later_history_from_complete_equality(monkeypatch, tm
         json.loads(line)
         for line in (
             tmp_path / "observability" / "physical_attempt_digests.jsonl"
-        ).read_text().splitlines()
+        ).read_text(encoding="utf-8").splitlines()
     ]
     pairs = [record for record in records if record["phase"] == "pair"]
     assert [pair["first_differing_segment"] for pair in pairs] == [
@@ -364,7 +364,10 @@ def test_retention_stays_bounded_for_unique_correlations_and_records(
     )
     assert all(character in "0123456789abcdef" for key in diagnostics._LAST_ATTEMPT for character in "".join(key[2:]))
     assert records_path.stat().st_size <= 1024
-    assert all(json.loads(line)["phase"] == "attempt" for line in records_path.read_text().splitlines())
+    assert all(
+        json.loads(line)["phase"] == "attempt"
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+    )
 
 
 def test_persisted_labels_redact_url_encoded_and_credential_shaped_values(

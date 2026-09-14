@@ -215,14 +215,128 @@ def test_second_read_failure_keeps_nous_selection_out_of_direct_fal_sink(isolate
     direct.submit.assert_not_called()
 
 @pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
-def test_cold_nonmissing_read_failure_returns_empty_for_both_raw_apis(isolated_hermes_home, monkeypatch, reader_name):
-    """Cold non-missing I/O faults retain the established empty raw contract."""
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize("fault_phase", [1, 2], ids=["digest", "parser"])
+@pytest.mark.parametrize(
+    ("fault_name", "fault_type"),
+    [("missing", FileNotFoundError), ("denied", PermissionError)],
+)
+def test_raw_reader_phase_fault_outcome_matrix(
+    isolated_hermes_home,
+    monkeypatch,
+    reader_name,
+    warm,
+    fault_phase,
+    fault_name,
+    fault_type,
+):
+    """W5: both public readers keep their distinct missing and last-good contracts.
+
+    ``_digest_file`` and the YAML parser intentionally open the same real file
+    separately.  This wrapper forwards every other operation and faults the
+    first ``read`` of exactly one counted ``rb`` handle, so the assertion is
+    about the public raw APIs rather than a mocked reader implementation.
+    """
     from hermes_cli import config as config_mod
+
     cfg = _write_config(isolated_hermes_home, {"image_gen": {"provider": "nous"}})
+    reader = getattr(config_mod, reader_name)
+    last_good = {"image_gen": {"provider": "nous"}}
+    if warm:
+        assert reader() == last_good
+        _write_config(isolated_hermes_home, {"image_gen": {"provider": "krea"}})
+
     original_open = Path.open
-    def deny(self, *args, **kwargs):
-        if self == cfg:
-            raise PermissionError("cold config denied")
-        return original_open(self, *args, **kwargs)
-    monkeypatch.setattr(Path, "open", deny)
+    target_opens = 0
+    fault_reads = 0
+
+    class PhaseFaultReader:
+        def __init__(self, source):
+            self._source = source
+
+        def read(self, size=-1):
+            nonlocal fault_reads
+            fault_reads += 1
+            if fault_reads == 1:
+                raise fault_type(f"{fault_name} phase-{fault_phase} read")
+            return self._source.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._source.close()
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
+    def phase_fault_open(self, *args, **kwargs):
+        nonlocal target_opens
+        source = original_open(self, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if self == cfg and mode == "rb":
+            target_opens += 1
+            if target_opens == fault_phase:
+                return PhaseFaultReader(source)
+        return source
+
+    monkeypatch.setattr(Path, "open", phase_fault_open)
+    result = reader()
+
+    assert target_opens == fault_phase
+    assert fault_reads == 1
+    if fault_type is FileNotFoundError or not warm:
+        assert result == {}
+    else:
+        assert result == last_good
+
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_malformed_raw_yaml_does_not_admit_a_digest_or_replace_last_good(
+    isolated_hermes_home, reader_name
+):
+    """W5: a malformed revision is empty, while the prior valid mapping survives."""
+    from hermes_cli import config as config_mod
+
+    cfg = isolated_hermes_home / "config.yaml"
+    valid = "image_gen:\n  provider: nous\n"
+    malformed = "image_gen: [nous\n"
+    cfg.write_text(valid, encoding="utf-8")
+    reader = getattr(config_mod, reader_name)
+    first = reader()
+    assert first == {"image_gen": {"provider": "nous"}}
+
+    cfg.write_text(malformed, encoding="utf-8")
+    assert reader() == {}
+
+    cfg.write_text(valid, encoding="utf-8")
+    restored = reader()
+    assert restored == first
+    if reader_name == "read_raw_config_readonly":
+        assert restored is first
+
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_nonmapping_raw_yaml_cannot_retire_an_outstanding_parse_refusal(
+    isolated_hermes_home, monkeypatch, reader_name
+):
+    """W5: normalizing a valid non-mapping root must preserve the real refusal."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.auth import AuthError, resolve_provider
+
+    cfg = isolated_hermes_home / "config.yaml"
+    broken = "model: [openrouter"
+    nonmapping = "[]".ljust(len(broken))
+    cfg.write_text(broken, encoding="utf-8")
+    broken_stat = cfg.stat()
+    config_mod.load_config()
+    assert config_mod.get_active_config_parse_failure()
+
+    cfg.write_text(nonmapping, encoding="utf-8")
+    os.utime(cfg, ns=(broken_stat.st_atime_ns, broken_stat.st_mtime_ns))
     assert getattr(config_mod, reader_name)() == {}
+    assert config_mod.get_active_config_parse_failure()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-FAKE1234567890")
+    with pytest.raises(AuthError, match="corrupt"):
+        resolve_provider("auto")

@@ -1845,7 +1845,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
-        override_snapshot = None
+        runtime_snapshot = None
         try:
             from agent.auxiliary_client import resolve_provider_client
             from hermes_cli.fallback_config import resolve_entry_api_key
@@ -1879,7 +1879,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
             from agent.agent_runtime_helpers import _copy_request_overrides
             live_overrides = getattr(agent, "request_overrides", {}) or {}
-            override_snapshot = _copy_request_overrides(live_overrides)
+            runtime_snapshot = {
+                "model": agent.model, "provider": agent.provider,
+                "requested_provider": getattr(agent, "requested_provider", agent.provider),
+                "base_url": agent.base_url, "api_mode": agent.api_mode,
+                "api_key": getattr(agent, "api_key", None), "client": getattr(agent, "client", None),
+                "client_kwargs": dict(getattr(agent, "_client_kwargs", {}) or {}),
+                "request_overrides": _copy_request_overrides(live_overrides),
+                "fallback_activated": getattr(agent, "_fallback_activated", False),
+                "reasoning_echo": getattr(agent, "_reasoning_echo_flag", False),
+                "config_context_length": getattr(agent, "_config_context_length", None),
+            }
             if not getattr(agent, "_fallback_activated", False):
                 primary_runtime = getattr(agent, "_primary_runtime", None)
                 if isinstance(primary_runtime, dict):
@@ -1934,9 +1944,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
             return True
         except Exception as e:
-            if override_snapshot is not None:
+            if runtime_snapshot is not None:
                 with contextlib.suppress(Exception):
-                    agent.request_overrides = override_snapshot
+                    agent.model = runtime_snapshot["model"]
+                    agent.provider = runtime_snapshot["provider"]
+                    agent.requested_provider = runtime_snapshot["requested_provider"]
+                    agent.base_url = runtime_snapshot["base_url"]
+                    agent.api_mode = runtime_snapshot["api_mode"]
+                    agent.api_key = runtime_snapshot["api_key"]
+                    agent.client = runtime_snapshot["client"]
+                    agent._client_kwargs = runtime_snapshot["client_kwargs"]
+                    agent.request_overrides = runtime_snapshot["request_overrides"]
+                    agent._fallback_activated = runtime_snapshot["fallback_activated"]
+                    agent._reasoning_echo_flag = runtime_snapshot["reasoning_echo"]
+                    agent._config_context_length = runtime_snapshot["config_context_length"]
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)

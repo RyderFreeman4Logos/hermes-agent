@@ -433,12 +433,13 @@ class ProcessSession:
     def mark_exited(self, exit_code, reason: str = "exited", source: str = "") -> None:
         """Record an exit. A kill that raced the observer already recorded its own
         exit_code/reason; never overwrite it."""
+        if self.exited:
+            return
         self.exited = True
-        if self.completion_reason != "killed":
-            self.exit_code = exit_code
-            self.completion_reason = reason
-            if source:
-                self.termination_source = source
+        self.exit_code = exit_code
+        self.completion_reason = reason
+        if source:
+            self.termination_source = source
 
 
 # Watcher routing fields, in event-dict key order (``watcher_<key>`` on the session).
@@ -1755,7 +1756,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # terminate() can race that reader's natural reap and then raise;
             # neither death nor signal delivery is attributable here, so leave
             # completion and authoritative exit metadata to the reader.
-            if not session.exited and session._pty is None:
+            # A pipe reader owns the decoder cutoff and terminal publication.  An
+            # error after a signal must not consume or label its still-unread tail.
+            reader = getattr(session, "_reader_thread", None)
+            if not session.exited and session._pty is None and reader is None:
                 waitable = getattr(session, "process", None)
                 wait_rc = None
                 if waitable is not None:

@@ -289,6 +289,9 @@ def test_failed_fallback_restores_original_request_overrides_deeply():
     ):
         assert try_activate_fallback(agent) is False
 
+    assert (agent.model, agent.provider, agent.base_url) == (
+        "x-ai/grok-4", "openrouter", "https://openrouter.ai/api/v1"
+    )
     assert agent.request_overrides == original
     agent.request_overrides["extra_body"]["nested"]["value"] = "mutated"
     assert original["extra_body"]["nested"]["value"] == "primary"

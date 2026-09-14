@@ -45,10 +45,7 @@ def is_hidden_loop_timing(message: Any) -> bool:
     return (
         isinstance(message, dict)
         and message.get("role") == "system"
-        and (
-            message.get("display_kind") == "hidden"
-            or str(message.get("content", "")).startswith(
-                "[Agent loop timing]\nCurrent loop start:"
-            )
+        and str(message.get("content", "")).startswith(
+            "[Agent loop timing]\nCurrent loop start:"
         )
     )

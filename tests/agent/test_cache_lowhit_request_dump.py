@@ -95,7 +95,12 @@ def _assert_fingerprint_only(payload: dict[str, Any], *secrets: str) -> None:
         assert isinstance(fingerprint, str) and len(fingerprint) == 64
         int(fingerprint, 16)
         assert sizes
-        assert request.get("model") == "grok-4.6"
+        model = request.get("model")
+        assert isinstance(model, str) and model
+        assert model != "grok-4.6"
+        if model != "unknown":
+            assert len(model) == 64
+            int(model, 16)
 
 
 def test_near_zero_zero_read_dumps_last_two_fingerprints(monkeypatch, tmp_path):
@@ -234,6 +239,47 @@ def test_remember_sent_request_enabled_is_digest_only(monkeypatch, tmp_path):
     assert dump._LAST
     text = json.dumps(list(dump._LAST))
     assert "ISSUE108-PRIVATE-SENTINEL" not in text
+    assert "grok-4.6" not in text
+
+
+def test_maybe_dump_on_usage_default_off_skips_mkdir_key_and_dump_after_prior_enabled_buffer(
+    monkeypatch, tmp_path
+):
+    from agent import cache_lowhit_request_dump as dump
+    from hermes_cli import config
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "agent.physical_attempt_diagnostics.get_hermes_home",
+        lambda: tmp_path,
+    )
+    enabled = {"value": True}
+    monkeypatch.setattr(dump, "enabled", lambda: enabled["value"])
+    key_calls = []
+    real_key = dump._key
+
+    def counted_key():
+        key_calls.append(1)
+        return real_key()
+
+    monkeypatch.setattr(dump, "_key", counted_key)
+    dump.reset_for_tests()
+    _remember_pair(dump, "UNREDACTED-PREFIX-A", "UNREDACTED-PREFIX-B")
+    assert dump._LAST
+    assert key_calls
+
+    enabled["value"] = False
+    key_calls.clear()
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": False}}},
+    )
+    _dump(dump, cache_read=0, prompt=10_000)
+
+    assert key_calls == []
+    assert not (tmp_path / "observability" / "cache_lowhit").exists()
+    assert not list(tmp_path.rglob("*.json"))
 
 
 def test_relay_record_attempt_default_off_creates_neither_directory_nor_key(monkeypatch, tmp_path):

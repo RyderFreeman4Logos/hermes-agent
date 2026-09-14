@@ -1443,6 +1443,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._credential_pool = None
         child.run_conversation.return_value = {
             "final_response": "Billing or credits exhausted: xAI spending-limit body",
+            "error": "xAI spending-limit body",
             "billing_block": {"provider": "xai-oauth"},
             "completed": False,
             "failed": True,
@@ -1459,6 +1460,12 @@ class TestChildCredentialLeasing(unittest.TestCase):
         )
 
         self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertNotIn("xAI spending-limit body", result.get("error", ""))
+        self.assertNotIn("billing_block", result)
+        self.assertEqual(
+            result["error"],
+            "Subagent failed with a provider error unrelated to its effective model.",
+        )
 
     def test_standard_child_hides_unverified_xai_fallback_terminal(self):
         """A standard child must not relay an xAI fallback's unverified terminal (#209)."""
@@ -1471,6 +1478,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._credential_pool = None
         child.run_conversation.return_value = {
             "final_response": "Provider reported usage/credit exhaustion (unverified): xAI spending-limit body",
+            "error": "xAI spending-limit body",
             "billing_block": {"provider": "xai-oauth"},
             "billing_unverified": True,
             "completed": False,
@@ -1488,6 +1496,12 @@ class TestChildCredentialLeasing(unittest.TestCase):
         )
 
         self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertNotIn("xAI spending-limit body", result.get("error", ""))
+        self.assertNotIn("billing_block", result)
+        self.assertEqual(
+            result["error"],
+            "Subagent failed after an unverified provider billing error.",
+        )
         self.assertIsNone(result["model"])
 
 

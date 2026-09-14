@@ -104,7 +104,7 @@ class FileAwareEnv:
         if path.endswith("/hermes_tools.py"):
             self.hold_once("before_launch_admission")
 
-    def execute(self, command, cwd=None, timeout=None):
+    def execute(self, command, cwd=None, timeout=None, **_kwargs):
         del cwd, timeout
         with self._lock:
             self.commands.append(command)
@@ -138,11 +138,15 @@ class FileAwareEnv:
         if command.startswith("echo '") and "base64 -d >" in command:
             encoded = command.split("'", 2)[1]
             decoded = base64.b64decode(encoded).decode("utf-8")
-            target = command.split("base64 -d >", 1)[1].split(".tmp", 1)[0].strip()
-            self.hold_once("rpc_response_rename")
+            raw_target = command.split("base64 -d >", 1)[1].split("&&", 1)[0].strip()
+            target = raw_target.removesuffix(".tmp")
+            is_rpc_response = "/rpc/res_" in target
+            if is_rpc_response:
+                self.hold_once("rpc_response_rename")
             with self._lock:
                 self.files[target] = decoded
-            self.rpc_done.set()
+            if is_rpc_response:
+                self.rpc_done.set()
             return {"output": "", "returncode": 0}
         if command.startswith("pkill -TERM"):
             if self.before_kill is not None:
@@ -1590,6 +1594,95 @@ class TestDispatchIntegration(unittest.TestCase):
             result = json.loads(_execute_remote("print()", "t", ["read_file"]))
         self.assertEqual(result["status"], "success")
         self.assertIn("per-call ran", result["output"])
+
+    def test_spawn_unavailable_fallback_uses_unique_real_rpc_namespaces(self):
+        """W12: safe fallback keeps one real RPC/result path per invocation."""
+        from tools.code_execution_tool import _execute_remote
+        import tools.terminal_tool as terminal_tool
+
+        class FallbackEnv(FileAwareEnv):
+            def __init__(self):
+                super().__init__()
+                self.fallback_dirs = []
+                self.terminal_commands = []
+
+            def execute(self, command, cwd=None, timeout=None, **kwargs):
+                if "nohup" in command:
+                    with self._lock:
+                        self.commands.append(command)
+                        self.spawn_count += 1
+                    return {"output": "runner started without a usable pid\n", "returncode": 0}
+                if "python3 script.py" in command:
+                    with self._lock:
+                        self.commands.append(command)
+                    assignments = {
+                        part.split("=", 1)[0]: part.split("=", 1)[1]
+                        for part in shlex.split(command)
+                        if part.startswith(("HERMES_RPC_DIR=", "HERMES_RPC_TOKEN="))
+                    }
+                    rpc_dir = assignments["HERMES_RPC_DIR"]
+                    rpc_token = assignments["HERMES_RPC_TOKEN"]
+                    self.fallback_dirs.append(rpc_dir.rsplit("/rpc", 1)[0])
+                    request_path = f"{rpc_dir}/req_000001"
+                    with self._lock:
+                        self.files[request_path] = json.dumps({
+                            "token": rpc_token,
+                            "seq": 1,
+                            "tool": "terminal",
+                            "args": {"command": "printf w12-real-dispatch"},
+                        })
+                    if not self.rpc_done.wait(5):
+                        raise AssertionError("real per-call RPC did not publish its response")
+                    response_path = f"{rpc_dir}/res_000001"
+                    with self._lock:
+                        response = self.files[response_path]
+                    self.rpc_done.clear()
+                    return {"output": response, "returncode": 0}
+                if command == "printf w12-real-dispatch":
+                    with self._lock:
+                        self.commands.append(command)
+                        self.terminal_commands.append(command)
+                    return {"output": "w12-dispatched", "returncode": 0}
+                return super().execute(command, cwd=cwd, timeout=timeout, **kwargs)
+
+        env = FallbackEnv()
+        terminal_config = {
+            "env_type": "ssh", "cwd": "/", "host_cwd": None, "timeout": 30,
+            "lifetime_seconds": 300, "docker_mount_cwd_to_workspace": False,
+            "docker_volumes": [], "docker_shared_container_key": "",
+        }
+        with terminal_tool._env_lock:
+            previous_envs = dict(terminal_tool._active_environments)
+            previous_activity = dict(terminal_tool._last_activity)
+            terminal_tool._active_environments.clear()
+            terminal_tool._last_activity.clear()
+            terminal_tool._active_environments["default"] = env
+        try:
+            with patch("tools.code_execution_tool._load_config",
+                       return_value={"timeout": 30, "max_tool_calls": 5}), \
+                 patch("tools.code_execution_tool._get_or_create_env",
+                       return_value=(env, "ssh")), \
+                 patch("tools.terminal_tool._get_env_config", return_value=terminal_config):
+                results = [
+                    json.loads(_execute_remote("fallback", "w12-owner", ["terminal"]))
+                    for _ in range(2)
+                ]
+        finally:
+            with terminal_tool._env_lock:
+                terminal_tool._active_environments.clear()
+                terminal_tool._active_environments.update(previous_envs)
+                terminal_tool._last_activity.clear()
+                terminal_tool._last_activity.update(previous_activity)
+
+        self.assertEqual([result["status"] for result in results], ["success", "success"])
+        self.assertTrue(all("w12-dispatched" in result["output"] for result in results))
+        self.assertEqual([result["tool_calls_made"] for result in results], [1, 1])
+        self.assertEqual(env.terminal_commands, ["printf w12-real-dispatch"] * 2)
+        self.assertEqual(len(env.fallback_dirs), 2)
+        self.assertEqual(len(set(env.fallback_dirs)), 2)
+        self.assertTrue(all("/hermes_exec_" in path for path in env.fallback_dirs))
+        self.assertEqual(sum("python3 script.py" in command for command in env.commands), 2)
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
 
 
 if __name__ == "__main__":

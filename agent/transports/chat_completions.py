@@ -358,7 +358,8 @@ class ChatCompletionsTransport(ProviderTransport):
             sanitized_pairs.append((message, sanitized))
         if all(s is None for _, s in sanitized_pairs):
             return messages
-        return [m if s is None else s for m, s in sanitized_pairs]
+        from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
+        return drop_thinking_only_and_merge_users([m if s is None else s for m, s in sanitized_pairs])
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Tools are already in OpenAI format — identity."""

@@ -216,21 +216,27 @@ def assemble_api_request(
         tools_for_api = _initial_cache_plan.tools
 
     from agent.conversation_loop import _drop_redundant_previous_loop_start
+    from agent.message_metadata import LOOP_TIMING_TURN_ID, is_hidden_loop_timing
     _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
     if _loop_timing_text:
         persisted = getattr(agent, "_loop_timing_persisted_text", "") or ""
         if not persisted:
             persisted = _drop_redundant_previous_loop_start(_loop_timing_text, messages)
             agent._loop_timing_persisted_text = persisted
+        event_id = str(getattr(agent, "_current_turn_id", "") or "")
         if persisted and not any(
-            isinstance(message, dict)
-            and message.get("role") == "system"
-            and message.get("content") == persisted
+            is_hidden_loop_timing(message)
+            and (
+                (event_id and isinstance(message.get("display_metadata"), dict)
+                 and message["display_metadata"].get(LOOP_TIMING_TURN_ID) == event_id)
+                or (not event_id and message.get("content") == persisted)
+            )
             for message in messages
         ):
             api_messages.append({"role": "system", "content": persisted})
             messages.append(
-                {"role": "system", "content": persisted, "display_kind": "hidden"}
+                {"role": "system", "content": persisted, "display_kind": "hidden",
+                 "display_metadata": {LOOP_TIMING_TURN_ID: event_id} if event_id else {}},
             )
 
     # Prepare the persistent-MoA request before measuring compression pressure: the

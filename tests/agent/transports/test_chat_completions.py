@@ -1,6 +1,7 @@
 """Tests for the ChatCompletionsTransport."""
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import httpx
@@ -133,6 +134,43 @@ class TestChatCompletionsBasic:
         assert payload["messages"][-1]["content"] == history[-1]["content"]
         assert history[-1]["role"] == "system"
         assert payload["messages"] is not history
+
+    def test_build_kwargs_coalesces_demoted_timing_with_adjacent_user(self, transport):
+        history = [
+            {"role": "system", "content": "stable instructions"},
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "[Agent loop timing] current"},
+        ]
+        payload = transport.build_kwargs(model="test/model", messages=history)
+        assert [message["role"] for message in payload["messages"]] == ["system", "user"]
+        assert payload["messages"][-1]["content"] == "hello\n\n[Agent loop timing] current"
+        assert history[-1]["role"] == "system"
+
+    def test_build_kwargs_keeps_marked_blocks_when_coalescing_timing(self, transport):
+        history = [
+            {"role": "system", "content": "stable instructions"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+                ],
+            },
+            {
+                "role": "system",
+                "content": "[Agent loop timing] current",
+                "display_kind": "hidden",
+            },
+        ]
+        original = deepcopy(history)
+
+        payload = transport.build_kwargs(model="test/model", messages=history)
+
+        assert [message["role"] for message in payload["messages"]] == ["system", "user"]
+        assert payload["messages"][-1]["content"] == [
+            {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "[Agent loop timing] current"},
+        ]
+        assert history == original
 
 
 

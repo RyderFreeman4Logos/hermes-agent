@@ -9,6 +9,7 @@ from typing import Any, MutableMapping, Optional, TypeVar
 # These fields describe Hermes' durable record, not provider-visible message
 # content. They must not influence context-pressure decisions.
 PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp"})
+LOOP_TIMING_TURN_ID = "loop_timing_turn_id"
 
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
 
@@ -37,3 +38,13 @@ def append_message(
     """Stamp and append one live transcript message."""
     messages.append(stamp_message_timestamp(message, timestamp=timestamp))
     return message
+
+
+def is_hidden_loop_timing(message: Any) -> bool:
+    """Whether a durable hidden system row is the loop-timing projection."""
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "system"
+        and message.get("display_kind") == "hidden"
+        and "[Agent loop timing]" in str(message.get("content", ""))
+    )

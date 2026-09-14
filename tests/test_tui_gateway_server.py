@@ -4628,6 +4628,28 @@ def test_startup_runtime_does_not_call_network_detector(monkeypatch):
     assert provider in {None, "anthropic"}
 
 
+def _await_entered_phase(entered, thread, *, timeout=5.0, name="entered phase"):
+    """Wait on *entered*; timeout is a deadlock guard, not the pass signal.
+
+    A worker that dies without publishing the phase still fails. Slice the
+    wait so a dead thread is observed before the guard elapses.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if entered.wait(timeout=min(0.05, remaining)):
+            return
+        if not thread.is_alive() and not entered.is_set():
+            raise AssertionError(f"worker died without entering {name}")
+    if entered.is_set():
+        return
+    if not thread.is_alive():
+        raise AssertionError(f"worker died without entering {name}")
+    raise AssertionError(f"deadlock waiting for {name}")
+
+
 def _session(agent=None, **extra):
     return {
         "agent": agent if agent is not None else types.SimpleNamespace(),
@@ -4700,7 +4722,7 @@ def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
     thread.start()
     acquired = False
     try:
-        assert teardown_started.wait(timeout=1.0)
+        _await_entered_phase(teardown_started, thread, name="slow-close teardown")
         assert "slow-close" not in server._sessions
         acquired = server._session_resume_lock.acquire(timeout=0.2)
         assert acquired, "slow teardown kept the global resume lock held"
@@ -4753,7 +4775,7 @@ def test_session_close_settles_active_turn_before_teardown(monkeypatch):
     run_thread.start()
     close_thread.start()
     try:
-        assert turn_started.wait(timeout=1.0)
+        _await_entered_phase(turn_started, run_thread, name="settle-close turn")
         assert not teardown_started.wait(timeout=0.1)
         release_turn.set()
         close_thread.join(timeout=2.0)
@@ -5102,7 +5124,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     thread.start()
     acquired = False
     try:
-        assert teardown_started.wait(timeout=1.0)
+        _await_entered_phase(teardown_started, thread, name="ws_orphan teardown")
         assert "slow-orphan" not in server._sessions
         acquired = server._session_resume_lock.acquire(timeout=0.2)
         assert acquired, "orphan teardown kept the global resume lock held"
@@ -7468,7 +7490,7 @@ def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
 
     try:
         dispatch_thread.start()
-        assert emit_entered.wait(timeout=1.0)
+        _await_entered_phase(emit_entered, dispatch_thread, name="message.start emit")
         popped.append(server._pop_session_by_id(sid))
         assert popped == [session]
         release_emit.set()
@@ -7484,6 +7506,24 @@ def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     assert dispatch_results == [False]
     assert session["running"] is False
     assert turns == []
+
+
+def test_await_entered_phase_fails_when_worker_dies_without_signal():
+    """Dead worker without the phase event must fail; timeout is not a pass."""
+    entered = threading.Event()
+
+    def _die():
+        return
+
+    thread = threading.Thread(target=_die)
+    thread.start()
+    try:
+        with pytest.raises(AssertionError, match="died without entering"):
+            _await_entered_phase(entered, thread, timeout=5.0)
+    finally:
+        thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert not entered.is_set()
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])

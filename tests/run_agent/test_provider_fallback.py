@@ -671,3 +671,16 @@ class TestFallbackExtraBodyReResolution:
         assert agent._cached_system_prompt == "Model: a-model\nProvider: custom:a"
         assert agent._pending_fallback_notice == ["A notice"]
         assert agent._consecutive_stale_streams == 4
+
+        # Exercise the request-local physical transport key without opening a
+        # socket.  The next native request must be constructed from A's restored
+        # credential and endpoint rather than B's rejected client state.
+        request_client = MagicMock(name="A-request-client")
+        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False), patch.object(
+            agent, "_checkout_request_slot", return_value=(None, None)
+        ), patch.object(
+            agent, "_build_anthropic_client_for_key", return_value=request_client
+        ) as build_client, patch.object(agent, "_store_request_slot"):
+            assert agent._create_request_anthropic_client(reason="post-rejected-fallback") is request_client
+        built_key = build_client.call_args.args[0]
+        assert built_key[:3] == ("direct", "a-key", a_url)

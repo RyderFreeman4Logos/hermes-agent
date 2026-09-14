@@ -1883,11 +1883,13 @@ class TestKillProcess:
         session.notify_on_complete = True
         session.systemd_unit = "hermes-worker-test.scope"
         visible = []
+        drained = []
         original_put = registry.completion_queue.put
 
         def inspect_put(event):
             visible.append(registry.is_completion_consumed(session.id))
             original_put(event)
+            drained.append(registry.drain_notifications(skip_poll_observed=False))
 
         monkeypatch.setattr(registry.completion_queue, "put", inspect_put)
         try:
@@ -1895,6 +1897,7 @@ class TestKillProcess:
             assert result["status"] == "killed"
             assert stopped == ["hermes-worker-test.scope"]
             assert visible == [consume_output]
+            assert [len(batch) for batch in drained] == [0 if consume_output else 1]
         finally:
             self._reap_child(session.process)
 
@@ -1987,7 +1990,7 @@ class TestKillProcess:
     def test_public_observer_waits_for_pipe_reader_terminal_owner(
         self, registry, monkeypatch, tmp_path, observer
     ):
-        """R8: poll/wait cannot publish while the real reader owns cutoff."""
+        """R8: poll/wait cannot publish while a signalled reader owns cutoff."""
         monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
         monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
         entered_finish = threading.Event()
@@ -2001,9 +2004,20 @@ class TestKillProcess:
 
         monkeypatch.setattr(registry, "_finish_reader", held_finish)
         session = registry.spawn_local(
-            f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(0.1)'", cwd=str(tmp_path)
+            f"{shlex.quote(sys.executable)} -c "
+            "'import signal,time; "
+            "signal.signal(signal.SIGTERM, lambda *_: (print(\"final-tail\", flush=True), raise_exit())); "
+            "exec(\"def raise_exit():\\n raise SystemExit(0)\"); "
+            "print(\"ready\", flush=True); time.sleep(60)'",
+            cwd=str(tmp_path),
         )
         session.notify_on_complete = True
+        assert _wait_until(lambda: "ready" in session.output_buffer)
+        kill_result = {}
+        killer = threading.Thread(target=lambda: kill_result.update(
+            registry.kill_process(session.id, source="test.reader.owner", consume_output=False)
+        ))
+        killer.start()
         assert entered_finish.wait(2)
         observer_result = {}
         observe = registry.poll if observer == "poll" else lambda sid: registry.wait(sid, timeout=2)
@@ -2013,9 +2027,15 @@ class TestKillProcess:
         assert poller.is_alive(), "poll stole terminal ownership before the reader cutoff"
         release_finish.set()
         poller.join(timeout=2)
+        killer.join(timeout=2)
         assert not poller.is_alive()
+        assert not killer.is_alive()
         assert observer_result["status"] == "exited"
-        assert (session.completion_reason, session.termination_source) == ("exited", "")
+        assert (session.exit_code, session.completion_reason, session.termination_source) == (
+            0, "killed", "test.reader.owner"
+        )
+        assert "final-tail" in observer_result.get("output", observer_result.get("output_preview", ""))
+        assert kill_result["termination_source"] == "test.reader.owner"
         assert registry.completion_queue.qsize() == 1
 
 

@@ -13,6 +13,8 @@ import pytest
 from agent.error_classifier import ClassifiedError, FailoverReason
 from run_agent import AIAgent
 from tools.delegate_tool import _build_child_agent, _run_single_child, delegate_task
+from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
+from tools.delegate_tool_progress import _ChildProgressRelay
 
 PRIMARY = {
     "provider": "primary-provider",
@@ -874,3 +876,38 @@ def test_delegate_result_keeps_primary_success_identity_after_failed_fallback():
 
     assert result["model"] == PRIMARY["model"]
     assert result["provider"] == PRIMARY["provider"]
+
+
+def test_app_server_success_projects_unknown_identity_without_erasing_known_route():
+    """An app-server completion has no selected route, even after known success."""
+    child = SimpleNamespace(
+        api_mode="codex_app_server",
+        _delegate_successful_llm_route=(PRIMARY["model"], PRIMARY["provider"]),
+        session_estimated_cost_usd=0, session_cost_status=None,
+        session_prompt_tokens=0, session_completion_tokens=0, _delegate_role="leaf",
+    )
+    result = {"completed": True, "final_response": "app-server result", "codex_turn_id": None}
+    entry = _build_result_entry(child, result, 0, 0.1, _SchemaOutcome(None, None, [], 0))
+
+    assert (entry["model"], entry["provider"]) == (None, None)
+    assert child._delegate_successful_llm_route == (PRIMARY["model"], PRIMARY["provider"])
+    relay = _ChildProgressRelay(
+        0, "task", None, None, 1, "subagent", None, 0, "cached-model", None, {"child": child}
+    )
+    assert relay._identity_kwargs()["model"] is None
+    assert relay._identity_kwargs()["provider"] is None
+
+
+def test_app_server_failure_keeps_last_known_success_identity():
+    """Unknown app-server success does not erase K needed by a later failure."""
+    child = SimpleNamespace(
+        api_mode="codex_app_server",
+        _delegate_successful_llm_route=(PRIMARY["model"], PRIMARY["provider"]),
+        session_estimated_cost_usd=0, session_cost_status=None,
+        session_prompt_tokens=0, session_completion_tokens=0, _delegate_role="leaf",
+    )
+    entry = _build_result_entry(
+        child, {"failed": True, "error": "later app-server failure", "codex_turn_id": None},
+        0, 0.1, _SchemaOutcome(None, None, [], 0),
+    )
+    assert (entry["model"], entry["provider"]) == (PRIMARY["model"], PRIMARY["provider"])

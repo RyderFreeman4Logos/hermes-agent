@@ -487,7 +487,20 @@ def _build_result_entry(
     _cost_status = getattr(child, "session_cost_status", None)
     # Result entry contract: see the _run_single_child docstring.
     route = getattr(child, "_delegate_successful_llm_route", None)
-    model, provider = (route if isinstance(route, tuple) and len(route) == 2 else (None, None))
+    app_server_success = (
+        getattr(child, "api_mode", None) == "codex_app_server"
+        and result.get("completed", False)
+        and not (result.get("failed") or result.get("error") or result.get("interrupted"))
+        and "codex_turn_id" in result
+    )
+    # The app-server result has no selected model/provider field. Retain the
+    # child's last positively known route for later failures, but never assign
+    # it to this newly successful yet unidentified turn.
+    model, provider = (
+        (None, None)
+        if app_server_success
+        else (route if isinstance(route, tuple) and len(route) == 2 else (None, None))
+    )
     entry: Dict[str, Any] = {
         "task_index": task_index,
         "status": status,
@@ -786,6 +799,8 @@ class _ChildRun:
             "output_tokens": _num(getattr(child, "session_completion_tokens", 0)),
             "reasoning_tokens": _num(getattr(child, "session_reasoning_tokens", 0)),
             "api_calls": _num(entry["api_calls"]),
+            "model": entry.get("model"),
+            "provider": entry.get("provider"),
             "files_read": _files_read,
             "files_written": sorted({p for tid, paths in _files_written_map.items() if tid == self.child_task_id for p in paths})[:40],
             "output_tail": _extract_output_tail(result, max_entries=8, max_chars=600),

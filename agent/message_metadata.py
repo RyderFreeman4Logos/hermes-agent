@@ -42,10 +42,16 @@ def append_message(
 
 def is_hidden_loop_timing(message: Any) -> bool:
     """Whether a durable hidden system row is the loop-timing projection."""
+    if not isinstance(message, dict) or message.get("role") != "system":
+        return False
+    content = message.get("content", "")
+    if not isinstance(content, str):
+        return False
+    if content.startswith("[Agent loop timing] Current loop start:"):
+        return True
+    lines = content.splitlines()
     return (
-        isinstance(message, dict)
-        and message.get("role") == "system"
-        and str(message.get("content", "")).startswith(
-            "[Agent loop timing]\nCurrent loop start:"
-        )
+        bool(lines)
+        and lines[0] == "[Agent loop timing]"
+        and any(line.startswith("Current loop start:") for line in lines[1:])
     )

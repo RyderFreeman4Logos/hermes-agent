@@ -162,3 +162,22 @@ class TestResolveProviderCorruptConfig:
         from hermes_cli.auth import resolve_provider
 
         assert resolve_provider("openrouter") == "openrouter"
+
+
+def test_same_metadata_recovery_restores_auto_provider_after_raw_validation(tmp_path, monkeypatch):
+    """A denied/corrupt revision must not keep auto resolution refused after validated restore."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.auth import AuthError, resolve_provider
+    home, cfg = _setup_home(tmp_path, monkeypatch, "gateway:\n  enabled: false\n")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-FAKE1234567890")
+    original = cfg.read_text()
+    broken = "gateway:\n  enabled: [false"
+    assert len(original) == len(broken)
+    config_mod.read_raw_config_readonly()
+    stat = cfg.stat(); cfg.write_text(broken); import os; os.utime(cfg, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    config_mod.load_config()
+    with pytest.raises(AuthError, match="corrupt"):
+        resolve_provider("auto")
+    cfg.write_text(original); os.utime(cfg, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    config_mod.read_raw_config_readonly()
+    assert resolve_provider("auto") == "openrouter"

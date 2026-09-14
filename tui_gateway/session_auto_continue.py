@@ -342,7 +342,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 "events": [dict(event) for event in completion_events if isinstance(event, dict)],
                 "generation": queue_generation,
             }
-    use_compute_host = _session_uses_compute_host(session)
+    # A structured receipt belongs to the local turn's core-ingestion hook.
+    # A compute-host bridge cannot consume that hook, so an otherwise active
+    # host must not receive this particular queued envelope.
+    use_compute_host = _session_uses_compute_host(session) and not completion_events
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             # Generation bump cancelled the claim (Stop, compress re-anchor, …): don't dispatch, but restore the
@@ -379,6 +382,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     except Exception as exc:
         _notif_log_failure("queued prompt dispatch failed", exc)
         _notif_release_turn(session)
+        if completion_events:
+            with session["history_lock"]:
+                active = session.get("_completion_active_receipt")
+                if active is kwargs.get("completion_receipt"):
+                    session.pop("_completion_active_receipt", None)
+                    session["_completion_pending"] = list(active.get("events") or []) + list(
+                        session.get("_completion_pending") or [])
         dispatch_failed = True
     if dispatch_failed:
         with session["history_lock"]:

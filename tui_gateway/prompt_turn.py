@@ -1063,18 +1063,9 @@ def _run_prompt_submit(
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
         followup_steer = None
+        receipt_agent = None
+        receipt_ingest = None
         try:
-            if completion_receipt:
-                def commit_completion_receipt() -> bool:
-                    with _completion_ownership_lock(session):
-                        active = session.get("_completion_active_receipt")
-                        if active is not completion_receipt:
-                            return False
-                        events = list(active.get("events") or [])
-                        session.pop("_completion_active_receipt", None)
-                        _mark_completion_events_consumed(events)
-                        return True
-                st.agent._completion_queue_ingest = commit_completion_receipt
             prepared = _prepare_turn_input(
                 sid, session, st, text, images, literal_completion=bool(completion_receipt)
             )
@@ -1086,6 +1077,19 @@ def _run_prompt_submit(
                     st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
+            if completion_receipt:
+                def commit_completion_receipt() -> bool:
+                    with _completion_ownership_lock(session):
+                        active = session.get("_completion_active_receipt")
+                        if active is not completion_receipt:
+                            return False
+                        events = list(active.get("events") or [])
+                        session.pop("_completion_active_receipt", None)
+                        _mark_completion_events_consumed(events)
+                        return True
+                receipt_agent = st.agent
+                receipt_ingest = commit_completion_receipt
+                receipt_agent._completion_queue_ingest = receipt_ingest
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata, turn_author, text)
@@ -1109,8 +1113,8 @@ def _run_prompt_submit(
                         session.pop("_completion_active_receipt", None)
                         session["_completion_pending"] = list(active.get("events") or []) + list(
                             session.get("_completion_pending") or [])
-                if getattr(st.agent, "_completion_queue_ingest", None) is not None:
-                    st.agent._completion_queue_ingest = None
+                if receipt_agent is not None and getattr(receipt_agent, "_completion_queue_ingest", None) is receipt_ingest:
+                    receipt_agent._completion_queue_ingest = None
             _finish_turn(sid, session, st)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)

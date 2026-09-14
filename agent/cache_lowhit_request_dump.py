@@ -14,6 +14,7 @@ from agent.physical_attempt_diagnostics import (
     _cache_key,
     _digest,
     _key,
+    _label,
     _later_history,
     _prefix,
     _serialized,
@@ -59,7 +60,7 @@ def remember_sent_request(
         "sizes": {
             f"{name}_bytes": len(_serialized(value)) for name, value in components.items()
         },
-        "model": request.get("model"),
+        "model": _label(request.get("model"), key),
     }
     with _LOCK:
         _LAST.append(snapshot)
@@ -81,6 +82,8 @@ def maybe_dump_on_usage(
     usage: CanonicalUsage, *, cache_telemetry: str = "unavailable"
 ) -> None:
     """Write the last two fingerprints when the hit is economically near-zero."""
+    if not enabled():
+        return
     if not _is_near_zero(usage, cache_telemetry=cache_telemetry):
         return
     with _LOCK:

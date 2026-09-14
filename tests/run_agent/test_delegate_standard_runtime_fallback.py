@@ -523,6 +523,42 @@ def test_delegate_task_ordinary_child_records_primary_success_identity():
     assert (complete[-1]["model"], complete[-1]["provider"]) == (PRIMARY["model"], PRIMARY["provider"])
 
 
+def test_delegate_task_zero_iteration_summary_records_successful_route(monkeypatch):
+    """A real summary-only child retains the route that produced its answer."""
+    import tools.delegate_tool as delegate_mod
+
+    events = []
+    summary_client = MagicMock()
+    summary_client.chat.completions.create.return_value = _response("summary result")
+    monkeypatch.setattr(delegate_mod, "_load_config", lambda: {"max_iterations": 0})
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+        patch.object(AIAgent, "_ensure_primary_openai_client", return_value=summary_client),
+        patch.object(AIAgent, "_persist_session"),
+        patch.object(AIAgent, "_save_trajectory"),
+        patch.object(AIAgent, "_cleanup_task_resources"),
+    ):
+        result = json.loads(
+            delegate_task(
+                tasks=[{"goal": "return the iteration-limit summary"}],
+                parent_agent=_delegate_parent(events),
+                background=False,
+            )
+        )
+
+    entry = result["results"][0]
+    assert entry["status"] == "completed"
+    assert entry["truncated"] is True
+    assert entry["summary"].startswith("summary result")
+    assert (entry["model"], entry["provider"]) == (PRIMARY["model"], PRIMARY["provider"])
+    complete = [event for event in events if event.get("status") == "completed"]
+    assert complete
+    assert (complete[-1]["model"], complete[-1]["provider"]) == (PRIMARY["model"], PRIMARY["provider"])
+
+
 def test_delegate_task_ordinary_child_records_fallback_success_identity():
     """The public no-profile child reports only its accepted fallback response."""
     events = []

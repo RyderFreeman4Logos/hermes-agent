@@ -198,39 +198,29 @@ def test_post_summary_demote_is_coalesced_into_one_durable_commit():
         assert tuple(unchanged_original) == (0, 0)
 
 
-def test_archive_classifies_interspersed_multimodal_tail_by_payload():
+def test_public_compaction_archives_rewritten_multimodal_tail_and_keeps_newest_three():
     from hermes_state import SessionDB
+    from agent.conversation_compression import compress_context
+    from run_agent import AIAgent
 
-    original = [
+    original = _tail_fixture()
+    changed = next(
+        message for message in original if message.get("tool_call_id") == "call_tail"
+    )
+    changed["content"] = [
         {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "changed", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+            "type": "text",
+            "text": "MULTIMODAL_ARCHIVE_TOKEN\n" + ("large screenshot detail " * 2_500),
         },
         {
-            "role": "tool",
-            "tool_call_id": "changed",
-            "content": [
-                {"type": "text", "text": "multimodal archive token"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
-            ],
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AA=="},
         },
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "same", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "same", "content": "UNCHANGED_TAIL_TOKEN"},
-        {"role": "user", "content": "continue"},
     ]
-    retained = [dict(message) for message in original]
-    retained[1] = {
-        **retained[1],
-        "content": [{"type": "text", "text": "[screenshot removed]"}],
-    }
 
     with TemporaryDirectory() as tmp:
-        db = SessionDB(db_path=Path(tmp) / "interspersed.db")
+        db_path = Path(tmp) / "interspersed.db"
+        db = SessionDB(db_path=db_path)
         session_id = "20260914_186_interspersed"
         db.create_session(session_id, "cli", model="test/model")
         for message in original:
@@ -242,25 +232,77 @@ def test_archive_classifies_interspersed_multimodal_tail_by_payload():
                 tool_call_id=message.get("tool_call_id"),
             )
 
-        db.archive_and_compact(session_id, retained, tail_count=len(retained))
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=128_000,
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id=session_id,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent.compression_in_place = True
+            agent._compression_feasibility_checked = True
+            agent.context_compressor._generate_summary = (
+                lambda *args, **kwargs: "compact middle summary"
+            )
+            compressed, _ = compress_context(
+                agent,
+                list(original),
+                approx_tokens=estimate_messages_tokens_rough(original),
+                system_message="sys",
+            )
 
-        assert len(db.search_messages("UNCHANGED_TAIL_TOKEN")) == 1
-        display_history = db.get_messages_as_conversation(
+        newest_three = [
+            {
+                key: message.get(key)
+                for key in ("role", "content", "tool_calls", "tool_call_id")
+                if message.get(key) is not None
+            }
+            for message in original[-3:]
+        ]
+        assert [
+            {
+                key: message.get(key)
+                for key in ("role", "content", "tool_calls", "tool_call_id")
+                if message.get(key) is not None
+            }
+            for message in compressed[-3:]
+        ] == newest_three
+        db.close()
+
+        reloaded = SessionDB(db_path=db_path)
+        active = reloaded.get_messages_as_conversation(session_id)
+        assert [
+            {
+                key: message.get(key)
+                for key in ("role", "content", "tool_calls", "tool_call_id")
+                if message.get(key) is not None
+            }
+            for message in active[-3:]
+        ] == newest_three
+        display_history = reloaded.get_messages_as_conversation(
             session_id, include_compacted=True
         )
         assert any(
-            message.get("tool_call_id") == "changed"
-            and message.get("content") == original[1]["content"]
+            message.get("tool_call_id") == "call_tail"
+            and message.get("content") == changed["content"]
             for message in display_history
         )
-        rows = db._conn.execute(
+        rows = reloaded._conn.execute(
             "SELECT tool_call_id, active, compacted FROM messages "
             "WHERE session_id = ? AND role = 'tool' ORDER BY id",
             (session_id,),
         ).fetchall()
         assert [tuple(row) for row in rows] == [
-            ("changed", 0, 1),
-            ("same", 0, 0),
-            ("changed", 1, 0),
-            ("same", 1, 0),
+            ("call_tail", 0, 1),
+            ("call_recent", 0, 0),
+            ("call_tail", 1, 0),
+            ("call_recent", 1, 0),
         ]
+        reloaded.close()

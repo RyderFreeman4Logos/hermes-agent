@@ -4,10 +4,15 @@ from __future__ import annotations
 import contextlib
 import queue
 import threading
+import time
 import types
 from unittest.mock import patch
 
+import pytest
+
+from hermes_cli.active_sessions import active_session_registry_snapshot
 from run_agent import AIAgent
+from tools import async_delegation
 from tools.process_registry import process_registry
 from tui_gateway import server
 
@@ -108,6 +113,149 @@ def _patch_inline_turn(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+
+
+def _durable_delegation(delegation_id: str) -> dict:
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": "owner-session",
+        "origin_ui_session_id": "owner-ui",
+        "status": "completed",
+    }
+    async_delegation._persist_dispatch({
+        "delegation_id": delegation_id,
+        "session_key": "owner-session",
+        "origin_ui_session_id": "owner-ui",
+        "dispatched_at": time.time(),
+    })
+    async_delegation._persist_completion(event, {"status": "completed"})
+    return event
+
+
+def test_real_refusal_does_not_release_successor_turn(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profile"
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 1})
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    blocker, refusal = server._claim_active_session_slot(
+        "blocker", live_session_id="blocker-ui", profile_home=profile_home
+    )
+    assert blocker is not None and refusal is None
+
+    agent = _bare_agent()
+    session = _session(
+        agent=agent,
+        active_session_lease=None,
+        profile_home=profile_home,
+        source="tui",
+    )
+    real_submit = server._run_prompt_submit
+    refused_returned = threading.Event()
+    resume_caller = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def paused_submit(*args, **kwargs):
+        accepted = real_submit(*args, **kwargs)
+        assert accepted is False
+        refused_returned.set()
+        assert resume_caller.wait(2), "notification caller release timed out"
+        return accepted
+
+    def submit_notification():
+        try:
+            outcome["accepted"] = server._notif_submit(
+                "rid", "owner-ui", session, "completion", "test notification"
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    monkeypatch.setattr(server, "_run_prompt_submit", paused_submit)
+    worker = threading.Thread(target=submit_notification)
+    try:
+        worker.start()
+        assert refused_returned.wait(2), "real capacity refusal did not return"
+        assert session["running"] is False
+        blocker.release()
+        session["running"] = True
+        assert server._admit_prompt_turn("owner-ui", session, "successor", None, None) == (
+            [], agent
+        )
+        successor_lease = session["active_session_lease"]
+        assert len(active_session_registry_snapshot(registry_home=profile_home)) == 1
+
+        resume_caller.set()
+        worker.join(2)
+        assert not worker.is_alive()
+        assert outcome == {"accepted": False}
+        assert session["running"] is True
+        assert session["active_session_lease"] is successor_lease
+        assert len(active_session_registry_snapshot(registry_home=profile_home)) == 1
+
+        server._release_active_session_slot(session)
+        blocker, refusal = server._claim_active_session_slot(
+            "blocker-emit", live_session_id="blocker-emit-ui", profile_home=profile_home
+        )
+        assert blocker is not None and refusal is None
+        emitted: list[str] = []
+
+        def fail_refusal_emit(kind, *_args, **_kwargs):
+            emitted.append(kind)
+            if kind == "error":
+                raise RuntimeError("emit failed")
+
+        exception_session = _session(
+            agent=_bare_agent(), active_session_lease=None, profile_home=profile_home,
+            source="tui",
+        )
+        monkeypatch.setattr(server, "_run_prompt_submit", real_submit)
+        monkeypatch.setattr(server, "_emit", fail_refusal_emit)
+        with pytest.raises(RuntimeError, match="emit failed"):
+            server._notif_submit(
+                "rid", "emit-ui", exception_session, "completion", "test notification"
+            )
+        assert emitted == ["message.start", "error"]
+        assert exception_session["running"] is False
+        assert exception_session.get("active_session_lease") is None
+        assert len(active_session_registry_snapshot(registry_home=profile_home)) == 1
+    finally:
+        resume_caller.set()
+        worker.join(2)
+        server._release_active_session_slot(session)
+        blocker.release()
+
+
+@pytest.mark.parametrize("caller", ["idle", "event", "batch"])
+@pytest.mark.parametrize("accepted", [False, True])
+def test_notification_claim_settlement_follows_submit_outcome(
+    monkeypatch, tmp_path, caller: str, accepted: bool
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    delegation_id = f"delegation-{caller}-{accepted}"
+    event = _durable_delegation(delegation_id)
+    session = _session(running=caller != "batch")
+
+    def submit(*args, **_kwargs):
+        if not accepted:
+            args[2]["running"] = False
+        return accepted
+
+    monkeypatch.setattr(server, "_notif_submit", submit)
+    if caller == "idle":
+        assert server._idle_completion_turn("owner-ui", session, event, "done") is accepted
+    elif caller == "event":
+        server._notif_dispatch_event("owner-ui", session, event, "done")
+    else:
+        server._notif_dispatch_completions(
+            "owner-ui", session, [(event, "done")], process_registry, []
+        )
+
+    durable = async_delegation.get_durable_delegation(delegation_id)
+    assert durable is not None
+    assert durable["delivery_state"] == ("delivered" if accepted else "pending")
+    if not accepted:
+        retry_claim = async_delegation.claim_event_delivery(event, "retry-proof")
+        assert retry_claim
+        async_delegation.release_event_delivery(event, retry_claim)
 
 
 def test_refused_idle_admission_requeues_once_and_normal_admission_settles_once(

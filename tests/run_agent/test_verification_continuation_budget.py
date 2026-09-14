@@ -51,13 +51,18 @@ def _assert_pending_response_survives(agent, result):
     assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
     assert result["completed"] is False
     assert agent._handle_max_iterations.call_count == 0
-    # The nudge is stripped by _drop_verification_continuation_scaffolding,
-    # so the role sequence is [user, assistant] — the candidate is the
-    # tail and matches final_response so it is not duplicated. (#65919 §7)
+    # The nudge is stripped by _drop_verification_continuation_scaffolding;
+    # the durable loop-timing row remains hidden system metadata, and the
+    # candidate is the tail and matches final_response so it is not duplicated.
     assert [message["role"] for message in result["messages"]] == [
         "user",
+        "system",
         "assistant",
     ]
+    timing = result["messages"][1]
+    assert timing["display_kind"] == "hidden"
+    assert timing["content"].startswith("[Agent loop timing]")
+    return result["messages"][2]
 
 
 def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeypatch):
@@ -75,9 +80,9 @@ def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeyp
     ):
         result = agent.run_conversation("edit changed.py")
 
-    _assert_pending_response_survives(agent, result)
+    assistant = _assert_pending_response_survives(agent, result)
     # The assistant response persists (it is real, unflagged content).
-    assert not result["messages"][1].get("_verification_stop_synthetic")
+    assert not assistant.get("_verification_stop_synthetic")
 
 
 def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch):
@@ -100,9 +105,9 @@ def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch
     ):
         result = agent.run_conversation("edit changed.py")
 
-    _assert_pending_response_survives(agent, result)
+    assistant = _assert_pending_response_survives(agent, result)
     # The assistant response persists (it is real, unflagged content).
-    assert not result["messages"][1].get("_pre_verify_synthetic")
+    assert not assistant.get("_pre_verify_synthetic")
 
 
 def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypatch):

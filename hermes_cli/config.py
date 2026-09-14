@@ -1898,6 +1898,12 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     config_path = get_config_path()
     path_key = str(config_path)
+    # A reader may hash outside the lock while another reader records a malformed
+    # revision.  Only a failure that was already active when this read began may
+    # be retired by its subsequently validated bytes; an older reader must not
+    # erase a later observation.
+    with _CONFIG_LOCK:
+        failure_at_start = _CONFIG_PARSE_FAILURES.get(path_key)
 
     def cached_or_empty(exc: OSError) -> Dict[str, Any]:
         with _CONFIG_LOCK:
@@ -1941,9 +1947,9 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             cached_copy = copy.deepcopy(data)
             _RAW_CONFIG_CACHE[path_key] = (digest, cached_copy)
             result = data if want_deepcopy else cached_copy
-        if valid_root and failure_before is not None and _CONFIG_PARSE_FAILURES.get(path_key) == failure_before:
+        if valid_root and failure_at_start is not None and _CONFIG_PARSE_FAILURES.get(path_key) == failure_at_start:
             _CONFIG_PARSE_FAILURES.pop(path_key, None)
-            _CONFIG_PARSE_WARNED.discard((path_key, failure_before[0], failure_before[1]))
+            _CONFIG_PARSE_WARNED.discard((path_key, failure_at_start[0], failure_at_start[1]))
         return result
 
 

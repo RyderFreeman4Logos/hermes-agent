@@ -425,8 +425,8 @@ def _payload(
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
     leftover = agent._drain_pending_steer()
     server._run_post_turn_followups("rid", "owner-ui", session, {"pending_steer": leftover}, None)
-    queued = session.get("queued_prompt") or {}
-    return str(queued.get("text", ""))
+    queued = [session.get("queued_prompt"), *(session.get("queued_prompts") or [])]
+    return "\n".join(str(entry.get("text", "")) for entry in queued if isinstance(entry, dict))
 
 
 @pytest.mark.parametrize("consumer", ["tool", "pre_api", "post_turn"])

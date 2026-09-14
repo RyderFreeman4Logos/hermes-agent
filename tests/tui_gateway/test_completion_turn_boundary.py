@@ -188,35 +188,88 @@ def test_late_busy_stage_reaches_one_idle_turn_without_new_activity(monkeypatch)
         _clear(event_id)
 
 
-def test_context_refusal_runs_the_existing_post_turn_handoff(monkeypatch):
+def test_context_refusal_preserves_staged_completion_without_replaying_user_prompt(tmp_path, monkeypatch):
     event_id = "proc_context_refusal_boundary"
     _clear(event_id)
     try:
         agent = _agent()
+        agent._config_context_length = 1_000
         session = _session(agent)
+        session["cwd"] = str(tmp_path)
         sid = "context-refusal-ui"
         server._sessions[sid] = session
+        for name in ("first.txt", "second.txt"):
+            (tmp_path / name).write_text("x" * 1_200, encoding="utf-8")
         monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
         monkeypatch.setattr(server, "_record_turn_marker", lambda *_a, **_k: "marker")
-        monkeypatch.setattr(server, "_prepare_turn_input", lambda *_a, **_k: None)
         monkeypatch.setattr(server, "_finish_turn", lambda *_a, **_k: None)
         monkeypatch.setattr(server, "_retire_turn_marker", lambda *_a, **_k: None)
         monkeypatch.setattr(server, "_clear_inflight_turn", lambda *_a, **_k: None)
         monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_a, **_k: None)
-        monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
+        real_drain = server._drain_queued_prompt
+        drains = 0
+
+        def drain_once(*args, **kwargs):
+            nonlocal drains
+            drains += 1
+            return real_drain(*args, **kwargs) if drains == 1 else False
+
+        monkeypatch.setattr(server, "_drain_queued_prompt", drain_once)
         assert server._deliver_completions_via_steer(
             sid, session, [_completion(event_id)], set()
         )
-
-        assert server._run_prompt_submit("rid", sid, session, "@/refused")
+        with session["history_lock"]:
+            server._enqueue_prompt(
+                session, "Inspect @file:first.txt and @file:second.txt", None
+            )
+            session["running"] = False
+        server._run_post_turn_followups("rid", sid, session, {}, None)
         session["_run_thread"].join(2)
         assert not session["_run_thread"].is_alive()
         assert session["running"] is False
         assert event_id in session["queued_prompt"]["text"]
+        assert "@file:first.txt" not in session["queued_prompt"]["text"]
+        assert "@file:second.txt" not in session["queued_prompt"]["text"]
         assert process_registry.is_completion_consumed(event_id)
         assert session.get("_completion_transfer") == []
     finally:
         server._sessions.pop("context-refusal-ui", None)
+        _clear(event_id)
+
+
+def test_staged_completion_and_late_user_prompt_keep_separate_queue_entries(monkeypatch):
+    event_id = "proc_completion_queue_interleaving"
+    _clear(event_id)
+    try:
+        agent = _agent()
+        session = _session(agent)
+        sid = "completion-queue-interleaving-ui"
+        server._sessions[sid] = session
+        monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+        assert server._deliver_completions_via_steer(
+            sid, session, [_completion(event_id)], set()
+        )
+        with session["history_lock"]:
+            session["running"] = False
+        drains = 0
+
+        def enqueue_late_user(*_args, **_kwargs):
+            nonlocal drains
+            drains += 1
+            if drains == 2:
+                with session["history_lock"]:
+                    server._enqueue_prompt(session, "late user prompt", None)
+            return False
+
+        monkeypatch.setattr(server, "_drain_queued_prompt", enqueue_late_user)
+        server._run_post_turn_followups("rid", sid, session, {}, None)
+
+        assert event_id in session["queued_prompt"]["text"]
+        assert session["queued_prompt"]["text"].strip() != "late user prompt"
+        assert [entry["text"] for entry in session["queued_prompts"]] == ["late user prompt"]
+        assert process_registry.is_completion_consumed(event_id)
+    finally:
+        server._sessions.pop("completion-queue-interleaving-ui", None)
         _clear(event_id)
 
 

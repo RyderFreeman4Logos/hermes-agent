@@ -360,17 +360,26 @@ class EventBridge:
 
     def stop(self):
         """Request the current owner stop without replacing a live owner."""
+        idle_watcher = None
         with self._lifecycle_lock:
             self._stop_requested = True
             self._running = False
             thread = self._thread
             starting = self._starting
+            if thread is None and not starting:
+                # Detach the exact residue owned by this idle decision while
+                # admission is still excluded.  A later start may install its
+                # own watcher as soon as this lock is released.
+                idle_watcher, self._state_watch_conn = self._state_watch_conn, None
+                self._state_watch_identity = None
             self._new_event.set()
         if thread is not None:
             thread.join(timeout=5)
-        elif not starting:
-            # No worker acquired ownership; this is starter-owned residue.
-            self._close_state_watch_conn()
+        elif idle_watcher is not None:
+            try:
+                idle_watcher.close()
+            except (sqlite3.Error, OSError) as exc:
+                logger.debug("EventBridge: closing idle state.db watcher failed: %s", exc)
         if thread is not None and thread.is_alive():
             logger.warning(
                 "EventBridge: poll thread still running after stop(); "
@@ -501,13 +510,25 @@ class EventBridge:
                 if not session_id:
                     continue
                 try:
-                    latest = _latest_ts(db.get_messages(session_id))
+                    messages = db.get_messages(session_id)
                 except Exception:
                     reads_succeeded = False
                     cutoff = cutoffs.get(session_key)
                     if cutoff is not None:
                         self._baseline_cutoffs[session_key] = cutoff
                     continue
+                cutoff = cutoffs.get(session_key)
+                if cutoff is not None:
+                    # The cutoff snapshot is the startup boundary even when
+                    # this body read succeeds.  A row committed after that
+                    # snapshot belongs to the first polling tick, not history.
+                    self._baseline_cutoffs[session_key] = cutoff
+                    messages = [
+                        message for message in messages
+                        if not isinstance(message.get("id"), (int, float))
+                        or int(message["id"]) <= cutoff
+                    ]
+                latest = _latest_ts(messages)
                 if latest > 0.0:
                     self._last_poll_timestamps[session_key] = latest
             if reads_succeeded:

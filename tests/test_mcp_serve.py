@@ -1787,6 +1787,160 @@ def test_event_bridge_failed_baseline_read_does_not_replay_prestart_history(monk
     assert bridge.poll_events()["events"] == []
 
 
+def test_event_bridge_start_keeps_post_cutoff_commit_for_first_poll(monkeypatch, tmp_path):
+    """A successful startup read may not absorb a row committed past its cutoff."""
+    import mcp_serve
+
+    db_path = tmp_path / "state.db"
+    sqlite3.connect(str(db_path)).close()
+    entries = {
+        "agent:main:test:a": {"session_id": "a", "platform": "test", "origin": {}},
+        "agent:main:test:b": {"session_id": "b", "platform": "test", "origin": {}},
+    }
+    messages = {
+        "a": [{"id": 1, "role": "user", "content": "old a", "timestamp": 1}],
+        "b": [{"id": 1, "role": "user", "content": "old b", "timestamp": 1}],
+    }
+    b_read_entered, release_b_read = threading.Event(), threading.Event()
+    worker_entered, release_worker = threading.Event(), threading.Event()
+    db_calls = 0
+
+    class DB:
+        def list_gateway_sessions(self, *, active_only):
+            assert active_only is True
+            return [
+                {"session_key": key, "id": entry["session_id"], "source": "test"}
+                for key, entry in entries.items()
+            ]
+
+        def get_active_message_watermark(self, session_id):
+            if session_id == "b" and not b_read_entered.is_set():
+                b_read_entered.set()
+                assert release_b_read.wait(timeout=3)
+            return len(messages[session_id])
+
+        def get_messages(self, session_id):
+            if session_id == "b" and not b_read_entered.is_set():
+                b_read_entered.set()
+                assert release_b_read.wait(timeout=3)
+            return list(messages[session_id])
+
+        def close(self):
+            pass
+
+    db = DB()
+
+    def acquire_db():
+        nonlocal db_calls
+        db_calls += 1
+        # Baseline owns the first DB and strict-index acquisitions.  Hold only
+        # the real worker's later acquisition so its poll cannot mask the
+        # startup frontier we are asserting.
+        if db_calls >= 3:
+            worker_entered.set()
+            assert release_worker.wait(timeout=3)
+        return db
+
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", acquire_db)
+    bridge = mcp_serve.EventBridge()
+    starter = threading.Thread(target=bridge.start)
+    starter.start()
+    assert b_read_entered.wait(timeout=2)
+    messages["a"].append({"id": 2, "role": "assistant", "content": "after cutoff", "timestamp": 2})
+    # Advance the real watched file too: the worker must receive a changed tick
+    # without relying on a later unrelated write.
+    now_ns = time.time_ns() + 1_000_000_000
+    os.utime(db_path, ns=(now_ns, now_ns))
+    release_b_read.set()
+    starter.join(timeout=2)
+    assert not starter.is_alive()
+    assert worker_entered.wait(timeout=2)
+    assert bridge._last_poll_timestamps["agent:main:test:a"] == 1
+    release_worker.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if [event["content"] for event in bridge.poll_events()["events"]] == ["after cutoff"]:
+            break
+        time.sleep(0.02)
+    assert [event["content"] for event in bridge.poll_events()["events"]] == ["after cutoff"]
+    bridge.stop()
+
+
+def test_event_bridge_idle_stop_cannot_close_later_start_watcher(monkeypatch, tmp_path):
+    """A stop's idle decision owns only the watcher it detached under that lock."""
+    import mcp_serve
+
+    tmp_path.joinpath("state.db").touch()
+    bridge = mcp_serve.EventBridge()
+
+    class Watcher:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    old_watcher, later_watcher = Watcher(), Watcher()
+    bridge._state_watch_conn = old_watcher
+
+    class ReleaseBarrier:
+        def __init__(self, lock):
+            self.lock, self.arm, self.fired = lock, False, False
+
+        def __enter__(self):
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.release()
+
+        def acquire(self, *args, **kwargs):
+            return self.lock.acquire(*args, **kwargs)
+
+        def release(self):
+            self.lock.release()
+            if self.arm and not self.fired:
+                self.fired = True
+                self.arm = False
+                assert bridge.start() is True
+
+    barrier = ReleaseBarrier(bridge._lifecycle_lock)
+    bridge._lifecycle_lock = barrier
+
+    def baseline_for_later_start():
+        bridge._state_watch_conn = later_watcher
+        bridge._state_watch_identity = (1, 2)
+        return True
+
+    worker_entered, release_worker = threading.Event(), threading.Event()
+
+    class DB:
+        def list_gateway_sessions(self, *, active_only):
+            return []
+
+        def close(self):
+            pass
+
+    def block_worker_acquisition():
+        worker_entered.set()
+        assert release_worker.wait(timeout=3)
+        return DB()
+
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(bridge, "_establish_baseline", baseline_for_later_start)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", block_worker_acquisition)
+    barrier.arm = True
+    bridge.stop()
+    assert barrier.fired
+    assert worker_entered.wait(timeout=2)
+    assert old_watcher.closed
+    assert not later_watcher.closed
+    assert bridge._thread is not None and bridge._thread.is_alive()
+    release_worker.set()
+    bridge.stop()
+
+
 def test_event_bridge_start_closes_watcher_when_worker_cannot_acquire_db(monkeypatch):
     """Public start hands a baseline watcher to cleanup even on early worker exit."""
     import mcp_serve

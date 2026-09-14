@@ -486,18 +486,16 @@ def _build_result_entry(
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
     # Result entry contract: see the _run_single_child docstring.
+    route = getattr(child, "_delegate_successful_llm_route", None)
+    model, provider = (route if isinstance(route, tuple) and len(route) == 2 else (None, None))
     entry: Dict[str, Any] = {
         "task_index": task_index,
         "status": status,
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
-        "model": _str_or_none(getattr(child, "model", None)) if (
-            result.get("completed", False) or getattr(child, "_delegate_has_successful_llm_request", False)
-        ) else None,
-        "provider": _str_or_none(getattr(child, "provider", None)) if (
-            result.get("completed", False) or getattr(child, "_delegate_has_successful_llm_request", False)
-        ) else None,
+        "model": _str_or_none(model),
+        "provider": _str_or_none(provider),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.

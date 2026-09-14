@@ -1835,14 +1835,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         saved_until = getattr(agent, "_rate_limited_until", 0)
         saved_backoff = getattr(agent, "_rate_limit_backoff_count", 0)
         try:
-            return _try_activate_fallback_unlocked(agent, reason)
+            return _try_activate_fallback_unlocked(agent, reason, announce_cooldown=False)
         finally:
             agent._rate_limited_until = saved_until
             agent._rate_limit_backoff_count = saved_backoff
     return _try_activate_fallback_unlocked(agent, reason)
 
 
-def _try_activate_fallback_unlocked(agent, reason: "FailoverReason | None" = None) -> bool:
+def _try_activate_fallback_unlocked(
+    agent, reason: "FailoverReason | None" = None, *, announce_cooldown: bool = True,
+) -> bool:
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
     while True:
@@ -1921,7 +1923,7 @@ def _try_activate_fallback_unlocked(agent, reason: "FailoverReason | None" = Non
             notice = (
                 f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
                 f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}.")
-            if cooldown_seconds is not None:
+            if announce_cooldown and cooldown_seconds is not None:
                 remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
                 notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
             _buffer_fallback_notice(agent, notice)

@@ -476,9 +476,15 @@ def recover_after_classification(
     multimodal-tool-content strip → corrupt-image strip → Anthropic OAuth 1M-beta
     disable → per-provider 401 credential refresh → format-recovery strips.
     Returns ``(retry_now, recovered_with_pool)``; the latter feeds the Nous rate-limit guard."""
-    from agent.conversation_loop import _is_nous_inference_route, _is_standard_profile_child
+    from agent.conversation_loop import (
+        _is_nous_inference_route, _is_standard_profile_child, _standard_child_can_fallback,
+    )
 
-    if _is_standard_profile_child(agent):
+    if (
+        _is_standard_profile_child(agent)
+        and agent._has_pending_fallback()
+        and _standard_child_can_fallback(agent, reason=classified.reason)
+    ):
         return False, False
 
     if (
@@ -1407,7 +1413,7 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
-    _should_fallback = _wrapped_output_cap_budget is None and (
+    _should_fallback = not _is_output_cap_error and _wrapped_output_cap_budget is None and (
         (
             _is_standard_profile_child(agent)
             and _standard_child_can_fallback(agent, reason=classified.reason)

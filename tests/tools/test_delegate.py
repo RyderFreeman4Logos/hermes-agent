@@ -537,10 +537,9 @@ class TestDelegateObservability(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.model = "claude-sonnet-4-6"
-            mock_child._delegate_has_successful_llm_request = True
             mock_child.session_prompt_tokens = 5000
             mock_child.session_completion_tokens = 1200
-            mock_child.run_conversation.return_value = {
+            response = {
                 "final_response": "done",
                 "completed": True,
                 "interrupted": False,
@@ -554,6 +553,12 @@ class TestDelegateObservability(unittest.TestCase):
                     {"role": "assistant", "content": "done"},
                 ],
             }
+            def run_conversation(*_args, **_kwargs):
+                mock_child._delegate_successful_llm_route = (
+                    "claude-sonnet-4-6", mock_child.provider,
+                )
+                return response
+            mock_child.run_conversation.side_effect = run_conversation
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test observability", parent_agent=parent))
@@ -2265,7 +2270,7 @@ class TestStandardProfileAttached(unittest.TestCase):
             )
         child = MockAgent.return_value
         self.assertEqual(child._delegate_model_profile, "standard")
-        self.assertIs(child._delegate_has_successful_llm_request, False)
+        self.assertIsNone(child._delegate_successful_llm_route)
 
 
 if __name__ == "__main__":

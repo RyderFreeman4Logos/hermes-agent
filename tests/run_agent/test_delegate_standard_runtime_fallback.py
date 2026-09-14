@@ -77,7 +77,7 @@ def _make_child(*, max_retries: int = 2, route=PRIMARY, profile=None):
     agent._api_max_retries = max_retries
     if profile is not None:
         agent._delegate_model_profile = profile
-    agent._delegate_has_successful_llm_request = False
+    agent._delegate_successful_llm_route = None
     return agent
 
 
@@ -116,6 +116,7 @@ def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldo
 ):
     agent = _make_standard_child(max_retries=3, route=route)
     calls = []
+    notices = []
 
     def api_call(_kwargs):
         calls.append((agent.provider, agent.model))
@@ -134,6 +135,7 @@ def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldo
         stack.enter_context(
             patch.object(agent, "_interruptible_api_call", side_effect=api_call)
         )
+        stack.enter_context(patch.object(agent, "_buffer_status", side_effect=notices.append))
         stack.enter_context(
             patch.object(agent, "_recover_with_credential_pool", pool_recovery)
         )
@@ -182,6 +184,7 @@ def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldo
     nous_refresh.assert_not_called()
     pool_recovery.assert_not_called()
     assert getattr(agent, "_rate_limited_until", 0) == 0
+    assert all("Primary retry eligible" not in notice for notice in notices)
 
 
 @pytest.mark.parametrize(
@@ -385,7 +388,10 @@ def test_standard_child_falls_back_after_first_successful_request():
         second = agent.run_conversation("second")
 
     assert first["completed"] is True
-    assert agent._delegate_has_successful_llm_request is True
+    assert agent._delegate_successful_llm_route == (
+        FALLBACK_CHAIN[0]["model"],
+        FALLBACK_CHAIN[0]["provider"],
+    )
     assert second["completed"] is True
     assert calls == [
         (PRIMARY["provider"], PRIMARY["model"]),
@@ -427,7 +433,10 @@ def test_delegate_progress_and_result_use_only_successful_fallback_identity():
         assert failed.status_code == 429
         child.provider = FALLBACK_CHAIN[0]["provider"]
         child.model = FALLBACK_CHAIN[0]["model"]
-        child._delegate_has_successful_llm_request = True
+        child._delegate_successful_llm_route = (
+            FALLBACK_CHAIN[0]["model"],
+            FALLBACK_CHAIN[0]["provider"],
+        )
         attempts.append((child.provider, child.model))
         child.tool_progress_callback("tool.started", tool_name="terminal")
         return {"final_response": "fallback result", "completed": True, "api_calls": 2}

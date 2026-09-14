@@ -262,7 +262,7 @@ def _build_child_agent(
     child_session_ref["child"] = child
     child._progress_identity_ref = child_session_ref
     child._delegate_model_profile = model_profile
-    child._delegate_has_successful_llm_request = False
+    child._delegate_successful_llm_route = None
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     _apply_child_compression_cap(child, delegation_cfg)

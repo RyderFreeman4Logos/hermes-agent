@@ -886,14 +886,20 @@ _MISSING = object()
 
 
 def _copy_request_overrides(value: Any) -> Any:
-    """Deep-copy override graphs for rollback/restore. Hostile ``__deepcopy__`` falls back to a
-    shallow dict so a failed switch cannot poison the successor."""
+    """Structurally copy supported override containers without invoking value hooks.
+
+    Request overrides are plain configuration data.  Calling arbitrary ``__deepcopy__``
+    hooks while a switch snapshot is being made lets a rejected switch mutate the live
+    graph before there is anything safe to restore.  Copy only dict/list structure and
+    retain opaque leaves as values; route configuration does not promise to clone them.
+    """
     if value is _MISSING:
         return value
-    try:
-        return copy.deepcopy(value)
-    except Exception:
-        return dict(value) if isinstance(value, dict) else value
+    if isinstance(value, dict):
+        return {key: _copy_request_overrides(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_request_overrides(item) for item in value]
+    return value
 
 
 def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:

@@ -187,6 +187,26 @@ def test_copy_request_overrides_hostile_deepcopy_does_not_poison_snapshot():
     assert nested["owned"] is True
 
 
+def test_copy_request_overrides_never_invokes_hostile_nested_copy_hook():
+    class HostileCopy:
+        def __init__(self, sibling):
+            self.sibling = sibling
+
+        def __deepcopy__(self, _memo):
+            self.sibling["mutated"] = True
+            raise RuntimeError("copy hook must not run")
+
+    sibling = {"mutated": False}
+    original = {"extra_body": {"sibling": sibling, "hostile": HostileCopy(sibling)}}
+    copied = arh._copy_request_overrides(original)
+
+    assert sibling["mutated"] is False
+    assert copied is not original
+    assert copied["extra_body"] is not original["extra_body"]
+    copied["extra_body"]["sibling"]["mutated"] = True
+    assert original["extra_body"]["sibling"]["mutated"] is False
+
+
 def test_primary_runtime_snapshot_deep_copies_request_overrides():
     class _Agent:
         pass

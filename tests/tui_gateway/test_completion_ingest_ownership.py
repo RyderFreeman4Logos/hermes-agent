@@ -279,18 +279,18 @@ def test_idle_mixed_completion_transaction(monkeypatch, scenario: str):
             payload = submitted[0]
             if scenario == "filter":
                 assert first_id not in payload and payload.count(second_id) == 1
-                assert settlements == [[second_id]]
+                assert settlements == []
             else:
                 assert payload.index(first_id) < payload.index(second_id)
-                assert settlements == [[first_id, second_id]]
+                assert settlements == []
             assert session.get("_completion_transfer") == []
             if scenario == "late":
                 assert [event["session_id"] for event in session["_completion_pending"]] == [late_id]
                 assert process_registry.is_completion_consumed(late_id) is False
             else:
                 assert session.get("_completion_pending") == []
-            assert process_registry.is_completion_consumed(first_id) is True
-            assert process_registry.is_completion_consumed(second_id) is True
+            assert process_registry.is_completion_consumed(first_id) is (scenario == "filter")
+            assert process_registry.is_completion_consumed(second_id) is False
     finally:
         _clear_ids(first_id, second_id, late_id)
 
@@ -374,11 +374,12 @@ def test_idle_mixed_ingest_and_reclaim_have_one_winner(monkeypatch, winner: str)
             assert errors == []
 
             if winner == "ingest":
-                payload = session["queued_prompt"]["text"]
-                assert payload.index(first_id) < payload.index(second_id)
-                assert _queued_ids(isolated) == []
-                assert process_registry.is_completion_consumed(first_id) is True
-                assert process_registry.is_completion_consumed(second_id) is True
+                # Queue publication reserves, but does not beat a concurrent
+                # dying-session reclaim before the real core row exists.
+                assert _queued_ids(isolated) == [first_id, second_id]
+                assert session.get("queued_prompt") is None
+                assert process_registry.is_completion_consumed(first_id) is False
+                assert process_registry.is_completion_consumed(second_id) is False
             else:
                 assert _queued_ids(isolated) == [first_id, second_id]
                 assert session.get("queued_prompt") is None
@@ -487,8 +488,8 @@ def test_ingest_and_reclaim_have_one_winner(monkeypatch, consumer: str, winner: 
             payload = payloads[0]
             if winner == "ingest":
                 assert payload.count(event_id) == 1
-                assert process_registry.is_completion_consumed(event_id) is True
-                assert _queued_ids(isolated).count(event_id) == 0
+                assert process_registry.is_completion_consumed(event_id) is (consumer != "post_turn")
+                assert _queued_ids(isolated).count(event_id) == (1 if consumer == "post_turn" else 0)
             else:
                 assert event_id not in payload
                 assert process_registry.is_completion_consumed(event_id) is False
@@ -543,7 +544,7 @@ def test_restage_and_redirect_clear_do_not_reuse_old_authority(monkeypatch, cons
             payload = _payload(consumer, second, second_session, monkeypatch)
             assert payload.count(event_id) == 1
             assert "real user steer" not in payload
-            assert process_registry.is_completion_consumed(event_id) is True
+            assert process_registry.is_completion_consumed(event_id) is (consumer != "post_turn")
             assert _queued_ids(isolated).count(event_id) == 0
     finally:
         _clear_ids(event_id)
@@ -617,8 +618,8 @@ def test_explicit_consumption_is_reconciled_at_insertion(
             assert payload.count(first_id) == (0 if consumed else 1)
             assert payload.count(later_id) == 1
             assert payload.count("keep this user steer") == 1
-            assert process_registry.is_completion_consumed(first_id) is True
-            assert process_registry.is_completion_consumed(later_id) is True
+            assert process_registry.is_completion_consumed(first_id) is (consumed or consumer != "post_turn")
+            assert process_registry.is_completion_consumed(later_id) is (consumer != "post_turn")
     finally:
         _clear_ids(first_id, later_id)
 
@@ -765,7 +766,7 @@ def test_successful_snapshot_flushes_idle_completion_despite_foreign_busy_watch(
             assert turns_a[0].count(completion_id) == 1
             assert watch_id not in turns_a[0]
             assert turns_b == []
-            assert process_registry.is_completion_consumed(completion_id) is True
+            assert process_registry.is_completion_consumed(completion_id) is False
     finally:
         stop_a.set()
         stop_b.set()

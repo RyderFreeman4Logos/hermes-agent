@@ -1054,6 +1054,12 @@ def build_turn_context(
     bind_image_token_cost(agent)
     # Append the user message now that close persistence is safe.
     append_message(messages, user_msg)
+    # A queued structured completion is still only reserved until this real core
+    # row exists.  Queue publication, turn admission and context preparation are
+    # deliberately earlier boundaries and must not settle its process receipt.
+    completion_ingest = getattr(agent, "_completion_queue_ingest", None)
+    if callable(completion_ingest):
+        completion_ingest()
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 

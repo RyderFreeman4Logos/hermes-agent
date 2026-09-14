@@ -692,7 +692,18 @@ def convert_messages_to_anthropic(
     for m in messages:
         role = m.get("role", "user")
         if role == "system":
-            system = _convert_system_content(m.get("content", ""))
+            system_entry = _convert_system_content(m.get("content", ""))
+            if system is None:
+                system = system_entry
+            elif isinstance(system, list):
+                if isinstance(system_entry, list):
+                    system.extend(system_entry)
+                else:
+                    system.append({"type": "text", "text": system_entry})
+            elif isinstance(system_entry, list):
+                system = [{"type": "text", "text": system}, *system_entry]
+            else:
+                system = f"{system}\n\n{system_entry}"
         elif role == "assistant":
             result.append(_convert_assistant_message(m))
         elif role == "tool":

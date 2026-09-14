@@ -321,6 +321,22 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         return None
 
 
+def _usage_has(obj: Any, *path: str) -> bool:
+    """True when every hop exists (dict key or attribute), even if the value is 0."""
+    for hop in path:
+        if obj is None:
+            return False
+        if isinstance(obj, dict):
+            if hop not in obj:
+                return False
+            obj = obj[hop]
+        elif hasattr(obj, hop):
+            obj = getattr(obj, hop)
+        else:
+            return False
+    return True
+
+
 def _usage_field(obj: Any, *path: str) -> int:
     """Non-negative int at ``obj.path[0].path[1]...``; 0 if any hop is falsy or
     non-numeric. Hops read dicts and attribute objects alike (the Responses API
@@ -624,12 +640,23 @@ def normalize_usage(
             cache_read_tokens, cache_write_tokens,
         )
 
-    return CanonicalUsage(
+    usage = CanonicalUsage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
         raw_usage=dict(u) if isinstance(u, dict) else (u.model_dump() if callable(getattr(u, 'model_dump', None)) else None),
         cache_telemetry=cache_telemetry,
     )
+    cache_telemetry = (
+        "reported"
+        if any(_usage_has(u, *path) for paths in shape[2:] for path in paths)
+        else "unavailable"
+    )
+    try:
+        from agent.cache_lowhit_request_dump import maybe_dump_on_usage
+        maybe_dump_on_usage(usage, cache_telemetry=cache_telemetry)
+    except Exception:
+        logger.debug("cache low-hit dump failed", exc_info=True)
+    return usage
 
 
 def _unknown_cost(source: CostSource, *notes: str) -> CostResult:

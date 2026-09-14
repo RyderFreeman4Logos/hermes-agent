@@ -893,13 +893,50 @@ def _copy_request_overrides(value: Any) -> Any:
     graph before there is anything safe to restore.  Copy only dict/list structure and
     retain opaque leaves as values; route configuration does not promise to clone them.
     """
-    if value is _MISSING:
-        return value
-    if isinstance(value, dict):
-        return {key: _copy_request_overrides(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_copy_request_overrides(item) for item in value]
-    return value
+    memo: Dict[int, Any] = {}
+    active: set[int] = set()
+    remaining = 10_000
+
+    def copy_plain(item: Any, depth: int = 0) -> Any:
+        nonlocal remaining
+        if item is _MISSING:
+            return item
+        if isinstance(item, (dict, list)) and type(item) not in (dict, list):
+            raise ValueError("request_overrides containers must be plain built-in dict/list values")
+        if type(item) not in (dict, list):
+            return item
+        if depth >= 100:
+            raise ValueError("request_overrides nesting exceeds 100 containers")
+        oid = id(item)
+        if oid in active:
+            raise ValueError("request_overrides contains a cyclic container graph")
+        if oid in memo:
+            return memo[oid]
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError("request_overrides exceeds 10000 containers")
+        active.add(oid)
+        try:
+            if type(item) is dict:
+                copied: Any = {}
+                memo[oid] = copied
+                for key, child in dict.items(item):
+                    if type(key) is not str:
+                        raise ValueError("request_overrides mapping keys must be plain strings")
+                    copied[key] = copy_plain(child, depth + 1)
+            else:
+                copied = []
+                memo[oid] = copied
+                for child in list.__iter__(item):
+                    copied.append(copy_plain(child, depth + 1))
+            return copied
+        except Exception:
+            memo.pop(oid, None)
+            raise
+        finally:
+            active.remove(oid)
+
+    return copy_plain(value)
 
 
 def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:

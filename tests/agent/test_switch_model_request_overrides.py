@@ -13,6 +13,7 @@ extra_body configured for another model.
 """
 
 import agent.agent_runtime_helpers as arh
+import pytest
 
 
 class _Agent:
@@ -205,6 +206,71 @@ def test_copy_request_overrides_never_invokes_hostile_nested_copy_hook():
     assert copied["extra_body"] is not original["extra_body"]
     copied["extra_body"]["sibling"]["mutated"] = True
     assert original["extra_body"]["sibling"]["mutated"] is False
+
+
+@pytest.mark.parametrize("container_kind", ["dict", "list"])
+def test_public_switch_rejects_container_hooks_before_mutating_route(container_kind):
+    """A switch snapshot must not execute mapping/sequence subclass hooks."""
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    sibling = {"mutated": False}
+
+    class HostileDict(dict):
+        def items(self):
+            sibling["mutated"] = True
+            raise RuntimeError("items hook ran")
+
+    class HostileList(list):
+        def __iter__(self):
+            sibling["mutated"] = True
+            raise RuntimeError("iter hook ran")
+
+    nested = HostileDict({"value": 1}) if container_kind == "dict" else HostileList([1])
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "openrouter"
+    agent.model = "x-ai/grok-4"
+    agent.requested_provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.api_key = "old-key"
+    agent.api_mode = "chat_completions"
+    agent.client = MagicMock()
+    agent._client_kwargs = {"api_key": "old-key", "base_url": agent.base_url}
+    agent._anthropic_client = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = None
+    agent._is_anthropic_oauth = False
+    agent._config_context_length = None
+    agent._reasoning_echo_flag = False
+    agent.runtime_capabilities = {}
+    agent._credential_pool = None
+    agent._credential_pool_entry_id = None
+    agent.request_overrides = {"extra_body": {"sibling": sibling, "hostile": nested}}
+
+    with pytest.raises(ValueError, match="plain built-in"):
+        agent.switch_model(
+            new_model="gpt-5", new_provider="openai", api_key="new-key",
+            base_url="https://api.openai.com/v1", api_mode="chat_completions",
+            capabilities={},
+        )
+
+    assert sibling == {"mutated": False}
+    assert (agent.model, agent.provider, agent.base_url) == (
+        "x-ai/grok-4", "openrouter", "https://openrouter.ai/api/v1"
+    )
+
+
+def test_copy_request_overrides_preserves_shared_graph_and_rejects_cycle():
+    shared = {"value": [1, 2]}
+    copied = arh._copy_request_overrides({"left": shared, "right": shared})
+    assert copied["left"] is copied["right"]
+    assert copied["left"] is not shared
+
+    cyclic = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="cyclic"):
+        arh._copy_request_overrides(cyclic)
 
 
 def test_primary_runtime_snapshot_deep_copies_request_overrides():

@@ -1825,6 +1825,77 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
+_FALLBACK_SNAPSHOT_FIELDS = (
+    "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
+    "_client_kwargs", "request_overrides", "_fallback_activated", "_reasoning_echo_flag",
+    "_config_context_length", "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url",
+    "_is_anthropic_oauth", "_credential_pool", "_credential_pool_entry_id",
+    "_use_prompt_caching", "_use_native_cache_layout", "reasoning_config", "runtime_capabilities",
+    "_provider_fallback_active", "_provider_fallback_route", "_cached_system_prompt",
+    "_pending_fallback_notice", "_retry_status_buffer", "_consecutive_stale_streams",
+    "_primary_runtime",
+)
+_FALLBACK_COPY_FIELDS = {
+    "_client_kwargs", "request_overrides", "reasoning_config", "runtime_capabilities",
+    "_primary_runtime",
+}
+_COMPRESSOR_RUNTIME_FIELDS = (
+    "model", "base_url", "api_key", "provider", "api_mode", "context_length",
+    "_base_threshold_percent", "threshold_percent", "max_tokens", "threshold_tokens",
+    "_tail_token_budget", "max_summary_tokens", "last_prompt_tokens", "last_completion_tokens",
+    "last_total_tokens", "_prellm_skip_count", "_fallback_compression_streak",
+    "_summary_failure_cooldown_until", "_last_summary_error", "_consecutive_timeout_failures",
+    "_cooldown_persist_failed", "_verify_compaction_cleared_threshold",
+    "_last_compression_made_progress",
+)
+
+
+def _snapshot_fallback_runtime(agent) -> dict:
+    """Capture the finite runtime owners mutated by one fallback activation."""
+    from agent.agent_runtime_helpers import _MISSING, _copy_request_overrides
+
+    values = {}
+    for name in _FALLBACK_SNAPSHOT_FIELDS:
+        value = getattr(agent, name, _MISSING)
+        if name in _FALLBACK_COPY_FIELDS and value is not _MISSING and value is not None:
+            value = _copy_request_overrides(value)
+        elif name in {"_pending_fallback_notice", "_retry_status_buffer"} and isinstance(value, list):
+            value = list(value)
+        values[name] = value
+    cache = getattr(agent, "_transport_cache", _MISSING)
+    cache_contents = dict(cache) if isinstance(cache, dict) else cache
+    compressor = getattr(agent, "context_compressor", None)
+    compressor_values = {
+        name: getattr(compressor, name, _MISSING) for name in _COMPRESSOR_RUNTIME_FIELDS
+    } if compressor is not None else None
+    return {"values": values, "transport_cache": cache_contents, "compressor": compressor_values}
+
+
+def _restore_fallback_runtime(agent, snapshot: dict) -> None:
+    """Restore a rejected candidate before the loop considers its successor."""
+    from agent.agent_runtime_helpers import _MISSING
+
+    for name, value in snapshot["values"].items():
+        if value is _MISSING:
+            with contextlib.suppress(AttributeError):
+                delattr(agent, name)
+        else:
+            setattr(agent, name, value)
+    cache = snapshot["transport_cache"]
+    if isinstance(cache, dict) and isinstance(getattr(agent, "_transport_cache", None), dict):
+        agent._transport_cache.clear()
+        agent._transport_cache.update(cache)
+    compressor_values = snapshot["compressor"]
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None and compressor_values is not None:
+        for name, value in compressor_values.items():
+            if value is _MISSING:
+                with contextlib.suppress(AttributeError):
+                    delattr(compressor, name)
+            else:
+                setattr(compressor, name, value)
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
@@ -1879,17 +1950,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
             from agent.agent_runtime_helpers import _copy_request_overrides
             live_overrides = getattr(agent, "request_overrides", {}) or {}
-            runtime_snapshot = {
-                "model": agent.model, "provider": agent.provider,
-                "requested_provider": getattr(agent, "requested_provider", agent.provider),
-                "base_url": agent.base_url, "api_mode": agent.api_mode,
-                "api_key": getattr(agent, "api_key", None), "client": getattr(agent, "client", None),
-                "client_kwargs": dict(getattr(agent, "_client_kwargs", {}) or {}),
-                "request_overrides": _copy_request_overrides(live_overrides),
-                "fallback_activated": getattr(agent, "_fallback_activated", False),
-                "reasoning_echo": getattr(agent, "_reasoning_echo_flag", False),
-                "config_context_length": getattr(agent, "_config_context_length", None),
-            }
+            runtime_snapshot = _snapshot_fallback_runtime(agent)
             if not getattr(agent, "_fallback_activated", False):
                 primary_runtime = getattr(agent, "_primary_runtime", None)
                 if isinstance(primary_runtime, dict):
@@ -1946,18 +2007,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         except Exception as e:
             if runtime_snapshot is not None:
                 with contextlib.suppress(Exception):
-                    agent.model = runtime_snapshot["model"]
-                    agent.provider = runtime_snapshot["provider"]
-                    agent.requested_provider = runtime_snapshot["requested_provider"]
-                    agent.base_url = runtime_snapshot["base_url"]
-                    agent.api_mode = runtime_snapshot["api_mode"]
-                    agent.api_key = runtime_snapshot["api_key"]
-                    agent.client = runtime_snapshot["client"]
-                    agent._client_kwargs = runtime_snapshot["client_kwargs"]
-                    agent.request_overrides = runtime_snapshot["request_overrides"]
-                    agent._fallback_activated = runtime_snapshot["fallback_activated"]
-                    agent._reasoning_echo_flag = runtime_snapshot["reasoning_echo"]
-                    agent._config_context_length = runtime_snapshot["config_context_length"]
+                    _restore_fallback_runtime(agent, runtime_snapshot)
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)

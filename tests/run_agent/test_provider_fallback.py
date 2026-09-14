@@ -591,3 +591,83 @@ class TestFallbackExtraBodyReResolution:
         assert next_kwargs["model"] == "c-model"
         assert agent.client.base_url == c_url
         assert next_kwargs["extra_body"] == {"caller": "kept", "c_only": 3}
+
+    def test_exhausted_late_native_failure_restores_complete_primary_runtime(self):
+        """A rejected native fallback cannot leave its transport or compressor on B."""
+        a_url = "https://a.example.com/anthropic"
+        b_url = "https://b.example.com/anthropic"
+        agent = _make_agent(fallback_model=[{
+            "provider": "custom:b", "model": "b-model", "base_url": b_url,
+            "api_mode": "anthropic_messages",
+        }])
+        agent.provider = agent.requested_provider = "custom:a"
+        agent.model = "a-model"
+        agent.base_url = a_url
+        agent.api_mode = "anthropic_messages"
+        agent.api_key = agent._anthropic_api_key = "a-key"
+        agent._anthropic_base_url = a_url
+        agent._anthropic_client = MagicMock(name="A-native-client")
+        agent._is_anthropic_oauth = False
+        agent.client = None
+        agent._client_kwargs = {}
+        agent._credential_pool = MagicMock(name="A-pool", provider="custom:a")
+        agent._credential_pool_entry_id = "a-entry"
+        agent._use_prompt_caching = True
+        agent._use_native_cache_layout = True
+        agent.reasoning_config = {"effort": "high"}
+        agent.runtime_capabilities = {"route": "a"}
+        agent._provider_fallback_active = False
+        agent._provider_fallback_route = None
+        agent._cached_system_prompt = "Model: a-model\nProvider: custom:a"
+        agent._pending_fallback_notice = ["A notice"]
+        agent._consecutive_stale_streams = 4
+        agent.request_overrides = {"extra_body": {"route": "a"}}
+        compressor = MagicMock()
+        compressor.model = "a-model"
+        compressor.provider = "custom:a"
+        compressor.base_url = a_url
+        compressor.api_key = "a-key"
+        compressor.api_mode = "anthropic_messages"
+        compressor.context_length = 111
+        agent.context_compressor = compressor
+
+        def mutate_compressor(**kwargs):
+            for key, value in kwargs.items():
+                setattr(compressor, key, value)
+
+        compressor.update_model.side_effect = mutate_compressor
+        fb_client = _mock_client(base_url=b_url, api_key="b-key")
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client", return_value=(fb_client, "b-model")
+        ), patch(
+            "agent.client_lifecycle._swap_fallback_clients"
+        ) as swap, patch(
+            "agent.model_metadata.get_model_context_length", return_value=222
+        ), patch(
+            "agent.native_compaction.resolve_native_compaction_capabilities",
+            side_effect=RuntimeError("late capability failure"),
+        ):
+            def install_b(*_args):
+                agent.api_key = agent._anthropic_api_key = "b-key"
+                agent._anthropic_base_url = b_url
+                agent._anthropic_client = MagicMock(name="B-native-client")
+                agent._credential_pool = MagicMock(name="B-pool", provider="custom:b")
+                agent._credential_pool_entry_id = "b-entry"
+            swap.side_effect = install_b
+            assert agent._try_activate_fallback() is False
+
+        assert (agent.model, agent.provider, agent.base_url, agent.api_mode) == (
+            "a-model", "custom:a", a_url, "anthropic_messages"
+        )
+        assert (agent._anthropic_api_key, agent._anthropic_base_url) == ("a-key", a_url)
+        assert agent._anthropic_client._mock_name == "A-native-client"
+        assert (agent._credential_pool.provider, agent._credential_pool_entry_id) == ("custom:a", "a-entry")
+        assert (compressor.model, compressor.provider, compressor.base_url, compressor.context_length) == (
+            "a-model", "custom:a", a_url, 111
+        )
+        assert agent.request_overrides == {"extra_body": {"route": "a"}}
+        assert agent.runtime_capabilities == {"route": "a"}
+        assert agent._cached_system_prompt == "Model: a-model\nProvider: custom:a"
+        assert agent._pending_fallback_notice == ["A notice"]
+        assert agent._consecutive_stale_streams == 4

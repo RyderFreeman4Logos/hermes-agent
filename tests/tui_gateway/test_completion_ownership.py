@@ -172,7 +172,7 @@ class _BlockingMessages(list):
             assert self.release.wait(2), "user-row release timed out"
 
 
-def test_ack_uses_drained_event_identity_not_formatted_text(monkeypatch):
+def test_ingest_uses_structured_identity_not_formatted_text(monkeypatch):
     first_id = "proc_identity_a"
     staged_id = "proc_identity_b"
     restaged_id = "proc_identity_c"
@@ -199,41 +199,35 @@ def test_ack_uses_drained_event_identity_not_formatted_text(monkeypatch):
             apply_thread = threading.Thread(target=apply, daemon=True)
             apply_thread.start()
             assert messages.user_appended.wait(2), "first completion was not ingested"
-            assert session["_completion_pending"][0].get("_steer_drained") is True
+            messages.release.set()
+            apply_thread.join(2)
+            assert not apply_thread.is_alive()
+            assert errors == []
+            assert process_registry.is_completion_consumed(first_id) is True
+            assert messages[-1]["content"].count(first_id) >= 2
+
             assert server._deliver_completions_via_steer(
                 "owner-ui",
                 session,
                 [_completion(staged_id, output=f"ordinary output mentions {first_id} token")],
                 set(),
             )
-            messages.release.set()
-            apply_thread.join(2)
-            assert not apply_thread.is_alive()
-            assert errors == []
-
-            assert process_registry.is_completion_consumed(first_id) is True
-            assert process_registry.is_completion_consumed(staged_id) is False
-            assert [
-                event["session_id"] for event in session.get("_completion_pending") or []
-            ] == [staged_id]
-
-            agent.clear_interrupt()
+            process_registry._completion_consumed.add(staged_id)
             assert server._deliver_completions_via_steer(
                 "owner-ui", session, [_completion(restaged_id)], set()
             )
-            leftover = agent._drain_pending_steer()
-            assert leftover and restaged_id in leftover
             monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
-            server._run_post_turn_followups(
-                "rid", "owner-ui", session, {"pending_steer": leftover}, None
-            )
+            server._run_post_turn_followups("rid", "owner-ui", session, {}, None)
 
-            assert process_registry.is_completion_consumed(staged_id) is False
+            payload = session["queued_prompt"]["text"]
+            assert staged_id not in payload
+            assert restaged_id in payload
+            assert process_registry.is_completion_consumed(staged_id) is True
             assert process_registry.is_completion_consumed(restaged_id) is True
             session.update(_closing=True, _finalized=True)
             stop = threading.Event()
             stop.set()
             server._notification_poller_loop(stop, "owner-ui", session)
-            assert _queued_ids(isolated) == [staged_id]
+            assert _queued_ids(isolated) == []
     finally:
         _clear_ids(first_id, staged_id, restaged_id)

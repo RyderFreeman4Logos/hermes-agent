@@ -74,12 +74,15 @@ def _warn_config_parse_failure(
     try:
         st = config_path.stat()
         key = (str(config_path), st.st_mtime_ns, st.st_size)
-        _CONFIG_PARSE_FAILURES[str(config_path)] = (st.st_mtime_ns, st.st_size, str(exc))
+        record = (st.st_mtime_ns, st.st_size, str(exc))
     except OSError:
         key = (str(config_path), 0, 0)
-    if key in _CONFIG_PARSE_WARNED:
-        return
-    _CONFIG_PARSE_WARNED.add(key)
+        record = (0, 0, str(exc))
+    with _CONFIG_LOCK:
+        _CONFIG_PARSE_FAILURES[str(config_path)] = record
+        if key in _CONFIG_PARSE_WARNED:
+            return
+        _CONFIG_PARSE_WARNED.add(key)
     from hermes_cli.config_backups import backup_config
     backup_path = backup_config(config_path, "corrupt")
     msg = f"Failed to parse {config_path}: {exc}. " + _PARSE_FAILURE_FALLBACK_MSG.get(
@@ -99,7 +102,11 @@ def get_active_config_parse_failure() -> Optional[str]:
     (mtime_ns + size) to the file that failed to parse; else None."""
     try:
         path = get_config_path()
-        mtime_ns, size, err = _CONFIG_PARSE_FAILURES[str(path)]
+        with _CONFIG_LOCK:
+            record = _CONFIG_PARSE_FAILURES.get(str(path))
+        if record is None:
+            return None
+        mtime_ns, size, err = record
         st = path.stat()
         return err if (st.st_mtime_ns, st.st_size) == (mtime_ns, size) else None
     except Exception:
@@ -1891,47 +1898,53 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     config_path = get_config_path()
     path_key = str(config_path)
+
+    def cached_or_empty(exc: OSError) -> Dict[str, Any]:
+        with _CONFIG_LOCK:
+            cached = _RAW_CONFIG_CACHE.get(path_key)
+        _warn_config_parse_failure(config_path, exc, fallback="last-known-good" if cached else "defaults")
+        if cached is None:
+            return {}
+        return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
+
     try:
-        # Every warm lookup validates freshness, but does not materialize the
-        # complete configuration or hold the process-wide parser lock.
         digest = _digest_file(config_path)
     except FileNotFoundError:
         return {}
     except OSError as exc:
-        with _CONFIG_LOCK:
-            cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None:
-            _warn_config_parse_failure(config_path, exc, fallback="last-known-good")
-            return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
-        _warn_config_parse_failure(config_path, exc)
-        return {}
+        return cached_or_empty(exc)
 
     with _CONFIG_LOCK:
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[0] == digest:
+        failure_before = _CONFIG_PARSE_FAILURES.get(path_key)
+        if cached is not None and cached[0] == digest and failure_before is None:
             return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
-
         try:
-            # Hash from the same bounded stream as parsing so the stored key
-            # cannot name bytes from a different in-place revision.
             with config_path.open("rb") as source:
                 reader = _DigestingConfigReader(source)
-                data = fast_safe_load(reader) or {}
+                loaded = fast_safe_load(reader)
                 digest = reader.digest()
-            cached = _RAW_CONFIG_CACHE.get(path_key)
-            if cached is not None and cached[0] == digest:
-                return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
-        except Exception as e:
-            _warn_config_parse_failure(config_path, e)
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            return cached_or_empty(exc)
+        except Exception as exc:
+            _warn_config_parse_failure(config_path, exc)
             return {}
 
-        if not isinstance(data, dict):
-            data = {}
-        # The cache stores its own deepcopy. The readonly path returns THAT object (identity
-        # invariant: later cache hits return the same dict); the mutable path returns the parse.
-        cached_copy = copy.deepcopy(data)
-        _RAW_CONFIG_CACHE[path_key] = (digest, cached_copy)
-        return data if want_deepcopy else cached_copy
+        valid_root = loaded is None or isinstance(loaded, dict)
+        data = loaded or {} if valid_root else {}
+        cached = _RAW_CONFIG_CACHE.get(path_key)
+        if cached is not None and cached[0] == digest:
+            result = copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
+        else:
+            cached_copy = copy.deepcopy(data)
+            _RAW_CONFIG_CACHE[path_key] = (digest, cached_copy)
+            result = data if want_deepcopy else cached_copy
+        if valid_root and failure_before is not None and _CONFIG_PARSE_FAILURES.get(path_key) == failure_before:
+            _CONFIG_PARSE_FAILURES.pop(path_key, None)
+            _CONFIG_PARSE_WARNED.discard((path_key, failure_before[0], failure_before[1]))
+        return result
 
 
 def read_raw_config() -> Dict[str, Any]:

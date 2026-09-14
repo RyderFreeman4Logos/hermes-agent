@@ -136,3 +136,26 @@ def test_warm_read_hashes_bounded_chunks_outside_config_lock(
     assert reads
     assert all(0 < size <= 64 * 1024 and not locked
                for size, locked in reads)
+
+
+def test_validated_raw_recovery_retires_same_metadata_failure(isolated_hermes_home):
+    """A warm digest hit cannot keep an old corrupt-config refusal alive."""
+    from hermes_cli import config as config_mod
+
+    cfg = isolated_hermes_home / "config.yaml"
+    valid = "model:\n  provider: openrouter\n"
+    broken = "model:\n  provider: [openrouter"
+    assert len(valid) == len(broken)
+    cfg.write_text(valid, encoding="utf-8")
+    original_stat = cfg.stat()
+    assert config_mod.read_raw_config_readonly()["model"]["provider"] == "openrouter"
+
+    cfg.write_text(broken, encoding="utf-8")
+    os.utime(cfg, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    config_mod.load_config()
+    assert config_mod.get_active_config_parse_failure()
+
+    cfg.write_text(valid, encoding="utf-8")
+    os.utime(cfg, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    assert config_mod.read_raw_config_readonly()["model"]["provider"] == "openrouter"
+    assert config_mod.get_active_config_parse_failure() is None

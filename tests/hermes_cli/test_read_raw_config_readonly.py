@@ -58,6 +58,19 @@ def test_freshness_after_config_edit(isolated_hermes_home):
     assert second["display"]["ephemeral_system_ttl"] == 7
 
 
+def test_mutating_mutable_raw_result_does_not_corrupt_readonly_cache(isolated_hermes_home):
+    """W7: write-back callers receive a copy, not the shared readonly object."""
+    from hermes_cli import config as config_mod
+
+    _write_config(isolated_hermes_home, {"nested": {"values": ["kept"]}})
+    mutable = config_mod.read_raw_config()
+    mutable["nested"]["values"].append("caller-only")
+
+    readonly = config_mod.read_raw_config_readonly()
+    assert readonly == {"nested": {"values": ["kept"]}}
+    assert config_mod.read_raw_config_readonly() is readonly
+
+
 def test_missing_config_returns_empty(isolated_hermes_home):
     from hermes_cli.config import read_raw_config_readonly
 
@@ -148,7 +161,8 @@ def test_validated_raw_recovery_retires_same_metadata_failure(isolated_hermes_ho
     assert len(valid) == len(broken)
     cfg.write_text(valid, encoding="utf-8")
     original_stat = cfg.stat()
-    assert config_mod.read_raw_config_readonly()["model"]["provider"] == "openrouter"
+    first = config_mod.read_raw_config_readonly()
+    assert first["model"]["provider"] == "openrouter"
 
     cfg.write_text(broken, encoding="utf-8")
     os.utime(cfg, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
@@ -157,7 +171,9 @@ def test_validated_raw_recovery_retires_same_metadata_failure(isolated_hermes_ho
 
     cfg.write_text(valid, encoding="utf-8")
     os.utime(cfg, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-    assert config_mod.read_raw_config_readonly()["model"]["provider"] == "openrouter"
+    recovered = config_mod.read_raw_config_readonly()
+    assert recovered["model"]["provider"] == "openrouter"
+    assert recovered is first
     assert config_mod.get_active_config_parse_failure() is None
 
 
@@ -361,3 +377,33 @@ def test_same_metadata_valid_rewrite_returns_the_new_raw_literal(
     cfg.write_text(second, encoding="utf-8")
     os.utime(cfg, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
     assert reader()["image_gen"]["provider"] == "krea"
+
+
+def test_partial_save_keeps_another_profile_raw_cache_intact(isolated_hermes_home):
+    """W7: saving this profile invalidates only this profile's raw cache entry."""
+    from hermes_cli import config as config_mod
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root = isolated_hermes_home
+    other = root.parent / "other-profile"
+    other.mkdir()
+    _write_config(root, {"agent": {"max_turns": 7}, "marker": "root"})
+    _write_config(other, {"agent": {"max_turns": 9}, "marker": "other"})
+    assert config_mod.read_raw_config_readonly()["marker"] == "root"
+
+    token = set_hermes_home_override(other)
+    try:
+        other_cached = config_mod.read_raw_config_readonly()
+        assert other_cached["marker"] == "other"
+    finally:
+        reset_hermes_home_override(token)
+
+    config_mod.save_config({"agent": {"max_turns": 8}}, merge_existing=True)
+    assert config_mod.read_raw_config_readonly()["agent"]["max_turns"] == 8
+
+    token = set_hermes_home_override(other)
+    try:
+        assert config_mod.read_raw_config_readonly() is other_cached
+        assert other_cached["agent"]["max_turns"] == 9
+    finally:
+        reset_hermes_home_override(token)

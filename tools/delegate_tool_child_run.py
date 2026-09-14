@@ -497,6 +497,9 @@ def _build_result_entry(
             if result.get("billing_unverified", False)
             else "Subagent failed with a provider error unrelated to its effective model."
         )
+        safe_error = summary
+    else:
+        safe_error = None
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
@@ -565,7 +568,11 @@ def _build_result_entry(
                 "Final answer does not satisfy the declared output_schema" + (" (after 1 retry)." if schema.retries else ".")
             )
         else:
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            entry["error"] = (
+                safe_error
+                if safe_error is not None
+                else result.get("error", "Subagent did not produce a response.")
+            )
         # Classified reason from the child loop (e.g. "rate_limit", "billing")
         # lets the parent tell a quota wall from a task error without parsing prose.
         _failure_reason = result.get("failure_reason")

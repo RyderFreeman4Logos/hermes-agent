@@ -8,6 +8,7 @@ from copy import deepcopy
 from unittest.mock import patch
 
 from agent.turn_iteration_prep import prepare_iteration
+from agent.turn_stop_gates import apply_stop_gates
 from hermes_state import SessionDB
 from run_agent import AIAgent
 from tools.process_registry import process_registry
@@ -304,6 +305,164 @@ def test_current_tool_boundary_persists_ordered_completions_and_user_steer(tmp_p
         assert _rows(db.get_messages_as_conversation(agent.session_id)) == _rows(messages)
         assert session.get("_completion_transfer") == []
         assert all(process_registry.is_completion_consumed(item) for item in event_ids)
+    finally:
+        db.close()
+        _clear(*event_ids)
+
+
+def test_pre_api_after_persisted_interim_answer_retains_appendable_prefix(tmp_path):
+    event_id = "proc_after_interim_answer"
+    _clear(event_id)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("turn-boundary-session", source="test")
+    try:
+        agent = _agent(db)
+        session = _session(agent)
+        messages = _history()
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "current-call",
+                            "type": "function",
+                            "function": {"name": "terminal", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "current-call", "content": "T1"},
+            ]
+        )
+        agent._persist_user_message_idx = 4
+        agent._persist_session(messages, [])
+        agent._emit_interim_assistant_message = lambda _message: None
+        agent._interim_content_was_streamed = lambda _content: False
+        with patch("agent.turn_stop_gates._verify_on_stop_nudge", return_value="verify N1"):
+            verdict = apply_stop_gates(
+                agent,
+                {"role": "assistant", "content": "persisted A1"},
+                final_response="persisted A1",
+                messages=messages,
+                conversation_history=[],
+                pending_verification_response=None,
+                pending_verification_response_previewed=False,
+            )
+        assert verdict.continue_turn
+        live_prefix = json.dumps(messages, sort_keys=False, separators=(",", ":"))
+        durable_prefix = _rows(db.get_messages_as_conversation(agent.session_id))
+        assert durable_prefix[-1] == ("assistant", "persisted A1")
+        assert server._deliver_completions_via_steer(
+            "owner-ui", session, [_completion(event_id)], set()
+        )
+        assert agent.steer("genuine user steer")
+
+        prepare_iteration(
+            agent,
+            messages=messages,
+            api_call_count=2,
+            user_message="U1",
+            current_turn_user_idx=4,
+        )
+        agent._persist_session(messages, [])
+
+        assert json.dumps(messages, sort_keys=False, separators=(",", ":")) == live_prefix
+        assert _rows(db.get_messages_as_conversation(agent.session_id)) == durable_prefix
+        assert [item["session_id"] for item in session["_completion_transfer"]] == [event_id]
+        assert not process_registry.is_completion_consumed(event_id)
+        assert agent._drain_pending_steer() == "genuine user steer"
+        assert agent._drain_pending_steer() is None
+    finally:
+        db.close()
+        _clear(event_id)
+
+
+def test_prior_completion_keeps_order_until_next_valid_tool_boundary(tmp_path):
+    event_ids = ("proc_prior_completion", "proc_later_completion")
+    _clear(*event_ids)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("turn-boundary-session", source="test")
+    try:
+        agent = _agent(db)
+        session = _session(agent)
+        messages = _history()
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "first-call",
+                            "type": "function",
+                            "function": {"name": "terminal", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "first-call", "content": "T1"},
+            ]
+        )
+        agent._persist_user_message_idx = 4
+        agent._persist_session(messages, [])
+        assert server._deliver_completions_via_steer(
+            "owner-ui", session, [_completion(event_ids[0])], set()
+        )
+        prepare_iteration(
+            agent, messages=messages, api_call_count=1,
+            user_message="U1", current_turn_user_idx=4,
+        )
+        agent._persist_session(messages, [])
+        assert process_registry.is_completion_consumed(event_ids[0])
+
+        assert server._deliver_completions_via_steer(
+            "owner-ui", session, [_completion(event_ids[1])], set()
+        )
+        assert agent.steer("genuine later steer")
+        prior_prefix = json.dumps(messages, sort_keys=False, separators=(",", ":"))
+        prepare_iteration(
+            agent, messages=messages, api_call_count=2,
+            user_message="U1", current_turn_user_idx=4,
+        )
+
+        assert json.dumps(messages, sort_keys=False, separators=(",", ":")) == prior_prefix
+        assert [item["session_id"] for item in session["_completion_transfer"]] == [event_ids[1]]
+        assert not process_registry.is_completion_consumed(event_ids[1])
+        assert agent._pending_steer == "genuine later steer"
+
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "second-call",
+                            "type": "function",
+                            "function": {"name": "terminal", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "second-call", "content": "T2"},
+            ]
+        )
+        agent._persist_session(messages, [])
+        prepare_iteration(
+            agent, messages=messages, api_call_count=3,
+            user_message="U1", current_turn_user_idx=4,
+        )
+        agent._persist_session(messages, [])
+
+        prior_rows = [i for i, row in enumerate(messages)
+                      if row.get("role") == "user" and event_ids[0] in str(row.get("content"))]
+        later_rows = [i for i, row in enumerate(messages)
+                      if row.get("role") == "user" and event_ids[1] in str(row.get("content"))]
+        assert len(prior_rows) == len(later_rows) == 1
+        assert prior_rows[0] < later_rows[0]
+        assert "genuine later steer" in str(messages[later_rows[0]]["content"])
+        assert _rows(db.get_messages_as_conversation(agent.session_id)) == _rows(messages)
+        assert session.get("_completion_transfer") == []
+        assert process_registry.is_completion_consumed(event_ids[1])
     finally:
         db.close()
         _clear(*event_ids)

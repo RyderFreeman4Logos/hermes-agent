@@ -343,10 +343,12 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
         with session["history_lock"]:
             if session.get("running") or session.get("_closing") or session.get("_finalized"):
                 return False
-            _enqueue_prompt(session, text, session.get("transport"))
+            _enqueue_prompt(session, text, session.get("transport"), structured_completion=True)
             return True
 
     if not pending:
+        if _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session):
+            return
         if _ingest_completion_transfer(session, insert):
             _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
         return
@@ -371,6 +373,8 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
                         transfer.append(dict(evt))
                         have.add(event_id)
                 session["_completion_transfer"] = transfer
+        if _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session):
+            return
         inserted = not pending_only and _ingest_completion_transfer(session, insert)
 
     if pending_only:
@@ -821,8 +825,7 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
         if event.get("type", "completion") != "completion":
             _notif_dispatch_completions(sid, session, completions, registry, deferred)
             completions = []
-            if deferred is None and _notification_event_belongs_elsewhere(
-                    sid, session, event):
+            if deferred is None:
                 _flush_pending_completions_if_idle(sid, session, emitted)
         if not _notif_handle_event(sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned):
             for remaining in events[index + 1:]:

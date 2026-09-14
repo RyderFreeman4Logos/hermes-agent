@@ -799,10 +799,27 @@ class SessionMessagesMixin:
                 conn, session_id, carried_messages or [])
             if tail_count > 0:
                 bound = watermark is not None
-                rewind_ids += [int(row["id"]) for row in conn.execute(
-                    f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
+                rewind_rows = conn.execute(
+                    f"SELECT id, role, content, api_content, tool_call_id FROM messages "
+                    f"WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
                     "ORDER BY id DESC LIMIT ?",
-                    (session_id, *((int(watermark),) if bound else ()), int(tail_count))).fetchall()]
+                    (session_id, *((int(watermark),) if bound else ()), int(tail_count))).fetchall()
+                retained_tail = compacted_messages[-int(tail_count):]
+                retained_tools: Dict[str, List[Dict[str, Any]]] = {}
+                for message in retained_tail:
+                    if isinstance(message, dict) and message.get("role") == "tool" and message.get("tool_call_id"):
+                        retained_tools.setdefault(str(message["tool_call_id"]), []).append(message)
+                for row in rewind_rows:
+                    if row["role"] != "tool" or not row["tool_call_id"]:
+                        rewind_ids.append(int(row["id"]))
+                        continue
+                    matches = retained_tools.get(str(row["tool_call_id"]), [])
+                    if len(matches) != 1:
+                        continue
+                    retained = matches[0]
+                    if (row["content"] == self._encode_content(retained.get("content"))
+                            and row["api_content"] == _scrub_surrogates(retained.get("api_content"))):
+                        rewind_ids.append(int(row["id"]))
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
             if rewind_ids:

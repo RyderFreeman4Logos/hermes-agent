@@ -249,10 +249,10 @@ def _inject_steer_after_newest_tool_result(
                 break
             from agent.prompt_builder import steer_user_row
 
-            def insert(completion_text: str) -> bool:
+            def insert(completion_text: str, _events: list) -> str:
                 text = f"{completion_text}\n{steer_text}" if steer_text else completion_text
                 messages.insert(_si + 1, steer_user_row(text))
-                return True
+                return "inserted"
 
             if callable(ingest_completion) and ingest_completion(insert):
                 return

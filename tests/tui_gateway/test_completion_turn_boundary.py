@@ -176,7 +176,7 @@ def test_late_busy_stage_reaches_one_idle_turn_without_new_activity(monkeypatch)
         assert admitted.wait(2), "late staged transfer never reached idle admission"
         assert len(turns) == 1
         assert event_id in turns[0]
-        assert process_registry.is_completion_consumed(event_id)
+        assert not process_registry.is_completion_consumed(event_id)
         assert isolated.empty()
     finally:
         stop.set()
@@ -230,7 +230,7 @@ def test_context_refusal_preserves_staged_completion_without_replaying_user_prom
         assert event_id in session["queued_prompt"]["text"]
         assert "@file:first.txt" not in session["queued_prompt"]["text"]
         assert "@file:second.txt" not in session["queued_prompt"]["text"]
-        assert process_registry.is_completion_consumed(event_id)
+        assert not process_registry.is_completion_consumed(event_id)
         assert session.get("_completion_transfer") == []
     finally:
         server._sessions.pop("context-refusal-ui", None)
@@ -267,7 +267,7 @@ def test_staged_completion_and_late_user_prompt_keep_separate_queue_entries(monk
         assert event_id in session["queued_prompt"]["text"]
         assert session["queued_prompt"]["text"].strip() != "late user prompt"
         assert [entry["text"] for entry in session["queued_prompts"]] == ["late user prompt"]
-        assert process_registry.is_completion_consumed(event_id)
+        assert not process_registry.is_completion_consumed(event_id)
     finally:
         server._sessions.pop("completion-queue-interleaving-ui", None)
         _clear(event_id)

@@ -12,6 +12,7 @@ import pytest
 
 from run_agent import AIAgent
 from tools.process_registry import process_registry
+from tools.process_registry_notifications import format_process_notification
 from tui_gateway import server
 
 
@@ -94,6 +95,36 @@ def _run_poller_until(sid: str, sess: dict, pred, timeout: float = 2.0) -> None:
     finally:
         stop.set()
         thread.join(timeout=2.0)
+
+
+def test_live_owned_barrier_keeps_later_completion_out_of_busy_transfer(monkeypatch):
+    """The real ready-snapshot path must not flatten C1/watch/C2 while C1 is busy."""
+    isolated: queue_mod.Queue = queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    agent = _SteerAgent()
+    session = _session(agent=agent, running=True)
+    c1 = _completion("proc_barrier_c1", 0, "echo c1")
+    c2 = _completion("proc_barrier_c2", 0, "echo c2")
+    watch = {
+        "type": "watch_match", "session_id": "proc_barrier_watch", "session_key": "session-key",
+        "pattern": "ready", "output": "ready",
+    }
+    for event in (c1, c2):
+        process_registry._completion_consumed.discard(event["session_id"])
+    try:
+        server._notif_handle_ready(
+            "barrier-ui", session, [c1, watch, c2], set(), process_registry,
+            format_process_notification, None, owned=True,
+        )
+        assert [event["session_id"] for event in session["_completion_transfer"]] == ["proc_barrier_c1"]
+        assert [event["session_id"] for event in session["_completion_pending"]] == ["proc_barrier_c2"]
+        assert session["_completion_transfer_barrier"]["session_id"] == "proc_barrier_watch"
+        assert not process_registry.is_completion_consumed("proc_barrier_c1")
+        assert not process_registry.is_completion_consumed("proc_barrier_c2")
+    finally:
+        process_registry._completion_consumed.discard("proc_barrier_c1")
+        process_registry._completion_consumed.discard("proc_barrier_c2")
 
 
 def test_busy_completions_coalesce_to_one_ingest_batch_idle_stays_immediate(

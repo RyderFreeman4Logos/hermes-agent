@@ -1869,19 +1869,16 @@ class TestKillProcess:
 
     @pytest.mark.linux_only
     @pytest.mark.parametrize("consume_output", [True, False])
-    def test_pipe_kill_commits_disposition_and_scope_before_publication(
+    def test_pipe_kill_commits_disposition_before_notification_drain(
         self, registry, monkeypatch, tmp_path, consume_output
     ):
-        """R5/R6: owned scope cleanup and consumption precede queue visibility."""
+        """R6: consumption is committed before an actual notification drain."""
         monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
         monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
-        stopped = []
-        monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda unit: stopped.append(unit) or True)
         session = registry.spawn_local(
             f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)'", cwd=str(tmp_path)
         )
         session.notify_on_complete = True
-        session.systemd_unit = "hermes-worker-test.scope"
         visible = []
         drained = []
         original_put = registry.completion_queue.put
@@ -1895,9 +1892,26 @@ class TestKillProcess:
         try:
             result = registry.kill_process(session.id, source="test.scope", consume_output=consume_output)
             assert result["status"] == "killed"
-            assert stopped == ["hermes-worker-test.scope"]
             assert visible == [consume_output]
             assert [len(batch) for batch in drained] == [0 if consume_output else 1]
+        finally:
+            self._reap_child(session.process)
+
+    @pytest.mark.linux_only
+    def test_pipe_kill_stops_owned_scope_before_completed_return(self, registry, monkeypatch, tmp_path):
+        """R5: completed reader return cannot skip its owned scope cleanup."""
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        stopped = []
+        monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda unit: stopped.append(unit) or True)
+        session = registry.spawn_local(
+            f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)'", cwd=str(tmp_path)
+        )
+        session.systemd_unit = "hermes-worker-test.scope"
+        try:
+            result = registry.kill_process(session.id, source="test.scope", consume_output=True)
+            assert result["status"] == "killed"
+            assert stopped == ["hermes-worker-test.scope"]
         finally:
             self._reap_child(session.process)
 

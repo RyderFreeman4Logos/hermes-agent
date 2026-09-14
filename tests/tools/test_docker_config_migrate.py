@@ -143,8 +143,9 @@ def test_docker_config_migrate_skip_env_leaves_config_unchanged(tmp_path: Path) 
     assert not list(tmp_path.glob("*.bak-*"))
 
 
+@pytest.mark.parametrize("with_unreadable_env_backup", [False, True])
 def test_docker_config_migrate_restores_backups_after_failed_migration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_unreadable_env_backup: bool
 ) -> None:
     module = _load_script_module()
     config_path = tmp_path / "config.yaml"
@@ -153,6 +154,16 @@ def test_docker_config_migrate_restores_backups_after_failed_migration(
     original_env = "TELEGRAM_BOT_TOKEN=test-token\n"
     config_path.write_text(original_config, encoding="utf-8")
     env_path.write_text(original_env, encoding="utf-8")
+    prior_env = None
+    if with_unreadable_env_backup:
+        root = tmp_path / "backups" / "config"
+        root.mkdir(parents=True)
+        prior_env = root / ".env.pre-docker-migrate.20260101-000000"
+        prior_env.write_bytes(b"old\n")
+        prior_env.chmod(0)
+        assert prior_env.stat().st_size != env_path.stat().st_size
+        with pytest.raises(PermissionError):
+            prior_env.read_bytes()
 
     monkeypatch.setattr(module, "check_config_version", lambda: (12, DEFAULT_CONFIG["_config_version"]))
     monkeypatch.setattr(module, "get_config_path", lambda: config_path)
@@ -165,8 +176,12 @@ def test_docker_config_migrate_restores_backups_after_failed_migration(
 
     monkeypatch.setattr(module, "migrate_config", _failing_migrate)
 
-    with pytest.raises(RuntimeError, match="boom"):
-        module.main()
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            module.main()
+    finally:
+        if prior_env is not None:
+            prior_env.chmod(0o600)
 
     assert config_path.read_text(encoding="utf-8") == original_config
     assert env_path.read_text(encoding="utf-8") == original_env

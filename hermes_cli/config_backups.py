@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import stat
 import time
 from pathlib import Path
 from typing import Optional
@@ -41,6 +42,25 @@ def list_config_backups(config_path: Path, reason: Optional[str] = None) -> list
                   key=lambda p: p.name, reverse=True)
 
 
+def _same_contents(left: Path, right: Path) -> bool:
+    """Compare two regular files without caching or file-sized allocations."""
+    left_stat = left.stat()
+    right_stat = right.stat()
+    if not stat.S_ISREG(left_stat.st_mode) or not stat.S_ISREG(right_stat.st_mode):
+        return False
+    if left_stat.st_size != right_stat.st_size:
+        return False
+
+    with left.open("rb") as left_stream, right.open("rb") as right_stream:
+        while True:
+            left_chunk = left_stream.read(8192)
+            right_chunk = right_stream.read(8192)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
 def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -> Optional[Path]:
     """Copy *config_path* to the backups dir; return the new path, or None when skipped/failed.
 
@@ -54,7 +74,7 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         root.mkdir(parents=True, exist_ok=True)
         _sweep_legacy_siblings(config_path, root)
         existing = list_config_backups(config_path, reason)
-        if existing and config_path.read_bytes() == existing[0].read_bytes():
+        if existing and _same_contents(config_path, existing[0]):
             return None
         dest = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"
         if dest.is_symlink() or dest.exists():  # never write through a planted link

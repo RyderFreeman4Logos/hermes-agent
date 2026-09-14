@@ -9,6 +9,8 @@ exits the wizard early.
 
 from argparse import Namespace
 
+import pytest
+
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     get_config_path,
@@ -50,8 +52,9 @@ def _backups(tmp_path):
 
 
 class TestResetBackupOrdering:
+    @pytest.mark.parametrize("with_unreadable_prior", [False, True])
     def test_reset_backs_up_user_config_not_the_reset_defaults(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, with_unreadable_prior
     ):
         """The --reset backup must hold the user's config, not DEFAULT_CONFIG.
 
@@ -64,12 +67,30 @@ class TestResetBackupOrdering:
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         config_path = _write_user_config(tmp_path)
+        original_bytes = config_path.read_bytes()
+        prior = None
+        if with_unreadable_prior:
+            root = tmp_path / "backups" / "config"
+            root.mkdir(parents=True)
+            prior = root / "config.yaml.pre-setup.20260101-000000"
+            prior.write_bytes(b"old\n")
+            prior.chmod(0)
+            with pytest.raises(PermissionError):
+                prior.read_bytes()
+        before = set(_backups(tmp_path))
 
-        run_setup_wizard(_make_setup_args(non_interactive=True, reset=True))
+        try:
+            run_setup_wizard(_make_setup_args(non_interactive=True, reset=True))
+        finally:
+            if prior is not None:
+                prior.chmod(0o600)
 
         backups = _backups(tmp_path)
-        assert len(backups) == 1, f"expected exactly one backup, got {backups}"
-        backup_text = backups[0].read_text(encoding="utf-8")
+        created = set(backups) - before
+        assert len(created) == 1, f"expected exactly one new backup, got {created}"
+        backup = created.pop()
+        backup_text = backup.read_text(encoding="utf-8")
+        assert backup.read_bytes() == original_bytes
         assert SENTINEL_MODEL in backup_text, (
             "backup captured the post-reset defaults instead of the user's config"
         )

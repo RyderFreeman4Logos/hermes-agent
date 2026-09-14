@@ -7083,7 +7083,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text, *, turn_origin):
+    def _deliver(_rid, sid, session, text, *, turn_origin, **_kwargs):
         assert turn_origin == "background_completion"
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False

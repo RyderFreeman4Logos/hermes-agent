@@ -399,6 +399,7 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
             run_thread_alive = bool(session.get("_cache_warm_worker_token"))
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
+        _reclaim_queued_completion_receipts(session)
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1

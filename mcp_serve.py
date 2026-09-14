@@ -372,10 +372,12 @@ class EventBridge:
         db_file = _hermes_home() / "state.db"
         try:
             try:
-                entries = self._refresh_index_and_watermark(db_file)
+                entries, watermark = self._refresh_index_and_watermark(db_file)
             except Exception:
-                self._cached_sessions_index = entries = {}
-                self._state_db_mtime, self._state_db_version = self._sample_state_watermark(db_file)
+                # A failed index read is not an empty index and must not
+                # acknowledge its change as quiet.
+                return
+            reads_succeeded = True
             for session_key, entry in entries.items():
                 session_id = entry.get("session_id", "")
                 if not session_id:
@@ -383,14 +385,17 @@ class EventBridge:
                 try:
                     latest = _latest_ts(db.get_messages(session_id))
                 except Exception:
+                    reads_succeeded = False
                     continue
                 if latest > 0.0:
                     self._last_poll_timestamps[session_key] = latest
+            if reads_succeeded:
+                self._state_db_mtime, self._state_db_version = watermark
         finally:
             _close_quietly(db, "baseline")
 
-    def _refresh_index_and_watermark(self, db_file: Path) -> dict:
-        """Refresh the routing index and record the watermark it has observed.
+    def _refresh_index_and_watermark(self, db_file: Path) -> tuple[dict, tuple[float, Optional[int]]]:
+        """Refresh the routing index and return its pending watermark.
 
         The stored watermark is sampled AFTER an index refresh, because that
         refresh opens SessionDB, whose schema initialisation commits the first
@@ -412,11 +417,11 @@ class EventBridge:
         """
         before = self._sample_state_watermark(db_file)
         entries = _load_sessions_index()
-        self._state_db_mtime, self._state_db_version = self._sample_state_watermark(db_file)
-        if (self._state_db_mtime, self._state_db_version) != before:
+        watermark = self._sample_state_watermark(db_file)
+        if watermark != before:
             entries = _load_sessions_index()
         self._cached_sessions_index = entries
-        return entries
+        return entries, watermark
 
     def _close_state_watch_conn(self) -> None:
         """Drop the watcher connection; the next sample reopens it."""
@@ -514,6 +519,7 @@ class EventBridge:
                 time.sleep(POLL_INTERVAL)
         finally:
             _close_quietly(db, "polling")
+            self._close_state_watch_conn()
 
     def _poll_once(self, db):
         """Check for new messages across all sessions.
@@ -554,10 +560,17 @@ class EventBridge:
                 return  # Confirmed quiet since last poll — skip entirely
 
         # Refresh the index on every change tick: one indexed query, never lags
-        # messages. The watermark is taken with it, so the index can never
-        # trail what the skip gate treats as already seen.
-        entries = self._refresh_index_and_watermark(db_file)
+        # messages. Commit the pending watermark only after every required
+        # message read succeeds, so a transient read failure cannot turn an
+        # unread commit into confirmed quietness.
+        try:
+            entries, watermark = self._refresh_index_and_watermark(db_file)
+        except Exception:
+            # Keep the prior watermark so this change is retried rather than
+            # confusing a failed index load with a real empty index.
+            return
 
+        reads_succeeded = True
         for session_key, entry in entries.items():
             session_id = entry.get("session_id", "")
             if not session_id:
@@ -566,6 +579,7 @@ class EventBridge:
             try:
                 messages = db.get_messages(session_id)
             except Exception:
+                reads_succeeded = False
                 continue
             if not messages:
                 continue
@@ -582,6 +596,8 @@ class EventBridge:
             latest = _latest_ts(messages)
             if latest > last_seen:
                 self._last_poll_timestamps[session_key] = latest
+        if reads_succeeded:
+            self._state_db_mtime, self._state_db_version = watermark
 
 
 # --- MCP Server ---------------------------------------------------------------

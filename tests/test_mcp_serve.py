@@ -1614,6 +1614,71 @@ class TestEventBridgePollE2E:
         assert db.call_count == delivered_calls, \
             "A poll over a confirmed-quiet state.db must not read messages"
 
+    def test_poll_retries_commit_after_required_read_failure(self, tmp_path, monkeypatch):
+        """A failed required read must not acknowledge its commit as quiet."""
+        session_id = "20260329_150000_retry_read"
+        with _baselined_bridge(tmp_path, monkeypatch, session_id) as (bridge, db, db_path):
+            _commit_reply(db_path, session_id, "retry after read failure")
+            read_messages = db.get_messages
+            calls = 0
+
+            def fail_once(sid):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise sqlite3.OperationalError("protected read interrupted")
+                return read_messages(sid)
+
+            monkeypatch.setattr(db, "get_messages", fail_once)
+            bridge._poll_once(db)
+            bridge._poll_once(db)
+            events = bridge.poll_events(after_cursor=0)["events"]
+
+        assert [event["content"] for event in events] == ["retry after read failure"]
+
+    def test_timed_out_stop_closes_watcher_when_worker_exits(self, monkeypatch):
+        """A stop timeout must not close a live watcher, but worker exit must."""
+        import mcp_serve
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Watcher:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        class DB:
+            def close(self):
+                pass
+
+        bridge = mcp_serve.EventBridge()
+        watcher = Watcher()
+        bridge._state_watch_conn = watcher
+        bridge._state_watch_identity = (1, 1)
+
+        def block_poll(_db):
+            entered.set()
+            assert release.wait(timeout=1)
+
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+        monkeypatch.setattr(bridge, "_poll_once", block_poll)
+        bridge._running = True
+        bridge._thread = threading.Thread(target=bridge._poll_loop)
+        bridge._thread.start()
+        assert entered.wait(timeout=1)
+
+        join = bridge._thread.join
+        monkeypatch.setattr(bridge._thread, "join", lambda timeout=None: None)
+        bridge.stop()
+        assert not watcher.closed
+
+        release.set()
+        join(timeout=1)
+        assert not bridge._thread.is_alive()
+        assert watcher.closed
+
     def test_poll_interval_is_200ms(self):
         """Verify the poll interval constant."""
         from mcp_serve import POLL_INTERVAL

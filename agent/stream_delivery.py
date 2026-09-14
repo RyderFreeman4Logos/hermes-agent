@@ -85,14 +85,27 @@ class StreamDeliveryMixin:
     @_current_streamed_assistant_text.setter
     def _current_streamed_assistant_text(self, value: str) -> None:
         self._streamed_assistant_text_parts = [value] if value else []
+        self._current_streamed_payload_bytes = len((value or "").encode("utf-8"))
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks (superseded writers excluded)."""
-        if isinstance(text, str) and text and not self._stream_writer_superseded():
-            parts = getattr(self, "_streamed_assistant_text_parts", None)
-            if parts is None:
-                parts = self._streamed_assistant_text_parts = []
-            parts.append(text)
+        if not (isinstance(text, str) and text) or self._stream_writer_superseded():
+            return
+        from agent.stream_payload_bound import (
+            DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+            StreamPayloadBoundExceeded,
+            streamed_payload_bytes,
+        )
+
+        extra = streamed_payload_bytes(text)
+        size = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0) + extra
+        if size > DEFAULT_STREAM_PAYLOAD_BOUND_BYTES:
+            raise StreamPayloadBoundExceeded(size)
+        parts = getattr(self, "_streamed_assistant_text_parts", None)
+        if parts is None:
+            parts = self._streamed_assistant_text_parts = []
+        parts.append(text)
+        self._current_streamed_payload_bytes = size
 
     @staticmethod
     def _normalize_interim_visible_text(text: str) -> str:

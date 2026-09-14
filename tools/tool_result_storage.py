@@ -6,6 +6,7 @@ ran a terminal), remote backends get the translated in-sandbox path (probed for 
 else a copy in the sandbox temp dir; (3) ``enforce_turn_budget``."""
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -24,6 +25,15 @@ SPILLOVER_MAX_AGE_HOURS = 24
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_INSERTION_COMPACT_THRESHOLD_CHARS = 32_000
+_HIGH_VOLUME_TOOL_NAMES = frozenset({
+    "execute_code",
+    "process",
+    "search_files",
+    "terminal",
+    "web_extract",
+    "web_search",
+})
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_once = False
@@ -189,23 +199,69 @@ def extract_persisted_path(content: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _needs_insertion_compaction(tool_name: str, content: str) -> bool:
+    if tool_name in _HIGH_VOLUME_TOOL_NAMES:
+        return True
+    stripped = content.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return False
+    try:
+        return isinstance(json.loads(stripped), (dict, list))
+    except (TypeError, ValueError):
+        return False
+
+
 def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, env=None,
                               config: BudgetConfig = DEFAULT_BUDGET,
-                              threshold: int | float | None = None) -> str:
+                              threshold: int | float | None = None,
+                              history_suffix: str = "") -> str:
     """Layer 2: persist an oversized result, return preview + path. ``threshold`` overrides
     ``config.resolve_threshold(tool_name)``; falls back to inline truncation when no write
-    location succeeds."""
-    if threshold is None:
-        threshold = config.resolve_threshold(tool_name)
-    if threshold == float("inf") or len(content) <= threshold:
-        return content
+    location succeeds. ``history_suffix`` is reserved from the insertion threshold and
+    appended after persist-or-keep."""
+    configured_threshold = (
+        threshold if threshold is not None else config.resolve_threshold(tool_name)
+    )
+    if configured_threshold == float("inf"):
+        return content + history_suffix
+
+    history_threshold = configured_threshold
+    insertion = (
+        threshold is None
+        and env is not None
+        and _needs_insertion_compaction(tool_name, content)
+    )
+    if insertion:
+        history_threshold = min(history_threshold, _INSERTION_COMPACT_THRESHOLD_CHARS)
+    effective_threshold = (
+        max(0, history_threshold - len(history_suffix))
+        if env is not None
+        else history_threshold
+    )
+    history_limited = (
+        len(content) <= configured_threshold and len(content) > effective_threshold
+    )
+    if len(content) <= effective_threshold:
+        return content + history_suffix
+
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
     def _persisted(path: str, host_suffix: str = "") -> str:
         logger.info("Persisted large tool result: %s (%s, %d chars -> %s%s)",
                     tool_name, tool_use_id, len(content), path, host_suffix)
-        return _build_persisted_message(preview, has_more, len(content), path)
+        return _build_persisted_message(preview, has_more, len(content), path) + history_suffix
+
+    # Insertion-time high-volume payloads must be recoverable in the active env
+    # before they enter history; host spillover remains the fallback for other
+    # oversized results.
+    if insertion:
+        remote_path = f"{_resolve_storage_dir(env)}/{filename}"
+        try:
+            if _write_to_sandbox(content, remote_path, env):
+                return _persisted(remote_path)
+        except Exception as exc:
+            logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
 
     # Always persist host-side first: cache/spillover is the single canonical home.
     host_path = _write_to_spillover(content, filename)
@@ -224,10 +280,16 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
                 return _persisted(remote_path)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+    if history_limited:
+        logger.warning(
+            "Keeping recoverable %s result inline after sandbox write failed",
+            tool_name,
+        )
+        return content + history_suffix
     logger.info("Inline-truncating large tool result: %s (%d chars, no sandbox write)",
                 tool_name, len(content))
     return (f"{preview}\n\n[Truncated: tool response was {len(content):,} chars. "
-            "Full output could not be saved to sandbox.]")
+            "Full output could not be saved to sandbox.]" + history_suffix)
 
 
 def enforce_turn_budget(tool_messages: list[dict], env=None,

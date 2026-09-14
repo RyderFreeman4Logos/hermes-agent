@@ -341,6 +341,52 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    @pytest.mark.parametrize("during_server_request", [False, True])
+    def test_stream_payload_overflow_is_terminal_before_later_work(
+        self, during_server_request
+    ):
+        from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+        client = FakeClient()
+        if during_server_request:
+            client.queue_server_request(
+                "item/commandExecution/requestApproval",
+                request_id="approval-after-overflow",
+                command="pwd",
+                cwd="/tmp",
+            )
+        client.queue_notification(
+            "item/agentMessage/delta",
+            delta="overflowing delta",
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        def on_event(note):
+            if note.get("method") == "item/agentMessage/delta":
+                raise StreamPayloadBoundExceeded(262_145)
+
+        result = make_session(client, on_event=on_event).run_turn(
+            "hi", turn_timeout=2.0
+        )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert "262145 bytes" in (result.error or "")
+        assert result.final_text == result.error
+        assert result.projected_messages == [
+            {"role": "assistant", "content": result.error}
+        ]
+        assert [method for method, _params in client.requests].count(
+            "turn/interrupt"
+        ) == 1
+        assert client.responses == []
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})

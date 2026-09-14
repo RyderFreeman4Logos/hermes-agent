@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
 from agent.redact import redact_sensitive_text
+from agent.stream_payload_bound import StreamPayloadBoundExceeded, stream_payload_error_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient, CodexAppServerError, CodexAppServerTransportError,
 )
@@ -425,6 +426,8 @@ class CodexAppServerSession:
         if self._on_event is not None:
             try:
                 self._on_event(note)
+            except StreamPayloadBoundExceeded:
+                raise
             except Exception:  # pragma: no cover - display callback
                 logger.debug("on_event callback raised", exc_info=True)
         _apply_accounting_notification(result, note)
@@ -536,13 +539,21 @@ class CodexAppServerSession:
                 self._set_classified_error(result, f"turn ended status={turn_status}", err_msg, err_msg)
             return True
 
-        self._drive_turn(
-            result, turn_timeout=turn_timeout, notification_poll_timeout=notification_poll_timeout,
-            timeout_label="turn", before_poll=warn_if_quiet, on_server_request=on_server_request,
-            on_note=on_note, accept_final_text_at_deadline=True,
-        )
-        with self._active_turn_lock:
-            self._active_turn_id = None
+        try:
+            self._drive_turn(
+                result, turn_timeout=turn_timeout, notification_poll_timeout=notification_poll_timeout,
+                timeout_label="turn", before_poll=warn_if_quiet, on_server_request=on_server_request,
+                on_note=on_note, accept_final_text_at_deadline=True,
+            )
+        except StreamPayloadBoundExceeded as exc:
+            self._issue_interrupt(result.turn_id)
+            result.interrupted = True
+            result.should_retire = True
+            result.error = result.final_text = stream_payload_error_text(exc.size, exc.bound)
+            result.projected_messages.append({"role": "assistant", "content": result.final_text})
+        finally:
+            with self._active_turn_lock:
+                self._active_turn_id = None
 
     def _drive_turn(
         self, result: TurnResult, *, turn_timeout: float, notification_poll_timeout: float,

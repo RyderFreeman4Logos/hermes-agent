@@ -97,6 +97,8 @@ class FileAwareEnv:
     def ship(self, _env, path, content):
         with self._lock:
             self.files[path] = content
+        if path.endswith("/hermes_tools.py"):
+            self.hold_once("before_launch_admission")
 
     def execute(self, command, cwd=None, timeout=None):
         del cwd, timeout
@@ -806,6 +808,80 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
         env.before_spawn = None
         result["new"] = _run(env, code="new", task="global")
         self.assertEqual(result["new"]["status"], "success")
+
+    def test_owner_shutdown_before_cold_launch_admission_preserves_other_owner(self):
+        """W05: cleanup before nohup admission cancels only the old owner call."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        self.assertEqual(_run(env, code="other-seed", task="other-owner")["status"], "success")
+        env.hold_stage = "before_launch_admission"
+        result = {}
+        errors = []
+
+        def invoke_old_owner():
+            try:
+                result["old"] = _run(env, code="must-not-launch", task="old-owner")
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=invoke_old_owner)
+        worker.start()
+        self.assertTrue(env.stage_entered.wait(5), "cold spawn did not reach pre-launch admission")
+        shutdown_remote_kernels_for_owner("old-owner")
+        env.stage_release.set()
+        worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["old"]["status"], "error")
+        self.assertIn("canceled by session cleanup", result["old"]["error"])
+        self.assertEqual(env.spawn_count, 1, "canceled owner admitted a nohup launch")
+        self.assertFalse(any("must-not-launch" in body for body in env.files.values()))
+        with _REGISTRY.lock:
+            self.assertEqual({key[0] for key in _REMOTE_KERNELS}, {"other-owner"})
+
+        env.hold_stage = None
+        self.assertEqual(_run(env, code="other-after", task="other-owner")["stdout"], "other-after")
+        self.assertEqual(_run(env, code="new-after", task="old-owner")["stdout"], "new-after")
+
+    def test_owner_shutdown_retires_admitted_cold_launch_without_publication(self):
+        """W05: a late PID is retired by identity and cannot publish or submit."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        self.assertEqual(_run(env, code="other-seed", task="other-owner")["status"], "success")
+        launch_admitted = threading.Event()
+        release_launch = threading.Event()
+        env.before_spawn = lambda: (launch_admitted.set(), release_launch.wait(5))
+        result = {}
+        errors = []
+
+        def invoke_old_owner():
+            try:
+                result["old"] = _run(env, code="must-not-submit", task="old-owner")
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=invoke_old_owner)
+        worker.start()
+        self.assertTrue(launch_admitted.wait(5), "cold spawn did not enter the admitted launch")
+        shutdown_remote_kernels_for_owner("old-owner")
+        with _REGISTRY.lock:
+            self.assertEqual({key[0] for key in _REMOTE_KERNELS}, {"other-owner"})
+        release_launch.set()
+        worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["old"]["status"], "error")
+        self.assertIn("canceled by session cleanup", result["old"]["error"])
+        self.assertTrue(any("7002" in command for command in env.killed))
+        self.assertFalse(any("must-not-submit" in body for body in env.files.values()))
+        with _REGISTRY.lock:
+            self.assertEqual({key[0] for key in _REMOTE_KERNELS}, {"other-owner"})
+
+        env.before_spawn = None
+        self.assertEqual(_run(env, code="other-after", task="other-owner")["stdout"], "other-after")
+        self.assertEqual(_run(env, code="new-after", task="old-owner")["stdout"], "new-after")
 
     def test_failed_stale_rpc_cleanup_retires_before_submission(self):
         """W03: an unsafe old RPC namespace cannot arm a new authority window."""

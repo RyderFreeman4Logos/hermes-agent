@@ -592,6 +592,109 @@ class TestFallbackExtraBodyReResolution:
         assert agent.client.base_url == c_url
         assert next_kwargs["extra_body"] == {"caller": "kept", "c_only": 3}
 
+    def test_repeated_late_native_failures_leave_only_successful_d_runtime(self):
+        """Two rejected native candidates cannot leak into the later successful route."""
+        urls = {
+            name: f"https://{name.lower()}.example.com/anthropic"
+            for name in ("A", "B", "C", "D")
+        }
+        agent = _make_agent(fallback_model=[
+            {
+                "provider": f"custom:{name.lower()}",
+                "model": f"{name.lower()}-model",
+                "base_url": urls[name],
+                "api_mode": "anthropic_messages",
+            }
+            for name in ("B", "C", "D")
+        ])
+        agent.provider = agent.requested_provider = "custom:a"
+        agent.model = "a-model"
+        agent.base_url = urls["A"]
+        agent.api_mode = "anthropic_messages"
+        agent.api_key = agent._anthropic_api_key = "a-key"
+        agent._anthropic_base_url = urls["A"]
+        agent._anthropic_client = MagicMock(name="A-native-client")
+        agent._is_anthropic_oauth = False
+        agent.client = None
+        agent._client_kwargs = {}
+        agent._credential_pool = MagicMock(name="A-pool", provider="custom:a")
+        agent._credential_pool_entry_id = "a-entry"
+        agent.runtime_capabilities = {"route": "a"}
+        agent._cached_system_prompt = "Model: a-model\nProvider: custom:a"
+        agent._pending_fallback_notice = ["A notice"]
+        agent.request_overrides = {"extra_body": {"caller": "kept", "a_only": 1}}
+        agent._custom_providers = [
+            {
+                "provider_key": name.lower(),
+                "base_url": urls[name],
+                "extra_body": {f"{name.lower()}_only": index},
+            }
+            for index, name in enumerate(("A", "B", "C", "D"), 1)
+        ]
+        compressor = MagicMock()
+        compressor.model = "a-model"
+        compressor.provider = "custom:a"
+        compressor.base_url = urls["A"]
+        compressor.api_key = "a-key"
+        compressor.api_mode = "anthropic_messages"
+        compressor.context_length = 111
+        compressor.update_model.side_effect = lambda **kw: [setattr(compressor, k, v) for k, v in kw.items()]
+        agent.context_compressor = compressor
+
+        clients = {
+            name: _mock_client(base_url=urls[name], api_key=f"{name.lower()}-key")
+            for name in ("B", "C", "D")
+        }
+
+        def install_candidate(_agent, _client, provider, *_args):
+            name = provider.rsplit(":", 1)[-1].upper()
+            agent.api_key = agent._anthropic_api_key = f"{name.lower()}-key"
+            agent._anthropic_base_url = urls[name]
+            agent._anthropic_client = MagicMock(name=f"{name}-native-client")
+            pool = MagicMock(name=f"{name}-pool", provider=provider)
+            pool.entry_id_for_api_key.return_value = f"{name.lower()}-entry"
+            agent._credential_pool = pool
+            agent._credential_pool_entry_id = f"{name.lower()}-entry"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(clients[name], f"{name.lower()}-model") for name in ("B", "C", "D")],
+        ), patch(
+            "agent.client_lifecycle._swap_fallback_clients", side_effect=install_candidate
+        ), patch(
+            "agent.model_metadata.get_model_context_length", return_value=222
+        ), patch(
+            "agent.native_compaction.resolve_native_compaction_capabilities",
+            side_effect=[RuntimeError("late B"), RuntimeError("late C"), {"route": "d"}],
+        ):
+            assert agent._try_activate_fallback() is True
+
+        request_client = MagicMock(name="D-request-client")
+        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False), patch.object(
+            agent, "_checkout_request_slot", return_value=(None, None)
+        ), patch.object(
+            agent, "_build_anthropic_client_for_key", return_value=request_client
+        ) as build_client, patch.object(agent, "_store_request_slot"):
+            assert agent._create_request_anthropic_client(reason="post-repeated-fallback") is request_client
+
+        assert build_client.call_args.args[0][:3] == ("direct", "d-key", urls["D"])
+        assert (agent.model, agent.provider, agent.base_url, agent.api_mode) == (
+            "d-model", "custom:d", urls["D"], "anthropic_messages"
+        )
+        assert (agent._anthropic_api_key, agent._anthropic_base_url) == ("d-key", urls["D"])
+        assert agent._anthropic_client._mock_name == "D-native-client"
+        assert (agent._credential_pool.provider, agent._credential_pool_entry_id) == ("custom:d", "d-entry")
+        assert (compressor.model, compressor.provider, compressor.base_url, compressor.context_length) == (
+            "d-model", "custom:d", urls["D"], 222
+        )
+        assert agent.request_overrides == {"extra_body": {"caller": "kept", "d_only": 4}}
+        assert agent.runtime_capabilities == {"route": "d"}
+        assert agent._cached_system_prompt == "Model: d-model\nProvider: custom:d"
+        assert len(agent._pending_fallback_notice) == 2
+        assert "d-model via custom:d" in agent._pending_fallback_notice[-1]
+        assert "b-model" not in agent._pending_fallback_notice[-1]
+        assert "c-model" not in agent._pending_fallback_notice[-1]
+
     def test_exhausted_late_native_failure_restores_complete_primary_runtime(self):
         """A rejected native fallback cannot leave its transport or compressor on B."""
         a_url = "https://a.example.com/anthropic"

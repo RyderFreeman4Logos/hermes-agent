@@ -7122,6 +7122,85 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
             isolated_queue.get_nowait()
 
 
+@pytest.mark.linux_only
+def test_process_kill_rpc_hides_consumed_completion_before_idle_poller_delivery(
+    monkeypatch, tmp_path
+):
+    """The session RPC caller owns output before the idle poller sees publication."""
+    import shlex
+
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+    session_key = "rpc-kill-publication-owner"
+    runtime_id = "sid-rpc-kill-publication-owner"
+    runtime = _session(session_key=session_key)
+    server._sessions[runtime_id] = runtime
+    emitted = []
+    dispatched = []
+    rpc_done = threading.Event()
+    publication_observed = threading.Event()
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    def record_dispatch(_rid, _sid, _session, text, **_kwargs):
+        dispatched.append(text)
+        _session["running"] = False
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", record_dispatch)
+    monkeypatch.setattr(server, "_poll_bot_live_delivery_once", lambda *_args: False)
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
+    monkeypatch.setattr(server, "_maybe_fire_tui_heartbeat_tick", lambda *_args: None)
+    monkeypatch.setattr(server, "_notif_poll_kanban", lambda *_args: None)
+    child = registry.spawn_local(
+        f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)'",
+        cwd=str(tmp_path),
+        session_key=session_key,
+    )
+    child.notify_on_complete = True
+    original_put = registry.completion_queue.put
+
+    def deliver_while_rpc_waits(event):
+        assert not rpc_done.is_set(), "process.kill RPC returned before owner publication"
+        publication_observed.set()
+        original_put(event)
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), runtime_id, runtime
+        )
+
+    monkeypatch.setattr(registry.completion_queue, "put", deliver_while_rpc_waits)
+    response = {}
+
+    def invoke_rpc():
+        response.update(server.handle_request({
+            "id": "kill-rpc",
+            "method": "process.kill",
+            "params": {"session_id": runtime_id, "process_id": child.id},
+        }))
+        rpc_done.set()
+
+    worker = threading.Thread(target=invoke_rpc)
+    worker.start()
+    try:
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "process.kill RPC did not return"
+        assert publication_observed.is_set()
+        assert response["result"]["status"] == "killed"
+        assert response["result"]["session_id"] == child.id
+        assert emitted == []
+        assert dispatched == []
+        assert registry.completion_queue.empty()
+    finally:
+        server._sessions.pop(runtime_id, None)
+        if child.process.poll() is None:
+            child.process.kill()
+        child.process.wait()
+
+
 def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
     """A provenance lookup failure cannot turn an addressed event into ours."""
     import queue as _queue_mod

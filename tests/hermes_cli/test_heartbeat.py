@@ -85,6 +85,21 @@ def test_paused_never_due():
     assert s.is_due(now) is False
 
 
+@pytest.mark.parametrize("legacy_status", ["paused", "cleared"])
+def test_legacy_positional_status_survives_save_and_reload(legacy_status):
+    """The exported state keeps its original positional status slot."""
+    session_id = f"heartbeat-legacy-{legacy_status}"
+    save_heartbeat(session_id, HeartbeatState("watch CI", 60, legacy_status))
+
+    reloaded = HeartbeatManager(session_id)
+    if legacy_status == "paused":
+        assert reloaded.state is not None
+        assert reloaded.state.status == "paused"
+        assert reloaded.due_prompt(now=1000) is None
+    else:
+        assert reloaded.state is None
+
+
 def test_render_prompt_contains_instruction_and_interval():
     s = HeartbeatState(prompt="check the deploy", interval_seconds=600)
     rendered = s.render_prompt()

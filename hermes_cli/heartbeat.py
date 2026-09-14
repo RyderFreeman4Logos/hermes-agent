@@ -69,11 +69,11 @@ class HeartbeatState:
 
     prompt: str
     interval_seconds: int
-    route: str = ""
     status: str = "active"          # active | paused | cleared
     created_at: float = 0.0
     last_fired_at: float = 0.0
     fire_count: int = 0
+    route: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

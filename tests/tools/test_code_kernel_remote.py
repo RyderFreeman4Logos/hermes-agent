@@ -689,7 +689,7 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
 
     def test_reservation_overflow_releases_attachment_and_invocation(self):
         """W14: a cap conversion failure leaves no attachment or call record."""
-        from tools.code_kernel_remote import _ACTIVE_INVOCATIONS
+        from tools import code_kernel_remote as remote
 
         env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
         with patch("tools.code_execution_tool._load_config", return_value={
@@ -699,7 +699,7 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
                 _run(env, task="cap-overflow")
         with _REGISTRY.lock:
             self.assertTrue(all(kernel.attached == 0 for kernel in _REMOTE_KERNELS.values()))
-            self.assertEqual(_ACTIVE_INVOCATIONS, set())
+            self.assertEqual(getattr(remote, "_ACTIVE_INVOCATIONS", set()), set())
 
 
 class TestRemoteInvocationOwnership(RemoteKernelBase):
@@ -786,7 +786,9 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
         self.assertEqual(len(_REMOTE_KERNELS), 0)
 
     def test_owner_shutdown_cancels_attached_cell_waiter(self):
-        """W06: an attached waiter keeps its reservation but cannot run after cleanup."""
+        """W06/W14: a mutex waiter keeps its reservation but cannot run after cleanup."""
+        from tools import code_kernel_remote as remote
+
         env = FileAwareEnv()
         self._ship_mock.side_effect = env.ship
         first_submitted = threading.Event()
@@ -798,11 +800,11 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
                 release_first.wait(5)
 
         env.before_submit = hold_first_submit
-        results = []
+        results = {}
         workers = [
-            threading.Thread(target=lambda code=code: results.append(
-                _run(env, code=code, task="waiter-owner")
-            ))
+            threading.Thread(target=lambda code=code: results.setdefault(
+                code, _run(env, code=code, task="waiter-owner")
+            ), name=f"w14-{code}")
             for code in ("first", "waiting")
         ]
         workers[0].start()
@@ -816,15 +818,65 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
                 break
             self.assertLess(time.monotonic(), deadline)
             threading.Event().wait(0.01)
+        self.assertTrue(workers[1].is_alive())
+        self.assertEqual(env.cell_submissions, [])
+        with _REGISTRY.lock:
+            kernel = next(iter(_REMOTE_KERNELS.values()))
         shutdown_remote_kernels_for_owner("waiter-owner")
         release_first.set()
         for worker in workers:
             worker.join(5)
 
         self.assertTrue(all(not worker.is_alive() for worker in workers))
-        self.assertEqual([result["status"] for result in results], ["error", "error"])
+        self.assertEqual(set(results), {"first", "waiting"})
+        self.assertTrue(all(result["status"] == "error" for result in results.values()))
+        self.assertTrue(all("canceled by session cleanup" in result["error"]
+                            for result in results.values()))
         self.assertEqual(sum(c.startswith("mv ") for c in env.commands), 1)
+        self.assertFalse(any("python3 script.py" in command for command in env.commands))
+        self.assertEqual(kernel.attached, 0)
         self.assertEqual(len(_REMOTE_KERNELS), 0)
+        self.assertEqual(getattr(remote, "_ACTIVE_INVOCATIONS", set()), set())
+
+    def test_empty_registry_cleanup_cancels_unpublished_invocation(self):
+        """W14: cleanup fences active acquisition even when the map is empty."""
+        from tools import code_kernel_remote as remote
+
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        env.hold_stage = "before_launch_admission"
+        result = {}
+        errors = []
+
+        def invoke():
+            try:
+                result["value"] = _run(env, code="must-not-run", task="empty-owner")
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=invoke, name="w14-empty-map")
+        worker.start()
+        try:
+            self.assertTrue(env.stage_entered.wait(5))
+            with _REGISTRY.lock:
+                self.assertEqual(_REMOTE_KERNELS, {})
+                if hasattr(remote, "_ACTIVE_INVOCATIONS"):
+                    self.assertEqual(len(remote._ACTIVE_INVOCATIONS), 1)
+            shutdown_remote_kernels_for_owner("empty-owner")
+        finally:
+            env.stage_release.set()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["value"]["status"], "error")
+        self.assertIn("canceled by session cleanup", result["value"]["error"])
+        self.assertEqual(env.spawn_count, 0)
+        self.assertEqual(env.cell_submissions, [])
+        self.assertFalse(any("python3 script.py" in command for command in env.commands))
+        with _REGISTRY.lock:
+            self.assertEqual(_REMOTE_KERNELS, {})
+            self.assertEqual(getattr(remote, "_ACTIVE_INVOCATIONS", set()), set())
 
     def test_warm_rpc_dispatch_keeps_each_callers_context(self):
         """W02: the real file poller dispatches under each serialized caller context."""
@@ -1809,6 +1861,65 @@ class TestDispatchIntegration(unittest.TestCase):
         self.assertTrue(all("/hermes_exec_" in path for path in env.fallback_dirs))
         self.assertEqual(sum("python3 script.py" in command for command in env.commands), 2)
         self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_partial_kernel_initialization_falls_back_without_publication(self):
+        """W14: four pre-submission failures leave no partial kernel state."""
+        from tools.code_execution_tool import _execute_remote
+        from tools import code_kernel_remote as remote
+
+        class PartialInitEnv(FileAwareEnv):
+            def __init__(self, failure_stage):
+                super().__init__()
+                self.failure_stage = failure_stage
+
+            def execute(self, command, cwd=None, timeout=None, **kwargs):
+                if (self.failure_stage == "mkdir" and command.startswith("mkdir -p ")
+                        and "/hermes_rkernel_" in command):
+                    with self._lock:
+                        self.commands.append(command)
+                    raise RuntimeError("synthetic kernel mkdir failure")
+                if (self.failure_stage == "runner-shipping" and command.startswith("echo '")
+                        and "/hermes_rkernel_" in command and "/kernel_runner.py" in command):
+                    with self._lock:
+                        self.commands.append(command)
+                    raise RuntimeError("synthetic runner shipping failure")
+                if self.failure_stage == "missing-pid" and "nohup" in command:
+                    with self._lock:
+                        self.commands.append(command)
+                        self.spawn_count += 1
+                    return {"output": "launch response omitted pid\n", "returncode": 0}
+                if self.failure_stage == "liveness" and "kill -0" in command:
+                    with self._lock:
+                        self.commands.append(command)
+                    return {"output": "", "returncode": 1}
+                if "python3 script.py" in command:
+                    with self._lock:
+                        self.commands.append(command)
+                    return {"output": f"fallback-after-{self.failure_stage}\n", "returncode": 0}
+                return super().execute(command, cwd=cwd, timeout=timeout, **kwargs)
+
+        for stage in ("mkdir", "runner-shipping", "missing-pid", "liveness"):
+            with self.subTest(stage=stage):
+                shutdown_all_remote_kernels()
+                env = PartialInitEnv(stage)
+                with patch("tools.code_execution_tool._load_config",
+                           return_value={"timeout": 30, "max_tool_calls": 5}), \
+                     patch("tools.code_execution_tool._get_or_create_env",
+                           return_value=(env, "ssh")):
+                    result = json.loads(_execute_remote("fallback", f"w14-{stage}", ["read_file"]))
+
+                self.assertEqual(result["status"], "success", result)
+                self.assertIn(f"fallback-after-{stage}", result["output"])
+                self.assertEqual(result["tool_calls_made"], 0)
+                self.assertEqual(sum("python3 script.py" in command
+                                     for command in env.commands), 1)
+                self.assertEqual(env.cell_submissions, [])
+                self.assertTrue(any(command.startswith("rm -rf ")
+                                    and "/hermes_rkernel_" in command
+                                    for command in env.commands))
+                with _REGISTRY.lock:
+                    self.assertEqual(_REMOTE_KERNELS, {})
+                    self.assertEqual(getattr(remote, "_ACTIVE_INVOCATIONS", set()), set())
 
 
 if __name__ == "__main__":

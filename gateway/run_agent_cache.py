@@ -88,6 +88,20 @@ class GatewayAgentCacheMixin:
             path = resolve_config_path()
             try:
                 digest, raw_config, overflow = _read_honcho_snapshot(path)
+            except FileNotFoundError:
+                # Match the client path: a missing optional Honcho file falls
+                # back to the environment without granting malformed files a
+                # second interpretation.
+                hcfg = HonchoClientConfig.from_global_config(config_path=path)
+                aliases = hcfg.user_peer_aliases or {}
+                return {
+                    "honcho.peer_name": hcfg.peer_name,
+                    "honcho.ai_peer": hcfg.ai_peer,
+                    "honcho.pin_peer_name": bool(hcfg.pin_peer_name),
+                    "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
+                    "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
+                    "honcho.overflow_content": None,
+                }
             except OSError:
                 return empty
             path_key = str(path)

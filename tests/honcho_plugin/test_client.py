@@ -115,6 +115,96 @@ class TestFromGlobalConfig:
         assert config.base_url == "http://localhost:8000"
         assert config.enabled is True
 
+    def test_missing_config_with_env_key_keeps_client_and_cache_extractor_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """W8: a missing file keeps both public Honcho fallback paths usable."""
+        from gateway.run import GatewayRunner
+        from plugins.memory.honcho import client as client_mod
+
+        path = tmp_path / "missing-honcho.json"
+        monkeypatch.setenv("HONCHO_API_KEY", "fake-honcho-key")
+        monkeypatch.setattr(client_mod, "resolve_config_path", lambda: path)
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+        client = HonchoClientConfig.from_global_config(config_path=path)
+        extracted = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        assert client.enabled is True
+        assert client.api_key == "fake-honcho-key"
+        assert extracted["honcho.ai_peer"] == "hermes"
+        assert extracted["honcho.pin_peer_name"] is False
+
+    def test_malformed_config_keeps_client_env_fallback_but_extractor_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        """W8: malformed small JSON cannot supply identity to the extractor."""
+        from gateway.run import GatewayRunner
+        from plugins.memory.honcho import client as client_mod
+
+        path = tmp_path / "honcho.json"
+        path.write_text("{not-json", encoding="utf-8")
+        monkeypatch.setenv("HONCHO_API_KEY", "fake-honcho-key")
+        monkeypatch.setattr(client_mod, "resolve_config_path", lambda: path)
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+        client = HonchoClientConfig.from_global_config(config_path=path)
+        extracted = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        assert client.enabled is True
+        assert client.api_key == "fake-honcho-key"
+        assert all(
+            extracted[key] is None
+            for key in GatewayRunner._HONCHO_CACHE_BUSTING_KEYS
+        )
+
+    @pytest.mark.parametrize("has_conflicting_file", [False, True], ids=["missing", "conflict"])
+    def test_explicit_empty_raw_snapshot_never_opens_target_file(
+        self, tmp_path, monkeypatch, has_conflicting_file
+    ):
+        """W8: `{}` is an explicit supplied snapshot, not an env/disk fallback."""
+        path = tmp_path / "honcho.json"
+        if has_conflicting_file:
+            path.write_text(json.dumps({"apiKey": "disk-key", "peerName": "Disk"}))
+        monkeypatch.setenv("HONCHO_API_KEY", "env-key")
+        original_open = Path.open
+
+        def forbid_target_open(self, *args, **kwargs):
+            if self == path:
+                raise AssertionError("explicit raw snapshot re-opened target file")
+            return original_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", forbid_target_open)
+        config = HonchoClientConfig.from_global_config(config_path=path, raw_config={})
+
+        assert config.enabled is True
+        assert config.api_key == "env-key"
+        assert config.peer_name is None
+
+    def test_supplied_nonempty_raw_snapshot_never_opens_target_file(self, tmp_path, monkeypatch):
+        """W8: a normal supplied mapping is also a complete no-second-read snapshot."""
+        path = tmp_path / "honcho.json"
+        path.write_text(json.dumps({"apiKey": "disk-key", "peerName": "Disk"}))
+        original_open = Path.open
+
+        def forbid_target_open(self, *args, **kwargs):
+            if self == path:
+                raise AssertionError("supplied raw snapshot re-opened target file")
+            return original_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", forbid_target_open)
+        config = HonchoClientConfig.from_global_config(
+            config_path=path, raw_config={"apiKey": "provided-key", "peerName": "Provided"}
+        )
+
+        assert config.enabled is True
+        assert config.api_key == "provided-key"
+        assert config.peer_name == "Provided"
+
 
     def test_base_url_from_sdk_native_endpoint_block(self, tmp_path):
         """endpoint.baseUrl is the SDK-native spelling Claude Desktop writes."""
@@ -762,4 +852,3 @@ class TestGetHonchoClientBaseUrlDoublePrefixFix:
         assert passed_base_url == expected, (
             f"Expected {expected!r}, got {passed_base_url!r}"
         )
-

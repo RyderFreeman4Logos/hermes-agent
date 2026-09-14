@@ -3527,8 +3527,6 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
     else:
         existing = getattr(agent, "_pending_steer", None)
         agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
-    if callable(requeued := getattr(agent, "_completion_steer_requeued", None)):
-        requeued()
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
@@ -3554,22 +3552,29 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()
-    if not steer_text:
+    ingest_completion = getattr(agent, "_completion_steer_ingest", None)
+    if not steer_text and not callable(ingest_completion):
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
     target = next((messages[j] for j in tail if isinstance(messages[j], dict) and messages[j].get("role") == "tool"), None)
     if target is None:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # requeue so the fallback path delivers it as a normal next-turn
-        # user message (which persists like any other user turn).
-        _requeue_pending_steer(agent, steer_text)
+        # No tool result in this batch (e.g. all skipped by interrupt); true user
+        # steer returns to its rail and a structured completion keeps its owner.
+        if steer_text:
+            _requeue_pending_steer(agent, steer_text)
+        return
+
+    def insert(completion_text: str) -> bool:
+        text = f"{completion_text}\n{steer_text}" if steer_text else completion_text
+        messages.append(steer_user_row(text))
+        return True
+
+    if callable(ingest_completion) and ingest_completion(insert):
+        return
+    if not steer_text:
         return
     messages.append(steer_user_row(steer_text))
-    _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
-        steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
-    )
 
 
 def _shutdown_socket(sock: Any) -> None:

@@ -166,3 +166,101 @@ def test_post_summary_demote_is_coalesced_into_one_durable_commit():
         )
         assert committed_tool["content"].startswith("[read_file]")
         assert committed_messages[-1]["content"] == messages[-1]["content"]
+
+        # The retained tool row was rewritten by Unit C.  Its original is
+        # archived history, not an unchanged rewind duplicate: normal search
+        # and display history must still recover the raw bytes.
+        hits = db.search_messages("REPORT_START")
+        assert len(hits) == 1
+        display_history = db.get_messages_as_conversation(
+            session_id, include_compacted=True
+        )
+        assert any(
+            message.get("role") == "tool"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith("REPORT_START")
+            for message in display_history
+        )
+        raw_original = db._conn.execute(
+            "SELECT active, compacted FROM messages "
+            "WHERE session_id = ? AND role = 'tool' AND content LIKE 'REPORT_START%'",
+            (session_id,),
+        ).fetchone()
+        assert tuple(raw_original) == (0, 1)
+
+        unchanged_hits = db.search_messages("recent report is intact")
+        assert len(unchanged_hits) == 1
+        unchanged_original = db._conn.execute(
+            "SELECT active, compacted FROM messages "
+            "WHERE session_id = ? AND role = 'tool' AND content = ? ORDER BY id LIMIT 1",
+            (session_id, "recent report is intact"),
+        ).fetchone()
+        assert tuple(unchanged_original) == (0, 0)
+
+
+def test_archive_classifies_interspersed_multimodal_tail_by_payload():
+    from hermes_state import SessionDB
+
+    original = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "changed", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "changed",
+            "content": [
+                {"type": "text", "text": "multimodal archive token"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "same", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "same", "content": "UNCHANGED_TAIL_TOKEN"},
+        {"role": "user", "content": "continue"},
+    ]
+    retained = [dict(message) for message in original]
+    retained[1] = {
+        **retained[1],
+        "content": [{"type": "text", "text": "[screenshot removed]"}],
+    }
+
+    with TemporaryDirectory() as tmp:
+        db = SessionDB(db_path=Path(tmp) / "interspersed.db")
+        session_id = "20260914_186_interspersed"
+        db.create_session(session_id, "cli", model="test/model")
+        for message in original:
+            db.append_message(
+                session_id=session_id,
+                role=message["role"],
+                content=message.get("content"),
+                tool_calls=message.get("tool_calls"),
+                tool_call_id=message.get("tool_call_id"),
+            )
+
+        db.archive_and_compact(session_id, retained, tail_count=len(retained))
+
+        assert len(db.search_messages("UNCHANGED_TAIL_TOKEN")) == 1
+        display_history = db.get_messages_as_conversation(
+            session_id, include_compacted=True
+        )
+        assert any(
+            message.get("tool_call_id") == "changed"
+            and message.get("content") == original[1]["content"]
+            for message in display_history
+        )
+        rows = db._conn.execute(
+            "SELECT tool_call_id, active, compacted FROM messages "
+            "WHERE session_id = ? AND role = 'tool' ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("changed", 0, 1),
+            ("same", 0, 0),
+            ("changed", 1, 0),
+            ("same", 1, 0),
+        ]

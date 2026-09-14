@@ -468,3 +468,149 @@ def test_delegate_progress_and_result_use_only_successful_fallback_identity():
     assert all(event.get("provider") != PRIMARY["provider"] for event in events)
     assert events[-1]["model"] == FALLBACK_CHAIN[0]["model"]
     assert events[-1]["provider"] == FALLBACK_CHAIN[0]["provider"]
+
+
+def test_standard_child_without_fallback_keeps_nous_entitlement_recovery():
+    """Fallback availability alone may defer same-route Nous repair."""
+    agent = _make_standard_child(max_retries=2, route=NOUS)
+    agent._fallback_chain = []
+    calls = []
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(429, "usage limit has been reached")
+        return _response("recovered on the same route")
+
+    refreshed = MagicMock(return_value=True)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(
+            patch(
+                "agent.turn_api_error.classify_api_error",
+                return_value=ClassifiedError(
+                    reason=FailoverReason.billing,
+                    status_code=429,
+                    retryable=False,
+                    should_fallback=True,
+                ),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "agent.turn_recovery._try_refresh_nous_paid_entitlement_credentials",
+                refreshed,
+            )
+        )
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [(NOUS["provider"], NOUS["model"])] * 2
+    refreshed.assert_called_once_with(agent)
+
+
+def test_standard_child_direct_output_cap_retries_same_route_before_fallback():
+    """A direct 400 max-output error is a request-shape repair, not failover."""
+    agent = _make_standard_child(max_retries=2)
+    agent.max_tokens = 98_304
+    agent.context_compressor.context_length = 200_000
+    calls = []
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(
+                400,
+                "max_tokens (98304) exceeds model's maximum output tokens (65536)",
+            )
+        return _response("clamped result")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200_000))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [(PRIMARY["provider"], PRIMARY["model"])] * 2
+    assert agent._fallback_index == 0
+
+
+def test_standard_child_forbidden_fallback_is_terminal_after_one_request():
+    """A content-policy rejection cannot retry or consume a configured fallback."""
+    agent = _make_standard_child(max_retries=3)
+    calls = []
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        raise _HTTPError(403, "content policy blocked")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(
+            patch(
+                "agent.turn_api_error.classify_api_error",
+                return_value=ClassifiedError(
+                    reason=FailoverReason.content_policy_blocked,
+                    status_code=403,
+                    retryable=False,
+                    should_fallback=True,
+                ),
+            )
+        )
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("disallowed")
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert calls == [(PRIMARY["provider"], PRIMARY["model"])]
+    assert agent._fallback_index == 0
+
+
+def test_nonstandard_child_records_its_successful_primary_route():
+    agent = _make_child(profile="premium")
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", return_value=_response("ok")))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert agent._delegate_successful_llm_route == (PRIMARY["model"], PRIMARY["provider"])
+
+
+def test_delegate_result_keeps_primary_success_identity_after_failed_fallback():
+    """A later failed fallback must not relabel an already-successful child."""
+    parent = SimpleNamespace(
+        base_url=PRIMARY["base_url"], api_key="primary-key", provider=PRIMARY["provider"],
+        api_mode="chat_completions", model=PRIMARY["model"], platform="cli",
+        enabled_toolsets=[], disabled_toolsets=[], _fallback_chain=FALLBACK_CHAIN,
+        _delegate_depth=0, _active_children=[], _active_children_lock=None, _print_fn=None,
+        _session_db=None, tool_progress_callback=None,
+    )
+    child = MagicMock()
+    child.provider = PRIMARY["provider"]
+    child.model = PRIMARY["model"]
+    child._credential_pool = None
+    child.session_prompt_tokens = child.session_completion_tokens = 0
+
+    def primary_then_failed_fallback(*_args, **_kwargs):
+        child._delegate_successful_llm_route = (PRIMARY["model"], PRIMARY["provider"])
+        child.provider, child.model = FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]
+        return {"completed": False, "failed": True, "error": "fallback failed", "api_calls": 2}
+
+    child.run_conversation.side_effect = primary_then_failed_fallback
+    with patch("run_agent.AIAgent", return_value=child):
+        built = _build_child_agent(
+            task_index=0, goal="keep successful identity", context=None, toolsets=None,
+            model=None, max_iterations=2, parent_agent=parent, task_count=1,
+            model_profile="premium",
+        )
+        result = _run_single_child(0, "keep successful identity", built, parent)
+
+    assert result["model"] == PRIMARY["model"]
+    assert result["provider"] == PRIMARY["provider"]

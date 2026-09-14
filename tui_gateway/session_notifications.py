@@ -337,7 +337,11 @@ def _deliver_completion_notifications(sid: str, session: dict, events: list, emi
     receipt = None
     with _completion_ownership_lock(session):
         with session["history_lock"]:
-            if session.get("_closing") or session.get("_finalized"):
+            # Status output is deliberately outside the claim so a slow client
+            # cannot hold history.  A user may have claimed the idle turn while
+            # it was emitted; make the final check and receipt creation one
+            # transaction so that user row can never acknowledge these events.
+            if session.get("running") or session.get("_closing") or session.get("_finalized"):
                 pending = session.setdefault("_completion_pending", [])
                 session["_completion_pending"] = list(events) + list(pending)
                 return
@@ -396,6 +400,19 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
     if not pending:
         if _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session):
             return
+        if _ingest_completion_transfer(session, insert):
+            _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
+        return
+
+    # A noncompletion observed after a prior transfer is an ordering boundary,
+    # not merely a busy-turn detail.  First let the older transfer reserve its
+    # own turn; leave the later pending suffix with P until the boundary route
+    # has actually started.  This prevents C1/W/C2 from becoming C1+C2/W when
+    # the session becomes idle between poller snapshots.
+    with _completion_ownership_lock(session):
+        barrier = session.get("_completion_transfer_barrier")
+        transfer_waiting_for_barrier = isinstance(barrier, dict) and not barrier.get("started")
+    if transfer_waiting_for_barrier:
         if _ingest_completion_transfer(session, insert):
             _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
         return

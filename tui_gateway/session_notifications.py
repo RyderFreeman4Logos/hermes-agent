@@ -322,12 +322,24 @@ def _deliver_completion_notifications(sid: str, session: dict, events: list, emi
 def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) -> None:
     with session["history_lock"]:
         pending = list(session.get("_completion_pending") or [])
-        if not pending or session.get("_closing") or session.get("_finalized"):
+        if session.get("_closing") or session.get("_finalized"):
             return
         running = bool(session.get("running"))
-        if running and not _session_can_steer_completions(session):
-            return
-        session["_completion_pending"] = []
+        if pending:
+            if running and not _session_can_steer_completions(session):
+                return
+            session["_completion_pending"] = []
+    if not pending:
+        def insert(text: str) -> bool:
+            with session["history_lock"]:
+                if session.get("running") or session.get("_closing") or session.get("_finalized"):
+                    return False
+                _enqueue_prompt(session, text, session.get("transport"))
+                return True
+
+        if _ingest_completion_transfer(session, insert):
+            _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
+        return
     if running:
         if not _deliver_completions_via_steer(sid, session, pending, emitted):
             with session["history_lock"]:

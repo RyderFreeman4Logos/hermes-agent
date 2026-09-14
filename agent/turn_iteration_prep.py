@@ -136,7 +136,9 @@ def prepare_iteration(
     # break the prompt cache — same contract as apply_pending_steer_to_tool_results).
     _pre_api_steer = agent._drain_pending_steer()
     if _pre_api_steer or callable(getattr(agent, "_completion_steer_ingest", None)):
-        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer or "")
+        _inject_steer_after_newest_tool_result(
+            agent, messages, _pre_api_steer or "", current_turn_user_idx=current_turn_user_idx
+        )
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -234,10 +236,13 @@ def _previous_tool_round(messages: Any) -> list:
     return []
 
 
-def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
-    """Insert structured completions and true user steer after the newest tool row."""
+def _inject_steer_after_newest_tool_result(
+    agent: Any, messages: Any, steer_text: str, *, current_turn_user_idx: Any = None
+) -> None:
+    """Insert after a tool row in this turn; never rewrite a historical turn."""
     ingest_completion = getattr(agent, "_completion_steer_ingest", None)
-    for _si in range(len(messages) - 1, -1, -1):
+    _turn_start = current_turn_user_idx if isinstance(current_turn_user_idx, int) else -1
+    for _si in range(len(messages) - 1, _turn_start, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import steer_user_row

@@ -75,7 +75,21 @@ class FileAwareEnv:
         self.result_payload = None
         self.emit_rpc = False
         self.rpc_done = threading.Event()
+        self.hold_stage = None
+        self.stage_entered = threading.Event()
+        self.stage_release = threading.Event()
+        self._held_stage = False
         self._lock = threading.Lock()
+
+    def hold_once(self, stage):
+        with self._lock:
+            should_hold = self.hold_stage == stage and not self._held_stage
+            if should_hold:
+                self._held_stage = True
+        if should_hold:
+            self.stage_entered.set()
+            if not self.stage_release.wait(5):
+                raise AssertionError(f"timed out holding {stage}")
 
     def get_temp_dir(self):
         return "/tmp"
@@ -108,11 +122,14 @@ class FileAwareEnv:
         if command.startswith("cat ") and "/rpc/req_" in command:
             path = shlex.split(command)[1]
             with self._lock:
-                return {"output": self.files.get(path, ""), "returncode": 0}
+                output = self.files.get(path, "")
+            self.hold_once("rpc_request_read")
+            return {"output": output, "returncode": 0}
         if command.startswith("echo '") and "base64 -d >" in command:
             encoded = command.split("'", 2)[1]
             decoded = base64.b64decode(encoded).decode("utf-8")
             target = command.split("base64 -d >", 1)[1].split(".tmp", 1)[0].strip()
+            self.hold_once("rpc_response_rename")
             with self._lock:
                 self.files[target] = decoded
             self.rpc_done.set()
@@ -156,7 +173,9 @@ class FileAwareEnv:
         if command.startswith("cat ") and "/cells/cell_res_" in command:
             path = shlex.split(command)[1]
             with self._lock:
-                return {"output": self.files.get(path, ""), "returncode": 0}
+                output = self.files.get(path, "")
+            self.hold_once("cell_result_read")
+            return {"output": output, "returncode": 0}
         if command.startswith("rm -f ") and "/cells/cell_res_" in command:
             if self.result_cleanup_error is not None:
                 raise self.result_cleanup_error
@@ -221,9 +240,9 @@ class RemoteKernelBase(unittest.TestCase):
         self._ship.stop()
         self._poll.stop()
         shutdown_all_remote_kernels()
-        from tools.code_kernel_remote import _ACTIVE_INVOCATIONS
+        from tools import code_kernel_remote
         with _REGISTRY.lock:
-            self.assertEqual(_ACTIVE_INVOCATIONS, set())
+            self.assertEqual(getattr(code_kernel_remote, "_ACTIVE_INVOCATIONS", set()), set())
 
 
 class TestSpawnAndReuse(RemoteKernelBase):
@@ -691,6 +710,78 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
         self.assertEqual(first["status"], "success")
         self.assertEqual(second["status"], "success")
         self.assertEqual(observed, [("alpha", "alpha"), ("beta", "beta")])
+
+    def _assert_warm_waiter_is_held_through(self, stage):
+        """W02: one kernel owner retains namespace authority through *stage*."""
+        from tools.code_execution_rpc import _rpc_poll_loop
+
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        with patch("tools.code_kernel_remote.secrets.token_urlsafe", return_value="fixed-rpc-token"):
+            self.assertEqual(_run(env, code="seed", task="held-rpc")["status"], "success")
+        env.emit_rpc = True
+        env.hold_stage = stage
+        current_call = contextvars.ContextVar("remote_held_call", default="missing")
+        observed = []
+        results = {}
+        errors = []
+
+        def default_dispatch(_task_id):
+            return lambda _name, args: observed.append((current_call.get(), args["path"])) or "ok"
+
+        def invoke(label):
+            token = current_call.set(label)
+            try:
+                results[label] = _run(env, code=label, task="held-rpc")
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                current_call.reset(token)
+
+        with patch("tools.code_execution_tool._rpc_poll_loop", _rpc_poll_loop), \
+             patch("tools.code_execution_rpc._default_dispatch", default_dispatch), \
+             patch("tools.code_kernel_remote.secrets.token_urlsafe", return_value="fixed-rpc-token"):
+            first = threading.Thread(target=invoke, args=("alpha",))
+            second = threading.Thread(target=invoke, args=("beta",))
+            first.start()
+            self.assertTrue(
+                env.stage_entered.wait(5),
+                f"first call never reached {stage}; commands={env.commands!r}; errors={errors!r}",
+            )
+            second.start()
+            try:
+                time.sleep(0.1)
+                self.assertTrue(second.is_alive(), f"same-key waiter passed {stage}")
+                submitted = [c for c in env.commands if c.startswith("mv ") and "/cells/cell_req_" in c]
+                self.assertEqual(len(submitted), 2, "waiting call submitted before first namespace retired")
+                self.assertNotIn(("beta", "beta"), observed)
+            finally:
+                env.stage_release.set()
+                first.join(5)
+                second.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["alpha"]["stdout"], "alpha")
+        self.assertEqual(results["beta"]["stdout"], "beta")
+        self.assertEqual(observed, [("alpha", "alpha"), ("beta", "beta")])
+        submitted = [c for c in env.commands if c.startswith("mv ") and "/cells/cell_req_" in c]
+        self.assertEqual(len(submitted), 3)
+        first_remove = next(i for i, c in enumerate(env.commands)
+                            if c.startswith("rm -f ") and "/cells/cell_res_000002" in c)
+        second_submit = next(i for i, c in enumerate(env.commands)
+                             if c.startswith("mv ") and "/cells/cell_req_000003" in c)
+        self.assertLess(first_remove, second_submit)
+
+    def test_warm_waiter_is_held_during_rpc_request_read(self):
+        self._assert_warm_waiter_is_held_through("rpc_request_read")
+
+    def test_warm_waiter_is_held_during_rpc_response_rename(self):
+        self._assert_warm_waiter_is_held_through("rpc_response_rename")
+
+    def test_warm_waiter_is_held_between_cell_result_read_and_removal(self):
+        self._assert_warm_waiter_is_held_through("cell_result_read")
 
     def test_global_shutdown_retires_late_spawn_but_allows_later_call(self):
         """W05/W07: the boundary cancels old work without an owner tombstone."""

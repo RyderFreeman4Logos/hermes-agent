@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +12,7 @@ import pytest
 
 from agent.error_classifier import ClassifiedError, FailoverReason
 from run_agent import AIAgent
-from tools.delegate_tool import _build_child_agent, _run_single_child
+from tools.delegate_tool import _build_child_agent, _run_single_child, delegate_task
 
 PRIMARY = {
     "provider": "primary-provider",
@@ -48,7 +50,10 @@ def _response(text: str):
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
-                message=SimpleNamespace(content=text, tool_calls=None),
+                message=SimpleNamespace(
+                    content=text, tool_calls=None, reasoning_content=None,
+                    reasoning=None, reasoning_details=None, model_extra={},
+                ),
                 finish_reason="stop",
             )
         ],
@@ -468,6 +473,121 @@ def test_delegate_progress_and_result_use_only_successful_fallback_identity():
     assert all(event.get("provider") != PRIMARY["provider"] for event in events)
     assert events[-1]["model"] == FALLBACK_CHAIN[0]["model"]
     assert events[-1]["provider"] == FALLBACK_CHAIN[0]["provider"]
+
+
+def test_delegate_task_ordinary_child_records_primary_success_identity():
+    """The public no-profile child records identity only after a real response."""
+    events = []
+    parent = SimpleNamespace(
+        base_url=PRIMARY["base_url"],
+        api_key="primary-key",
+        provider=PRIMARY["provider"],
+        api_mode="chat_completions",
+        model=PRIMARY["model"],
+        platform="cli",
+        enabled_toolsets=[],
+        disabled_toolsets=[],
+        request_overrides={},
+        _fallback_chain=[],
+        _delegate_depth=0,
+        _active_children=[],
+        _active_children_lock=threading.Lock(),
+        _print_fn=None,
+        _session_db=None,
+        session_id=None,
+        tool_progress_callback=lambda *args, **kwargs: events.append(kwargs),
+    )
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+        patch.object(AIAgent, "_interruptible_api_call", return_value=_response("ordinary result")),
+        patch.object(AIAgent, "_interruptible_streaming_api_call", return_value=_response("ordinary result")),
+        patch.object(AIAgent, "_persist_session"),
+        patch.object(AIAgent, "_save_trajectory"),
+        patch.object(AIAgent, "_cleanup_task_resources"),
+    ):
+        result = json.loads(
+            delegate_task(tasks=[{"goal": "return a normal response"}], parent_agent=parent, background=False)
+        )
+
+    entry = result["results"][0]
+    assert entry["status"] == "completed"
+    assert (entry["model"], entry["provider"]) == (PRIMARY["model"], PRIMARY["provider"])
+    complete = [event for event in events if event.get("status") == "completed"]
+    assert complete
+    assert (complete[-1]["model"], complete[-1]["provider"]) == (PRIMARY["model"], PRIMARY["provider"])
+
+
+def test_delegate_task_ordinary_child_records_fallback_success_identity():
+    """The public no-profile child reports only its accepted fallback response."""
+    events = []
+    attempts = []
+    parent = SimpleNamespace(
+        base_url=PRIMARY["base_url"],
+        api_key="primary-key",
+        provider=PRIMARY["provider"],
+        api_mode="chat_completions",
+        model=PRIMARY["model"],
+        platform="cli",
+        enabled_toolsets=[],
+        disabled_toolsets=[],
+        request_overrides={},
+        _fallback_chain=FALLBACK_CHAIN,
+        _delegate_depth=0,
+        _active_children=[],
+        _active_children_lock=threading.Lock(),
+        _print_fn=None,
+        _session_db=None,
+        session_id=None,
+        tool_progress_callback=lambda *args, **kwargs: events.append(kwargs),
+    )
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
+
+    def stream_call(agent, _kwargs, **_ignored):
+        attempts.append((agent.provider, agent.model))
+        if len(attempts) == 1:
+            raise _HTTPError(429, "usage limit has been reached")
+        return _response("fallback result")
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+        patch.object(AIAgent, "_interruptible_streaming_api_call", stream_call),
+        patch.object(AIAgent, "_persist_session"),
+        patch.object(AIAgent, "_save_trajectory"),
+        patch.object(AIAgent, "_cleanup_task_resources"),
+        patch("agent.auxiliary_client.resolve_provider_client", return_value=(fallback_client, FALLBACK_CHAIN[0]["model"])),
+        patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda model, _provider: model),
+        patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        patch("agent.turn_recovery.time.sleep"),
+        patch("agent.retry_utils.jittered_backoff", return_value=0),
+    ):
+        result = json.loads(
+            delegate_task(
+                tasks=[{"goal": "return a fallback response"}],
+                parent_agent=parent,
+                credentials_cfg={},
+                background=False,
+            )
+        )
+
+    entry = result["results"][0]
+    assert entry["status"] == "completed"
+    assert attempts == [
+        (PRIMARY["provider"], PRIMARY["model"]),
+        (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]),
+    ]
+    assert (entry["model"], entry["provider"]) == (FALLBACK_CHAIN[0]["model"], FALLBACK_CHAIN[0]["provider"])
+    complete = [event for event in events if event.get("status") == "completed"]
+    assert complete
+    assert (complete[-1]["model"], complete[-1]["provider"]) == (FALLBACK_CHAIN[0]["model"], FALLBACK_CHAIN[0]["provider"])
 
 
 def test_standard_child_without_fallback_keeps_nous_entitlement_recovery():

@@ -140,7 +140,7 @@ def check_api_response(
             return _verdict(_iv.action, _iv.result)
 
     agent._turn_received_provider_response = True
-    if getattr(agent, "_delegate_model_profile", None) is not None:
+    if hasattr(agent, "_delegate_successful_llm_route"):
         agent._delegate_successful_llm_route = (agent.model, agent.provider)
     finish_reason = _derive_finish_reason(agent, response, messages)
 

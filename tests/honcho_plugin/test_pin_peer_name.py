@@ -676,6 +676,68 @@ def test_cache_busting_oversized_honcho_snapshot_tracks_content(tmp_path, monkey
     assert second["honcho.peer_name"] is None
 
 
+def test_cache_busting_honcho_projection_boundaries_preserve_live_identity(tmp_path, monkeypatch):
+    """W1: projection size never changes live Honcho identity or cache freshness."""
+    from gateway.run import GatewayRunner
+
+    path = tmp_path / "honcho.json"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+    def document(peer_name, pin_peer_name, size):
+        body = {"apiKey": "k", "peerName": peer_name, "pinPeerName": pin_peer_name, "padding": ""}
+        padding = size - len(json.dumps(body, separators=(",", ":")).encode())
+        assert padding >= 0
+        body["padding"] = " " * padding
+        encoded = json.dumps(body, separators=(",", ":")).encode()
+        assert len(encoded) == size
+        return encoded
+
+    def observe(peer_name, pin_peer_name, size):
+        path.write_bytes(document(peer_name, pin_peer_name, size))
+        live = HonchoClientConfig.from_global_config(config_path=path)
+        keys = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+        signature = GatewayRunner._agent_config_signature("test-model", {}, [], "", cache_keys=keys)
+        manager = HonchoSessionManager(
+            honcho=MagicMock(), config=live, runtime_user_peer_name="runtime-42"
+        )
+        _patch_manager_for_resolution_test(manager)
+        session = manager.get_or_create("telegram:42")
+        return live, keys, signature, session
+
+    below = 1024 * 1024 - 1
+    edge = 1024 * 1024
+    above = 1024 * 1024 + 1
+    small_live, small_keys, small_signature, small_session = observe("Alice", True, below)
+    edge_live, edge_keys, edge_signature, edge_session = observe("Alice", True, edge)
+    large_live, large_keys, large_signature, large_session = observe("Alice", True, above)
+    stable_large = GatewayRunner._agent_config_signature(
+        "test-model", {}, [], "",
+        cache_keys=GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}}),
+    )
+    peer_live, peer_keys, peer_signature, peer_session = observe("Blice", True, above)
+    pin_live, pin_keys, pin_signature, pin_session = observe("Blice", False, above)
+    returned_live, returned_keys, returned_signature, returned_session = observe("Alice", True, below)
+
+    for live in (small_live, edge_live, large_live, peer_live, pin_live, returned_live):
+        assert live.api_key == "k"
+    assert [small_live.peer_name, edge_live.peer_name, large_live.peer_name] == ["Alice"] * 3
+    assert small_keys["honcho.overflow_content"] is None
+    assert edge_keys["honcho.overflow_content"] is None
+    assert large_keys["honcho.overflow_content"] is not None
+    assert large_signature == stable_large
+    assert large_signature != peer_signature
+    assert peer_signature != pin_signature
+    assert small_signature == returned_signature
+    assert edge_signature != large_signature
+    assert small_session.user_peer_id == edge_session.user_peer_id == large_session.user_peer_id == "Alice"
+    assert peer_session.user_peer_id == "Blice"
+    assert pin_session.user_peer_id == "runtime-42"
+    assert returned_session.user_peer_id == "Alice"
+    assert peer_keys["honcho.overflow_content"] != pin_keys["honcho.overflow_content"]
+    assert returned_keys["honcho.overflow_content"] is None
+
+
 def test_cache_busting_null_snapshot_never_reopens_to_new_identity(tmp_path, monkeypatch):
     """A null read is invalid snapshot data, not permission to reopen a newer file."""
     from gateway.run import GatewayRunner

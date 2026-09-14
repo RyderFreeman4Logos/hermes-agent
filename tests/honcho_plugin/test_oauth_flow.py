@@ -452,8 +452,14 @@ def test_get_flow_status_reports_stored_connection(tmp_path, monkeypatch, reset_
     from plugins.memory.honcho import client as honcho_client
 
     cfgfile = tmp_path / "honcho.json"
+    resolved_raw = []
+
+    def active_host(raw_config=None):
+        resolved_raw.append(raw_config)
+        return "hermes"
+
     monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: cfgfile)
-    monkeypatch.setattr(honcho_client, "resolve_active_host", lambda: "hermes")
+    monkeypatch.setattr(honcho_client, "resolve_active_host", active_host)
     monkeypatch.delenv("HONCHO_API_KEY", raising=False)
 
     cfgfile.write_text(json.dumps({"hosts": {"hermes": {}}}))
@@ -470,6 +476,13 @@ def test_get_flow_status_reports_stored_connection(tmp_path, monkeypatch, reset_
     }}}))
     s = oauth_flow.get_flow_status()
     assert s["connected"] is True and s["auth"] == "oauth"
+    assert resolved_raw[-1] == {
+        "hosts": {"hermes": {
+            "apiKey": "hch-at-tok",
+            "oauth": {"refreshToken": "hch-rt-x", "expiresAt": 9_999_999_999,
+                      "clientId": "hermes-desktop", "tokenEndpoint": "http://x/oauth/token"},
+        }},
+    }
 
 
 def test_memory_oauth_router_dispatches_by_provider_convention():

@@ -767,3 +767,94 @@ def test_cache_busting_read_barrier_uses_the_already_read_small_snapshot(
     assert swapped
     assert values["honcho.peer_name"] == "Alice"
     assert values["honcho.pin_peer_name"] is True
+
+
+def test_profile_host_precedence_and_shared_oversized_snapshot_scope(tmp_path, monkeypatch):
+    """W9: profile resolution keeps provenance and projects shared overflow per scope."""
+    from gateway.run import GatewayRunner
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root = tmp_path / "hermes-root"
+    root.mkdir()
+    default_home = root
+    custom_home = tmp_path / "custom-home"
+    custom_home.mkdir()
+    alpha_home = root / "profiles" / "alpha"
+    beta_home = root / "profiles" / "beta"
+    alpha_home.mkdir(parents=True)
+    beta_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.delenv("HERMES_HONCHO_HOST", raising=False)
+
+    def write_config(path, default_host, hosts, padding=""):
+        path.write_text(json.dumps({
+            "defaultHost": default_host,
+            "hosts": hosts,
+            "padding": padding,
+        }), encoding="utf-8")
+
+    write_config(default_home / "honcho.json", "default-local", {
+        "default-local": {"apiKey": "default-key", "workspace": "default-ws"},
+    })
+    write_config(custom_home / "honcho.json", "custom-local", {
+        "custom-local": {"apiKey": "custom-key", "workspace": "custom-ws"},
+    })
+
+    def resolve_in(home, host=None):
+        token = set_hermes_home_override(home)
+        try:
+            return HonchoClientConfig.from_global_config(host=host)
+        finally:
+            reset_hermes_home_override(token)
+
+    default_cfg = resolve_in(default_home)
+    custom_cfg = resolve_in(custom_home)
+    assert default_cfg.host == "default-local"
+    assert custom_cfg.host == "custom-local"
+    assert default_cfg.config_path == default_home / "honcho.json"
+    assert default_cfg.hermes_home == default_home
+    assert custom_cfg.config_path == custom_home / "honcho.json"
+    assert custom_cfg.hermes_home == custom_home
+
+    shared_path = root / "honcho.json"
+    write_config(shared_path, "must-not-select-for-named", {
+        "hermes_alpha": {"apiKey": "alpha-key", "workspace": "alpha-ws"},
+        "hermes_beta": {"apiKey": "beta-key", "workspace": "beta-ws"},
+        "env-host": {"apiKey": "env-key", "workspace": "env-ws"},
+        "call-host": {"apiKey": "call-key", "workspace": "call-ws"},
+    })
+
+    alpha_cfg = resolve_in(alpha_home)
+    beta_cfg = resolve_in(beta_home)
+    assert alpha_cfg.host == "hermes_alpha"
+    assert beta_cfg.host == "hermes_beta"
+    assert alpha_cfg.config_path == shared_path
+    assert beta_cfg.config_path == shared_path
+    assert alpha_cfg.hermes_home == alpha_home
+    assert beta_cfg.hermes_home == beta_home
+
+    monkeypatch.setenv("HERMES_HONCHO_HOST", "env-host")
+    assert resolve_in(alpha_home).host == "env-host"
+    assert resolve_in(alpha_home, host="call-host").host == "call-host"
+    monkeypatch.delenv("HERMES_HONCHO_HOST", raising=False)
+
+    write_config(shared_path, "must-not-select-for-named", {
+        "hermes_alpha": {"apiKey": "alpha-key", "workspace": "alpha-ws"},
+        "hermes_beta": {"apiKey": "beta-key", "workspace": "beta-ws"},
+    }, padding=" " * (1024 * 1024 + 32))
+    monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+    def extract_in(home):
+        token = set_hermes_home_override(home)
+        try:
+            return GatewayRunner._extract_honcho_cache_busting_config()
+        finally:
+            reset_hermes_home_override(token)
+
+    alpha_first = extract_in(alpha_home)
+    beta = extract_in(beta_home)
+    alpha_again = extract_in(alpha_home)
+    assert len(GatewayRunner._HONCHO_CACHE_BUSTING_MEMO) == 1
+    assert alpha_first["honcho.overflow_content"] is not None
+    assert alpha_first["honcho.overflow_content"] != beta["honcho.overflow_content"]
+    assert alpha_first["honcho.overflow_content"] == alpha_again["honcho.overflow_content"]

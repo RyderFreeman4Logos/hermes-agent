@@ -1406,6 +1406,88 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
         self.assertEqual(len(env.killed), 1)
         self.assertEqual(len(_REMOTE_KERNELS), 1)
 
+    def _assert_late_loser_after_winner_second_cell(self, cleanup_before_release):
+        """W10: a late candidate never owns or destroys the active winner."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        loser_at_launch = threading.Event()
+        release_loser = threading.Event()
+        second_submitted = threading.Event()
+        release_second = threading.Event()
+
+        def before_spawn():
+            if threading.current_thread().name == "w10-loser":
+                loser_at_launch.set()
+                release_loser.wait(5)
+
+        def before_submit():
+            if threading.current_thread().name == "w10-second":
+                second_submitted.set()
+                release_second.wait(5)
+
+        env.before_spawn = before_spawn
+        env.before_submit = before_submit
+        results = {}
+        errors = []
+
+        def invoke(label):
+            try:
+                results[label] = _run(env, code=label, task="late-loser-owner")
+            except BaseException as exc:
+                errors.append(exc)
+
+        loser = threading.Thread(target=invoke, args=("late-loser",), name="w10-loser")
+        loser.start()
+        self.assertTrue(loser_at_launch.wait(5), "late candidate did not hold its launch")
+        self.assertEqual(_run(env, code="winner-first", task="late-loser-owner")["stdout"], "winner-first")
+        second = threading.Thread(target=invoke, args=("winner-second",), name="w10-second")
+        second.start()
+        self.assertTrue(second_submitted.wait(5), "winner did not begin its second cell")
+        with _REGISTRY.lock:
+            winner = next(iter(_REMOTE_KERNELS.values()))
+            self.assertEqual((winner.pid, winner.execution_count), ("7001", 1))
+
+        if cleanup_before_release:
+            shutdown_remote_kernels_for_owner("late-loser-owner")
+        release_loser.set()
+        if not cleanup_before_release:
+            deadline = time.monotonic() + 5
+            while not any("7002" in command for command in env.killed):
+                self.assertLess(time.monotonic(), deadline, "late loser was not retired by identity")
+                time.sleep(0.01)
+        release_second.set()
+        loser.join(5)
+        second.join(5)
+
+        self.assertFalse(loser.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(any("7002" in command for command in env.killed))
+        if cleanup_before_release:
+            self.assertEqual({result["status"] for result in results.values()}, {"error"})
+            self.assertTrue(all("canceled by session cleanup" in result["error"]
+                                for result in results.values()))
+            self.assertEqual(sum(request["code"] == "late-loser"
+                                 for request in env.cell_submissions), 0)
+            with _REGISTRY.lock:
+                self.assertEqual(len(_REMOTE_KERNELS), 0)
+        else:
+            self.assertEqual(results["winner-second"]["stdout"], "winner-second")
+            self.assertEqual(results["late-loser"]["stdout"], "late-loser")
+            self.assertEqual([request["code"] for request in env.cell_submissions],
+                             ["winner-first", "winner-second", "late-loser"])
+            self.assertFalse(any("7001" in command for command in env.killed))
+            with _REGISTRY.lock:
+                self.assertIs(next(iter(_REMOTE_KERNELS.values())), winner)
+                self.assertEqual(winner.attached, 0)
+        self.assertEqual(env.spawn_count, 2)
+
+    def test_late_cold_loser_adopts_after_winner_begins_second_cell(self):
+        self._assert_late_loser_after_winner_second_cell(False)
+
+    def test_owner_cleanup_before_late_loser_release_prevents_adoption(self):
+        self._assert_late_loser_after_winner_second_cell(True)
+
     def test_live_poller_forces_permanent_retirement_before_handoff(self):
         """W10: join timeout cannot expose K to the next caller."""
         env = FileAwareEnv()

@@ -31,6 +31,7 @@ from agent.error_classifier import (
     _extract_status_code)
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
@@ -3824,6 +3825,9 @@ class _StreamingCall(StreamingWaitMonitor):
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    self.result["error"] = e
+                    return
                 except Exception as e:
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
@@ -4056,6 +4060,8 @@ class _StreamingCall(StreamingWaitMonitor):
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
         if self.result["error"] is not None:
+            if isinstance(self.result["error"], StreamPayloadBoundExceeded):
+                raise self.result["error"]
             if self.deltas_were_sent["yes"]:
                 return self._partial_stream_stub()
             raise self.result["error"]

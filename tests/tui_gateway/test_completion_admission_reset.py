@@ -1,7 +1,10 @@
 """Admission reset ordering for busy prompt corrections (#315)."""
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import threading
+import types
 
 import pytest
 
@@ -47,6 +50,143 @@ class _Agent(InterruptControlMixin):
         self._execution_thread_id = None
         self._supports_active_turn_redirect = True
         self.api_mode = "chat_completions"
+        self.session_id = "owner-agent"
+        self._active_children = []
+        self._active_children_lock = threading.Lock()
+        self.client = None
+        self._session_messages = None
+
+
+class _InlineThread:
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+def _session(agent: _Agent) -> dict:
+    return {
+        "agent": agent,
+        "session_key": "owner-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+        "attached_images": [],
+        "image_counter": 0,
+        "cols": 80,
+        "slash_worker": None,
+        "show_reasoning": False,
+        "tool_progress_mode": "all",
+        "inflight_turn": None,
+        "active_session_lease": types.SimpleNamespace(enabled=False, released=True),
+    }
+
+
+def _patch_inline_turn(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda _sid, _session: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
+
+
+@pytest.mark.parametrize(
+    ("result_steer", "late_steer", "expected"),
+    [
+        ("result correction", None, "result correction"),
+        (None, "late correction", "late correction"),
+        ("result correction", "late correction", "result correction\nlate correction"),
+        (None, None, None),
+    ],
+)
+def test_turn_finally_hands_off_result_then_late_steer(
+    monkeypatch, tmp_path, result_steer: str | None, late_steer: str | None,
+    expected: str | None,
+):
+    _patch_inline_turn(monkeypatch, tmp_path)
+    agent = _Agent()
+    result = {"final_response": "done"}
+    if result_steer is not None:
+        result["pending_steer"] = result_steer
+    agent.run_conversation = lambda *_a, **_k: result
+    session = _session(agent)
+    real_finish = server._finish_turn
+
+    def finish_then_late(sid, target_session, state):
+        real_finish(sid, target_session, state)
+        if late_steer is not None:
+            assert agent.steer(late_steer)
+
+    monkeypatch.setattr(server, "_finish_turn", finish_then_late)
+    assert server._run_prompt_submit("rid", "owner-ui", session, "prompt") is True
+
+    queued = session.get("queued_prompt")
+    assert (queued or {}).get("text") == expected
+    assert agent._drain_pending_steer() is None
+
+
+@pytest.mark.parametrize("mode", ["steer", "interrupt"])
+@pytest.mark.parametrize("exit_kind", ["normal", "early", "error", "cancel"])
+def test_finishing_turn_never_drains_successor_correction(
+    monkeypatch, tmp_path, mode: str, exit_kind: str,
+):
+    _patch_inline_turn(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: mode)
+    agent = _Agent()
+    session = _session(agent)
+    correction = f"successor {mode} correction"
+    admitted: dict[str, object] = {}
+
+    if exit_kind == "normal":
+        agent.run_conversation = lambda *_a, **_k: {"final_response": "done"}
+    elif exit_kind == "error":
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("turn failed")
+        agent.run_conversation = fail
+    elif exit_kind == "cancel":
+        def cancel(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+        agent.run_conversation = cancel
+    else:
+        agent.run_conversation = lambda *_a, **_k: {"final_response": "unused"}
+        monkeypatch.setattr(server, "_prepare_turn_input", lambda *_a, **_k: None)
+
+    def admit_and_correct(*_args, **_kwargs):
+        session["running"] = True
+        assert server._admit_prompt_turn(
+            "owner-ui", session, "successor", None, None
+        ) == ([], agent)
+        agent._executing_tools = mode == "interrupt"
+        response = server._handle_busy_submit(
+            "rid-b", "owner-ui", session, correction, None
+        )
+        admitted["status"] = response["result"]["status"]
+
+    monkeypatch.setattr(server, "_emit_settled_session_info", admit_and_correct)
+    with contextlib.suppress(asyncio.CancelledError):
+        assert server._run_prompt_submit("rid-a", "owner-ui", session, "turn A") is True
+
+    assert admitted["status"] in {"steered", "redirected"}
+    assert session["running"] is True
+    assert session.get("queued_prompt") is None
+    assert agent._drain_pending_steer() == correction
+    assert agent._drain_pending_steer() is None
 
 
 @pytest.mark.parametrize(

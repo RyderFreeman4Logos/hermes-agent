@@ -135,8 +135,8 @@ def prepare_iteration(
     # row is already persisted append-only, so replay would diverge from the live request and
     # break the prompt cache — same contract as apply_pending_steer_to_tool_results).
     _pre_api_steer = agent._drain_pending_steer()
-    if _pre_api_steer:
-        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
+    if _pre_api_steer or callable(getattr(agent, "_completion_steer_ingest", None)):
+        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer or "")
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -235,17 +235,26 @@ def _previous_tool_round(messages: Any) -> list:
 
 
 def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
-    """Append the steer marker as a standalone user row after the newest tool message; with no
-    tool message, put the text back so the post-tool-execution drain delivers it later."""
+    """Insert structured completions and true user steer after the newest tool row."""
+    ingest_completion = getattr(agent, "_completion_steer_ingest", None)
     for _si in range(len(messages) - 1, -1, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import steer_user_row
-            messages.insert(_si + 1, steer_user_row(steer_text))
-            logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
+
+            def insert(completion_text: str) -> bool:
+                text = f"{completion_text}\n{steer_text}" if steer_text else completion_text
+                messages.insert(_si + 1, steer_user_row(text))
+                return True
+
+            if callable(ingest_completion) and ingest_completion(insert):
+                return
+            if steer_text:
+                messages.insert(_si + 1, steer_user_row(steer_text))
             return
-    from agent.agent_runtime_helpers import _requeue_pending_steer
-    _requeue_pending_steer(agent, steer_text)
+    if steer_text:
+        from agent.agent_runtime_helpers import _requeue_pending_steer
+        _requeue_pending_steer(agent, steer_text)
 
 
 @dataclass

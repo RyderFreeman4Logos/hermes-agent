@@ -209,8 +209,11 @@ def test_second_read_oserror_keeps_warm_raw_value(isolated_hermes_home, monkeypa
     assert target_opens == 2
 
 
-def test_second_read_failure_keeps_nous_selection_out_of_direct_fal_sink(isolated_hermes_home, monkeypatch):
-    """A second raw read failure cannot turn a stored managed pick into FAL_KEY direct submit."""
+@pytest.mark.parametrize("fault", ["open", "read"])
+def test_second_read_failure_keeps_nous_selection_out_of_direct_fal_sink(
+    isolated_hermes_home, monkeypatch, fault
+):
+    """W2: either second-phase fault keeps a stored managed choice out of direct FAL."""
     import importlib
     from unittest.mock import MagicMock
     from tools import image_generation_tool
@@ -222,21 +225,53 @@ def test_second_read_failure_keeps_nous_selection_out_of_direct_fal_sink(isolate
     cfg.write_text("image_gen:\n  provider: krea\n", encoding="utf-8")
     original_open = Path.open
     opens = 0
+    successful_reads = 0
+    failed_reads = 0
+
+    class ForwardingReader:
+        def __init__(self, source, fail=False):
+            self._source = source
+            self._fail = fail
+
+        def read(self, size=-1):
+            nonlocal successful_reads, failed_reads
+            if self._fail:
+                failed_reads += 1
+                raise PermissionError("second parser read denied")
+            successful_reads += 1
+            return self._source.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._source.close()
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
     def fail_second(self, *args, **kwargs):
         nonlocal opens
+        source = original_open(self, *args, **kwargs)
         if self == cfg and (args[0] if args else kwargs.get("mode")) == "rb":
             opens += 1
             if opens == 2:
-                raise PermissionError("second parser read denied")
-        return original_open(self, *args, **kwargs)
+                if fault == "open":
+                    source.close()
+                    raise PermissionError("second parser open denied")
+                return ForwardingReader(source, fail=True)
+            return ForwardingReader(source)
+        return source
+
     direct = MagicMock()
     monkeypatch.setattr(Path, "open", fail_second)
     monkeypatch.setattr(tool, "fal_client", direct)
     monkeypatch.setenv("FAL_KEY", "test-key")
-    monkeypatch.setattr(tool, "resolve_managed_tool_gateway", lambda _name: None)
     with pytest.raises(ValueError, match="Nous"):
         tool._submit_fal_request("fal-ai/test", {"prompt": "x"})
     assert opens == 2
+    assert successful_reads
+    assert failed_reads == (1 if fault == "read" else 0)
     direct.submit.assert_not_called()
 
 @pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])

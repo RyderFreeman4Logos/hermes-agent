@@ -749,13 +749,18 @@ def test_cache_busting_null_snapshot_never_reopens_to_new_identity(tmp_path, mon
     original_open = Path.open
     swapped = False
 
+    def replace_snapshot(snapshot):
+        replacement = path.with_suffix(".next")
+        replacement.write_text(snapshot, encoding="utf-8")
+        replacement.replace(path)
+
     class SwitchingReader:
         def __init__(self, stream): self._stream = stream
         def read(self, *args, **kwargs):
             nonlocal swapped
             value = self._stream.read(*args, **kwargs)
             if not swapped:
-                path.write_text(json.dumps({"apiKey": "k", "peerName": "Bob"}))
+                replace_snapshot(json.dumps({"apiKey": "k", "peerName": "Bob"}))
                 swapped = True
             return value
         def __enter__(self): return self
@@ -778,6 +783,21 @@ def test_cache_busting_null_snapshot_never_reopens_to_new_identity(tmp_path, mon
     warm = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
     assert warm["honcho.peer_name"] is None
     assert warm["honcho.overflow_content"] is None
+
+
+def test_cache_busting_nonmapping_snapshots_are_not_missing_files(tmp_path, monkeypatch):
+    """W4: non-mapping JSON roots remain unavailable snapshots, never an env fallback."""
+    from gateway.run import GatewayRunner
+
+    path = tmp_path / "honcho.json"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for root in ("[]", '"not-a-mapping"', "42", "true"):
+        path.write_text(root, encoding="utf-8")
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+        values = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+        assert values["honcho.peer_name"] is None
+        assert values["honcho.pin_peer_name"] is None
+        assert values["honcho.overflow_content"] is None
 
 
 def test_cache_busting_same_metadata_honcho_rewrite_changes_identity_and_signature(

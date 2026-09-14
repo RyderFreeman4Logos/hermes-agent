@@ -167,6 +167,44 @@ class TestResolveProviderCorruptConfig:
         assert resolve_provider("openrouter") == "openrouter"
 
 
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_denied_raw_read_recovers_auto_resolution_after_forwarding_restore(
+    tmp_path, monkeypatch, reader_name
+):
+    """W3: a real I/O denial blocks auto resolution until the same bytes validate again."""
+    from pathlib import Path
+
+    from hermes_cli import config as config_mod
+    from hermes_cli.auth import AuthError, resolve_provider
+
+    _home, cfg = _setup_home(tmp_path, monkeypatch, VALID_YAML)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-FAKE1234567890")
+    assert config_mod.load_config()["gateway"]["enabled"] is False
+    readonly = config_mod.read_raw_config_readonly()
+    reader = getattr(config_mod, reader_name)
+    assert reader()["gateway"]["enabled"] is False
+    original_open = Path.open
+
+    def deny_target(self, *args, **kwargs):
+        if self == cfg and (args[0] if args else kwargs.get("mode")) == "rb":
+            raise PermissionError("configured raw reader denied")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_target)
+    assert reader()["gateway"]["enabled"] is False
+    with pytest.raises(AuthError) as denied:
+        resolve_provider("auto")
+    assert denied.value.code == "corrupt_config"
+
+    monkeypatch.setattr(Path, "open", original_open)
+    recovered = reader()
+    assert recovered["gateway"]["enabled"] is False
+    assert config_mod.get_active_config_parse_failure() is None
+    assert resolve_provider("auto") == "openrouter"
+    if reader_name == "read_raw_config_readonly":
+        assert recovered is readonly
+
+
 def test_same_metadata_failure_recovery_and_repeat_warning_require_raw_validation(tmp_path, monkeypatch, caplog):
     """W12: only validated bytes retire a failure, and a later identical failure warns again."""
     from hermes_cli import config as config_mod

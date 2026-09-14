@@ -4,7 +4,6 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -62,15 +61,23 @@ def _seed_backup(config_path: Path, reason: str, contents: bytes) -> Path:
     return prior
 
 
+class _FifoWatchdogFired(AssertionError):
+    pass
+
+
 @contextmanager
 def _bounded_fifo_call(seconds: float = 2.0):
+    fired = False
+
     def _timeout(_signum, _frame):
-        raise TimeoutError("backup comparison blocked on a FIFO")
+        nonlocal fired
+        fired = True
+        raise _FifoWatchdogFired("backup comparison blocked on a FIFO")
 
     previous = signal.signal(signal.SIGALRM, _timeout)
     signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
-        yield
+        yield lambda: fired
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
@@ -127,10 +134,9 @@ def test_backup_rechecks_metadata_before_comparing(tmp_path: Path, monkeypatch, 
         monkeypatch.setattr(config_backups, "list_config_backups", mutate_after_enumeration)
 
     try:
-        started = time.monotonic()
-        with _bounded_fifo_call():
+        with _bounded_fifo_call() as watchdog_fired:
             result = backup_config(config_path, "race")
-        elapsed = time.monotonic() - started
+        assert not watchdog_fired()
     finally:
         if old_mode is not None:
             prior.chmod(old_mode)
@@ -145,8 +151,6 @@ def test_backup_rechecks_metadata_before_comparing(tmp_path: Path, monkeypatch, 
     else:
         assert result is None
         assert after - before == set()
-        if case == "source-fifo":
-            assert elapsed < 1.0
 
 
 class _FaultAfterFirstChunk:

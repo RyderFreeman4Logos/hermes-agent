@@ -512,6 +512,7 @@ def finalize_turn(
     # interrupted turn; the gateway stream gate and the API run status rely on that contract.
     completed = (
         final_response is not None
+        and not interrupted
         and not failed
         and not interrupted
         and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))

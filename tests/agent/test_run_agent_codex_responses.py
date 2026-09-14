@@ -261,6 +261,146 @@ class _FakeCreateStream:
         self.closed = True
 
 
+def test_codex_stream_payload_overflow_wins_over_same_handoff_interrupt(monkeypatch):
+    """The recorder's terminal control signal must survive callback guards.
+
+    The display callback raises the user interrupt flag while the overflowing
+    delta is being delivered.  The already-observed payload overflow remains
+    authoritative and the provider stream is closed without consuming the
+    later completion frame.
+    """
+    from agent.stream_payload_bound import (
+        DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        StreamPayloadBoundExceeded,
+    )
+
+    agent = _build_agent(monkeypatch)
+    consumed: list[str] = []
+
+    def display(text: str) -> None:
+        consumed.append(text)
+        if text == "y":
+            agent._interrupt_requested = True
+
+    agent.stream_delta_callback = display
+    stream = _FakeCreateStream([
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            delta="x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="y"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed"),
+        ),
+    ])
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream)
+    )
+
+    with pytest.raises(StreamPayloadBoundExceeded):
+        agent._run_codex_stream(_codex_request_kwargs())
+
+    assert stream.closed is True
+    assert consumed == ["x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES, "y"]
+    assert agent._current_streamed_assistant_text == (
+        "x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+    )
+
+
+def test_codex_nonstream_owner_preserves_overflow_during_interrupt(monkeypatch):
+    from agent.stream_payload_bound import (
+        DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        StreamPayloadBoundExceeded,
+    )
+
+    agent = _build_agent(monkeypatch)
+
+    def display(text: str) -> None:
+        if text == "y":
+            agent._interrupt_requested = True
+
+    agent.stream_delta_callback = display
+    stream = _FakeCreateStream([
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            delta="x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="y"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed"),
+        ),
+    ])
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(StreamPayloadBoundExceeded):
+        agent._interruptible_api_call(_codex_request_kwargs())
+
+    assert stream.closed is True
+
+
+def test_run_conversation_persists_bounded_overflow_when_interrupt_races(monkeypatch):
+    from agent.stream_payload_bound import DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+
+    agent = _build_agent(monkeypatch)
+
+    def display(text: str) -> None:
+        if text == "y":
+            agent._interrupt_requested = True
+
+    agent.stream_delta_callback = display
+    stream = _FakeCreateStream([
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            delta="x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="y"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed"),
+        ),
+    ])
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda *_args, **_kwargs: None
+    )
+
+    result = agent.run_conversation("overflow please")
+
+    assert result["completed"] is False
+    assert result["interrupted"] is True
+    assert "262145 bytes" in result["final_response"]
+    assert result["messages"][-1]["role"] == "assistant"
+    assert result["messages"][-1]["content"] == result["final_response"]
+    assert len(result["final_response"].encode("utf-8")) < 1024
+    assert stream.closed is True
+
+
 def _codex_request_kwargs():
     return {
         "model": "gpt-5-codex",

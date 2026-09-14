@@ -213,3 +213,16 @@ def test_second_read_failure_keeps_nous_selection_out_of_direct_fal_sink(isolate
         tool._submit_fal_request("fal-ai/test", {"prompt": "x"})
     assert opens == 2
     direct.submit.assert_not_called()
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_cold_nonmissing_read_failure_returns_empty_for_both_raw_apis(isolated_hermes_home, monkeypatch, reader_name):
+    """Cold non-missing I/O faults retain the established empty raw contract."""
+    from hermes_cli import config as config_mod
+    cfg = _write_config(isolated_hermes_home, {"image_gen": {"provider": "nous"}})
+    original_open = Path.open
+    def deny(self, *args, **kwargs):
+        if self == cfg:
+            raise PermissionError("cold config denied")
+        return original_open(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", deny)
+    assert getattr(config_mod, reader_name)() == {}

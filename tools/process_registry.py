@@ -27,7 +27,7 @@ _IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -421,6 +421,10 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    # A successful direct signal is provenance for the reader-owned terminal record;
+    # it is not terminal publication itself.
+    _pending_termination_source: str = field(default="", repr=False)
+    _kill_source_candidate: str = field(default="", repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
 
     def append_output(self, text: str) -> None:
@@ -746,7 +750,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return ProcessRegistry._config_seconds("daemon_term_grace_seconds", 2.0)
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
+    def _terminate_host_pid(
+        cls, pid: int, expected_start: Optional[int] = None,
+        on_direct_signal: Optional[Callable[[], None]] = None,
+    ) -> None:
         """Terminate a host-visible PID and its descendants.
         ``expected_start`` (kernel start time at spawn) is re-validated first: a mismatch
         or dead PID means the number was recycled onto a stranger and we refuse to touch
@@ -791,6 +798,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         for proc in targets:
             with suppress(gone):
                 proc.terminate()
+                if proc.pid == pid and on_direct_signal is not None:
+                    on_direct_signal()
         # Escalate to SIGKILL for anything that ignored SIGTERM within the grace window.
         # ``psutil.wait_procs``' gone/alive partition is deliberately NOT trusted: it
         # reaps via ``Process.wait()`` and mis-partitions across zombie transitions in a
@@ -1250,8 +1259,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._emit_output(session, text)
 
     def _finish_exited(self, session: ProcessSession, exit_code) -> None:
-        """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish."""
-        session.mark_exited(exit_code)
+        """Let the stream owner publish after its final decoder flush.
+
+        A direct local kill records delivered-signal provenance only. The pipe reader
+        owns the final bytes and the one terminal publication, so a graceful SIGTERM
+        handler can report its actual exit code without losing that provenance.
+        """
+        with session._lock:
+            source = session._pending_termination_source
+            session.mark_exited(
+                exit_code,
+                reason="killed" if source else "exited",
+                source=source,
+            )
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -1723,15 +1743,36 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 self._completion_consumed.add(session_id)
             return result
         try:
+            with session._lock:
+                session._kill_source_candidate = source
             early = self._signal_kill(session, session_id, consume_output)
             if early is not None:
                 return early
+            # A local pipe reader owns the decoder cutoff and terminal publication.
+            # The signal itself is provenance only; wait for that owner to retain the
+            # final tail and observed return code before exposing a terminal result.
+            reader = getattr(session, "_reader_thread", None)
+            if session.process is not None and session._pty is None and reader is not None:
+                # POSIX readers bound descendant-held pipes themselves. Keep this
+                # bounded for the Windows blocking-pipe fallback, where a caller gets
+                # an honest in-progress result instead of a competing decoder/drain.
+                if not session._completion_event.wait(timeout=5):
+                    return {
+                        "status": "stopping", "session_id": session.id,
+                        "output": _output_tail(session, 2000),
+                    }
+                with session._lock:
+                    if consume_output:
+                        self._completion_consumed.add(session_id)
+                    result = self._exit_snapshot(session, "killed")
+                result["session_id"] = session.id
+                return result
             # Additive to the PID kill: stopping the scope reaps double-forked
             # descendants reparented inside the cgroup.
             if session.systemd_unit:
                 _stop_systemd_unit(session.systemd_unit)
-            # Capture output, mark consumed, THEN expose ``exited`` to watcher tasks —
-            # closes the delayed-notification race without losing the transcript.
+            # Backends without a stream reader retain their established direct
+            # settlement behavior.
             with session._lock:
                 output = _output_tail(session, 2000)
                 if consume_output:
@@ -1806,7 +1847,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
         elif session.process:
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
             # leaves Git Bash descendants behind.
-            self._terminate_host_pid(session.process.pid, session.host_start_time)
+            def record_direct_signal() -> None:
+                with session._lock:
+                    session._pending_termination_source = session._kill_source_candidate
+
+            self._terminate_host_pid(
+                session.process.pid, session.host_start_time, record_direct_signal
+            )
         elif session.env_ref and session.pid:
             session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
         elif session.detached and session.pid_scope == "host" and session.pid:

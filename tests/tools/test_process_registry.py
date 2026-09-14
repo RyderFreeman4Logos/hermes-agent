@@ -1350,6 +1350,42 @@ class TestKillProcess:
         assert event["completion_reason"] == "exited"
         assert event["termination_source"] == ""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX local-pipe reader ownership")
+    def test_direct_kill_waits_for_pipe_reader_final_tail(self, registry, monkeypatch, tmp_path):
+        """A delivered signal is provenance; the real reader publishes the tail once."""
+        code = (
+            "import signal, sys, time\n"
+            "def finish(_signum, _frame):\n"
+            "    print('FINAL-TAIL-41', flush=True)\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, finish)\n"
+            "print('READY-41', flush=True)\n"
+            "while True: time.sleep(1)\n"
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+        # Keep this real public spawn/read/queue path isolated from persistent test
+        # state; the terminal owner and completion queue are not mocked.
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        session = registry.spawn_local(command, cwd=str(tmp_path))
+        session.notify_on_complete = True
+        try:
+            assert _wait_until(lambda: "READY-41" in session.output_buffer), "reader never received readiness"
+            result = registry.kill_process(session.id, source="test.pipe.kill", consume_output=True)
+            assert result["status"] == "killed"
+            assert result["output"].endswith("FINAL-TAIL-41\n")
+            assert result["exit_code"] == 0
+            assert result["completion_reason"] == "killed"
+            assert result["termination_source"] == "test.pipe.kill"
+            event = registry.completion_queue.get_nowait()
+            assert event["output"].endswith("FINAL-TAIL-41\n")
+            assert event["exit_code"] == 0
+            assert event["completion_reason"] == "killed"
+            assert event["termination_source"] == "test.pipe.kill"
+            assert registry.completion_queue.empty()
+        finally:
+            self._reap_child(session.process)
+
     def _bind_real_child(self, registry, sid: str):
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],

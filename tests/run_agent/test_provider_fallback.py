@@ -530,3 +530,55 @@ class TestFallbackExtraBodyReResolution:
         assert original["extra_body"]["nested"]["value"] == "primary"
         live = agent.request_overrides.get("extra_body") or {}
         assert "old_only" not in live
+
+    def test_late_b_failure_restores_a_before_real_c_rescope(self):
+        """A rejected B cannot make C retain A-only provider overrides.
+
+        B's extra-body derivation is intentionally real.  The only injected fault is
+        the later notice sink, after identity/client/override publication, so the next
+        chain entry exercises the public fallback loop rather than a rescope stub.
+        """
+        b_url = "https://b-llm.example.com/v1"
+        c_url = "https://c-llm.example.com/v1"
+        agent = _make_agent(fallback_model=[
+            {"provider": "custom:b", "model": "b-model", "base_url": b_url},
+            {"provider": "custom:c", "model": "c-model", "base_url": c_url},
+        ])
+        agent.provider = "custom"
+        agent.model = "a-model"
+        agent.base_url = self.OLD_URL
+        agent.requested_provider = "custom"
+        agent._custom_providers = [
+            {"name": "aprov", "base_url": self.OLD_URL, "extra_body": {"a_only": 1}},
+            {"provider_key": "b", "base_url": b_url, "extra_body": {"b_only": 2}},
+            {"provider_key": "c", "base_url": c_url, "extra_body": {"c_only": 3}},
+        ]
+        agent.request_overrides = {"extra_body": {"a_only": 1, "caller": "kept"}}
+        original_notice = chat_completion_helpers._buffer_fallback_notice
+
+        def fail_only_after_b_rescope(live_agent, notice):
+            if live_agent.model == "b-model":
+                raise RuntimeError("late B notice sink failure")
+            return original_notice(live_agent, notice)
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[
+                (_mock_client(base_url=b_url), "b-model"),
+                (_mock_client(base_url=c_url), "c-model"),
+            ],
+        ), patch(
+            "agent.model_metadata.get_model_context_length", return_value=128_000
+        ), patch(
+            "agent.chat_completion_helpers._buffer_fallback_notice",
+            side_effect=fail_only_after_b_rescope,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert (agent.model, agent.provider, agent.base_url) == (
+            "c-model", "custom:c", c_url
+        )
+        extra = agent.request_overrides["extra_body"]
+        assert extra == {"caller": "kept", "c_only": 3}
+        assert "a_only" not in extra
+        assert "b_only" not in extra

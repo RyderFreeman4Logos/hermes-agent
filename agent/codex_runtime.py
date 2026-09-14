@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.usage_anchor import set_usage_anchor
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,8 @@ def _call_guarded(fn: Callable | None, fail_msg: str, *fail_args: Any, args: tup
         return
     try:
         fn(*args, **(kwargs or {}))
+    except StreamPayloadBoundExceeded:
+        raise
     except Exception:
         logger.debug(fail_msg, *fail_args, exc_info=True)
 
@@ -317,7 +320,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     started: dict[str, tuple[str, dict, float]] = {}
 
     def agent_cb(attr: str, fail_msg: str, *fail_args: Any, args: tuple = (), kwargs: dict | None = None) -> None:
-        _call_guarded(getattr(agent, attr, None), fail_msg, *fail_args, args=args, kwargs=kwargs)
+        try:
+            _call_guarded(getattr(agent, attr, None), fail_msg, *fail_args, args=args, kwargs=kwargs)
+        except StreamPayloadBoundExceeded:
+            # The app-server turn owner persists its bounded explanation from
+            # projected messages; retire this request's recorder accounting now.
+            agent._current_streamed_assistant_text = ""
+            raise
 
     def _fire_tool_started(item: dict) -> None:
         item_id, name = item.get("id") or "", _codex_item_to_tool_name(item)
@@ -515,6 +524,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                                   "without a truthful pre-compaction transcript boundary")
     _ensure_codex_session(agent)
     try:
+        agent._reset_stream_delivery_tracking()
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
@@ -1047,6 +1057,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     attempt + 1, max_stream_retries + 1, agent._client_log_context(), exc,
                 )
                 continue
+            except StreamPayloadBoundExceeded:
+                raise
             except RuntimeError:
                 # "No terminal response"; Relay may still hold a finalizer-assembled response.
                 if event_stream is not None and event_stream.final_response is not None:

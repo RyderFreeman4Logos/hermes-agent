@@ -2703,8 +2703,12 @@ class _StreamingCall(StreamingWaitMonitor):
     @staticmethod
     def _quiet(fn, *args) -> None:
         """Best-effort callback: never let a display hook break the stream."""
-        with contextlib.suppress(Exception):
+        try:
             fn(*args)
+        except StreamPayloadBoundExceeded:
+            raise
+        except Exception:
+            pass
 
     def _set_managed_stream(self, stream: Any) -> Any:
         self.managed_stream_holder["stream"] = stream
@@ -2783,7 +2787,8 @@ class _StreamingCall(StreamingWaitMonitor):
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
         if self.agent.stream_delta_callback:
-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+            self._quiet(self.agent.stream_delta_callback, text)
+            self.agent._record_streamed_assistant_text(text)
 
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
@@ -3329,6 +3334,9 @@ class _StreamingCall(StreamingWaitMonitor):
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
                         return
+        except StreamPayloadBoundExceeded as e:
+            self.result["error"] = e
+            return
         except InterruptedError as e:
             # Fast pre-retry interrupt surfaces through the normal result channel.
             self.result["error"] = e
@@ -3490,13 +3498,13 @@ class _StreamingCall(StreamingWaitMonitor):
             self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
             self.worker.start()
             self._monitor_loop()
+        if isinstance(self.result["error"], StreamPayloadBoundExceeded):
+            raise self.result["error"]
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
         if self.result["error"] is not None:
-            if isinstance(self.result["error"], StreamPayloadBoundExceeded):
-                raise self.result["error"]
             if self.deltas_were_sent["yes"]:
                 return self._partial_stream_stub()
             raise self.result["error"]

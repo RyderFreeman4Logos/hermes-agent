@@ -1836,6 +1836,188 @@ class TestKillProcess:
             registry._signal_kill = orig
             self._reap_child(stranger)
 
+    @pytest.mark.linux_only
+    def test_recovered_natural_death_during_kill_error_stays_unconsumed(self, registry, tmp_path, monkeypatch):
+        """R1/R2: recovery observes death, but a failed operation did not deliver it."""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.25)"])
+        checkpoint = tmp_path / "processes.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_recovered_natural", "command": "sleep", "pid": proc.pid,
+            "pid_scope": "host", "host_start_time": ProcessRegistry._safe_host_start_time(proc.pid),
+            "task_id": "t1", "notify_on_complete": True,
+        }]))
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        try:
+            with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+                assert registry.recover_from_checkpoint() == 1
+                session = registry.get("proc_recovered_natural")
+
+                def natural_then_error(*_args):
+                    proc.wait(timeout=2)
+                    raise RuntimeError("adapter failed after natural death")
+
+                monkeypatch.setattr(registry, "_signal_kill", natural_then_error)
+                result = registry.kill_process(session.id, source="test.failed", consume_output=True)
+
+            assert result == {"status": "error", "error": "adapter failed after natural death"}
+            assert (session.exit_code, session.completion_reason, session.termination_source) == (None, "exited", "")
+            assert session.id not in registry._completion_consumed
+            event = registry.completion_queue.get_nowait()
+            assert (event["completion_reason"], event["termination_source"]) == ("exited", "")
+        finally:
+            self._reap_child(proc)
+
+    @pytest.mark.linux_only
+    @pytest.mark.parametrize("consume_output", [True, False])
+    def test_pipe_kill_commits_disposition_and_scope_before_publication(
+        self, registry, monkeypatch, tmp_path, consume_output
+    ):
+        """R5/R6: owned scope cleanup and consumption precede queue visibility."""
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        stopped = []
+        monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda unit: stopped.append(unit) or True)
+        session = registry.spawn_local(
+            f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)'", cwd=str(tmp_path)
+        )
+        session.notify_on_complete = True
+        session.systemd_unit = "hermes-worker-test.scope"
+        visible = []
+        original_put = registry.completion_queue.put
+
+        def inspect_put(event):
+            visible.append(registry.is_completion_consumed(session.id))
+            original_put(event)
+
+        monkeypatch.setattr(registry.completion_queue, "put", inspect_put)
+        try:
+            result = registry.kill_process(session.id, source="test.scope", consume_output=consume_output)
+            assert result["status"] == "killed"
+            assert stopped == ["hermes-worker-test.scope"]
+            assert visible == [consume_output]
+        finally:
+            self._reap_child(session.process)
+
+    def test_concurrent_failed_source_cannot_replace_delivering_source(self, registry, monkeypatch):
+        """R7: pending provenance belongs to the invocation whose signal succeeded."""
+        session = _make_session(sid="proc_source_race")
+        session.process = MagicMock(pid=424242)
+        session._reader_thread = MagicMock()
+        session.notify_on_complete = True
+        registry._running[session.id] = session
+        success_entered = threading.Event()
+        failed_done = threading.Event()
+        results = {}
+
+        def terminate(_pid, _start, on_direct_signal=None):
+            if threading.current_thread().name == "success-kill":
+                success_entered.set()
+                assert failed_done.wait(2)
+                on_direct_signal()
+                registry._finish_exited(session, 0)
+                return
+            assert success_entered.wait(2)
+            failed_done.set()
+            raise PermissionError("failed competitor")
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        threads = [
+            threading.Thread(name="success-kill", target=lambda: results.setdefault(
+                "success", registry.kill_process(session.id, source="delivered", consume_output=False))),
+            threading.Thread(name="failed-kill", target=lambda: results.setdefault(
+                "failed", registry.kill_process(session.id, source="failed", consume_output=True))),
+        ]
+        threads[0].start()
+        threads[1].start()
+        for thread in threads:
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+        assert results["failed"]["status"] == "error"
+        assert session.termination_source == "delivered"
+        assert registry.completion_queue.get_nowait()["termination_source"] == "delivered"
+
+    def test_pipe_stopping_result_still_stops_owned_scope(self, registry, monkeypatch):
+        """R5 bounded-stopping return cannot bypass its cgroup obligation."""
+        session = _make_session(sid="proc_scope_stopping")
+        session.process = MagicMock(pid=424242)
+        session._reader_thread = MagicMock()
+        session._completion_event = MagicMock()
+        session._completion_event.wait.return_value = False
+        session.systemd_unit = "hermes-worker-stopping.scope"
+        registry._running[session.id] = session
+        stopped = []
+        monkeypatch.setattr(registry, "_signal_kill", lambda *_args: None)
+        monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda unit: stopped.append(unit) or True)
+
+        result = registry.kill_process(session.id, source="test.stopping", consume_output=True)
+
+        assert result["status"] == "stopping"
+        assert stopped == ["hermes-worker-stopping.scope"]
+
+    @pytest.mark.linux_only
+    def test_posix_fallback_signal_records_delivering_source(self, registry, monkeypatch, tmp_path):
+        """R7: os.kill fallback is a successful delivery, not missing provenance."""
+        import psutil
+
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        session = registry.spawn_local(
+            f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)'", cwd=str(tmp_path)
+        )
+        original_process = psutil.Process
+
+        def inaccessible_parent(pid):
+            if pid == session.pid:
+                raise OSError("psutil unavailable")
+            return original_process(pid)
+
+        monkeypatch.setattr(psutil, "Process", inaccessible_parent)
+        try:
+            result = registry.kill_process(session.id, source="test.posix.fallback", consume_output=True)
+            assert result["status"] == "killed"
+            assert result["termination_source"] == "test.posix.fallback"
+            assert session.termination_source == "test.posix.fallback"
+        finally:
+            self._reap_child(session.process)
+
+    @pytest.mark.linux_only
+    @pytest.mark.parametrize("observer", ["poll", "wait"])
+    def test_public_observer_waits_for_pipe_reader_terminal_owner(
+        self, registry, monkeypatch, tmp_path, observer
+    ):
+        """R8: poll/wait cannot publish while the real reader owns cutoff."""
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        entered_finish = threading.Event()
+        release_finish = threading.Event()
+        original_finish = registry._finish_reader
+
+        def held_finish(*args, **kwargs):
+            entered_finish.set()
+            assert release_finish.wait(2)
+            return original_finish(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_finish_reader", held_finish)
+        session = registry.spawn_local(
+            f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(0.1)'", cwd=str(tmp_path)
+        )
+        session.notify_on_complete = True
+        assert entered_finish.wait(2)
+        observer_result = {}
+        observe = registry.poll if observer == "poll" else lambda sid: registry.wait(sid, timeout=2)
+        poller = threading.Thread(target=lambda: observer_result.update(observe(session.id)))
+        poller.start()
+        time.sleep(0.1)
+        assert poller.is_alive(), "poll stole terminal ownership before the reader cutoff"
+        release_finish.set()
+        poller.join(timeout=2)
+        assert not poller.is_alive()
+        assert observer_result["status"] == "exited"
+        assert (session.completion_reason, session.termination_source) == ("exited", "")
+        assert registry.completion_queue.qsize() == 1
+
 
 # =========================================================================
 # Tool handler
@@ -2905,7 +3087,10 @@ class TestSystemdCgroupIsolation:
         stopped = []
         terminated = []
         monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, start: False)
-        monkeypatch.setattr(registry, "_terminate_host_pid", lambda pid, start: terminated.append((pid, start)))
+        monkeypatch.setattr(
+            registry, "_terminate_host_pid",
+            lambda pid, start, on_direct_signal=None: terminated.append((pid, start)),
+        )
         monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda unit: stopped.append(unit) or True)
 
         with patch.object(registry, "_write_checkpoint"):

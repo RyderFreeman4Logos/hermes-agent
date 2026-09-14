@@ -424,7 +424,7 @@ class ProcessSession:
     # A successful direct signal is provenance for the reader-owned terminal record;
     # it is not terminal publication itself.
     _pending_termination_source: str = field(default="", repr=False)
-    _kill_source_candidate: str = field(default="", repr=False)
+    _pending_consume_output: Optional[bool] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
 
     def append_output(self, text: str) -> None:
@@ -475,6 +475,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._kill_context = threading.local()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -769,8 +770,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return
 
         def _sigterm_quietly():
-            with suppress(OSError, ProcessLookupError, PermissionError):
+            try:
                 os.kill(pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError, PermissionError):
+                return
+            if on_direct_signal is not None:
+                on_direct_signal()
         if _IS_WINDOWS:
             try:
                 subprocess.run(
@@ -1272,6 +1277,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 reason="killed" if source else "exited",
                 source=source,
             )
+            # Commit an output-bearing kill's disposition before the terminal
+            # notification becomes visible.  A failed operation never installs
+            # this claim, so its error-only return cannot hide the completion.
+            if session._pending_consume_output:
+                self._completion_consumed.add(session.id)
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -1564,6 +1574,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return
         if rc is None:
             return  # Direct child still running — reader block is legitimate.
+        reader = getattr(session, "_reader_thread", None)
+        if reader is not None and reader.is_alive():
+            # The stream owner has the decoder state and any delivered-signal
+            # provenance.  Its POSIX orphan cutoff is bounded; allow it to
+            # publish before this observer takes the readerless fallback.
+            if session._completion_event.wait(timeout=0.75):
+                return
         # Best-effort non-blocking drain of whatever the reader hasn't consumed.
         stdout = getattr(proc, "stdout", None)
         if stdout is not None and not _IS_WINDOWS:
@@ -1743,11 +1760,21 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 self._completion_consumed.add(session_id)
             return result
         try:
-            with session._lock:
-                session._kill_source_candidate = source
-            early = self._signal_kill(session, session_id, consume_output)
+            self._kill_context.source = source
+            self._kill_context.consume_output = consume_output
+            try:
+                early = self._signal_kill(session, session_id, consume_output)
+            finally:
+                for name in ("source", "consume_output"):
+                    with suppress(AttributeError):
+                        delattr(self._kill_context, name)
             if early is not None:
                 return early
+            # Scope ownership is independent of decoder ownership.  Stop it
+            # before either reader result can return so reparented descendants
+            # cannot outlive a completed main child.
+            if session.systemd_unit:
+                _stop_systemd_unit(session.systemd_unit)
             # A local pipe reader owns the decoder cutoff and terminal publication.
             # The signal itself is provenance only; wait for that owner to retain the
             # final tail and observed return code before exposing a terminal result.
@@ -1769,8 +1796,6 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return result
             # Additive to the PID kill: stopping the scope reaps double-forked
             # descendants reparented inside the cgroup.
-            if session.systemd_unit:
-                _stop_systemd_unit(session.systemd_unit)
             # Backends without a stream reader retain their established direct
             # settlement behavior.
             with session._lock:
@@ -1822,12 +1847,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
                             identity_gone = live_start != session.host_start_time
                 if wait_rc is not None or identity_gone:
                     with session._lock:
-                        if consume_output:
-                            self._completion_consumed.add(session_id)
+                        delivered_source = session._pending_termination_source
                         session.mark_exited(
                             wait_rc if wait_rc is not None else None,
-                            reason="killed",
-                            source=source,
+                            reason="killed" if delivered_source else "exited",
+                            source=delivered_source,
                         )
                     with suppress(Exception):
                         self._move_to_finished(session)
@@ -1841,21 +1865,23 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if session._pty:
             try:
                 session._pty.terminate(force=True)
+                self._record_kill_delivery(session)
             except Exception:
                 if session.pid:
                     os.kill(session.pid, signal.SIGTERM)
+                    self._record_kill_delivery(session)
         elif session.process:
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
             # leaves Git Bash descendants behind.
             def record_direct_signal() -> None:
-                with session._lock:
-                    session._pending_termination_source = session._kill_source_candidate
+                self._record_kill_delivery(session)
 
             self._terminate_host_pid(
                 session.process.pid, session.host_start_time, record_direct_signal
             )
         elif session.env_ref and session.pid:
             session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+            self._record_kill_delivery(session)
         elif session.detached and session.pid_scope == "host" and session.pid:
             # Identity check, not bare liveness: a gone/recycled PID means our
             # process exited — never tree-kill the stranger. Still stop an owned
@@ -1874,7 +1900,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     self._completion_consumed.add(session_id)
                 self._move_to_finished(session)
                 return {"status": "already_exited", "exit_code": session.exit_code, "output": output}
-            self._terminate_host_pid(session.pid, session.host_start_time)
+            self._terminate_host_pid(
+                session.pid, session.host_start_time,
+                lambda: self._record_kill_delivery(session),
+            )
         else:
             return {
                 # Reject non-positive timeouts — the schema declares minimum=1, but not every caller
@@ -1886,6 +1915,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
                          "its original runtime handle is no longer available",
             }
         return None
+
+    def _record_kill_delivery(self, session: ProcessSession) -> None:
+        """Bind first successful signal delivery to its immutable invocation."""
+        source = getattr(self._kill_context, "source", "")
+        consume_output = bool(getattr(self._kill_context, "consume_output", False))
+        with session._lock:
+            if not session._pending_termination_source:
+                session._pending_termination_source = source
+                session._pending_consume_output = consume_output
 
     def _stdin_op(self, session_id: str, pty_op, pipe_op, ok: dict) -> dict:
         """Run a stdin operation on a running session — ``pty_op(pty)`` under PTY mode,

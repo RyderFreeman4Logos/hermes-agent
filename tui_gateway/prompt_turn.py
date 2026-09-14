@@ -860,7 +860,7 @@ def _run_prompt_submit(
                     session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
-        _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
+            _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
     run_thread = threading.Thread(target=run, daemon=True)
     with _sessions_lock:
         registered = _sessions.get(sid)

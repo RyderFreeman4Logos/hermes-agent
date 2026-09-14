@@ -181,8 +181,14 @@ class GatewayConfigLoadersMixin:
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
         if resolved_session_key:
             _r_state = self._peek_session_state(resolved_session_key)
-            if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-                return _r_state.conversation.reasoning_override
+            if _r_state is not None:
+                if _r_state.conversation.reasoning_override is not None:
+                    return _r_state.conversation.reasoning_override
+                model_override = _r_state.conversation.model_override
+                if isinstance(model_override, dict):
+                    model_reasoning = model_override.get("reasoning_config")
+                    if isinstance(model_reasoning, dict):
+                        return dict(model_reasoning)
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:

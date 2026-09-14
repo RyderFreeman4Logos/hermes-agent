@@ -555,7 +555,7 @@ def _sandbox_tools_for(enabled_tools: Optional[List[str]]) -> frozenset:
 
 def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
                          sandbox_tools: frozenset, *, timeout: int, max_tool_calls: int,
-                         exec_start: float) -> str:
+                         exec_start: float, invocation=None) -> str:
     """Per-call script ship: stage hermes_tools.py + script.py in a fresh remote sandbox dir,
     serve file-RPC from a polling thread, run, clean up."""
     sandbox_dir = f"{_env_temp_dir(env)}/hermes_exec_{uuid.uuid4().hex[:12]}"
@@ -563,6 +563,10 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
     quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
     tool_call_counter, stop_event, rpc_thread = [0], threading.Event(), None
     try:
+        if invocation is not None:
+            from tools.code_kernel_remote import _is_canceled
+            if _is_canceled(invocation):
+                return _error_result("Remote execution was canceled by session cleanup.")
         env.execute(f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10)
         rpc_token = secrets.token_urlsafe(32)
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py",
@@ -581,6 +585,10 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
+        if invocation is not None:
+            from tools.code_kernel_remote import _admit_fallback
+            if not _admit_fallback(invocation):
+                return _error_result("Remote execution was canceled by session cleanup.")
         logger.info("Executing code on %s backend (task %s)...", env_type, effective_task_id[:8])
         script_result = env.execute(f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
                                     timeout=timeout)
@@ -612,8 +620,8 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
     return json.dumps(result, ensure_ascii=False)
 
 
-def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[List[str]],
-                    reset: bool = False) -> str:
+def _execute_remote_with_invocation(code: str, task_id: Optional[str], enabled_tools: Optional[List[str]],
+                                    reset: bool, invocation) -> str:
     """Run code on the remote terminal backend: the owner's persistent remote session kernel
     (tools/code_kernel_remote.py) first, else the per-call script ship — the fail-open route when
     a kernel cannot be spawned and the only route for hosts that cannot sustain a background process."""
@@ -640,6 +648,7 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[L
                 sandbox_tools=frozenset(sandbox_tools), timeout=timeout,
                 max_tool_calls=max_tool_calls, reset=bool(reset),
                 idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
+                _invocation=invocation,
             )
         except Exception:
             logger.warning("remote session-kernel path failed; falling back to per-call", exc_info=True)
@@ -650,7 +659,17 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[L
     except Exception as exc:
         return _remote_failure(exc, exec_start, 0)
     return _run_remote_per_call(env, env_type, code, effective_task_id, sandbox_tools,
-                                timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start)
+                                timeout=timeout, max_tool_calls=max_tool_calls,
+                                exec_start=exec_start, invocation=invocation)
+
+
+def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[List[str]],
+                    reset: bool = False) -> str:
+    from tools.code_kernel_remote import _remote_invocation
+
+    effective_task_id = task_id or "default"
+    with _remote_invocation(effective_task_id) as invocation:
+        return _execute_remote_with_invocation(code, task_id, enabled_tools, reset, invocation)
 
 
 # ---- Main entry point ----

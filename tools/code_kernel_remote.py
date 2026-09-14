@@ -25,8 +25,9 @@ import shlex
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from tools.code_kernel import RUNNER_CELL_SOURCE, KernelRegistry
 
@@ -118,6 +119,9 @@ class RemoteKernel:
     # kernels: killing one mid-cell tears the runner out from under a live
     # poll loop (same guard as tools.code_kernel, hermes-agent#101861).
     attached: int = 0
+    cell_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    retired: bool = False
+    active_stop: Optional[threading.Event] = field(default=None, repr=False)
 
     def sh(self, cmd: str, timeout: int = 15) -> str:
         return _sh(self.env, cmd, timeout)
@@ -157,15 +161,95 @@ _REGISTRY = KernelRegistry(lambda kernel: kernel.kill())
 _REMOTE_KERNELS: Dict[Tuple, RemoteKernel] = _REGISTRY.kernels
 
 
+@dataclass(eq=False)
+class _RemoteInvocation:
+    owner: str
+    canceled: bool = False
+    may_have_submitted: bool = False
+
+
+_ACTIVE_INVOCATIONS: set[_RemoteInvocation] = set()
+
+
+@contextmanager
+def _remote_invocation(task_env_id: str) -> Iterator[_RemoteInvocation]:
+    """Register one remote operation across kernel acquisition and fallback."""
+    from tools.code_kernel import _resolve_owner
+
+    invocation = _RemoteInvocation(owner=_resolve_owner(task_env_id))
+    with _REGISTRY.lock:
+        _ACTIVE_INVOCATIONS.add(invocation)
+    try:
+        yield invocation
+    finally:
+        with _REGISTRY.lock:
+            _ACTIVE_INVOCATIONS.discard(invocation)
+
+
+def _is_canceled(invocation: _RemoteInvocation) -> bool:
+    with _REGISTRY.lock:
+        return invocation.canceled
+
+
+def _admit_fallback(invocation: _RemoteInvocation) -> bool:
+    with _REGISTRY.lock:
+        return not invocation.canceled
+
+
+def _cancel_result(*, state_reset: bool = False, state_lost: bool = False) -> Dict[str, Any]:
+    kernel_info: Dict[str, Any] = {"remote": True, "ended": True}
+    if state_reset:
+        kernel_info["state_reset"] = True
+    if state_lost:
+        kernel_info["state_lost"] = True
+    return {
+        "status": "error", "stdout": "", "stderr": "", "traceback": "",
+        "tool_calls_made": 0, "kernel": kernel_info,
+        "error": "Remote execution was canceled by session cleanup.",
+    }
+
+
+def _retire_unlocked(key: Tuple, kernel: RemoteKernel) -> bool:
+    kernel.retired = True
+    if kernel.active_stop is not None:
+        kernel.active_stop.set()
+    if _REMOTE_KERNELS.get(key) is kernel:
+        _REMOTE_KERNELS.pop(key)
+        return True
+    return False
+
+
+def _discard_remote_kernel(key: Tuple, kernel: RemoteKernel) -> None:
+    with _REGISTRY.lock:
+        removed = _retire_unlocked(key, kernel)
+    if removed:
+        kernel.kill()
+
+
+def _shutdown_remote(owner: Optional[str]) -> None:
+    """Cancel admitted calls and remove their kernels in one identity transaction."""
+    with _REGISTRY.lock:
+        for invocation in _ACTIVE_INVOCATIONS:
+            if owner is None or invocation.owner == owner:
+                invocation.canceled = True
+        doomed = []
+        for key, kernel in list(_REMOTE_KERNELS.items()):
+            if owner is None or key[0] == owner:
+                _retire_unlocked(key, kernel)
+                doomed.append(kernel)
+    for kernel in doomed:
+        kernel.kill()
+
+
 def shutdown_all_remote_kernels() -> None:
-    _REGISTRY.shutdown()
+    _shutdown_remote(None)
 
 
 def shutdown_remote_kernels_for_owner(owner: str) -> None:
     """Session-boundary disposal — wired to the same clear_session hook as
     local kernels, so /new and session close reap both kinds."""
     if owner:
-        _REGISTRY.shutdown(owner)
+        _shutdown_remote(owner)
 
 
 def _reap_unlocked(idle_timeout: int) -> List["RemoteKernel"]:
@@ -175,7 +259,12 @@ def _reap_unlocked(idle_timeout: int) -> List["RemoteKernel"]:
     now = time.monotonic()
     doomed = [key for key, kernel in _REMOTE_KERNELS.items()
               if kernel.attached == 0 and now - kernel.last_used > idle_timeout]
-    return [_REMOTE_KERNELS.pop(key) for key in doomed]
+    retired = []
+    for key in doomed:
+        kernel = _REMOTE_KERNELS[key]
+        _retire_unlocked(key, kernel)
+        retired.append(kernel)
+    return retired
 
 
 def _evict_over_cap_unlocked(keep: Tuple) -> List["RemoteKernel"]:
@@ -187,7 +276,12 @@ def _evict_over_cap_unlocked(keep: Tuple) -> List["RemoteKernel"]:
         return []
     by_age = sorted((key for key in _REMOTE_KERNELS if key != keep and _REMOTE_KERNELS[key].attached == 0),
                     key=lambda key: _REMOTE_KERNELS[key].last_used)
-    return [_REMOTE_KERNELS.pop(key) for key in by_age[: len(_REMOTE_KERNELS) - cap]]
+    retired = []
+    for key in by_age[: len(_REMOTE_KERNELS) - cap]:
+        kernel = _REMOTE_KERNELS[key]
+        _retire_unlocked(key, kernel)
+        retired.append(kernel)
+    return retired
 
 
 def _reserve_unlocked(key: Tuple, kernel: RemoteKernel) -> List["RemoteKernel"]:
@@ -205,7 +299,8 @@ atexit.register(shutdown_all_remote_kernels)
 
 
 def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
-                         sandbox_tools: frozenset, *, idle_exit: int) -> Optional[RemoteKernel]:
+                         sandbox_tools: frozenset, *, idle_exit: int,
+                         invocation: _RemoteInvocation) -> Optional[RemoteKernel]:
     """Start a detached kernel runner on the remote. None on failure (dir removed)."""
     from tools.code_execution_tool import (
         MAX_STDOUT_BYTES, _ship_file_to_remote, _env_temp_dir, generate_hermes_tools_module,
@@ -214,12 +309,18 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
     q_dir = shlex.quote(kernel_dir)
     kernel = None
     try:
+        if _is_canceled(invocation):
+            return None
         _sh(env, f"mkdir -p {q_dir}/cells {q_dir}/rpc")
+        if _is_canceled(invocation):
+            raise RuntimeError("remote invocation canceled during spawn")
         rpc_token = secrets.token_urlsafe(32)
         _ship_file_to_remote(env, f"{kernel_dir}/kernel_runner.py", REMOTE_KERNEL_RUNNER_SOURCE.format(
             cell_source=RUNNER_CELL_SOURCE, capture_limit=MAX_STDOUT_BYTES, idle_exit=idle_exit))
         _ship_file_to_remote(env, f"{kernel_dir}/hermes_tools.py",
                              generate_hermes_tools_module(list(sandbox_tools), transport="file"))
+        if _is_canceled(invocation):
+            raise RuntimeError("remote invocation canceled during spawn")
         env_prefix = (f"HERMES_KERNEL_DIR={q_dir} HERMES_RPC_DIR={shlex.quote(kernel_dir + '/rpc')} "
                       f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} PYTHONDONTWRITEBYTECODE=1 PYTHONPATH={q_dir}")
         started = _sh(env, f"cd {q_dir} && nohup env {env_prefix} python3 kernel_runner.py "
@@ -253,31 +354,37 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
 
 def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
                            sandbox_tools: frozenset, *, reset: bool,
-                           idle_exit: int) -> Tuple[Optional[RemoteKernel], bool, bool, bool]:
+                           idle_exit: int, invocation: _RemoteInvocation,
+                           prior_state_reset: bool = False,
+                           prior_state_lost: bool = False) -> Tuple[Optional[RemoteKernel], bool, bool, bool]:
     """Find/respawn the owner's kernel: (kernel|None, reused, state_reset, state_lost); reaps
     idle-expired entries on the way in. A returned kernel is already attached."""
     key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
-    state_lost = state_reset = False
+    state_lost, state_reset = prior_state_lost, prior_state_reset
     reset_pending = reset
     while True:
         with _REGISTRY.lock:
+            if invocation.canceled:
+                return None, False, state_reset, state_lost
             expired = _reap_unlocked(idle_exit)
             kernel = _REMOTE_KERNELS.get(key)
         for doomed in expired:
             doomed.kill()
 
         if kernel is not None and reset_pending:
-            _REGISTRY.discard(key, kernel)
+            _discard_remote_kernel(key, kernel)
             kernel, state_reset, reset_pending = None, True, False
         if kernel is not None and not kernel.is_alive():
             # Transport drop, container restart, self-reaped on idle, OOM — all
             # the same answer: report the loss, respawn fresh (kill is then only
             # best-effort dir cleanup; the process is already gone).
-            _REGISTRY.discard(key, kernel)
+            _discard_remote_kernel(key, kernel)
             kernel, state_lost = None, True
 
         if kernel is not None:
             with _REGISTRY.lock:
+                if invocation.canceled:
+                    return None, False, state_reset, state_lost
                 if _REMOTE_KERNELS.get(key) is not kernel:
                     continue
                 evicted = _reserve_unlocked(key, kernel)
@@ -287,35 +394,57 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
 
         candidate = _spawn_remote_kernel(
             env, env_type, owner, task_env_id, sandbox_tools, idle_exit=idle_exit,
+            invocation=invocation,
         )
         if candidate is None:
             return None, False, state_reset, state_lost
         with _REGISTRY.lock:
-            if key in _REMOTE_KERNELS:
+            if invocation.canceled:
                 published = False
+                canceled = True
+            elif key in _REMOTE_KERNELS:
+                published = False
+                canceled = False
             else:
                 _REMOTE_KERNELS[key] = candidate
                 evicted = _reserve_unlocked(key, candidate)
                 published = True
+                canceled = False
         if not published:
             candidate.kill()
+            if canceled:
+                return None, False, state_reset, state_lost
             continue
         for doomed in evicted:
             doomed.kill()
         return candidate, False, state_reset, state_lost
 
 
-def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> Tuple[str, Dict[str, Any]]:
-    """Ship one cell request and poll for its result: (cell status, payload)."""
+def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int,
+                     invocation: _RemoteInvocation) -> Tuple[str, Dict[str, Any], bool]:
+    """Ship one cell and return status, payload, and result-cleanup failure."""
     from tools.code_execution_tool import _ship_file_to_remote
     kernel.cell_seq += 1
     seq = f"{kernel.cell_seq:06d}"
     q_cells, q_res = shlex.quote(f"{kernel.kernel_dir}/cells"), shlex.quote(f"cell_res_{seq}.json")
+    if _is_canceled(invocation):
+        return "canceled", {}, False
     _ship_file_to_remote(kernel.env, f"{kernel.kernel_dir}/cells/cell_req_{seq}.json.tmp",
                          json.dumps({"id": seq, "code": code}, ensure_ascii=False))
-    kernel.sh(f"mv {q_cells}/cell_req_{seq}.json.tmp {q_cells}/cell_req_{seq}.json", timeout=10)
+    with _REGISTRY.lock:
+        if invocation.canceled:
+            return "canceled", {}, False
+        invocation.may_have_submitted = True
+    submitted = kernel.env.execute(
+        f"mv {q_cells}/cell_req_{seq}.json.tmp {q_cells}/cell_req_{seq}.json",
+        cwd="/", timeout=10,
+    )
+    if isinstance(submitted, dict) and submitted.get("returncode", 0) != 0:
+        raise RuntimeError("remote cell submission failed")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if _is_canceled(invocation):
+            return "canceled", {}, False
         try:
             body = kernel.sh(f"cat {q_cells}/{q_res} 2>/dev/null", timeout=20).strip()
         except Exception:
@@ -324,65 +453,141 @@ def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> Tuple[str
         if body:
             try:
                 payload = json.loads(body)
+                if not isinstance(payload, dict):
+                    raise ValueError("cell result is not an object")
                 status = payload.get("status", "error")
-            except ValueError:
+            except (TypeError, ValueError):
                 payload, status = {}, "protocol-error"
-            kernel.sh(f"rm -f {q_cells}/{q_res}", timeout=10)
-            return status, payload
+            cleanup_failed = False
+            try:
+                cleanup = kernel.env.execute(f"rm -f {q_cells}/{q_res}", cwd="/", timeout=10)
+                cleanup_failed = isinstance(cleanup, dict) and cleanup.get("returncode", 0) != 0
+            except Exception:
+                cleanup_failed = True
+            return status, payload, cleanup_failed
         time.sleep(_CELL_POLL_INTERVAL)
-    return "timeout", {}
+    return "timeout", {}, False
 
 
 def execute_in_remote_kernel(
     code: str, *, env, env_type: str, task_env_id: str, sandbox_tools: frozenset,
     timeout: int, max_tool_calls: int, reset: bool, idle_exit: int = 1800,
+    _invocation: Optional[_RemoteInvocation] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run one cell in the owner's remote kernel. Returns the raw cell result dict (caller
     post-processes output), or ``None`` when no kernel could be spawned (caller falls open to
     per-call). ``state_lost``/``state_reset``/``reused`` ride in the ``kernel`` sub-dict."""
-    from tools.code_kernel import _resolve_owner
-    owner = _resolve_owner(task_env_id)
-    kernel, reused, state_reset, state_lost = _acquire_remote_kernel(
-        env, env_type, owner, task_env_id, sandbox_tools, reset=reset, idle_exit=idle_exit)
-    if kernel is None:
-        return None  # fail open to per-call
+    if _invocation is None:
+        with _remote_invocation(task_env_id) as invocation:
+            return execute_in_remote_kernel(
+                code, env=env, env_type=env_type, task_env_id=task_env_id,
+                sandbox_tools=sandbox_tools, timeout=timeout,
+                max_tool_calls=max_tool_calls, reset=reset, idle_exit=idle_exit,
+                _invocation=invocation,
+            )
+    invocation = _invocation
+    owner = invocation.owner
     key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
-    try:
-        return _run_attached_cell(kernel, key, code, env=env, task_env_id=task_env_id,
-                                  sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                                  reused=reused, state_reset=state_reset, state_lost=state_lost)
-    finally:
-        with _REGISTRY.lock:
-            kernel.attached -= 1
-            kernel.last_used = time.monotonic()
+    state_reset = state_lost = False
+    reset_pending = reset
+    while True:
+        kernel, reused, state_reset, state_lost = _acquire_remote_kernel(
+            env, env_type, owner, task_env_id, sandbox_tools,
+            reset=reset_pending, idle_exit=idle_exit, invocation=invocation,
+            prior_state_reset=state_reset, prior_state_lost=state_lost,
+        )
+        reset_pending = False
+        if kernel is None:
+            if _is_canceled(invocation):
+                return _cancel_result(state_reset=state_reset, state_lost=state_lost)
+            return None
+        acquired_cell = False
+        try:
+            while not kernel.cell_lock.acquire(timeout=0.1):
+                if _is_canceled(invocation):
+                    return _cancel_result(state_reset=state_reset, state_lost=state_lost)
+            acquired_cell = True
+            with _REGISTRY.lock:
+                if invocation.canceled:
+                    return _cancel_result(state_reset=state_reset, state_lost=state_lost)
+                retry = kernel.retired or _REMOTE_KERNELS.get(key) is not kernel
+            if retry:
+                state_lost = True
+                continue
+            try:
+                return _run_attached_cell(
+                    kernel, key, code, task_env_id=task_env_id,
+                    sandbox_tools=sandbox_tools, timeout=timeout,
+                    max_tool_calls=max_tool_calls, reused=reused,
+                    state_reset=state_reset, state_lost=state_lost,
+                    invocation=invocation,
+                )
+            except Exception as exc:
+                if invocation.may_have_submitted:
+                    _discard_remote_kernel(key, kernel)
+                    return {
+                        "status": "error", "stdout": "", "stderr": "", "traceback": "",
+                        "tool_calls_made": 0,
+                        "kernel": {"remote": True, "ended": True, "state_lost": True},
+                        "error": f"Remote cell outcome is uncertain; execution was not replayed: {exc}",
+                    }
+                raise
+        finally:
+            if acquired_cell:
+                kernel.cell_lock.release()
+            with _REGISTRY.lock:
+                kernel.attached -= 1
+                kernel.last_used = time.monotonic()
 
 
-def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task_env_id: str,
+def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, task_env_id: str,
                        sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-                       reused: bool, state_reset: bool, state_lost: bool) -> Dict[str, Any]:
+                       reused: bool, state_reset: bool, state_lost: bool,
+                       invocation: _RemoteInvocation) -> Dict[str, Any]:
     from tools.code_execution_tool import _rpc_poll_loop
     from tools.thread_context import propagate_context_to_thread
     # Clean stale tool-RPC requests from a previous cell before arming this cell's poll loop, so
     # a background thread the last cell leaked cannot smuggle a call into this authority window.
     q_rpc = shlex.quote(kernel.kernel_dir + '/rpc')
     try:
-        kernel.sh(f"rm -f {q_rpc}/req_* {q_rpc}/res_*", timeout=10)
+        cleanup = kernel.env.execute(f"rm -f {q_rpc}/req_* {q_rpc}/res_*", cwd="/", timeout=10)
+        cleanup_failed = isinstance(cleanup, dict) and cleanup.get("returncode", 0) != 0
     except Exception:
-        pass
+        cleanup_failed = True
+    if cleanup_failed:
+        _discard_remote_kernel(key, kernel)
+        return {
+            "status": "error", "stdout": "", "stderr": "", "traceback": "",
+            "tool_calls_made": 0,
+            "kernel": {"remote": True, "ended": True, "state_lost": True},
+            "error": "Remote RPC namespace cleanup failed; kernel retired before submission.",
+        }
     tool_call_counter, stop_event = [0], threading.Event()
+    with _REGISTRY.lock:
+        if invocation.canceled:
+            return _cancel_result(state_reset=state_reset, state_lost=state_lost)
+        kernel.active_stop = stop_event
     # Per-cell RPC thread carrying THIS call's approval/session context — the remote analogue
     # of CellAuthority: authority lives exactly as long as the cell's poll loop.
     rpc_thread = threading.Thread(
         target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
-        args=(env, f"{kernel.kernel_dir}/rpc", task_env_id, [], tool_call_counter,
+        args=(kernel.env, f"{kernel.kernel_dir}/rpc", task_env_id, [], tool_call_counter,
               max_tool_calls, sandbox_tools, stop_event, kernel.rpc_token))
     rpc_thread.start()
-    cell_status, cell_payload = "no-result", {}
+    cell_status, cell_payload, cleanup_failed = "no-result", {}, False
     try:
-        cell_status, cell_payload = _run_remote_cell(kernel, code, timeout)
+        cell_status, cell_payload, cleanup_failed = _run_remote_cell(kernel, code, timeout, invocation)
     finally:
         stop_event.set()
         rpc_thread.join(timeout=5)
+        poller_alive = rpc_thread.is_alive()
+        with _REGISTRY.lock:
+            if kernel.active_stop is stop_event:
+                kernel.active_stop = None
+    if poller_alive or cleanup_failed:
+        _discard_remote_kernel(key, kernel)
+    if cell_status == "canceled" or _is_canceled(invocation):
+        return _cancel_result(state_reset=state_reset, state_lost=state_lost)
     kernel_info: Dict[str, Any] = {"reused": reused, "remote": True}
     result: Dict[str, Any] = {
         "status": "error", "stdout": cell_payload.get("stdout", ""), "stderr": cell_payload.get("stderr", ""),
@@ -390,7 +595,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
     }
     if cell_status in ("timeout", "protocol-error", "no-result"):
         # No safe way to interrupt one cell in place (same contract as local): kill, report, respawn.
-        _REGISTRY.discard(key, kernel)
+        _discard_remote_kernel(key, kernel)
         if cell_status == "timeout":
             result["status"] = "timeout"
         kernel_info.update(ended=True, state_lost=True, note=(
@@ -399,7 +604,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
             else "Remote kernel protocol failure; kernel killed, state lost."))
         return result
     if cell_status == "exit":
-        _REGISTRY.discard(key, kernel)
+        _discard_remote_kernel(key, kernel)
         kernel_info["ended"] = True
     kernel.execution_count = kernel_info["execution_count"] = int(cell_payload.get("execution_count", 0) or 0)
     if cell_status in ("ok", "exit"):
@@ -412,6 +617,9 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
         kernel_info.update(state_lost=True, note=(
             "The previous remote kernel was gone (transport drop, container "
             "restart, or idle self-exit); state from earlier calls was lost and a fresh kernel was started."))
+    if poller_alive or cleanup_failed:
+        kernel_info.update(ended=True, state_lost=True, note=(
+            "Remote kernel retired after its RPC or result namespace could not be safely handed off."))
     if cell_status == "error" and result["traceback"]:
         result["error"] = result["traceback"].strip().splitlines()[-1]
     return result

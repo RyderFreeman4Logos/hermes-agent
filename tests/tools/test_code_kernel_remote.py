@@ -8,8 +8,11 @@ kill) was verified live on Windows against a bash-backed env; these tests
 pin the host-side protocol logic: spawn parsing, liveness handling,
 state_lost/state_reset reporting, fail-open, and owner isolation.
 """
+import base64
+import contextvars
 import json
 import os
+import shlex
 import sys
 import threading
 import time
@@ -47,6 +50,120 @@ class ScriptedEnv:
         for needle, handler in self.handlers:
             if needle in command:
                 return handler(command)
+        return {"output": "", "returncode": 0}
+
+
+class FileAwareEnv:
+    """In-memory implementation of the remote file protocol.
+
+    The host still executes the public remote-kernel path, including request
+    staging, atomic rename, result polling and cleanup.  Only the remote
+    process/filesystem boundary is replaced.
+    """
+
+    def __init__(self):
+        self.commands = []
+        self.files = {}
+        self.spawn_count = 0
+        self.killed = []
+        self.before_submit = None
+        self.before_liveness = None
+        self.before_spawn = None
+        self.cleanup_returncode = 0
+        self.result_cleanup_error = None
+        self.submit_error_after_apply = None
+        self.result_payload = None
+        self.emit_rpc = False
+        self.rpc_done = threading.Event()
+        self._lock = threading.Lock()
+
+    def get_temp_dir(self):
+        return "/tmp"
+
+    def ship(self, _env, path, content):
+        with self._lock:
+            self.files[path] = content
+
+    def execute(self, command, cwd=None, timeout=None):
+        del cwd, timeout
+        with self._lock:
+            self.commands.append(command)
+        if "nohup" in command:
+            if self.before_spawn is not None:
+                self.before_spawn()
+            with self._lock:
+                self.spawn_count += 1
+                pid = str(7000 + self.spawn_count)
+            return {"output": f"PID:{pid}\n", "returncode": 0}
+        if "kill -0" in command:
+            if self.before_liveness is not None:
+                self.before_liveness()
+            return {"output": "ALIVE\n", "returncode": 0}
+        if "command -v python3" in command:
+            return {"output": "OK\n", "returncode": 0}
+        if command.startswith("ls -1 ") and "/rpc/req_*" in command:
+            with self._lock:
+                paths = sorted(path for path in self.files if "/rpc/req_" in path)
+            return {"output": "\n".join(paths), "returncode": 0}
+        if command.startswith("cat ") and "/rpc/req_" in command:
+            path = shlex.split(command)[1]
+            with self._lock:
+                return {"output": self.files.get(path, ""), "returncode": 0}
+        if command.startswith("echo '") and "base64 -d >" in command:
+            encoded = command.split("'", 2)[1]
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            target = command.split("base64 -d >", 1)[1].split(".tmp", 1)[0].strip()
+            with self._lock:
+                self.files[target] = decoded
+            self.rpc_done.set()
+            return {"output": "", "returncode": 0}
+        if command.startswith("pkill -TERM"):
+            with self._lock:
+                self.killed.append(command)
+            return {"output": "", "returncode": 0}
+        if "rm -f" in command and "/rpc/req_*" in command:
+            return {"output": "", "returncode": self.cleanup_returncode}
+        if command.startswith("rm -f ") and "/rpc/req_" in command:
+            path = shlex.split(command)[2]
+            with self._lock:
+                self.files.pop(path, None)
+            return {"output": "", "returncode": 0}
+        if command.startswith("mv ") and "/cells/cell_req_" in command:
+            if self.before_submit is not None:
+                self.before_submit()
+            source, target = shlex.split(command)[1:3]
+            with self._lock:
+                request = json.loads(self.files.pop(source))
+                self.files[target] = json.dumps(request)
+                if self.emit_rpc:
+                    rpc_dir = target.split("/cells/", 1)[0] + "/rpc"
+                    rpc_path = f"{rpc_dir}/req_{request['id']}"
+                    self.files[rpc_path] = json.dumps({
+                        "token": "fixed-rpc-token", "seq": int(request["id"]),
+                        "tool": "read_file", "args": {"path": request["code"]},
+                    })
+                result_path = target.replace("cell_req_", "cell_res_")
+                payload = self.result_payload
+                if payload is None:
+                    payload = _cell(stdout=request["code"], execution_count=int(request["id"]))
+                self.files[result_path] = json.dumps(payload)
+            if self.emit_rpc and not self.rpc_done.wait(5):
+                raise AssertionError("real RPC poller did not dispatch request")
+            self.rpc_done.clear()
+            if self.submit_error_after_apply is not None:
+                raise self.submit_error_after_apply
+            return {"output": "", "returncode": 0}
+        if command.startswith("cat ") and "/cells/cell_res_" in command:
+            path = shlex.split(command)[1]
+            with self._lock:
+                return {"output": self.files.get(path, ""), "returncode": 0}
+        if command.startswith("rm -f ") and "/cells/cell_res_" in command:
+            if self.result_cleanup_error is not None:
+                raise self.result_cleanup_error
+            path = shlex.split(command)[2]
+            with self._lock:
+                self.files.pop(path, None)
+            return {"output": "", "returncode": 0}
         return {"output": "", "returncode": 0}
 
 
@@ -94,16 +211,19 @@ class RemoteKernelBase(unittest.TestCase):
         self._ship = patch(
             "tools.code_execution_tool._ship_file_to_remote",
         )
-        self._ship.start()
+        self._ship_mock = self._ship.start()
         self._poll = patch(
             "tools.code_execution_tool._rpc_poll_loop",
         )
-        self._poll.start()
+        self._poll_mock = self._poll.start()
 
     def tearDown(self):
         self._ship.stop()
         self._poll.stop()
         shutdown_all_remote_kernels()
+        from tools.code_kernel_remote import _ACTIVE_INVOCATIONS
+        with _REGISTRY.lock:
+            self.assertEqual(_ACTIVE_INVOCATIONS, set())
 
 
 class TestSpawnAndReuse(RemoteKernelBase):
@@ -276,7 +396,8 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         results = []
         errors = []
 
-        def concurrent_spawn(env, env_type, owner, task_env_id, sandbox_tools, *, idle_exit):
+        def concurrent_spawn(env, env_type, owner, task_env_id, sandbox_tools, *, idle_exit, invocation):
+            del invocation
             kernel = RemoteKernel(
                 env=env, env_type=env_type, kernel_dir=f"/tmp/kernel-{len(spawned)}",
                 pid=str(5000 + len(spawned)), rpc_token="synthetic", owner=owner,
@@ -287,10 +408,11 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
 
         def acquire():
             try:
-                results.append(remote._acquire_remote_kernel(
-                    env, "ssh", "same-owner", "same-task", frozenset(),
-                    reset=False, idle_exit=1800,
-                ))
+                with remote._remote_invocation("same-owner") as invocation:
+                    results.append(remote._acquire_remote_kernel(
+                        env, "ssh", "same-owner", "same-task", frozenset(),
+                        reset=False, idle_exit=1800, invocation=invocation,
+                    ))
             except BaseException as exc:
                 errors.append(exc)
 
@@ -386,6 +508,347 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
             gate.set()
             worker.join(10)
         self.assertFalse(any("kill 4242" in c for c in busy_env.commands))
+
+    def test_zero_and_negative_capacity_normalize_to_one(self):
+        """W13: configured non-positive caps retain the selected attachment."""
+        for configured in (0, -2):
+            with self.subTest(configured=configured):
+                shutdown_all_remote_kernels()
+                env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
+                with patch("tools.code_execution_tool._load_config", return_value={
+                    "max_session_kernels": configured,
+                }):
+                    _run(env, task=f"first-{configured}")
+                    _run(env, task=f"second-{configured}")
+                self.assertEqual(len(_REMOTE_KERNELS), 1)
+                self.assertEqual(next(iter(_REMOTE_KERNELS.values())).attached, 0)
+
+    def test_reservation_overflow_releases_attachment_and_invocation(self):
+        """W14: a cap conversion failure leaves no attachment or call record."""
+        from tools.code_kernel_remote import _ACTIVE_INVOCATIONS
+
+        env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+        with patch("tools.code_execution_tool._load_config", return_value={
+            "max_session_kernels": float("inf"),
+        }):
+            with self.assertRaises(OverflowError):
+                _run(env, task="cap-overflow")
+        with _REGISTRY.lock:
+            self.assertTrue(all(kernel.attached == 0 for kernel in _REMOTE_KERNELS.values()))
+            self.assertEqual(_ACTIVE_INVOCATIONS, set())
+
+
+class TestRemoteInvocationOwnership(RemoteKernelBase):
+    def test_same_kernel_cells_own_the_complete_file_rpc_namespace(self):
+        """W01: cold racers adopt one K but serialize its complete namespace."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        cold_spawns = threading.Barrier(2)
+        env.before_spawn = lambda: cold_spawns.wait(5)
+        first_submitted = threading.Event()
+        release_first = threading.Event()
+        overlap = threading.Event()
+        submission_count = [0]
+
+        def before_submit():
+            submission_count[0] += 1
+            if submission_count[0] == 1:
+                first_submitted.set()
+                release_first.wait(5)
+            else:
+                overlap.set()
+
+        env.before_submit = before_submit
+        results = {}
+        errors = []
+
+        def invoke(label):
+            try:
+                results[label] = _run(env, code=label, task="shared")
+            except BaseException as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=invoke, args=("alpha",))
+        second = threading.Thread(target=invoke, args=("beta",))
+        first.start()
+        second.start()
+        self.assertTrue(first_submitted.wait(5))
+        try:
+            self.assertFalse(overlap.wait(0.2), "second cell submitted before first retired its poller")
+        finally:
+            release_first.set()
+            first.join(5)
+            second.join(5)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["alpha"]["stdout"], "alpha")
+        self.assertEqual(results["beta"]["stdout"], "beta")
+        self.assertEqual(env.spawn_count, 2)
+        self.assertEqual(len(env.killed), 1)
+        self.assertEqual(len(_REMOTE_KERNELS), 1)
+
+    def test_owner_shutdown_cancels_identity_retry_before_republication(self):
+        """W04/W06: cleanup invalidates a live invocation across acquire retry."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        self.assertEqual(_run(env, code="seed", task="owner-a")["status"], "success")
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+        probes = [0]
+
+        def pause_reuse_probe():
+            probes[0] += 1
+            if probes[0] == 1:
+                probe_started.set()
+                release_probe.wait(5)
+
+        env.before_liveness = pause_reuse_probe
+        result = {}
+
+        worker = threading.Thread(
+            target=lambda: result.setdefault("value", _run(env, code="late", task="owner-a"))
+        )
+        worker.start()
+        self.assertTrue(probe_started.wait(5))
+        shutdown_remote_kernels_for_owner("owner-a")
+        release_probe.set()
+        worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result["value"]["status"], "error")
+        self.assertIn("canceled by session cleanup", result["value"]["error"])
+        self.assertEqual(env.spawn_count, 1)
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_owner_shutdown_cancels_attached_cell_waiter(self):
+        """W06: an attached waiter keeps its reservation but cannot run after cleanup."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        first_submitted = threading.Event()
+        release_first = threading.Event()
+
+        def hold_first_submit():
+            if not first_submitted.is_set():
+                first_submitted.set()
+                release_first.wait(5)
+
+        env.before_submit = hold_first_submit
+        results = []
+        workers = [
+            threading.Thread(target=lambda code=code: results.append(
+                _run(env, code=code, task="waiter-owner")
+            ))
+            for code in ("first", "waiting")
+        ]
+        workers[0].start()
+        self.assertTrue(first_submitted.wait(5))
+        workers[1].start()
+        deadline = time.monotonic() + 5
+        while True:
+            with _REGISTRY.lock:
+                attached = sum(kernel.attached for kernel in _REMOTE_KERNELS.values())
+            if attached == 2:
+                break
+            self.assertLess(time.monotonic(), deadline)
+            threading.Event().wait(0.01)
+        shutdown_remote_kernels_for_owner("waiter-owner")
+        release_first.set()
+        for worker in workers:
+            worker.join(5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual([result["status"] for result in results], ["error", "error"])
+        self.assertEqual(sum(c.startswith("mv ") for c in env.commands), 1)
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_warm_rpc_dispatch_keeps_each_callers_context(self):
+        """W02: the real file poller dispatches under each serialized caller context."""
+        from tools.code_execution_rpc import _rpc_poll_loop
+
+        env = FileAwareEnv()
+        env.emit_rpc = True
+        self._ship_mock.side_effect = env.ship
+        current_call = contextvars.ContextVar("remote_test_call", default="missing")
+        observed = []
+
+        def default_dispatch(_task_id):
+            return lambda _name, args: observed.append((current_call.get(), args["path"])) or "ok"
+
+        def invoke(label):
+            token = current_call.set(label)
+            try:
+                return _run(env, code=label, task="shared-rpc")
+            finally:
+                current_call.reset(token)
+
+        with patch("tools.code_execution_tool._rpc_poll_loop", _rpc_poll_loop), \
+             patch("tools.code_execution_rpc._default_dispatch", default_dispatch), \
+             patch("tools.code_kernel_remote.secrets.token_urlsafe", return_value="fixed-rpc-token"):
+            first = invoke("alpha")
+            second = invoke("beta")
+
+        self.assertEqual(first["status"], "success")
+        self.assertEqual(second["status"], "success")
+        self.assertEqual(observed, [("alpha", "alpha"), ("beta", "beta")])
+
+    def test_global_shutdown_retires_late_spawn_but_allows_later_call(self):
+        """W05/W07: the boundary cancels old work without an owner tombstone."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        spawn_started = threading.Event()
+        release_spawn = threading.Event()
+        env.before_spawn = lambda: (spawn_started.set(), release_spawn.wait(5))
+        result = {}
+        worker = threading.Thread(
+            target=lambda: result.setdefault("old", _run(env, code="old", task="global"))
+        )
+        worker.start()
+        self.assertTrue(spawn_started.wait(5))
+        shutdown_all_remote_kernels()
+        release_spawn.set()
+        worker.join(5)
+        self.assertEqual(result["old"]["status"], "error")
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+        self.assertTrue(env.killed)
+
+        env.before_spawn = None
+        result["new"] = _run(env, code="new", task="global")
+        self.assertEqual(result["new"]["status"], "success")
+
+    def test_failed_stale_rpc_cleanup_retires_before_submission(self):
+        """W03: an unsafe old RPC namespace cannot arm a new authority window."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        env.cleanup_returncode = 1
+
+        result = _run(env, code="must-not-submit", task="cleanup")
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("cleanup failed", result["error"])
+        self.assertFalse(any(c.startswith("mv ") for c in env.commands))
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_post_submission_transport_uncertainty_is_not_replayed(self):
+        """W11: an applied rename followed by failure is terminal, never fallback."""
+        from tools.code_execution_tool import _execute_remote
+
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        env.submit_error_after_apply = RuntimeError("rename reply lost")
+        with patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env",
+                   return_value=(env, "ssh")):
+            result = json.loads(_execute_remote("once", "uncertain", ["read_file"]))
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("was not replayed", result["error"])
+        self.assertFalse(any("python3 script.py" in c for c in env.commands))
+        self.assertEqual(env.spawn_count, 1)
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_known_result_survives_cleanup_failure_and_kernel_retires(self):
+        """W10/W11: decoded output is authoritative even if removal fails."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        env.result_cleanup_error = RuntimeError("cleanup transport lost")
+
+        result = _run(env, code="known", task="known")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["stdout"], "known")
+        self.assertTrue(result["kernel"]["ended"])
+        self.assertTrue(result["kernel"]["state_lost"])
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_malformed_result_is_protocol_failure_and_not_reused(self):
+        """W08/W11: result shape failure retires K without a second execution."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        env.result_payload = ["not", "an", "object"]
+
+        result = _run(env, code="malformed", task="protocol")
+
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(result["kernel"]["state_lost"])
+        self.assertEqual(env.spawn_count, 1)
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_error_and_exit_results_keep_existing_status_contract(self):
+        """W08: serialized ownership preserves ordinary error and exit results."""
+        cases = (
+            (_cell(status="error", traceback="ValueError: bad"), "error", False),
+            (_cell(status="exit", stdout="bye"), "success", True),
+        )
+        for index, (payload, status, ended) in enumerate(cases):
+            with self.subTest(status=payload["status"]):
+                shutdown_all_remote_kernels()
+                env = FileAwareEnv()
+                self._ship_mock.side_effect = env.ship
+                env.result_payload = payload
+                result = _run(env, code="status", task=f"status-{index}")
+                self.assertEqual(result["status"], status)
+                self.assertEqual(result["kernel"].get("ended", False), ended)
+                if status == "error":
+                    self.assertEqual(result["error"], "ValueError: bad")
+                else:
+                    self.assertEqual(result["stdout"], "bye")
+
+    def test_live_poller_forces_permanent_retirement_before_handoff(self):
+        """W10: join timeout cannot expose K to the next caller."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        poller_started = threading.Event()
+        release_poller = threading.Event()
+
+        def stuck_poller(*_args, **_kwargs):
+            poller_started.set()
+            release_poller.wait(10)
+
+        self._poll_mock.side_effect = stuck_poller
+        result = _run(env, code="done", task="stuck-poller")
+        self.assertTrue(poller_started.is_set())
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["kernel"]["ended"])
+        self.assertEqual(len(_REMOTE_KERNELS), 0)
+        release_poller.set()
+
+    def test_cleanup_between_fallback_staging_and_admission_cancels_script(self):
+        """W12: kernel-unavailable fallback shares the invocation fence."""
+        from tools.code_execution_tool import _execute_remote
+
+        env = FileAwareEnv()
+        script_staged = threading.Event()
+        release_staging = threading.Event()
+
+        def hold_script(_env, path, content):
+            env.ship(_env, path, content)
+            if path.endswith("/script.py"):
+                script_staged.set()
+                release_staging.wait(5)
+
+        self._ship_mock.side_effect = hold_script
+        result = {}
+        with patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env",
+                   return_value=(env, "ssh")), \
+             patch("tools.code_kernel_remote.execute_in_remote_kernel", return_value=None):
+            worker = threading.Thread(
+                target=lambda: result.setdefault(
+                    "value", json.loads(_execute_remote("fallback", "fallback-owner", ["read_file"]))
+                )
+            )
+            worker.start()
+            self.assertTrue(script_staged.wait(5))
+            shutdown_remote_kernels_for_owner("fallback-owner")
+            release_staging.set()
+            worker.join(5)
+
+        self.assertEqual(result["value"]["status"], "error")
+        self.assertIn("canceled by session cleanup", result["value"]["error"])
+        self.assertFalse(any("python3 script.py" in c for c in env.commands))
 
 
 class TestDispatchIntegration(unittest.TestCase):

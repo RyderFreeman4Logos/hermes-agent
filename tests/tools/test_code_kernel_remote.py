@@ -11,12 +11,15 @@ state_lost/state_reset reporting, fail-open, and owner isolation.
 import json
 import os
 import sys
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.code_kernel_remote import (
+    _REGISTRY,
     _REMOTE_KERNELS,
     RemoteKernel,
     execute_in_remote_kernel,
@@ -220,6 +223,97 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
     (owner, env_type, task_env_id) that was never revisited, for the life
     of the gateway process."""
 
+    def test_acquire_publishes_reserved_and_rolls_back_on_error(self):
+        env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+        acquired = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        from tools import code_kernel_remote as remote
+        real_acquire = remote._acquire_remote_kernel
+
+        def pause_after_acquire(*args, **kwargs):
+            result = real_acquire(*args, **kwargs)
+            acquired.set()
+            release.wait(5)
+            return result
+
+        def run_cell():
+            try:
+                _run(env, task="reserved")
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(remote, "_acquire_remote_kernel", pause_after_acquire):
+            worker = threading.Thread(target=run_cell)
+            worker.start()
+            try:
+                self.assertTrue(acquired.wait(5))
+                with _REGISTRY.lock:
+                    attached = [kernel.attached for kernel in _REMOTE_KERNELS.values()]
+                self.assertEqual(attached, [1])
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+        shutdown_all_remote_kernels()
+        failing_env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+        with patch.object(remote, "_evict_over_cap_unlocked", side_effect=RuntimeError("cap read failed")):
+            with self.assertRaisesRegex(RuntimeError, "cap read failed"):
+                _run(failing_env, task="reservation-error")
+        with _REGISTRY.lock:
+            self.assertTrue(all(kernel.attached == 0 for kernel in _REMOTE_KERNELS.values()))
+
+    def test_concurrent_same_key_spawn_uses_one_reserved_winner(self):
+        from tools import code_kernel_remote as remote
+
+        env = ScriptedEnv(_spawn_ok_handlers([]))
+        spawn_barrier = threading.Barrier(2)
+        spawned = []
+        killed = []
+        results = []
+        errors = []
+
+        def concurrent_spawn(env, env_type, owner, task_env_id, sandbox_tools, *, idle_exit):
+            kernel = RemoteKernel(
+                env=env, env_type=env_type, kernel_dir=f"/tmp/kernel-{len(spawned)}",
+                pid=str(5000 + len(spawned)), rpc_token="synthetic", owner=owner,
+            )
+            spawned.append(kernel)
+            spawn_barrier.wait(5)
+            return kernel
+
+        def acquire():
+            try:
+                results.append(remote._acquire_remote_kernel(
+                    env, "ssh", "same-owner", "same-task", frozenset(),
+                    reset=False, idle_exit=1800,
+                ))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(remote, "_spawn_remote_kernel", concurrent_spawn), \
+             patch.object(RemoteKernel, "kill", lambda kernel: killed.append(kernel)):
+            workers = [threading.Thread(target=acquire) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(5)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(len(results), 2)
+        self.assertIs(results[0][0], results[1][0])
+        self.assertEqual(sorted(result[1] for result in results), [False, True])
+        with _REGISTRY.lock:
+            self.assertEqual(len(_REMOTE_KERNELS), 1)
+            self.assertEqual(next(iter(_REMOTE_KERNELS.values())).attached, 2)
+            next(iter(_REMOTE_KERNELS.values())).attached -= 2
+        self.assertEqual(len(killed), 1)
+        self.assertIn(killed[0], spawned)
+
     def test_idle_expired_kernel_is_reaped_on_next_call(self):
         env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
         execute_in_remote_kernel(
@@ -262,8 +356,6 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         """Cap eviction must never kill a kernel mid-cell (the local-kernel
         race from hermes-agent#101861): a busy kernel stays put and a
         settled one goes instead, even if the busy one is older."""
-        import threading
-
         gate = threading.Event()
 
         def slow_cat(command):
@@ -278,8 +370,15 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
             worker = threading.Thread(target=_run, args=(busy_env,), kwargs={"task": "busy"})
             worker.start()
-            while not any(k.attached for k in _REMOTE_KERNELS.values()):
-                pass
+            deadline = time.monotonic() + 5
+            while True:
+                with _REGISTRY.lock:
+                    busy_attached = any(k.attached for k in _REMOTE_KERNELS.values())
+                if busy_attached:
+                    break
+                self.assertTrue(worker.is_alive())
+                self.assertLess(time.monotonic(), deadline)
+                gate.wait(0.01)
             env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
             _run(env, task="settled")
             owners = {key[0] for key in _REMOTE_KERNELS}

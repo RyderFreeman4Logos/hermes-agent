@@ -190,6 +190,17 @@ def _evict_over_cap_unlocked(keep: Tuple) -> List["RemoteKernel"]:
     return [_REMOTE_KERNELS.pop(key) for key in by_age[: len(_REMOTE_KERNELS) - cap]]
 
 
+def _reserve_unlocked(key: Tuple, kernel: RemoteKernel) -> List["RemoteKernel"]:
+    """Reserve *kernel* for a cell and select cap victims under the registry lock."""
+    kernel.last_used = time.monotonic()
+    kernel.attached += 1
+    try:
+        return _evict_over_cap_unlocked(keep=key)
+    except Exception:
+        kernel.attached -= 1
+        raise
+
+
 atexit.register(shutdown_all_remote_kernels)
 
 
@@ -244,30 +255,54 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
                            sandbox_tools: frozenset, *, reset: bool,
                            idle_exit: int) -> Tuple[Optional[RemoteKernel], bool, bool, bool]:
     """Find/respawn the owner's kernel: (kernel|None, reused, state_reset, state_lost); reaps
-    idle-expired entries on the way in."""
+    idle-expired entries on the way in. A returned kernel is already attached."""
     key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
     state_lost = state_reset = False
-    with _REGISTRY.lock:
-        expired = _reap_unlocked(idle_exit)
-        kernel = _REMOTE_KERNELS.get(key)
-    for doomed in expired:
-        doomed.kill()
-    if kernel is not None and reset:
-        _REGISTRY.discard(key, kernel)
-        kernel, state_reset = None, True
-    if kernel is not None and not kernel.is_alive():
-        # Transport drop, container restart, self-reaped on idle, OOM — all
-        # the same answer: report the loss, respawn fresh (kill is then only
-        # best-effort dir cleanup; the process is already gone).
-        _REGISTRY.discard(key, kernel)
-        kernel, state_lost = None, True
-    reused = kernel is not None
-    if kernel is None:
-        kernel = _spawn_remote_kernel(env, env_type, owner, task_env_id, sandbox_tools, idle_exit=idle_exit)
+    reset_pending = reset
+    while True:
+        with _REGISTRY.lock:
+            expired = _reap_unlocked(idle_exit)
+            kernel = _REMOTE_KERNELS.get(key)
+        for doomed in expired:
+            doomed.kill()
+
+        if kernel is not None and reset_pending:
+            _REGISTRY.discard(key, kernel)
+            kernel, state_reset, reset_pending = None, True, False
+        if kernel is not None and not kernel.is_alive():
+            # Transport drop, container restart, self-reaped on idle, OOM — all
+            # the same answer: report the loss, respawn fresh (kill is then only
+            # best-effort dir cleanup; the process is already gone).
+            _REGISTRY.discard(key, kernel)
+            kernel, state_lost = None, True
+
         if kernel is not None:
             with _REGISTRY.lock:
-                _REMOTE_KERNELS[key] = kernel
-    return kernel, reused, state_reset, state_lost
+                if _REMOTE_KERNELS.get(key) is not kernel:
+                    continue
+                evicted = _reserve_unlocked(key, kernel)
+            for doomed in evicted:
+                doomed.kill()
+            return kernel, True, state_reset, state_lost
+
+        candidate = _spawn_remote_kernel(
+            env, env_type, owner, task_env_id, sandbox_tools, idle_exit=idle_exit,
+        )
+        if candidate is None:
+            return None, False, state_reset, state_lost
+        with _REGISTRY.lock:
+            if key in _REMOTE_KERNELS:
+                published = False
+            else:
+                _REMOTE_KERNELS[key] = candidate
+                evicted = _reserve_unlocked(key, candidate)
+                published = True
+        if not published:
+            candidate.kill()
+            continue
+        for doomed in evicted:
+            doomed.kill()
+        return candidate, False, state_reset, state_lost
 
 
 def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> Tuple[str, Dict[str, Any]]:
@@ -312,12 +347,6 @@ def execute_in_remote_kernel(
     if kernel is None:
         return None  # fail open to per-call
     key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
-    kernel.last_used = time.monotonic()
-    with _REGISTRY.lock:
-        kernel.attached += 1
-        evicted = _evict_over_cap_unlocked(keep=key)
-    for doomed in evicted:
-        doomed.kill()
     try:
         return _run_attached_cell(kernel, key, code, env=env, task_env_id=task_env_id,
                                   sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,

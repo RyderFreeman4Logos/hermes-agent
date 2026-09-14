@@ -3601,10 +3601,10 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             _requeue_pending_steer(agent, steer_text)
         return
 
-    def insert(completion_text: str) -> bool:
+    def insert(completion_text: str, _events: list) -> str:
         text = f"{completion_text}\n{steer_text}" if steer_text else completion_text
         messages.append(steer_user_row(text))
-        return True
+        return "inserted"
 
     if callable(ingest_completion) and ingest_completion(insert):
         return

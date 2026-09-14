@@ -112,13 +112,13 @@ def test_clear_later_user_steer_preserves_structured_transfer(monkeypatch):
 
             monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
             server._run_post_turn_followups("rid", "receipt-ui", session, {}, None)
-            assert process_registry.is_completion_consumed(event_id) is True
+            assert process_registry.is_completion_consumed(event_id) is False
             assert event_id in session["queued_prompt"]["text"]
             assert "later user steer" not in session["queued_prompt"]["text"]
 
             _dying_reclaim("receipt-ui", session)
-            assert process_registry.is_completion_consumed(event_id) is True
-            assert event_id not in _queued_ids(isolated)
+            assert process_registry.is_completion_consumed(event_id) is False
+            assert event_id in _queued_ids(isolated)
     finally:
         _clear_ids(event_id)
 

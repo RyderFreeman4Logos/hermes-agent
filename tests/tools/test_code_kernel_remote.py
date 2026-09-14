@@ -981,6 +981,100 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
     def test_owner_shutdown_at_winner_liveness_cancels_cold_loser_adoption(self):
         self._assert_owner_shutdown_cancels_cold_loser_adoption("winner_liveness")
 
+    def test_global_shutdown_cancels_multi_owner_work_at_acquire_retry(self):
+        """W07: a global boundary fences retries and active cells for every owner."""
+        from tools import code_kernel_remote as remote
+
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        self.assertEqual(_run(env, code="seed-a", task="owner-a")["status"], "success")
+        self.assertEqual(_run(env, code="seed-b", task="owner-b")["status"], "success")
+        first_probe = threading.Event()
+        release_first_probe = threading.Event()
+        retry_probe = threading.Event()
+        release_retry_probe = threading.Event()
+        reset_submitted = threading.Event()
+        release_reset = threading.Event()
+        owner_b_submitted = threading.Event()
+        release_owner_b = threading.Event()
+
+        def hold_owner_a_probes(command):
+            if threading.current_thread().name != "w07-retry":
+                return
+            if "7001" in command:
+                first_probe.set()
+                release_first_probe.wait(5)
+            elif "7003" in command:
+                retry_probe.set()
+                release_retry_probe.wait(5)
+
+        def hold_active_cells():
+            name = threading.current_thread().name
+            if name == "w07-reset":
+                reset_submitted.set()
+                release_reset.wait(5)
+            elif name == "w07-owner-b":
+                owner_b_submitted.set()
+                release_owner_b.wait(5)
+
+        env.before_liveness_command = hold_owner_a_probes
+        env.before_submit = hold_active_cells
+        results = {}
+        errors = []
+
+        def invoke(label, task, *, reset=False):
+            try:
+                results[label] = _run(env, code=label, task=task, reset=reset)
+            except BaseException as exc:
+                errors.append(exc)
+
+        owner_b = threading.Thread(
+            target=invoke, args=("active-b", "owner-b"), name="w07-owner-b"
+        )
+        retry = threading.Thread(
+            target=invoke, args=("retry-a", "owner-a"), name="w07-retry"
+        )
+        reset = threading.Thread(
+            target=invoke, args=("reset-a", "owner-a"), kwargs={"reset": True}, name="w07-reset"
+        )
+        owner_b.start()
+        self.assertTrue(owner_b_submitted.wait(5), "second owner did not enter its active cell")
+        retry.start()
+        self.assertTrue(first_probe.wait(5), "existing owner did not hold its successful probe")
+        reset.start()
+        self.assertTrue(reset_submitted.wait(5), "public reset did not publish replacement K3")
+        release_first_probe.set()
+        self.assertTrue(retry_probe.wait(5), "old acquisition did not retry against replacement K3")
+        with _REGISTRY.lock:
+            self.assertEqual({key[0] for key in _REMOTE_KERNELS}, {"owner-a", "owner-b"})
+            if hasattr(remote, "_ACTIVE_INVOCATIONS"):
+                self.assertEqual(len(remote._ACTIVE_INVOCATIONS), 3)
+
+        shutdown_all_remote_kernels()
+        release_retry_probe.set()
+        release_reset.set()
+        release_owner_b.set()
+        for worker in (owner_b, retry, reset):
+            worker.join(5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in (owner_b, retry, reset)))
+        self.assertEqual(errors, [])
+        self.assertEqual(set(results), {"active-b", "retry-a", "reset-a"})
+        self.assertTrue(all(result["status"] == "error" for result in results.values()))
+        self.assertTrue(all("canceled by session cleanup" in result["error"]
+                            for result in results.values()))
+        self.assertEqual(env.spawn_count, 3, "a pre-boundary retry admitted another spawn")
+        self.assertEqual(sum(command.startswith("mv ") for command in env.commands), 4)
+        with _REGISTRY.lock:
+            self.assertEqual(len(_REMOTE_KERNELS), 0)
+            self.assertEqual(getattr(remote, "_ACTIVE_INVOCATIONS", set()), set())
+
+        env.before_liveness_command = None
+        env.before_submit = None
+        self.assertEqual(_run(env, code="after-a", task="owner-a")["stdout"], "after-a")
+        self.assertEqual(_run(env, code="after-b", task="owner-b")["stdout"], "after-b")
+        self.assertEqual(env.spawn_count, 5)
+
     def test_failed_stale_rpc_cleanup_retires_before_submission(self):
         """W03: an unsafe old RPC namespace cannot arm a new authority window."""
         env = FileAwareEnv()

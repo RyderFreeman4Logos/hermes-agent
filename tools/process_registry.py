@@ -1751,7 +1751,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # live start-time mismatch. Do not invent -15. EPERM/unreadable start
             # while the PID still answers liveness is UNKNOWN — not death.
             # Never treat a sandbox PID as host.
-            if not session.exited:
+            # A PTY always has a reader that owns wait()/exitstatus settlement.
+            # terminate() can race that reader's natural reap and then raise;
+            # neither death nor signal delivery is attributable here, so leave
+            # completion and authoritative exit metadata to the reader.
+            if not session.exited and session._pty is None:
                 waitable = getattr(session, "process", None)
                 wait_rc = None
                 if waitable is not None:

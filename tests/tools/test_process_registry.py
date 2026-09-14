@@ -1270,6 +1270,86 @@ class TestKillProcess:
         finally:
             registry._running.pop(s.id, None)
 
+    @staticmethod
+    def _bind_natural_pty_exit_race(registry, monkeypatch, sid):
+        """Pause the PTY reader after it observes natural death but before settlement."""
+        observed = threading.Event()
+        release = threading.Event()
+
+        class NaturalExitPty:
+            exitstatus = None
+
+            def isalive(self):
+                observed.set()
+                assert release.wait(2), "test did not release the PTY reader"
+                self.exitstatus = 0
+                return False
+
+            def terminate(self, force=False):
+                raise OSError("ECHILD after natural exit")
+
+            def wait(self):
+                return self.exitstatus
+
+        session = _make_session(sid=sid, command="exit 0", output="complete output")
+        session.pid = 424242
+        session.pid_scope = "host"
+        session.host_start_time = 1
+        session._pty = NaturalExitPty()
+        session.notify_on_complete = True
+        registry._running[session.id] = session
+        monkeypatch.setattr(registry, "_is_host_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _session: None)
+
+        reader = threading.Thread(target=registry._pty_reader_loop, args=(session,))
+        reader.start()
+        assert observed.wait(2), "PTY reader did not observe natural exit"
+        return session, reader, release
+
+    def test_kill_error_does_not_consume_natural_pty_completion(self, registry, monkeypatch):
+        session, reader, release = self._bind_natural_pty_exit_race(
+            registry, monkeypatch, "proc_natural_kill_error"
+        )
+        try:
+            with patch("tools.process_registry.os.kill", side_effect=ProcessLookupError):
+                result = registry.kill_process(session.id, consume_output=True)
+
+            assert result["status"] == "error"
+            assert session.id not in registry._completion_consumed
+            assert session.exited is False
+        finally:
+            release.set()
+            reader.join(timeout=2)
+
+        assert not reader.is_alive()
+        assert session.exit_code == 0
+        assert session.completion_reason == "exited"
+        event = registry.completion_queue.get_nowait()
+        assert event["output"] == "complete output"
+        assert event["exit_code"] == 0
+        assert event["completion_reason"] == "exited"
+
+    def test_kill_all_preserves_natural_pty_exit_provenance(self, registry, monkeypatch):
+        session, reader, release = self._bind_natural_pty_exit_race(
+            registry, monkeypatch, "proc_natural_kill_all"
+        )
+        try:
+            with patch("tools.process_registry.os.kill", side_effect=ProcessLookupError):
+                assert registry.kill_all(source="kill_all", consume_output=False) == 0
+        finally:
+            release.set()
+            reader.join(timeout=2)
+
+        assert not reader.is_alive()
+        assert session.exit_code == 0
+        assert session.completion_reason == "exited"
+        assert session.termination_source == ""
+        event = registry.completion_queue.get_nowait()
+        assert event["exit_code"] == 0
+        assert event["completion_reason"] == "exited"
+        assert event["termination_source"] == ""
+
     def _bind_real_child(self, registry, sid: str):
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],

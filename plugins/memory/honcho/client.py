@@ -66,7 +66,7 @@ def _host_block(raw: dict, host: str) -> dict:
     return hosts.get(f"{HOST}.{host[len(HOST) + 1:]}", {})
 
 
-def resolve_active_host() -> str:
+def resolve_active_host(raw_config: dict | None = None) -> str:
     """Honcho host key: HERMES_HONCHO_HOST env, else the active profile. The config's
     ``defaultHost`` is honored only for the default profile so named profiles stay isolated."""
     explicit = os.environ.get("HERMES_HONCHO_HOST", "").strip()
@@ -79,7 +79,8 @@ def resolve_active_host() -> str:
         profile_host = HOST
     if profile_host == HOST:
         try:
-            default_host = str(_read_config(resolve_config_path()).get("defaultHost", "")).strip()
+            raw = raw_config if raw_config is not None else _read_config(resolve_config_path())
+            default_host = str(raw.get("defaultHost", "")).strip()
         except Exception:
             default_host = ""
         if default_host:
@@ -416,19 +417,25 @@ class HonchoClientConfig:
         )
 
     @classmethod
-    def from_global_config(cls, host: str | None = None, config_path: Path | None = None) -> HonchoClientConfig:
+    def from_global_config(
+        cls, host: str | None = None, config_path: Path | None = None,
+        raw_config: dict | None = None,
+    ) -> HonchoClientConfig:
         """Config from the resolved Honcho config path, falling back to env. ``host=None``
         derives it from the active Hermes profile."""
-        resolved_host = host or resolve_active_host()
         path = config_path or resolve_config_path()
-        if not path.exists():
+        if raw_config is None and not path.exists():
+            resolved_host = host or resolve_active_host()
             logger.debug("No global Honcho config at %s, falling back to env", path)
             return cls.from_env(host=resolved_host)
         try:
-            raw = _read_config(path)
+            raw = raw_config if raw_config is not None else _read_config(path)
         except (json.JSONDecodeError, OSError) as e:
+            resolved_host = host or resolve_active_host()
             logger.warning("Failed to read %s: %s, falling back to env", path, e)
             return cls.from_env(host=resolved_host)
+
+        resolved_host = host or resolve_active_host(raw)
 
         host_block = _host_block(raw, resolved_host)
         explicitly_configured = bool(host_block) or raw.get("enabled") is True

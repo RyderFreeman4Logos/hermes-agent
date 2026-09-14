@@ -188,6 +188,36 @@ _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str
 # path -> (sha256 digest, raw yaml dict) for read_raw_config() (no defaults merged in).
 # Digest, not (mtime_ns, size): same-tick same-size in-place rewrites keep those.
 _RAW_CONFIG_CACHE: Dict[str, Tuple[bytes, Dict[str, Any]]] = {}
+_RAW_CONFIG_READ_CHUNK_BYTES = 64 * 1024
+
+
+def _digest_file(path: Path) -> bytes:
+    """Hash *path* in bounded chunks without retaining its bytes."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(_RAW_CONFIG_READ_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.digest()
+
+
+class _DigestingConfigReader:
+    """Bounded read adapter that records exactly the bytes given to YAML."""
+
+    def __init__(self, source) -> None:
+        self._source = source
+        self._digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        # The YAML loaders use finite requests; retain the bound if another
+        # compatible loader asks for its usual "all" sentinel.
+        size = _RAW_CONFIG_READ_CHUNK_BYTES if size is None or size < 0 else min(
+            size, _RAW_CONFIG_READ_CHUNK_BYTES)
+        chunk = self._source.read(size)
+        self._digest.update(chunk)
+        return chunk
+
+    def digest(self) -> bytes:
+        return self._digest.digest()
 
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
 # flows directly). Also the set reload_env() may remove from os.environ.
@@ -1859,21 +1889,38 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
-    with _CONFIG_LOCK:
-        try:
-            config_path = get_config_path()
-            raw = config_path.read_bytes()
-        except (FileNotFoundError, OSError):
-            return {}
+    config_path = get_config_path()
+    path_key = str(config_path)
+    try:
+        # Every warm lookup validates freshness, but does not materialize the
+        # complete configuration or hold the process-wide parser lock.
+        digest = _digest_file(config_path)
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        with _CONFIG_LOCK:
+            cached = _RAW_CONFIG_CACHE.get(path_key)
+        if cached is not None:
+            _warn_config_parse_failure(config_path, exc, fallback="last-known-good")
+            return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
+        _warn_config_parse_failure(config_path, exc)
+        return {}
 
-        digest = hashlib.sha256(raw).digest()
-        path_key = str(config_path)
+    with _CONFIG_LOCK:
         cached = _RAW_CONFIG_CACHE.get(path_key)
         if cached is not None and cached[0] == digest:
             return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
 
         try:
-            data = fast_safe_load(raw.decode("utf-8")) or {}
+            # Hash from the same bounded stream as parsing so the stored key
+            # cannot name bytes from a different in-place revision.
+            with config_path.open("rb") as source:
+                reader = _DigestingConfigReader(source)
+                data = fast_safe_load(reader) or {}
+                digest = reader.digest()
+            cached = _RAW_CONFIG_CACHE.get(path_key)
+            if cached is not None and cached[0] == digest:
+                return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return {}

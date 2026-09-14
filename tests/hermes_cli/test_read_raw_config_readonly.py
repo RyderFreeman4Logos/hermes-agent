@@ -13,6 +13,7 @@ Contract under test:
 
 import os
 import time
+from pathlib import Path
 
 import pytest
 import yaml
@@ -66,3 +67,72 @@ def test_missing_config_returns_empty(isolated_hermes_home):
     assert read_raw_config_readonly() == {}
 
 
+def test_warm_nonmissing_read_failure_keeps_explicit_selection(
+    isolated_hermes_home, monkeypatch
+):
+    """A known explicit provider must not become an implicit selection on read failure."""
+    from hermes_cli import config as config_mod
+    from tools.tool_backend_helpers import read_selection
+
+    cfg = _write_config(isolated_hermes_home, {"image_gen": {"provider": "nous"}})
+    assert read_selection("image_gen") == "nous"
+
+    def deny_read(self, *args, **kwargs):
+        if self == cfg:
+            raise PermissionError("configured file became unreadable")
+        return original_open(self, *args, **kwargs)
+
+    original_open = Path.open
+    original_read_bytes = Path.read_bytes
+
+    def deny_read_bytes(self):
+        if self == cfg:
+            raise PermissionError("configured file became unreadable")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", deny_read_bytes)
+    monkeypatch.setattr(Path, "open", deny_read)
+
+    assert config_mod.read_raw_config_readonly()["image_gen"]["provider"] == "nous"
+    assert read_selection("image_gen") == "nous"
+
+
+def test_warm_read_hashes_bounded_chunks_outside_config_lock(
+    isolated_hermes_home, monkeypatch
+):
+    """Warm freshness hashing must not retain whole comment-heavy files under the lock."""
+    from hermes_cli import config as config_mod
+
+    cfg = isolated_hermes_home / "config.yaml"
+    cfg.write_text("display: {}\n" + "# comment\n" * 20000, encoding="utf-8")
+    first = config_mod.read_raw_config_readonly()
+    reads = []
+    original_open = Path.open
+
+    class TrackedReader:
+        def __init__(self, fileobj):
+            self._fileobj = fileobj
+
+        def read(self, size=-1):
+            reads.append((size, config_mod._CONFIG_LOCK._is_owned()))
+            return self._fileobj.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._fileobj.close()
+
+        def __getattr__(self, name):
+            return getattr(self._fileobj, name)
+
+    def track_open(self, *args, **kwargs):
+        fileobj = original_open(self, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        return TrackedReader(fileobj) if self == cfg and mode == "rb" else fileobj
+
+    monkeypatch.setattr(Path, "open", track_open)
+    assert config_mod.read_raw_config_readonly() is first
+    assert reads
+    assert all(0 < size <= 64 * 1024 and not locked
+               for size, locked in reads)

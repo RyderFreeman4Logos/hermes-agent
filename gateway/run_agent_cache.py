@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import logging
 import threading
 import time
@@ -23,6 +24,27 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+_HONCHO_READ_CHUNK_BYTES = 64 * 1024
+_HONCHO_SNAPSHOT_MAX_BYTES = 1024 * 1024
+
+
+def _digest_file(path) -> bytes:
+    """Hash a configuration file without materializing it on warm memo hits."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(_HONCHO_READ_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _read_honcho_snapshot(path) -> tuple[bytes, dict]:
+    """Return one bounded JSON snapshot and the digest of those exact bytes."""
+    with path.open("rb") as source:
+        raw = source.read(_HONCHO_SNAPSHOT_MAX_BYTES + 1)
+    if len(raw) > _HONCHO_SNAPSHOT_MAX_BYTES:
+        raise ValueError("honcho.json exceeds the supported snapshot size")
+    return hashlib.sha256(raw).digest(), json.loads(raw)
 
 # Override fields layered onto runtime kwargs when non-None (partial overrides don't clobber defaults).
 _OVERRIDE_APPLY_KEYS = (
@@ -50,15 +72,29 @@ class GatewayAgentCacheMixin:
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
             path = resolve_config_path()
             try:
-                # Digest, not mtime/size/inode: same-tick same-size in-place rewrites keep those.
-                digest = hashlib.sha256(path.read_bytes()).digest()
+                # A known path can stream-hash before consulting its memo. A
+                # first observation instead takes one bounded snapshot so the
+                # digest and parser cannot observe different revisions.
+                path_key = str(path)
+                has_path_memo = any(key[0] == path_key for key in cls._HONCHO_CACHE_BUSTING_MEMO)
+                if has_path_memo:
+                    digest = _digest_file(path)
+                    cached = cls._HONCHO_CACHE_BUSTING_MEMO.get((path_key, digest))
+                    if cached is not None:
+                        return dict(cached)
+                    digest, raw_config = _read_honcho_snapshot(path)
+                else:
+                    digest, raw_config = _read_honcho_snapshot(path)
             except OSError:
                 digest = None
+                raw_config = None
             memo_key = (str(path), digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
-            hcfg = HonchoClientConfig.from_global_config(config_path=path)
+            hcfg = HonchoClientConfig.from_global_config(
+                config_path=path, raw_config=raw_config) if raw_config is not None \
+                else HonchoClientConfig.from_global_config(config_path=path)
             aliases = hcfg.user_peer_aliases or {}
             values = {
                 "honcho.peer_name": hcfg.peer_name,

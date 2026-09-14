@@ -529,6 +529,46 @@ class TestPinTransition:
 
         assert sig_pinned["honcho.pin_peer_name"] != sig_unpinned["honcho.pin_peer_name"]
 
+    def test_cache_busting_identity_matches_the_digest_snapshot(self, tmp_path, monkeypatch):
+        """A rewrite after hashing must not parse a different Honcho identity."""
+        import gateway.run_agent_cache as agent_cache
+        from gateway.run import GatewayRunner
+
+        cfg_path = tmp_path / "honcho.json"
+        first = {"apiKey": "k", "peerName": "Alice", "pinPeerName": True}
+        second = {"apiKey": "k", "peerName": "Bob", "pinPeerName": False}
+        cfg_path.write_text(json.dumps(first))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+        original_sha256 = agent_cache.hashlib.sha256
+        swapped = False
+
+        def swap_after_digest(*args, **kwargs):
+            digest = original_sha256(*args, **kwargs)
+
+            class SwitchingDigest:
+                def digest(self):
+                    nonlocal swapped
+                    if not swapped:
+                        cfg_path.write_text(json.dumps(second))
+                        swapped = True
+                    return digest.digest()
+
+                def __getattr__(self, name):
+                    return getattr(digest, name)
+
+            return SwitchingDigest()
+
+        monkeypatch.setattr(agent_cache.hashlib, "sha256", swap_after_digest)
+        signature = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        assert signature["honcho.peer_name"] == "Alice"
+        assert signature["honcho.pin_peer_name"] is True
+
+
 
 class TestProfilePeerUniqueness:
     """Each Hermes profile can pin to its own unique peerName.
@@ -571,4 +611,3 @@ class TestProfilePeerUniqueness:
             "Profiles pinned to distinct peer names must not collapse to "
             "the same Honcho peer — otherwise profile isolation is fictional."
         )
-

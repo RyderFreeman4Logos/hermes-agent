@@ -15,6 +15,7 @@ chosen ``user_peer_id`` can be asserted without touching the network.
 """
 
 import hashlib
+import os
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -672,3 +673,10 @@ def test_cache_busting_null_snapshot_never_reopens_to_new_identity(tmp_path, mon
     assert swapped
     assert result["honcho.peer_name"] is None
     assert result["honcho.overflow_content"] is None
+    assert HonchoClientConfig.from_global_config(config_path=path).peer_name == "Bob"
+    path.write_text("null")
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+    warm = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
+    assert warm["honcho.peer_name"] is None
+    assert warm["honcho.overflow_content"] is None

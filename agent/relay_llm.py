@@ -13,7 +13,7 @@ from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
-from agent import relay_runtime
+from agent import cache_lowhit_request_dump, physical_attempt_diagnostics, relay_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,56 @@ def _relay_metadata(provider_name: str, metadata: dict[str, Any] | None) -> dict
     return relay_metadata
 
 
+def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
+    request_id = str((metadata or {}).get("api_request_id") or "")
+    correlation, marker, loop = request_id.rpartition(":api:")
+    if not marker or not correlation:
+        return None, ""
+    try:
+        return int(loop), correlation
+    except ValueError:
+        return None, ""
+
+
+def _record_attempt(
+    request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None
+) -> None:
+    try:
+        cache_lowhit_request_dump.remember_sent_request(
+            request, api_mode=str((metadata or {}).get("api_mode") or "unknown")
+        )
+    except Exception:
+        logger.debug("cache low-hit remember failed", exc_info=True)
+    scope = physical_attempt_diagnostics.take_cache_scope(request)
+    loop, correlation = _attempt_loop(metadata)
+    physical_attempt_diagnostics.start_attempt(
+        request,
+        api_mode=str((metadata or {}).get("api_mode") or "unknown"),
+        route=str((metadata or {}).get("api_mode") or "unknown"),
+        provider=name,
+        model=str(request.get("model") or model_name),
+        retry=int((metadata or {}).get("retry_count") or 0),
+        loop=loop,
+        correlation=correlation,
+        scope=scope,
+    )
+
+
+def _request_with_cache_scope(request: dict[str, Any], session_id: str | None) -> dict[str, Any]:
+    """Attach a diagnostic-only cache scope before Relay sees the request."""
+    extra_body = request.get("extra_body")
+    cache_scope = request.get("prompt_cache_key")
+    if cache_scope is None and isinstance(extra_body, dict):
+        cache_scope = extra_body.get("prompt_cache_key")
+    if cache_scope is None:
+        cache_scope = session_id
+    scope = physical_attempt_diagnostics.prepare_cache_scope(cache_scope)
+    return request if scope is None else {
+        **request,
+        "_hermes_physical_attempt_cache_scope": scope,
+    }
+
+
 class _ManagedAttempt:
     """Relay request state shared by the sync, async, and streaming adapters."""
 
@@ -64,6 +114,7 @@ class _ManagedAttempt:
         runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
         if runtime is None or session is None or not runtime.managed_execution_enabled():
             return None
+        request = _request_with_cache_scope(request, session_id)
         return cls(runtime, session, parent, request, metadata, name=name, model_name=model_name)
 
     def __init__(
@@ -71,6 +122,7 @@ class _ManagedAttempt:
         request: dict[str, Any], metadata: dict[str, Any] | None, *, name: str, model_name: str,
     ) -> None:
         self.runtime, self.session, self.request, self.metadata = runtime, session, request, metadata
+        self.name, self.model_name = name, model_name
         self.logical = _logical_parent(runtime, session, parent, metadata)
         self.parent = self.logical[1] if self.logical is not None else parent
         self.body = _relay_request_body(request, metadata)
@@ -88,10 +140,12 @@ class _ManagedAttempt:
         self.context = contextvars.copy_context()
 
     def provider_request(self, next_request: Any) -> dict[str, Any]:
-        return _provider_request(
+        final = _provider_request(
             self.request, next_request, relay_request_body=self.body,
             codec_baseline_body=self.codec_baseline, metadata=self.metadata,
         )
+        _record_attempt(final, name=self.name, model_name=self.model_name, metadata=self.metadata)
+        return final
 
     def run_callback(self, callback: Callable[..., Any], *args: Any) -> Any:
         """Run a Hermes callback in a fresh copy of the captured context.
@@ -182,6 +236,8 @@ def execute(
     ``session_id`` defaults to the inherited Hermes turn's session (unmanaged when there is none)."""
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
+        request = _request_with_cache_scope(request, session_id or _current_session_id())
+        _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
         return callback(request)
     try:
         managed = _run_awaitable(attempt.run_managed(
@@ -199,6 +255,8 @@ async def execute_async(
     """Async ``execute``."""
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
+        request = _request_with_cache_scope(request, session_id or _current_session_id())
+        _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
         return await callback(request)
     try:
         managed = await attempt.run_managed(attempt.runtime.relay.llm.execute, partial(attempt.invoke_async, callback))
@@ -239,6 +297,8 @@ def stream_current(
     # Inside a managed callback (on the Relay session's loop) a nested ManagedLlmStream would be
     # iterated synchronously on that loop, which asyncio forbids; the outer stream tracks this attempt.
     if session_id is None or _has_running_event_loop():
+        request = _request_with_cache_scope(request, session_id)
+        _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
         return stream_factory(request)
     managed = stream(
         request, stream_factory, session_id=session_id, name=name, model_name=model_name,
@@ -294,6 +354,8 @@ class ManagedLlmStream(Iterator[Any]):
         self._prefetched_chunks: list[Any] = []
         attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
         if attempt is None:
+            request = _request_with_cache_scope(request, session_id)
+            _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
             self._start_unmanaged(request)
             return
         self._logical = attempt.logical
@@ -763,6 +825,7 @@ def _relay_request_body(request: dict[str, Any], metadata: dict[str, Any] | None
     body = _jsonable_dict(request)
     # ``timeout`` configures the SDK client, not the wire: never expose it to intercepts.
     body.pop("timeout", None)
+    body.pop("_hermes_physical_attempt_cache_scope", None)
     normalize = _CODEC_TOOL_NORMALIZERS.get(_api_mode(metadata))
     if normalize is not None:
         normalize(body)

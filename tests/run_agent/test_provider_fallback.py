@@ -582,3 +582,12 @@ class TestFallbackExtraBodyReResolution:
         assert extra == {"caller": "kept", "c_only": 3}
         assert "a_only" not in extra
         assert "b_only" not in extra
+        # Build the next request through the active transport path without a
+        # network call.  The captured kwargs are the actual C-route request
+        # projection, not only the mutable runtime dictionary above.
+        next_kwargs = chat_completion_helpers.build_api_kwargs(
+            agent, [{"role": "user", "content": "capture C route"}], tools_for_api=[]
+        )
+        assert next_kwargs["model"] == "c-model"
+        assert agent.client.base_url == c_url
+        assert next_kwargs["extra_body"] == {"caller": "kept", "c_only": 3}

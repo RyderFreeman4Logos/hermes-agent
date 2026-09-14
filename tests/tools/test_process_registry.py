@@ -1386,6 +1386,142 @@ class TestKillProcess:
         finally:
             self._reap_child(session.process)
 
+    @staticmethod
+    def _spawn_pipe_parent_with_detached_writer(registry, monkeypatch, tmp_path, *, tail, waits_for_signal):
+        """Exercise the public pipe reader after its direct child is gone.
+
+        The small double-fork keeps a *test-owned* stdout writer alive after the
+        direct shell/Python child exits.  That is the production orphaned-pipe
+        shape: the real reader, not a fake finalizer, decides when its bounded
+        drain is complete.
+        """
+        mode = (
+            "def finish(_signum, _frame):\n"
+            f"    print({tail!r}, flush=True)\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, finish)\n"
+            f"print('READY-{tail}', flush=True)\n"
+            "while True: time.sleep(0.05)\n"
+            if waits_for_signal else
+            f"print('READY-{tail}', flush=True)\nprint({tail!r}, flush=True)\n"
+        )
+        code = (
+            "import os, signal, sys, time\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os.setsid()\n"
+            "    grandchild = os.fork()\n"
+            "    if grandchild:\n"
+            "        os._exit(0)\n"
+            "    time.sleep(1.2)\n"
+            "    os._exit(0)\n"
+            "os.waitpid(child, 0)\n"
+            + mode
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+        # Keep durable state out of this fixture.  The reader/finalizer and
+        # completion queue remain the real public path under test.
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        session = registry.spawn_local(command, cwd=str(tmp_path))
+        session.notify_on_complete = True
+        assert _wait_until(lambda: f"READY-{tail}" in session.output_buffer), "reader never received readiness"
+        return session
+
+    @pytest.mark.linux_only
+    def test_pipe_reader_owns_post_death_probe_error_and_natural_tail(self, registry, monkeypatch, tmp_path):
+        """P1: a post-death probe fault cannot consume or relabel a held pipe tail."""
+        session = self._spawn_pipe_parent_with_detached_writer(
+            registry, monkeypatch, tmp_path, tail="FINAL-P1-41", waits_for_signal=False,
+        )
+
+        def dead_probe_then_raise(pid, expected_start, on_direct_signal=None):
+            assert _wait_until(lambda: session.process.poll() is not None), "direct child did not exit"
+            assert not session._completion_event.is_set(), "reader was not held by its inherited pipe"
+            raise RuntimeError("post-death host probe failure")
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", dead_probe_then_raise)
+        try:
+            result = registry.kill_process(session.id, source="test.p1", consume_output=True)
+            assert result == {"status": "error", "error": "post-death host probe failure"}
+            assert session.id not in registry._completion_consumed
+            assert session._completion_event.wait(timeout=3), "reader did not finish its bounded drain"
+            assert session.output_buffer.endswith("FINAL-P1-41\n")
+            assert (session.exit_code, session.completion_reason, session.termination_source) == (0, "exited", "")
+            event = registry.completion_queue.get_nowait()
+            assert event["output"].endswith("FINAL-P1-41\n")
+            assert (event["exit_code"], event["completion_reason"], event["termination_source"]) == (0, "exited", "")
+            assert registry.completion_queue.empty()
+        finally:
+            self._reap_child(session.process)
+
+    @pytest.mark.linux_only
+    def test_pipe_reader_owns_post_signal_adapter_error_and_delivered_provenance(self, registry, monkeypatch, tmp_path):
+        """P2: delivery is real evidence, while the held reader owns terminal publication."""
+        session = self._spawn_pipe_parent_with_detached_writer(
+            registry, monkeypatch, tmp_path, tail="FINAL-P2-41", waits_for_signal=True,
+        )
+        original_terminate = registry._terminate_host_pid
+
+        def deliver_then_raise(*args, **kwargs):
+            original_terminate(*args, **kwargs)
+            assert not session._completion_event.is_set(), "reader was not held after real signal delivery"
+            raise RuntimeError("post-signal termination adapter failure")
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", deliver_then_raise)
+        try:
+            result = registry.kill_process(session.id, source="test.p2", consume_output=True)
+            assert result == {"status": "error", "error": "post-signal termination adapter failure"}
+            assert session.id not in registry._completion_consumed
+            assert session._completion_event.wait(timeout=3), "reader did not publish the delivered tail"
+            assert session.output_buffer.endswith("FINAL-P2-41\n")
+            assert (session.exit_code, session.completion_reason, session.termination_source) == (0, "killed", "test.p2")
+            event = registry.completion_queue.get_nowait()
+            assert event["output"].endswith("FINAL-P2-41\n")
+            assert (event["exit_code"], event["completion_reason"], event["termination_source"]) == (0, "killed", "test.p2")
+            assert registry.completion_queue.empty()
+            repeat = registry.kill_process(session.id, source="test.p2", consume_output=False)
+            assert repeat["status"] == "already_exited"
+            assert repeat["output"].endswith("FINAL-P2-41\n")
+            assert registry.completion_queue.empty()
+        finally:
+            self._reap_child(session.process)
+
+    @pytest.mark.linux_only
+    @pytest.mark.parametrize("reader_finishes_first", [True, False])
+    def test_pipe_reader_guard_race_preserves_natural_owner(self, registry, monkeypatch, tmp_path, reader_finishes_first):
+        """P4: both observer/reader schedules leave the reader as the sole owner."""
+        tail = f"FINAL-P4-41-{'reader' if reader_finishes_first else 'observer'}"
+        session = self._spawn_pipe_parent_with_detached_writer(
+            registry, monkeypatch, tmp_path, tail=tail, waits_for_signal=False,
+        )
+        observed_death = threading.Event()
+
+        def observe_death_then_raise(pid, expected_start, on_direct_signal=None):
+            assert _wait_until(lambda: session.process.poll() is not None), "observer never saw actual direct-child death"
+            observed_death.set()
+            if reader_finishes_first:
+                assert session._completion_event.wait(timeout=3), "reader did not win its scheduled race"
+            else:
+                assert not session._completion_event.is_set(), "reader did not remain draining for observer-first race"
+            raise RuntimeError("post-poll guard failure")
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", observe_death_then_raise)
+        try:
+            result = registry.kill_process(session.id, source="test.p4", consume_output=True)
+            assert observed_death.is_set()
+            assert result == {"status": "error", "error": "post-poll guard failure"}
+            assert session.id not in registry._completion_consumed
+            assert session._completion_event.wait(timeout=3), "reader did not finish its scheduled race"
+            assert session.output_buffer.endswith(f"{tail}\n")
+            assert (session.exit_code, session.completion_reason, session.termination_source) == (0, "exited", "")
+            event = registry.completion_queue.get_nowait()
+            assert event["output"].endswith(f"{tail}\n")
+            assert (event["exit_code"], event["completion_reason"], event["termination_source"]) == (0, "exited", "")
+            assert registry.completion_queue.empty()
+        finally:
+            self._reap_child(session.process)
+
     def _bind_real_child(self, registry, sid: str):
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],

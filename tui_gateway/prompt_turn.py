@@ -393,14 +393,13 @@ def _run_post_turn_followups(
     if _drain_queued_prompt(rid, sid, session):
         return
 
-    def insert(completion_text: str) -> bool:
+    def insert(completion_text: str, events: list) -> str | bool:
         with session["history_lock"]:
             if session.get("_closing") or session.get("_finalized"):
                 return False
-            _enqueue_prompt(
-                session, completion_text, session.get("transport"), structured_completion=True
-            )
-            return True
+            _enqueue_prompt(session, completion_text, session.get("transport"),
+                            structured_completion=True, completion_events=events)
+            return "reserved"
 
     ingest_completion = getattr(agent, "_completion_steer_ingest", None)
     if callable(ingest_completion):
@@ -458,7 +457,10 @@ class _TurnRun:
     receipt_attempted: bool = False
 
 
-def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
+def _prepare_turn_input(
+    sid: str, session: dict, st: _TurnRun, text: Any, images: list[str], *,
+    literal_completion: bool = False,
+):
     """Bind scopes, sync the agent, snapshot history, build the run message; returns
     ``(prompt, run_message, cols, streamer)`` or None when @-expansion was refused.
     Scopes fill field by field so a failure midway still leaves every bound token for the
@@ -499,7 +501,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     cols = session.get("cols", 80)
     streamer = make_stream_renderer(cols)
     prompt = text
-    if isinstance(prompt, str) and "@" in prompt:
+    if not literal_completion and isinstance(prompt, str) and "@" in prompt:
         from agent.context_references import preprocess_context_references
         from agent.model_metadata import get_model_context_length
         ctx_len = get_model_context_length(
@@ -777,7 +779,8 @@ def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
-    terminal_callback: Callable[[dict[str, Any]], None] | None = None) -> bool:
+    terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+    completion_receipt: dict | None = None) -> bool:
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
@@ -810,7 +813,20 @@ def _run_prompt_submit(
         goal_followup = None
         followup_steer = None
         try:
-            prepared = _prepare_turn_input(sid, session, st, text, images)
+            if completion_receipt:
+                def commit_completion_receipt() -> bool:
+                    with _completion_ownership_lock(session):
+                        active = session.get("_completion_active_receipt")
+                        if active is not completion_receipt:
+                            return False
+                        events = list(active.get("events") or [])
+                        session.pop("_completion_active_receipt", None)
+                        _mark_completion_events_consumed(events)
+                        return True
+                st.agent._completion_queue_ingest = commit_completion_receipt
+            prepared = _prepare_turn_input(
+                sid, session, st, text, images, literal_completion=bool(completion_receipt)
+            )
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:
                     st.receipt_attempted = True
@@ -835,6 +851,15 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            if completion_receipt:
+                with _completion_ownership_lock(session):
+                    active = session.get("_completion_active_receipt")
+                    if active is completion_receipt:
+                        session.pop("_completion_active_receipt", None)
+                        session["_completion_pending"] = list(active.get("events") or []) + list(
+                            session.get("_completion_pending") or [])
+                if getattr(st.agent, "_completion_queue_ingest", None) is not None:
+                    st.agent._completion_queue_ingest = None
             _finish_turn(sid, session, st)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)

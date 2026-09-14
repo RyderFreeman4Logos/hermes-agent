@@ -443,20 +443,27 @@ def _run_post_turn_followups(
         leftover = result.get("pending_steer")
     user_text = leftover if isinstance(leftover, str) and leftover.strip() else ""
 
+    if user_text:
+        with session["history_lock"]:
+            if session.get("_closing") or session.get("_finalized"):
+                return
+            _enqueue_prompt(session, user_text, session.get("transport"))
+
+    if _drain_queued_prompt(rid, sid, session):
+        return
+
     def insert(completion_text: str) -> bool:
-        text = f"{completion_text}\n{user_text}" if user_text else completion_text
         with session["history_lock"]:
             if session.get("_closing") or session.get("_finalized"):
                 return False
-            _enqueue_prompt(session, text, session.get("transport"))
+            _enqueue_prompt(
+                session, completion_text, session.get("transport"), structured_completion=True
+            )
             return True
 
     ingest_completion = getattr(agent, "_completion_steer_ingest", None)
-    inserted = bool(callable(ingest_completion) and ingest_completion(insert))
-    if user_text and not inserted:
-        with session["history_lock"]:
-            if not session.get("_closing") and not session.get("_finalized"):
-                _enqueue_prompt(session, user_text, session.get("transport"))
+    if callable(ingest_completion):
+        ingest_completion(insert)
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:

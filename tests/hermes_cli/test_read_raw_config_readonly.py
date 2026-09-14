@@ -159,3 +159,26 @@ def test_validated_raw_recovery_retires_same_metadata_failure(isolated_hermes_ho
     os.utime(cfg, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
     assert config_mod.read_raw_config_readonly()["model"]["provider"] == "openrouter"
     assert config_mod.get_active_config_parse_failure() is None
+
+
+def test_second_read_oserror_keeps_warm_raw_value(isolated_hermes_home, monkeypatch):
+    """The parser's same-read pass has the same last-good policy as hashing."""
+    from hermes_cli import config as config_mod
+
+    cfg = _write_config(isolated_hermes_home, {"image_gen": {"provider": "nous"}})
+    assert config_mod.read_raw_config_readonly()["image_gen"]["provider"] == "nous"
+    cfg.write_text("image_gen:\n  provider: krea\n", encoding="utf-8")
+    original_open = Path.open
+    target_opens = 0
+
+    def fail_parser_open(self, *args, **kwargs):
+        nonlocal target_opens
+        if self == cfg and (args[0] if args else kwargs.get("mode")) == "rb":
+            target_opens += 1
+            if target_opens == 2:
+                raise PermissionError("second raw read denied")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_parser_open)
+    assert config_mod.read_raw_config_readonly()["image_gen"]["provider"] == "nous"
+    assert target_opens == 2

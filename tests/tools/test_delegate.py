@@ -110,9 +110,14 @@ class TestDelegateRequirements(unittest.TestCase):
             "respond in Chinese",  # language example (weak models regress without it)
             "SELF-REPORTS",        # verification contract
             "clarify",             # child blocked-tool list
-            "delegation.provider", # model inheritance / pinning
+            "model_profile",       # pool routing (omitted uses standard)
+            "standard",            # required pool profile
+            "fail closed",         # unknown names / pool without standard
         ):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
+        # Runtime provider pinning still lives in delegate_tool_config/docs;
+        # the compact top-level text now carries the model_pool contract.
+        self.assertNotIn("delegation.provider", desc)
         # send_message must NOT be named: gateway-internal vocabulary most
         # sessions never see (still enforced via DELEGATE_BLOCKED_TOOLS).
         self.assertNotIn("send_message", desc)

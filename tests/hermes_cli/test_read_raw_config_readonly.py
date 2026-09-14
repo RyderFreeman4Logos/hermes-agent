@@ -182,3 +182,34 @@ def test_second_read_oserror_keeps_warm_raw_value(isolated_hermes_home, monkeypa
     monkeypatch.setattr(Path, "open", fail_parser_open)
     assert config_mod.read_raw_config_readonly()["image_gen"]["provider"] == "nous"
     assert target_opens == 2
+
+
+def test_second_read_failure_keeps_nous_selection_out_of_direct_fal_sink(isolated_hermes_home, monkeypatch):
+    """A second raw read failure cannot turn a stored managed pick into FAL_KEY direct submit."""
+    import importlib
+    from unittest.mock import MagicMock
+    from tools import image_generation_tool
+    from hermes_cli import config as config_mod
+
+    tool = importlib.reload(image_generation_tool)
+    cfg = _write_config(isolated_hermes_home, {"image_gen": {"provider": "nous"}})
+    assert config_mod.read_raw_config_readonly()["image_gen"]["provider"] == "nous"
+    cfg.write_text("image_gen:\n  provider: krea\n", encoding="utf-8")
+    original_open = Path.open
+    opens = 0
+    def fail_second(self, *args, **kwargs):
+        nonlocal opens
+        if self == cfg and (args[0] if args else kwargs.get("mode")) == "rb":
+            opens += 1
+            if opens == 2:
+                raise PermissionError("second parser read denied")
+        return original_open(self, *args, **kwargs)
+    direct = MagicMock()
+    monkeypatch.setattr(Path, "open", fail_second)
+    monkeypatch.setattr(tool, "fal_client", direct)
+    monkeypatch.setenv("FAL_KEY", "test-key")
+    monkeypatch.setattr(tool, "resolve_managed_tool_gateway", lambda _name: None)
+    with pytest.raises(ValueError, match="Nous"):
+        tool._submit_fal_request("fal-ai/test", {"prompt": "x"})
+    assert opens == 2
+    direct.submit.assert_not_called()

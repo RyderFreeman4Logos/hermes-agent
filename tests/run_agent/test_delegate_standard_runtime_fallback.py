@@ -511,6 +511,146 @@ def test_standard_child_without_fallback_keeps_nous_entitlement_recovery():
     refreshed.assert_called_once_with(agent)
 
 
+
+@pytest.mark.parametrize("unusable", [
+    pytest.param("same-backend", id="same-backend"),
+    pytest.param("already-unavailable", id="already-unavailable"),
+    pytest.param("known-unentitled", id="known-unentitled"),
+    pytest.param("locally-unusable", id="locally-unusable"),
+    pytest.param("resolver-none", id="resolver-none"),
+])
+def test_standard_child_unusable_fallback_suffix_reenters_nous_recovery(unusable):
+    """A nonempty standard-child suffix may still contain no activatable route."""
+    agent = _make_standard_child(max_retries=1, route=NOUS)
+    fallback = dict(FALLBACK_CHAIN[0])
+    if unusable == "same-backend":
+        fallback = dict(NOUS)
+    agent._fallback_chain = [fallback]
+    if unusable == "already-unavailable":
+        agent._unavailable_fallback_keys = {
+            (fallback["provider"], fallback["model"], fallback["base_url"])
+        }
+    calls = []
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(429, "usage limit has been reached")
+        return _response("recovered on the same route")
+
+    refreshed = MagicMock(return_value=True)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(
+            patch(
+                "agent.turn_api_error.classify_api_error",
+                return_value=ClassifiedError(
+                    reason=FailoverReason.billing,
+                    status_code=429,
+                    retryable=False,
+                    should_fallback=True,
+                ),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "agent.turn_recovery._try_refresh_nous_paid_entitlement_credentials",
+                refreshed,
+            )
+        )
+        if unusable == "same-backend":
+            stack.enter_context(
+                patch("agent.chat_completion_helpers._fallback_entry_unavailable_without_network", return_value=None)
+            )
+        elif unusable == "known-unentitled":
+            stack.enter_context(
+                patch("agent.fallback_cooldown._is_entitlement_rejected", return_value=True)
+            )
+        elif unusable == "locally-unusable":
+            stack.enter_context(
+                patch(
+                    "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                    return_value="not locally configured",
+                )
+            )
+        elif unusable == "resolver-none":
+            stack.enter_context(
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    return_value=(None, fallback["model"]),
+                )
+            )
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [(NOUS["provider"], NOUS["model"])] * 2
+    assert agent._fallback_index == len(agent._fallback_chain)
+    refreshed.assert_called_once_with(agent)
+
+
+def test_standard_child_post_mutation_fallback_failure_does_not_recover_original_route():
+    """A failed switch may not send the original error through changed runtime state."""
+    agent = _make_standard_child(max_retries=1, route=NOUS)
+    agent._fallback_chain = [dict(FALLBACK_CHAIN[0])]
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
+    refreshed = MagicMock(return_value=True)
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                agent, "_interruptible_api_call",
+                side_effect=_HTTPError(429, "usage limit has been reached"),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "agent.turn_api_error.classify_api_error",
+                return_value=ClassifiedError(
+                    reason=FailoverReason.billing,
+                    status_code=429,
+                    retryable=False,
+                    should_fallback=True,
+                ),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "agent.turn_recovery._try_refresh_nous_paid_entitlement_credentials",
+                refreshed,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, FALLBACK_CHAIN[0]["model"]),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, _provider: model,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "agent.agent_runtime_helpers.sync_credential_pool_entry_id",
+                side_effect=RuntimeError("late switch setup failed"),
+            )
+        )
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is False
+    assert agent.provider == FALLBACK_CHAIN[0]["provider"]
+    refreshed.assert_not_called()
+
 def test_standard_child_direct_output_cap_retries_same_route_before_fallback():
     """A direct 400 max-output error is a request-shape repair, not failover."""
     agent = _make_standard_child(max_retries=2)

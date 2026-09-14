@@ -1434,9 +1434,35 @@ def route_classified_error(
         if not pool_may_recover and _standard_child_can_fallback(
             agent, reason=classified.reason,
         ):
+            # A failed usable-destination search may consume entries without changing
+            # the current runtime. Only that case may re-enter same-route recovery:
+            # fallback activation mutates the route before later setup can fail.
+            _failing_runtime = (
+                agent.model, agent.provider, agent.base_url, agent.api_mode,
+                getattr(agent, "requested_provider", None), agent.client,
+                getattr(agent, "_credential_pool", None),
+                getattr(agent, "_credential_pool_entry_id", None),
+            )
             agent._buffer_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             if agent._try_activate_fallback(reason=classified.reason):
                 return _fallback_break()
+            _runtime_intact = (
+                (agent.model, agent.provider, agent.base_url, agent.api_mode,
+                 getattr(agent, "requested_provider", None)) == _failing_runtime[:5]
+                and agent.client is _failing_runtime[5]
+                and getattr(agent, "_credential_pool", None) is _failing_runtime[6]
+                and getattr(agent, "_credential_pool_entry_id", None) is _failing_runtime[7]
+            )
+            if _is_standard_profile_child(agent) and _runtime_intact:
+                _recovered, recovered_with_pool = recover_after_classification(
+                    agent, api_error, classified, _retry, status_code=status_code,
+                    error_context=error_context, messages=messages, api_messages=api_messages,
+                )
+                if _recovered:
+                    # ``handle_api_error`` charged this failure before this late
+                    # recovery point; preserve the prior budget, including max=1.
+                    retry_count = max(0, retry_count - 1)
+                    return _verdict("continue")
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:
     # escalate to the fallback chain once; False -> terminal handling.

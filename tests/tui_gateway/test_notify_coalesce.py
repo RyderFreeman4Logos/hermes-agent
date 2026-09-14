@@ -6,7 +6,6 @@ import queue as queue_mod
 import threading
 import time
 import types
-from collections.abc import Callable
 from unittest.mock import patch
 
 import pytest
@@ -289,13 +288,13 @@ def test_midloop_completions_use_steer_rail_not_new_turns(monkeypatch):
             isolated.put(evt)
         deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline:
-            if agent.steers:
+            if sess.get("_completion_transfer"):
                 break
             time.sleep(0.01)
 
         assert turns == []
-        assert len(agent.steers) == 1
-        steered = agent.steers[0]
+        assert agent.steers == []
+        steered = server._format_completion_batch(sess["_completion_transfer"])
         for evt in events:
             assert evt["session_id"] in steered
             assert str(evt["exit_code"]) in steered
@@ -304,7 +303,7 @@ def test_midloop_completions_use_steer_rail_not_new_turns(monkeypatch):
         assert all(evt["session_id"] in status[0][2]["text"] for evt in events)
         assert isolated.empty()
         assert "proc_mid_a" not in process_registry._completion_consumed
-        pending = sess.get("_completion_pending") or []
+        pending = sess.get("_completion_transfer") or []
         assert {evt.get("session_id") for evt in pending} == {
             "proc_mid_a",
             "proc_mid_b",
@@ -361,20 +360,20 @@ def test_llm_blocked_pileup_is_one_steer_batch_zero_drops(monkeypatch):
         isolated.put(events[1])
         deadline = time.monotonic() + 3.5
         while time.monotonic() < deadline:
-            if agent.steers:
+            if len(sess.get("_completion_transfer") or []) == 2:
                 break
             time.sleep(0.01)
 
         assert turns == []
         assert sess.get("running") is True
-        assert len(agent.steers) == 1
-        steered = agent.steers[0]
+        assert agent.steers == []
+        steered = server._format_completion_batch(sess["_completion_transfer"])
         assert "proc_llm_a" in steered and "proc_llm_b" in steered
         assert isolated.empty()
         consumed = process_registry._completion_consumed
         assert "proc_llm_a" not in consumed
         assert "proc_llm_b" not in consumed
-        pending = sess.get("_completion_pending") or []
+        pending = sess.get("_completion_transfer") or []
         pending_ids = {evt.get("session_id") for evt in pending}
         assert pending_ids == {"proc_llm_a", "proc_llm_b"}
     finally:
@@ -410,14 +409,14 @@ def test_single_completion_steers_while_parent_waits_on_tools(monkeypatch):
     process_registry._completion_consumed.discard("proc_wait_one")
     isolated.put(evt)
     try:
-        _run_poller_until(sid, sess, lambda: bool(agent.steers))
+        _run_poller_until(sid, sess, lambda: bool(sess.get("_completion_transfer")))
         assert turns == []
         assert sess.get("running") is True
-        assert len(agent.steers) == 1
-        assert "proc_wait_one" in agent.steers[0]
+        assert agent.steers == []
+        assert "proc_wait_one" in server._format_completion_batch(sess["_completion_transfer"])
         assert isolated.empty()
         assert "proc_wait_one" not in process_registry._completion_consumed
-        pending = sess.get("_completion_pending") or []
+        pending = sess.get("_completion_transfer") or []
         assert {evt.get("session_id") for evt in pending} == {"proc_wait_one"}
     finally:
         server._sessions.pop(sid, None)
@@ -426,36 +425,33 @@ def test_single_completion_steers_while_parent_waits_on_tools(monkeypatch):
             isolated.get_nowait()
 
 
-def test_steer_accept_does_not_ack_until_leftover_ingest():
-    """steer() True stages only; leftover enqueue is the ingest ACK."""
+def test_accept_does_not_settle_until_structured_ingest():
+    """Busy acceptance stages only; the insertion callback is the ingest ACK."""
     agent = _SteerAgent()
     sess = _session(running=True, agent=agent)
     evt = _completion("proc_ack_leftover", 0, "echo leftover")
     process_registry._completion_consumed.discard("proc_ack_leftover")
     try:
-        ok = server._deliver_completions_via_steer(
+        assert server._deliver_completions_via_steer(
             "sid_ack_leftover", sess, [evt], set()
         )
-        assert ok is True
-        assert agent.steers
+        assert agent.steers == []
         assert "proc_ack_leftover" not in process_registry._completion_consumed
-        pending = sess.get("_completion_pending") or []
-        assert {item.get("session_id") for item in pending} == {"proc_ack_leftover"}
+        assert [item["session_id"] for item in sess["_completion_transfer"]] == [
+            "proc_ack_leftover"
+        ]
 
-        leftover = agent._pending_steer
-        assert leftover and "proc_ack_leftover" in leftover
-        agent._pending_steer = None
-        with sess["history_lock"]:
-            server._enqueue_prompt(sess, leftover, sess.get("transport"))
-        server._ack_steered_completion_ingest(sess)
+        inserted: list[str] = []
+        assert agent._completion_steer_ingest(lambda text: inserted.append(text) or True)
+        assert "proc_ack_leftover" in inserted[0]
         assert "proc_ack_leftover" in process_registry._completion_consumed
-        assert sess.get("_completion_pending") in (None, [])
+        assert sess.get("_completion_transfer") == []
     finally:
         process_registry._completion_consumed.discard("proc_ack_leftover")
 
 
-def test_interrupt_after_steer_accept_does_not_drop_completion():
-    """clear_interrupt after accept must not lose the event or block replay."""
+def test_interrupt_after_accept_does_not_drop_structured_completion():
+    """Clearing unrelated user steer does not erase the structured transfer."""
     agent = _SteerAgent()
 
     def clear_interrupt(self, *, preserve_redirect=False):
@@ -470,34 +466,20 @@ def test_interrupt_after_steer_accept_does_not_drop_completion():
         assert server._deliver_completions_via_steer(
             "sid_int_drop", sess, [evt], set()
         )
-        assert agent._pending_steer
+        assert agent.steer("later user steer")
         assert "proc_int_drop" not in process_registry._completion_consumed
 
         agent.clear_interrupt()
         assert agent._pending_steer is None
-
-        pending = sess.get("_completion_pending") or []
-        assert {item.get("session_id") for item in pending} == {"proc_int_drop"}
-        assert process_registry.is_completion_consumed("proc_int_drop") is False
+        assert [item["session_id"] for item in sess["_completion_transfer"]] == [
+            "proc_int_drop"
+        ]
     finally:
         process_registry._completion_consumed.discard("proc_int_drop")
 
 
-def test_leftover_ack_does_not_consume_later_steer():
-    """Leftover harvest ACKs the snapshot only; a later steer stays replayable."""
+def test_structured_ingest_settles_current_batch_once():
     agent = _SteerAgent()
-
-    def _drain(self):
-        text = self._pending_steer
-        self._pending_steer = None
-        return text
-
-    def clear_interrupt(self, *, preserve_redirect=False):
-        self._pending_steer = None
-        return True
-
-    agent._drain_pending_steer = types.MethodType(_drain, agent)
-    agent.clear_interrupt = types.MethodType(clear_interrupt, agent)
     sess = _session(running=True, agent=agent)
     evt_a = _completion("proc_left_a", 0, "echo a")
     evt_b = _completion("proc_left_b", 0, "echo b")
@@ -505,81 +487,17 @@ def test_leftover_ack_does_not_consume_later_steer():
     process_registry._completion_consumed.discard("proc_left_b")
     try:
         assert server._deliver_completions_via_steer("sid_left", sess, [evt_a], set())
-        leftover = agent._drain_pending_steer()
-        assert leftover and "proc_left_a" in leftover
-
         assert server._deliver_completions_via_steer("sid_left", sess, [evt_b], set())
-        assert agent._pending_steer and "proc_left_b" in agent._pending_steer
-
-        with sess["history_lock"]:
-            server._enqueue_prompt(sess, leftover, sess.get("transport"))
-        server._ack_steered_completion_ingest(sess)
-
-        assert "proc_left_a" in process_registry._completion_consumed
-        assert "proc_left_b" not in process_registry._completion_consumed
-        pending_ids = {evt.get("session_id") for evt in (sess.get("_completion_pending") or [])}
-        assert "proc_left_b" in pending_ids
-
-        agent.clear_interrupt()
-        assert agent._pending_steer is None
-        assert "proc_left_b" not in process_registry._completion_consumed
-        assert process_registry.is_completion_consumed("proc_left_b") is False
+        inserted: list[str] = []
+        assert agent._completion_steer_ingest(lambda text: inserted.append(text) or True)
+        assert inserted[0].count("proc_left_a") >= 1
+        assert inserted[0].count("proc_left_b") >= 1
+        assert process_registry.is_completion_consumed("proc_left_a") is True
+        assert process_registry.is_completion_consumed("proc_left_b") is True
+        assert sess["_completion_transfer"] == []
     finally:
         process_registry._completion_consumed.discard("proc_left_a")
         process_registry._completion_consumed.discard("proc_left_b")
-
-
-def test_leftover_ack_toctou_does_not_consume_later_steer():
-    """Stale empty live snapshot must not ACK a concurrent later steer."""
-
-    class HookLock:
-        def __init__(self):
-            self._lock = threading.Lock()
-            self.hook: Callable[[], None] | None = None
-
-        def __enter__(self):
-            if self.hook:
-                fn, self.hook = self.hook, None
-                fn()
-            self._lock.acquire()
-            return self
-
-        def __exit__(self, *exc):
-            self._lock.release()
-            return False
-
-    agent = _SteerAgent()
-    lock = HookLock()
-    sess = _session(running=True, agent=agent, history_lock=lock)
-    evt_a = _completion("proc_race_a", 0, "echo a")
-    evt_b = _completion("proc_race_b", 0, "echo b")
-    process_registry._completion_consumed.discard("proc_race_a")
-    process_registry._completion_consumed.discard("proc_race_b")
-    try:
-        assert server._deliver_completions_via_steer("sid_race", sess, [evt_a], set())
-        leftover = agent._pending_steer
-        agent._pending_steer = None
-        assert leftover and "proc_race_a" in leftover
-        with lock._lock:
-            server._enqueue_prompt(sess, leftover, sess.get("transport"))
-
-        def _inject_b():
-            assert server._deliver_completions_via_steer("sid_race", sess, [evt_b], set())
-
-        lock.hook = _inject_b
-        server._ack_steered_completion_ingest(sess)
-
-        assert "proc_race_a" in process_registry._completion_consumed
-        assert "proc_race_b" not in process_registry._completion_consumed
-        assert process_registry.is_completion_consumed("proc_race_b") is False
-        pending_ids = {
-            evt.get("session_id") for evt in (sess.get("_completion_pending") or [])
-        }
-        assert "proc_race_b" in pending_ids
-        assert agent._pending_steer and "proc_race_b" in agent._pending_steer
-    finally:
-        process_registry._completion_consumed.discard("proc_race_a")
-        process_registry._completion_consumed.discard("proc_race_b")
 
 
 def _bare_aiagent():
@@ -598,42 +516,11 @@ def _bare_aiagent():
     return agent
 
 
-class _HookLock:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.hook: Callable[[], None] | None = None
-
-    def __enter__(self):
-        if self.hook:
-            fn, self.hook = self.hook, None
-            fn()
-        self._lock.acquire()
-        return self
-
-    def __exit__(self, *exc):
-        self._lock.release()
-        return False
-
-
 def _queued_completion_ids(q: queue_mod.Queue) -> list[str]:
     items = []
     while not q.empty():
         items.append(q.get_nowait())
     return [evt.get("session_id") for evt in items]
-
-
-def _watch_steer(agent) -> threading.Event:
-    steered = threading.Event()
-    orig = agent.steer
-
-    def _steer(text: str) -> bool:
-        ok = orig(text)
-        if ok:
-            steered.set()
-        return ok
-
-    agent.steer = _steer
-    return steered
 
 
 class _SignalQueue(queue_mod.Queue):
@@ -655,7 +542,6 @@ def test_steered_unacked_completion_survives_real_finalize(monkeypatch):
     monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
 
     agent = _bare_aiagent()
-    steered = _watch_steer(agent)
     sid = "sid_f1_unacked"
     sess = _session(running=True, agent=agent)
     server._sessions[sid] = sess
@@ -664,8 +550,12 @@ def test_steered_unacked_completion_survives_real_finalize(monkeypatch):
     isolated.put(evt)
     sess["_notif_stop"] = server._start_notification_poller(sid, sess)
     try:
-        assert steered.wait(timeout=2.0)
-        assert agent._pending_steer and "proc_f1_unacked" in agent._pending_steer
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not sess.get("_completion_transfer"):
+            time.sleep(0.01)
+        assert [item["session_id"] for item in sess["_completion_transfer"]] == [
+            "proc_f1_unacked"
+        ]
         assert "proc_f1_unacked" not in process_registry._completion_consumed
         assert isolated.empty()
 
@@ -689,7 +579,6 @@ def test_acked_steer_is_not_requeued_on_finalize(monkeypatch):
     monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
 
     agent = _bare_aiagent()
-    steered = _watch_steer(agent)
     sid = "sid_f1_acked"
     sess = _session(running=True, agent=agent)
     server._sessions[sid] = sess
@@ -698,12 +587,12 @@ def test_acked_steer_is_not_requeued_on_finalize(monkeypatch):
     isolated.put(evt)
     sess["_notif_stop"] = server._start_notification_poller(sid, sess)
     try:
-        assert steered.wait(timeout=2.0)
-        leftover = agent._drain_pending_steer()
-        assert leftover and "proc_f1_acked" in leftover
-        with sess["history_lock"]:
-            server._enqueue_prompt(sess, leftover, sess.get("transport"))
-        server._ack_steered_completion_ingest(sess)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not sess.get("_completion_transfer"):
+            time.sleep(0.01)
+        inserted: list[str] = []
+        assert agent._completion_steer_ingest(lambda text: inserted.append(text) or True)
+        assert "proc_f1_acked" in inserted[0]
         assert "proc_f1_acked" in process_registry._completion_consumed
         assert isolated.empty()
 
@@ -743,131 +632,5 @@ def test_unsteerable_busy_completion_requeues_through_finalize(monkeypatch):
     finally:
         server._sessions.pop(sid, None)
         process_registry._completion_consumed.discard("proc_f1_busy")
-        while not isolated.empty():
-            isolated.get_nowait()
-
-
-def test_ack_before_shutdown_split_does_not_duplicate(monkeypatch):
-    """ACK winning the history lock before leftover split must not requeue a consumed id."""
-    isolated = _SignalQueue()
-    monkeypatch.setattr(process_registry, "completion_queue", isolated)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
-
-    agent = _bare_aiagent()
-    steered = _watch_steer(agent)
-    lock = _HookLock()
-    sid = "sid_f1_ack_race"
-    sess = _session(running=True, agent=agent, history_lock=lock)
-    server._sessions[sid] = sess
-    evt = _completion("proc_f1_ack_race", 0, "echo race")
-    process_registry._completion_consumed.discard("proc_f1_ack_race")
-    isolated.put(evt)
-    sess["_notif_stop"] = server._start_notification_poller(sid, sess)
-    try:
-        assert steered.wait(timeout=2.0)
-        leftover = agent._drain_pending_steer()
-        assert leftover and "proc_f1_ack_race" in leftover
-        with lock._lock:
-            server._enqueue_prompt(sess, leftover, sess.get("transport"))
-
-        def _ack_first():
-            server._ack_steered_completion_ingest(sess)
-
-        lock.hook = _ack_first
-        closed = server._close_session_by_id(sid, end_reason="tui_close")
-        assert closed is True
-        assert "proc_f1_ack_race" in process_registry._completion_consumed
-        assert _queued_completion_ids(isolated) == []
-    finally:
-        server._sessions.pop(sid, None)
-        process_registry._completion_consumed.discard("proc_f1_ack_race")
-        while not isolated.empty():
-            isolated.get_nowait()
-
-
-def test_shutdown_reclaim_excludes_real_tool_result_ingest(monkeypatch):
-    """Reclaim owns a staged completion before a concurrent real ingest can drain it."""
-    isolated = queue_mod.Queue()
-    monkeypatch.setattr(process_registry, "completion_queue", isolated)
-    monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
-
-    snapshot_seen = threading.Event()
-    ingested = threading.Event()
-    state = {"armed": False, "snapshotted": False, "apply_tid": None}
-
-    def _get_pending(agent):
-        value = agent.__dict__.get("_pending_steer_raw")
-        if (
-            state["armed"]
-            and not state["snapshotted"]
-            and threading.get_ident() != state["apply_tid"]
-        ):
-            state["snapshotted"] = True
-            snapshot_seen.set()
-        return value
-
-    def _set_pending(agent, value):
-        agent.__dict__["_pending_steer_raw"] = value
-
-    monkeypatch.setattr(
-        AIAgent, "_pending_steer", property(_get_pending, _set_pending), raising=False
-    )
-    agent = _bare_aiagent()
-    sid = "sid_atomic_reclaim"
-    evt_id = "proc_atomic_reclaim"
-    sess = _session(running=True, agent=agent, _finalized=True, _closing=True)
-    server._sessions[sid] = sess
-    process_registry._completion_consumed.discard(evt_id)
-
-    class _IngestMessages(list):
-        def append(self, item):
-            super().append(item)
-            if isinstance(item, dict) and item.get("role") == "user":
-                ingested.set()
-
-    messages = _IngestMessages(
-        [{"role": "tool", "content": "ok", "tool_call_id": "t1"}]
-    )
-    apply_errors: list[BaseException] = []
-    try:
-        assert server._deliver_completions_via_steer(
-            sid, sess, [_completion(evt_id, 0, "echo atomic")], set()
-        )
-        original_drain = agent._drain_pending_steer
-
-        def _gated_drain():
-            if threading.get_ident() != state["apply_tid"]:
-                assert ingested.wait(timeout=2.0)
-            return original_drain()
-
-        agent._drain_pending_steer = _gated_drain
-
-        def _apply():
-            state["apply_tid"] = threading.get_ident()
-            assert snapshot_seen.wait(timeout=2.0)
-            try:
-                agent._apply_pending_steer_to_tool_results(messages, 1)
-            except BaseException as exc:
-                apply_errors.append(exc)
-
-        state["armed"] = True
-        apply_thread = threading.Thread(target=_apply, daemon=True)
-        apply_thread.start()
-        stop = threading.Event()
-        stop.set()
-        server._notification_poller_loop(stop, sid, sess)
-        apply_thread.join(timeout=2.0)
-
-        assert not apply_thread.is_alive()
-        assert apply_errors == []
-        assert snapshot_seen.is_set()
-        assert _queued_completion_ids(isolated) == [evt_id]
-        assert [row for row in messages if row.get("role") == "user"] == []
-        assert process_registry.is_completion_consumed(evt_id) is False
-    finally:
-        server._sessions.pop(sid, None)
-        process_registry._completion_consumed.discard(evt_id)
         while not isolated.empty():
             isolated.get_nowait()

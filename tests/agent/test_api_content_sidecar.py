@@ -503,7 +503,8 @@ class TestWireInvariant:
         assert len(reqs) == 2
         sent_1 = _user_messages(reqs[0])[0]["content"]
         sent_2 = _user_messages(reqs[1])[0]["content"]
-        assert sent_1 == "hello please\n\nPLUGIN-CTX"
+        assert sent_1.startswith("hello please\n\nPLUGIN-CTX")
+        assert "[Agent loop timing]" in sent_1
         assert sent_2 == sent_1  # repeated builds: identical bytes
 
         # The sidecar never reaches the provider.
@@ -514,7 +515,7 @@ class TestWireInvariant:
         # Persisted row: clean content + exact sent bytes in the sidecar.
         user_rows = [r for r in db.get_messages(sid) if r["role"] == "user"]
         assert user_rows[0]["content"] == "hello please"
-        assert user_rows[0]["api_content"] == sent_1
+        assert user_rows[0]["api_content"] == "hello please\n\nPLUGIN-CTX"
 
     def test_next_turn_replays_previous_turn_bytes(self, wire_env):
         """The cache invariant: the serialized user message replayed in turn
@@ -531,7 +532,7 @@ class TestWireInvariant:
         history = db.get_messages_as_conversation(sid)
         # The stored history carries the sidecar, not the injected content.
         assert history[0]["content"] == "hello please"
-        assert history[0]["api_content"] == turn_n_user["content"]
+        assert history[0]["api_content"] == "hello please\n\nPLUGIN-CTX"
 
         handler.captured_requests = []
         agent2 = make_agent()
@@ -544,7 +545,8 @@ class TestWireInvariant:
 
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
-        assert current["content"] == "second question\n\nPLUGIN-CTX"
+        assert current["content"].startswith("second question\n\nPLUGIN-CTX")
+        assert "[Agent loop timing]" in current["content"]
 
 
 # ---------------------------------------------------------------------------

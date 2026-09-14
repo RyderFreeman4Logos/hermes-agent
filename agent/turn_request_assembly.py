@@ -233,10 +233,18 @@ def assemble_api_request(
             )
             for message in messages
         ):
-            api_messages.append({"role": "system", "content": persisted})
+            timing_metadata = {LOOP_TIMING_TURN_ID: event_id} if event_id else {}
+            api_messages.append(
+                {
+                    "role": "system",
+                    "content": persisted,
+                    "display_kind": "hidden",
+                    "display_metadata": timing_metadata,
+                }
+            )
             messages.append(
                 {"role": "system", "content": persisted, "display_kind": "hidden",
-                 "display_metadata": {LOOP_TIMING_TURN_ID: event_id} if event_id else {}},
+                 "display_metadata": timing_metadata},
             )
 
     # Prepare the persistent-MoA request before measuring compression pressure: the

@@ -3124,7 +3124,11 @@ class TestRunConversation:
             },
         ]
         timing = agent.client.chat.completions.create.call_args.kwargs["messages"][-1]
-        assert timing["content"].startswith("[Agent loop timing]\nCurrent loop start:")
+        assert timing["role"] == "user"
+        assert any(
+            "[Agent loop timing]\nCurrent loop start:" in block.get("text", "")
+            for block in timing["content"]
+        )
         assert "cache_control" not in timing
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
@@ -3282,7 +3286,12 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        assert any(
+            msg.get("role") == "user"
+            and str(msg.get("content", "")).startswith("search something")
+            and "[Agent loop timing]" in str(msg.get("content", ""))
+            for msg in pre_request_calls[0]["request_messages"]
+        )
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
@@ -5004,14 +5013,14 @@ class TestRunConversation:
         # prompt), not the original multi-message window. Without this, the
         # output-cap retry would call the compressor but re-transmit the same
         # oversized request forever.
-        second_messages = [
+        rebuilt_user = next(
             message
             for message in second_call.get("messages", [])
-            if "[Agent loop timing]" not in str(message.get("content", ""))
-        ]
-        assert second_messages[-1].get("content") == "hello"
-        assert len(second_messages) == 2
-        assert second_messages[0]["role"] == "system"
+            if message.get("role") == "user" and "[Agent loop timing]" in str(message.get("content", ""))
+        )
+        assert rebuilt_user["content"].startswith("hello")
+        assert len(second_call["messages"]) == 2
+        assert second_call["messages"][0]["role"] == "system"
         # context_length was NOT mutated by an output-cap error.
         assert agent.context_compressor.context_length == 200_000
 

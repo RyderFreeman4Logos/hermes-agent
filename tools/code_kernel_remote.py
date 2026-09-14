@@ -374,6 +374,10 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         if kernel is not None and reset_pending:
             _discard_remote_kernel(key, kernel)
             kernel, state_reset, reset_pending = None, True, False
+        elif kernel is None and reset_pending:
+            # There is no prior state to reset. Consume the request before a
+            # cold-spawn loser retries, or it can kill the winner it adopts.
+            reset_pending = False
         if kernel is not None and not kernel.is_alive():
             # Transport drop, container restart, self-reaped on idle, OOM — all
             # the same answer: report the loss, respawn fresh (kill is then only

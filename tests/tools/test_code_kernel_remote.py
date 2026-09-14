@@ -69,6 +69,7 @@ class FileAwareEnv:
         self.before_submit = None
         self.before_liveness = None
         self.before_liveness_command = None
+        self.liveness_response = None
         self.before_spawn = None
         self.before_kill = None
         self.cleanup_returncode = 0
@@ -119,6 +120,8 @@ class FileAwareEnv:
                 self.before_liveness()
             if self.before_liveness_command is not None:
                 self.before_liveness_command(command)
+            if self.liveness_response is not None:
+                return self.liveness_response(command)
             return {"output": "ALIVE\n", "returncode": 0}
         if "command -v python3" in command:
             return {"output": "OK\n", "returncode": 0}
@@ -1262,6 +1265,146 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
 
     def test_exit_retires_before_waiting_same_key_call(self):
         self._assert_waiter_revalidates_after_terminal_outcome("exit")
+
+    def _assert_replacement_survives_old_teardown(self, replacement):
+        """W09: K1 teardown cannot remove K2 while the old caller adopts it."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        self.assertEqual(_run(env, code="seed", task="replacement-owner")["status"], "success")
+        old_teardown = threading.Event()
+        release_old_teardown = threading.Event()
+        winner_submitted = threading.Event()
+        release_winner = threading.Event()
+        dead_answered = [False]
+
+        def hold_old_kill(command):
+            if "7001" in command and not old_teardown.is_set():
+                old_teardown.set()
+                release_old_teardown.wait(5)
+
+        def hold_winner_submit():
+            if threading.current_thread().name == "w09-winner":
+                winner_submitted.set()
+                release_winner.wait(5)
+
+        def liveness(command):
+            if (replacement == "dead" and threading.current_thread().name == "w09-old"
+                    and "7001" in command and not dead_answered[0]):
+                dead_answered[0] = True
+                return {"output": "", "returncode": 1}
+            return {"output": "ALIVE\n", "returncode": 0}
+
+        env.before_kill = hold_old_kill
+        env.before_submit = hold_winner_submit
+        env.liveness_response = liveness
+        results = {}
+        errors = []
+
+        def invoke(label, *, reset=False):
+            try:
+                results[label] = _run(
+                    env, code=label, task="replacement-owner", reset=reset
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        old = threading.Thread(
+            target=invoke, args=("old-caller",), kwargs={"reset": replacement == "reset"}, name="w09-old"
+        )
+        winner = threading.Thread(target=invoke, args=("winner",), name="w09-winner")
+        old.start()
+        self.assertTrue(old_teardown.wait(5), "K1 teardown did not hold")
+        winner.start()
+        self.assertTrue(winner_submitted.wait(5), "concurrent caller did not publish K2")
+        with _REGISTRY.lock:
+            k2 = next(iter(_REMOTE_KERNELS.values()))
+            self.assertEqual(k2.pid, "7002")
+            self.assertEqual(k2.attached, 1)
+        release_old_teardown.set()
+        deadline = time.monotonic() + 5
+        while True:
+            with _REGISTRY.lock:
+                attached = k2.attached
+            if attached == 2:
+                break
+            self.assertLess(time.monotonic(), deadline, "old caller did not wait on K2")
+            time.sleep(0.01)
+        release_winner.set()
+        old.join(5)
+        winner.join(5)
+
+        self.assertFalse(old.is_alive())
+        self.assertFalse(winner.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["winner"]["stdout"], "winner")
+        self.assertEqual(results["old-caller"]["stdout"], "old-caller")
+        self.assertTrue(results["old-caller"]["kernel"]["reused"])
+        flag = "state_reset" if replacement == "reset" else "state_lost"
+        self.assertTrue(results["old-caller"]["kernel"][flag])
+        self.assertEqual(env.spawn_count, 3)
+        self.assertTrue(any("7001" in command for command in env.killed))
+        self.assertTrue(any("7003" in command for command in env.killed))
+        self.assertFalse(any("7002" in command for command in env.killed))
+        with _REGISTRY.lock:
+            self.assertIs(next(iter(_REMOTE_KERNELS.values())), k2)
+            self.assertEqual(k2.attached, 0)
+
+    def test_public_reset_old_teardown_cannot_remove_concurrent_winner(self):
+        self._assert_replacement_survives_old_teardown("reset")
+
+    def test_negative_liveness_old_teardown_cannot_remove_concurrent_winner(self):
+        self._assert_replacement_survives_old_teardown("dead")
+
+    def test_initially_absent_reset_is_consumed_once_across_cold_winner(self):
+        """W09: reset=True on an empty key survives loser adoption exactly once."""
+        env = FileAwareEnv()
+        self._ship_mock.side_effect = env.ship
+        spawn_barrier = threading.Barrier(2)
+        cold_spawns = [0]
+
+        def hold_initial_cold_spawns():
+            cold_spawns[0] += 1
+            if cold_spawns[0] <= 2:
+                spawn_barrier.wait(5)
+
+        env.before_spawn = hold_initial_cold_spawns
+        first_submitted = threading.Event()
+        release_first = threading.Event()
+
+        def hold_first_submit():
+            if not first_submitted.is_set():
+                first_submitted.set()
+                release_first.wait(5)
+
+        env.before_submit = hold_first_submit
+        results = []
+        errors = []
+
+        def invoke(label, reset):
+            try:
+                results.append(_run(env, code=label, task="absent-reset", reset=reset))
+            except BaseException as exc:
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=invoke, args=("reset-caller", True)),
+            threading.Thread(target=invoke, args=("plain-caller", False)),
+        ]
+        for worker in workers:
+            worker.start()
+        self.assertTrue(first_submitted.wait(5))
+        release_first.set()
+        for worker in workers:
+            worker.join(5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual({result["stdout"] for result in results}, {"reset-caller", "plain-caller"})
+        reset_result = next(result for result in results if result["stdout"] == "reset-caller")
+        self.assertFalse(reset_result["kernel"].get("state_reset", False))
+        self.assertEqual(env.spawn_count, 2)
+        self.assertEqual(len(env.killed), 1)
+        self.assertEqual(len(_REMOTE_KERNELS), 1)
 
     def test_live_poller_forces_permanent_retirement_before_handoff(self):
         """W10: join timeout cannot expose K to the next caller."""

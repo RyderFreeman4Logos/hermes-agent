@@ -162,9 +162,7 @@ def _admit_prompt_turn(
             sid, session, reason,
             error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
         return None
-    # clear_interrupt() can be wrapped by completion-steer bookkeeping. Keep it
-    # outside history_lock: the wrapper may need that same non-reentrant lock.
-    _bind_completion_steer_guards(session, agent)
+    _bind_completion_ingest(session, agent)
     with contextlib.suppress(Exception):
         agent.clear_interrupt()
     return images, agent
@@ -437,18 +435,29 @@ def _run_post_turn_followups(
     prompt wins over every auto follow-up (drain it, skip the rest); a leftover /steer is
     requeued first so it isn't dropped; then goal continuation, then completion
     notifications.  Each nested submit re-checks ``running`` under the lock."""
+    agent = session.get("agent")
     leftover = result.get("pending_steer") if isinstance(result, dict) else None
     if not (isinstance(leftover, str) and leftover.strip()):
-        drain = getattr(session.get("agent"), "_drain_pending_steer", None)
+        drain = getattr(agent, "_drain_pending_steer", None)
         if callable(drain):
             with contextlib.suppress(Exception):
                 leftover = drain()
-    if isinstance(leftover, str) and leftover.strip():
+    user_text = leftover if isinstance(leftover, str) and leftover.strip() else ""
+
+    def insert(completion_text: str) -> bool:
+        text = f"{completion_text}\n{user_text}" if user_text else completion_text
         with session["history_lock"]:
-            _enqueue_prompt(session, leftover, session.get("transport"))
-        _ack_steered_completion_ingest(session)
-    elif not getattr(session.get("agent"), "_pending_steer", None):
-        _ack_steered_completion_ingest(session)
+            if session.get("_closing") or session.get("_finalized"):
+                return False
+            _enqueue_prompt(session, text, session.get("transport"))
+            return True
+
+    ingest_completion = getattr(agent, "_completion_steer_ingest", None)
+    inserted = bool(callable(ingest_completion) and ingest_completion(insert))
+    if user_text and not inserted:
+        with session["history_lock"]:
+            if not session.get("_closing") and not session.get("_finalized"):
+                _enqueue_prompt(session, user_text, session.get("transport"))
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:

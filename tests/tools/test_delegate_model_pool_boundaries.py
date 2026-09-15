@@ -219,7 +219,7 @@ def test_all_fast_tasks_do_not_resolve_unused_standard_but_standard_is_required(
     assert "standard" in refused["error"].lower()
 
 
-def test_public_independent_units_keep_task_routes_in_manifest_dispatch_and_completion(tmp_path, monkeypatch):
+def _run_public_background_routes(tmp_path, monkeypatch, tasks):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     cfg = {
         "max_iterations": 4,
@@ -249,43 +249,44 @@ def test_public_independent_units_keep_task_routes_in_manifest_dispatch_and_comp
     ), patch("tools.async_delegation._get_executor", return_value=_NoRunExecutor()), patch(
         "tools.async_delegation._ensure_stale_monitor"
     ), patch("tools.delegate_tool._get_max_async_children", return_value=4):
-        sole_handle = json.loads(
-            delegate_task(
-                tasks=[{"goal": "run only fast", "model_profile": "fast"}],
-                background=True,
-                parent_agent=parent,
-            )
-        )
         handle = json.loads(
-            delegate_task(
-                tasks=[
-                    {"goal": "run fast independently", "model_profile": "fast"},
-                    {"goal": "run standard independently", "model_profile": "standard"},
-                ],
-                background=True,
-                parent_agent=parent,
-            )
+            delegate_task(tasks=tasks, background=True, parent_agent=parent)
         )
-
-    sole_manifest_path = (
-        tmp_path / "cache" / "delegation" / "live" / sole_handle["delegation_id"] / "manifest.json"
-    )
-    sole_manifest = json.loads(sole_manifest_path.read_text(encoding="utf-8"))
-    assert sole_manifest["model"] == "fast-model"
-    assert (sole_manifest["tasks"][0]["model"], sole_manifest["tasks"][0]["provider"]) == (
-        "fast-model", "custom"
-    )
 
     manifest_path = tmp_path / "cache" / "delegation" / "live" / handle["delegation_id"] / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return captured_children, persisted, manifest
+
+
+def test_public_sole_fast_task_keeps_route_in_manifest_and_persisted_record(tmp_path, monkeypatch):
+    children, persisted, manifest = _run_public_background_routes(
+        tmp_path, monkeypatch, [{"goal": "run only fast", "model_profile": "fast"}]
+    )
+
+    assert children[0]["model"] == "fast-model"
+    assert manifest["model"] == "fast-model"
+    assert (manifest["tasks"][0]["model"], manifest["tasks"][0]["provider"]) == (
+        "fast-model", "custom"
+    )
+    assert [record["model"] for record in persisted] == ["fast-model"]
+
+
+def test_public_independent_units_keep_routes_in_manifest_dispatch_and_completion(tmp_path, monkeypatch):
+    _children, persisted, manifest = _run_public_background_routes(
+        tmp_path,
+        monkeypatch,
+        [
+            {"goal": "run fast independently", "model_profile": "fast"},
+            {"goal": "run standard independently", "model_profile": "standard"},
+        ],
+    )
+
     assert [(t["model"], t["provider"]) for t in manifest["tasks"]] == [
         ("fast-model", "custom"),
         ("standard-model", "custom"),
     ]
     assert manifest["model"] is None
-    assert [record["model"] for record in persisted] == [
-        "fast-model", "fast-model", "standard-model"
-    ]
+    assert [record["model"] for record in persisted] == ["fast-model", "standard-model"]
 
     rendered = _format_batch_delegation(
         {

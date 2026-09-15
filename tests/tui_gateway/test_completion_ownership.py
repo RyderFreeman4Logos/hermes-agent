@@ -342,6 +342,71 @@ def test_idle_completion_claim_keeps_receipt_pending_when_prompt_submit_claims_a
     assert [item["session_id"] for item in session["_completion_pending"]] == ["proc_idle_claim_race"]
 
 
+def test_live_poller_prompt_submit_claim_keeps_completion_receipt_unconsumed(
+    monkeypatch,
+):
+    """A real prompt.submit admission wins the paused live-poller idle claim.
+
+    The transport pause is deliberately at the status emission boundary.  The
+    JSON-RPC handler therefore performs its normal history-lock admission
+    before the poller reaches the final ownership transaction.
+    """
+    event = _completion("proc_live_poller_prompt_claim")
+    _clear_ids(event["session_id"])
+    session = _session(running=False, agent=_bare_agent(), agent_ready=threading.Event())
+    submitted: list[dict] = []
+    completion_submits: list[dict] = []
+    sid = "owner-live-poller"
+
+    class _OnePoll:
+        checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            return self.checks > 1
+
+    def emit(kind, emitted_sid, _payload=None):
+        if kind != "status.update":
+            return
+        response = server.handle_request({
+            "id": "real-user-admission",
+            "method": "prompt.submit",
+            "params": {"session_id": emitted_sid, "text": "actual user prompt"},
+        })
+        assert response["result"]["status"] == "streaming"
+
+    try:
+        with _isolated_queue(monkeypatch) as isolated:
+            isolated.put(event)
+            server._sessions[sid] = session
+            monkeypatch.setattr(server, "_emit", emit)
+            monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a: None)
+            monkeypatch.setattr(server, "_persist_session_row_for_submit", lambda *_a: None)
+            monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *_a: True)
+            monkeypatch.setattr(server, "_run_after_agent_ready", lambda *_a: submitted.append(dict(session)))
+            monkeypatch.setattr(
+                server,
+                "_run_prompt_submit",
+                lambda *_a, **kwargs: completion_submits.append(dict(kwargs)) or True,
+            )
+            monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+
+            server._notification_poller_loop(_OnePoll(), sid, session)
+
+            assert len(submitted) == 1
+            assert completion_submits == []
+            assert session["running"] is True
+            assert session.get("_completion_active_receipt") is None
+            held = list(session.get("_completion_pending") or []) + list(
+                session.get("_completion_transfer") or [])
+            assert [item["session_id"] for item in held] == [event["session_id"]]
+            assert process_registry.is_completion_consumed(event["session_id"]) is False
+            assert _queued_ids(isolated) == []
+    finally:
+        server._sessions.pop(sid, None)
+        _clear_ids(event["session_id"])
+
+
 def test_idle_flush_keeps_suffix_pending_until_real_noncompletion_barrier_starts(monkeypatch):
     """C1/W/C2 must not merge C2 into C1 while W has not claimed its route."""
     c1, c2 = _completion("proc_barrier_first"), _completion("proc_barrier_later")

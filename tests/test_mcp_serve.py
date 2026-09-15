@@ -2263,7 +2263,8 @@ def test_event_bridge_startup_partial_gateway_rewind_keeps_handoff_historical(
 
 
 @pytest.mark.parametrize(
-    "replacement_mode", ["same-generation", "same-path", "different-inode"]
+    "replacement_mode",
+    ["same-generation", "same-path", "different-inode", "new-bridge"],
 )
 def test_event_bridge_restart_scopes_cutoff_to_current_database(
     monkeypatch, tmp_path, replacement_mode
@@ -2304,7 +2305,7 @@ def test_event_bridge_restart_scopes_cutoff_to_current_database(
         old_identity = db_path.stat().st_ino
         if replacement_mode == "same-generation":
             expected_message_id = "2"
-        elif replacement_mode == "same-path":
+        elif replacement_mode in {"same-path", "new-bridge"}:
             owner.close()
             db_path.unlink()
             replacement = SessionDB(db_path)
@@ -2318,6 +2319,10 @@ def test_event_bridge_restart_scopes_cutoff_to_current_database(
             os.replace(replacement_path, db_path)
             assert db_path.stat().st_ino != old_identity
             expected_message_id = "1"
+
+        if replacement_mode == "new-bridge":
+            bridge = mcp_serve.EventBridge()
+            original_poll_once = bridge._poll_once
 
         second_poll_entered = threading.Event()
         release_second_poll = threading.Event()

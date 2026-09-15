@@ -181,6 +181,11 @@ def _linux_watch_lost(poller, stdin_fd: int) -> bool:
         return True
 
 
+_LINUX_HARNESS_TEST = Path("tests") / "test_run_tests_parallel.py"
+# ponytail: one-file harness exception; widen the predicate if another
+# nested-runner integration file needs host systemd-run.
+
+
 def _linux_payload_environment(environment: dict[str, str]) -> dict[str, str]:
     """Drop user-session bus coordinates from the contained pytest env."""
     return {
@@ -188,6 +193,21 @@ def _linux_payload_environment(environment: dict[str, str]) -> dict[str, str]:
         for key, value in environment.items()
         if key not in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
     }
+
+
+def _linux_is_runner_harness_cmd(cmd: List[str], repo_root: str | Path) -> bool:
+    """True only for this file's pytest. Ordinary probes stay isolated."""
+    try:
+        marker = cmd.index("-m")
+    except ValueError:
+        return False
+    if marker + 2 >= len(cmd) or cmd[marker + 1] != "pytest":
+        return False
+    try:
+        relative = Path(cmd[marker + 2]).resolve().relative_to(Path(repo_root).resolve())
+    except (OSError, ValueError):
+        return False
+    return relative == _LINUX_HARNESS_TEST
 
 
 def _linux_isolated_pytest_cmd(cmd: List[str], path: str | None) -> List[str] | None:
@@ -221,10 +241,16 @@ def _linux_supervise(repo_root: str, completion_path: str, cmd: List[str]) -> in
         return 1
     if not _linux_enable_subreaper():
         return 1
-    payload_env = _linux_payload_environment(environment)
-    isolated = _linux_isolated_pytest_cmd(cmd, payload_env.get("PATH") or environment.get("PATH"))
-    if isolated is None:
-        return 1
+    if _linux_is_runner_harness_cmd(cmd, repo_root):
+        payload_env = dict(environment)
+        isolated = cmd
+    else:
+        payload_env = _linux_payload_environment(environment)
+        isolated = _linux_isolated_pytest_cmd(
+            cmd, payload_env.get("PATH") or environment.get("PATH"),
+        )
+        if isolated is None:
+            return 1
     before_events = _read_linux_resource_events()
     child = subprocess.Popen(isolated, cwd=repo_root, env=payload_env, stdin=subprocess.DEVNULL)
     stdin_fd = sys.stdin.fileno()
@@ -364,7 +390,11 @@ def _spawn_test_process(
         raise
     os.close(watch_r)
     try:
-        payload = json.dumps(_linux_payload_environment(env)).encode("utf-8") + b"\n"
+        payload_env = (
+            env if _linux_is_runner_harness_cmd(cmd, repo_root)
+            else _linux_payload_environment(env)
+        )
+        payload = json.dumps(payload_env).encode("utf-8") + b"\n"
         deadline = deadline or time.monotonic() + _LINUX_CLEANUP_SECONDS
         os.set_blocking(watch_w, False)
         import select

@@ -1352,6 +1352,137 @@ def test_missing_bwrap_fails_closed_without_payload(
     assert not completion.exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux nested-harness policy")
+def test_nested_runner_harness_keeps_host_supervision_without_payload_bus_restore(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Harness pytest may use the user bus; ordinary probe pytest must not.
+
+    Outer bwrap --tmpfs /run plus stripped bus env makes nested systemd-run
+    fail closed (No medium found). Do not restore bus to arbitrary pytest.
+    """
+    runner = _load_runner_module()
+    captured: dict[str, object] = {}
+    repo_root = Path(__file__).resolve().parent.parent
+    harness = Path(__file__).resolve()
+
+    class ImmediateChild:
+        def poll(self) -> int:
+            return 0
+
+        returncode = 0
+
+    def popen(cmd: object, **kwargs: object) -> ImmediateChild:
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        return ImmediateChild()
+
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(runner, "_linux_enable_subreaper", lambda: True)
+    monkeypatch.setattr(
+        runner,
+        "_read_linux_resource_events",
+        lambda: {field: 0 for field in runner._LINUX_RESOURCE_EVENT_FIELDS},
+    )
+    monkeypatch.setattr(runner, "_linux_terminate_and_reap_descendants", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        runner.shutil,
+        "which",
+        lambda name, path=None: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    payload = json.dumps({
+        "PATH": "/usr/bin:/bin",
+        "XDG_RUNTIME_DIR": "/run/user/1001",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1001/bus",
+        "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
+    }) + "\n"
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, payload.encode())
+    os.close(write_fd)
+    stdin_file = os.fdopen(read_fd)
+    monkeypatch.setattr(sys, "stdin", stdin_file)
+    completion = tmp_path / "completion.json"
+    cmd = [sys.executable, "-m", "pytest", str(harness), "-q"]
+    try:
+        rc = runner._linux_supervise(str(repo_root), str(completion), cmd)
+    finally:
+        stdin_file.close()
+    env = captured["env"]
+    child_cmd = captured["cmd"]
+    assert rc == 0
+    assert isinstance(env, dict)
+    assert env.get("XDG_RUNTIME_DIR") == "/run/user/1001"
+    assert env.get("DBUS_SESSION_BUS_ADDRESS") == "unix:path=/run/user/1001/bus"
+    assert isinstance(child_cmd, list)
+    assert child_cmd == cmd
+    assert "--tmpfs" not in child_cmd
+
+
+def test_nested_runner_harness_pipe_keeps_launcher_bus(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Spawn must hand the harness pytest the bus; systemd-run argv stays clean."""
+    if sys.platform != "linux":
+        pytest.skip("Linux nested-harness policy")
+    runner = _load_runner_module()
+    repo_root = Path(__file__).resolve().parent.parent
+    harness = Path(__file__).resolve()
+    captured_argv: list[str] = []
+    captured_launcher: dict[str, str] = {}
+    read_fd = -1
+
+    class FakeClient:
+        def kill(self) -> None:
+            return None
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, None]:
+            return "", None
+
+    def popen(*args: object, **kwargs: object) -> FakeClient:
+        nonlocal read_fd, captured_argv, captured_launcher
+        command = args[0]
+        stdin_fd = kwargs["stdin"]
+        launcher_env = kwargs["env"]
+        assert isinstance(command, list)
+        assert isinstance(stdin_fd, int)
+        assert isinstance(launcher_env, dict)
+        captured_argv = [str(part) for part in command]
+        captured_launcher = {str(key): str(value) for key, value in launcher_env.items()}
+        read_fd = os.dup(stdin_fd)
+        return FakeClient()
+
+    monkeypatch.setattr(runner.shutil, "which", lambda name, path=None: {
+        "systemd-run": "/usr/bin/systemd-run",
+        "env": "/usr/bin/env",
+    }.get(name))
+    monkeypatch.setattr(runner.subprocess, "Popen", popen)
+
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "XDG_RUNTIME_DIR": "/run/user/1001",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1001/bus",
+        "DIRECT_RUNNER_SECRET": "harness-pipe-secret",
+    }
+    cmd = [sys.executable, "-m", "pytest", str(harness), "-q"]
+    completion = tmp_path / "completion.json"
+    proc, watch_w = runner._spawn_test_process(
+        cmd, repo_root, env, completion, time.monotonic() + 2,
+    )
+    assert proc is not None
+    if watch_w is not None:
+        os.close(watch_w)
+    raw = os.read(read_fd, 65536)
+    os.close(read_fd)
+    payload = json.loads(raw.decode())
+    assert payload["XDG_RUNTIME_DIR"] == "/run/user/1001"
+    assert payload["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1001/bus"
+    assert payload["DIRECT_RUNNER_SECRET"] == "harness-pipe-secret"
+    assert set(captured_launcher) <= {"XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"}
+    assert "DIRECT_RUNNER_SECRET" not in captured_launcher
+    assert "harness-pipe-secret" not in " ".join(captured_argv)
+
+
 def test_typed_exit4_for_existing_file_can_retry_to_green(tmp_path: Path) -> None:
     """Preserve the intentional loaded-runner exit-4 retry contract."""
     proc, attempts = _run_fake_systemd_retry(tmp_path, "typed-exit4")

@@ -795,7 +795,8 @@ def _out_of_tree_collection_bounds(file: Path, repo_root: Path) -> List[str]:
     try:
         file.resolve().relative_to(repo_root.resolve())
     except ValueError:
-        root = str(file.resolve().parent)
+        # Pair argv with str(file); resolve() here would miss symlink TMPDIR.
+        root = str(file.parent)
         return [f"--rootdir={root}", f"--confcutdir={root}"]
     return []
 

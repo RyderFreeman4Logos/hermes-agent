@@ -823,6 +823,55 @@ def test_out_of_tree_probe_does_not_collect_host_tmp(
         shutil.rmtree(probe_root, ignore_errors=True)
 
 
+def test_out_of_tree_symlink_probe_file_matches_collection_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pytest file and --rootdir/--confcutdir must share one path form.
+
+    A lexical symlink probe (TMPDIR=$HOME/tmp on this host) is not under
+    file.resolve().parent, so mixed argv still walks an ancestor conftest.
+    """
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    (physical / "conftest.py").write_text(
+        "def pytest_configure(config):\n"
+        "    raise RuntimeError('WALKED_ANCESTOR_CONFTEST')\n",
+        encoding="utf-8",
+    )
+    probe = physical / "probe"
+    probe.mkdir()
+    test_file = probe / "test_smoke.py"
+    test_file.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    link_root = tmp_path / "link"
+    link_root.symlink_to(physical)
+    lexical_file = link_root / "probe" / "test_smoke.py"
+    assert str(lexical_file) != str(lexical_file.resolve())
+
+    runner = _load_runner_module()
+    repo_root = Path(__file__).resolve().parent.parent
+    captured: dict[str, list[str]] = {}
+
+    def fake_spawn(cmd, _repo_root, _env, completion_path=None, deadline=None):
+        captured["cmd"] = list(cmd)
+        raise RuntimeError("CAPTURED_SPAWN")
+
+    monkeypatch.setattr(runner, "_spawn_test_process", fake_spawn)
+    with pytest.raises(RuntimeError, match="CAPTURED_SPAWN"):
+        runner._run_one_file_once(lexical_file, ["-q"], repo_root, 30.0)
+
+    cmd = captured["cmd"]
+    assert cmd[1:3] == ["-m", "pytest"]
+    file_arg = Path(cmd[3])
+    rootdir = next(a.split("=", 1)[1] for a in cmd if a.startswith("--rootdir="))
+    confcutdir = next(a.split("=", 1)[1] for a in cmd if a.startswith("--confcutdir="))
+    assert "--noconftest" not in cmd
+    assert rootdir == confcutdir
+    file_arg.relative_to(rootdir)
+
+    proc = _run_runner(lexical_file.parent)
+    assert proc.returncode == 0, proc.stdout
+    assert "WALKED_ANCESTOR_CONFTEST" not in proc.stdout
+    assert "1✓" in proc.stdout or "1 tests passed" in proc.stdout, proc.stdout
 
 
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:

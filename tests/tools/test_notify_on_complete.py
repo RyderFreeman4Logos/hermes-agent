@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
+    format_process_notification,
 )
 
 
@@ -34,6 +35,9 @@ def _make_session(
     exit_code=None,
     output="",
     notify_on_complete=False,
+    delegated_child=False,
+    completion_reason="exited",
+    termination_source="",
 ) -> ProcessSession:
     s = ProcessSession(
         id=sid,
@@ -44,6 +48,9 @@ def _make_session(
         exit_code=exit_code,
         output_buffer=output,
         notify_on_complete=notify_on_complete,
+        delegated_child=delegated_child,
+        completion_reason=completion_reason,
+        termination_source=termination_source,
     )
     return s
 
@@ -129,6 +136,85 @@ class TestCompletionQueue:
         assert len(completions) == 3
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
+
+    @pytest.mark.parametrize(
+        ("exit_code", "completion_reason", "termination_source", "visible"),
+        (
+            (0, "exited", "", False),
+            (1, "exited", "", True),
+            (-1, "lost", "backend_lost", True),
+            (-15, "killed", "process.kill", True),
+        ),
+        ids=("success", "nonzero", "lost", "killed"),
+    )
+    def test_delegated_child_completion_suppresses_only_routine_success(
+        self, registry, exit_code, completion_reason, termination_source, visible
+    ):
+        session = _make_session(
+            notify_on_complete=True,
+            delegated_child=True,
+            output="child output",
+            exit_code=exit_code,
+            completion_reason=completion_reason,
+            termination_source=termination_source,
+        )
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        notifications = registry.drain_notifications()
+        assert (len(notifications) == 1) is visible
+        assert registry._finished[session.id].output_buffer == "child output"
+
+    def test_parent_owned_success_still_notifies(self, registry):
+        session = _make_session(notify_on_complete=True, output="done", exit_code=0)
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        assert len(registry.drain_notifications()) == 1
+
+    @staticmethod
+    def _canonical_delegated_child_completion():
+        return {
+            "type": "completion",
+            "session_id": "proc_child",
+            "command": "echo child",
+            "started_at": 1.0,
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "delegated_child": True,
+        }
+
+    def test_routine_delegated_child_suppresses_canonical_envelope(self):
+        assert format_process_notification(self._canonical_delegated_child_completion()) is None
+
+    @pytest.mark.parametrize(
+        ("name", "changes", "missing_fields"),
+        (
+            ("boolean_exit", {"exit_code": False}, ()),
+            ("float_exit", {"exit_code": 0.0}, ()),
+            ("missing_reason", {}, ("completion_reason",)),
+            ("unknown_reason", {"completion_reason": "unknown"}, ()),
+            ("missing_termination_source", {}, ("termination_source",)),
+            ("unknown_termination_source", {"termination_source": "unknown"}, ()),
+            ("missing_session_id", {}, ("session_id",)),
+            ("empty_session_id", {"session_id": ""}, ()),
+            ("missing_command", {}, ("command",)),
+            ("empty_command", {"command": ""}, ()),
+            ("missing_started_at", {}, ("started_at",)),
+            ("boolean_started_at", {"started_at": True}, ()),
+            ("unknown_provenance", {"delegated_child": None}, ()),
+        ),
+    )
+    def test_malformed_delegated_child_completion_fails_open(
+        self, name, changes, missing_fields
+    ):
+        event = {**self._canonical_delegated_child_completion(), **changes}
+        for field in missing_fields:
+            event.pop(field)
+        assert format_process_notification(event) is not None, name
 
 
 # =========================================================================
@@ -304,9 +390,11 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     config = _silent_bg_base_config(tmp_path)
+    spawn_kwargs = []
     dummy_env = SimpleNamespace(env={})
 
     def fake_spawn_local(**kwargs):
+        spawn_kwargs.append(kwargs)
         return SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
@@ -326,6 +414,7 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    setattr(terminal_tool_module, "_test_spawn_kwargs", spawn_kwargs)
     return terminal_tool_module
 
 
@@ -353,6 +442,30 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
     assert "silent" in hint.lower() or "no way to learn" in hint.lower(), (
         "Hint must explain the failure mode, not just suggest the fix"
     )
+
+
+def test_delegated_child_background_process_is_not_parent_scoped(monkeypatch, tmp_path):
+    """A native child may manage its process, but cannot wake its parent."""
+    from agent.delegation_context import delegated_child_context
+    from tools import approval
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(approval, "get_current_session_key", lambda default="": "parent-session")
+    try:
+        with delegated_child_context("child-session"):
+            result = json.loads(tt.terminal_tool(
+                command="false", background=True, notify_on_complete=True,
+                task_id="child-task",
+            ))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    spawn = tt._test_spawn_kwargs[-1]
+    assert spawn["session_key"] == ""
+    assert spawn["task_id"] == "child-task"
+    assert spawn.get("notify_on_complete") is not True
+    assert result.get("notify_on_complete") is not True
 
 
 def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):

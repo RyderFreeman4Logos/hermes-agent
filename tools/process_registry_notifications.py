@@ -341,6 +341,10 @@ def _completion_status(evt: dict) -> str:
 
 def format_process_notification(evt: dict) -> "str | None":
     """Format a completion_queue event into an ``[IMPORTANT: ...]`` message."""
+    from tools.process_registry import ProcessRegistry
+
+    if ProcessRegistry._is_routine_delegated_child_completion(evt):
+        return None
     evt_type = evt.get("type", "completion")
     # watch_disabled and overflow events carry their own human-readable `message`;
     # otherwise overflow events would fall through to the completion formatter as a

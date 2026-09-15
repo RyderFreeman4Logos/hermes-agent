@@ -267,3 +267,52 @@ def test_lean_digest_workers_reuse_selected_codex_route_settings():
         assert call["route_info"] == {
             "fallback_label": "fallback_chain[1](openai-codex)"
         }
+
+
+def test_generic_aux_error_advances_across_configured_codex_hops():
+    route_info = {}
+    route = aux._LadderRoute(
+        MagicMock(), "classifier", "", False, "https://primary.invalid/v1",
+        "explicit-provider", "primary-model", None, None, None, "primary-model", None, route_info,
+    )
+    first = (MagicMock(), "codex-one", "fallback_chain[0](openai-codex)")
+    second = (MagicMock(), "codex-two", "fallback_chain[1](openai-codex)")
+
+    with patch.object(aux, "_try_configured_fallback_chain", side_effect=[first, second]):
+        ladder = aux._ladder_provider_fallback(ValueError("provider runtime failed"), route)
+        step = next(ladder)
+        assert step.args[2] == first[2]
+        step = ladder.throw(ValueError("first fallback candidate failed"))
+        assert step.args[2] == second[2]
+        with pytest.raises(StopIteration) as completed:
+            ladder.send("served by second codex hop")
+
+    assert completed.value.value == "served by second codex hop"
+
+
+def test_generic_aux_error_never_admits_non_codex_destination():
+    route = aux._LadderRoute(
+        MagicMock(), "classifier", "", False, "https://primary.invalid/v1",
+        "explicit-provider", "primary-model", None, None, None, "primary-model", None, {},
+    )
+    with patch.object(aux, "_try_configured_fallback_chain", return_value=(None, None, "")) as chain, \
+         patch.object(aux, "_try_main_agent_model_fallback", return_value=(None, None, "")):
+        ladder = aux._ladder_provider_fallback(ValueError("provider runtime failed"), route)
+        with pytest.raises(StopIteration) as completed:
+            next(ladder)
+
+    assert completed.value.value is None
+    chain.assert_called_once()
+
+
+def test_auxiliary_safety_or_approval_denial_does_not_fallback():
+    route = aux._LadderRoute(
+        MagicMock(), "classifier", "", False, "https://primary.invalid/v1",
+        "explicit-provider", "primary-model", None, None, None, "primary-model", None, {},
+    )
+    for message in ("content policy blocked this request", "approval denied by operator"):
+        with patch.object(aux, "_try_configured_fallback_chain") as chain:
+            ladder = aux._ladder_provider_fallback(ValueError(message), route)
+            with pytest.raises(StopIteration):
+                next(ladder)
+        chain.assert_not_called()

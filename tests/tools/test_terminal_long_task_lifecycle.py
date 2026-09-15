@@ -54,8 +54,8 @@ class TestSpawnLocalNotifyArming:
         assert registry.completion_queue.get_nowait()["session_id"] == session.id
 
 
-def _silent_bg_base_config(tmp_path):
-    return {
+def _silent_bg_base_config(tmp_path, extra=None):
+    cfg = {
         "env_type": "local",
         "docker_image": "",
         "singularity_image": "",
@@ -65,16 +65,19 @@ def _silent_bg_base_config(tmp_path):
         "timeout": 180,
         "auto_background_timeout_threshold": 200,
     }
+    if extra:
+        cfg.update(extra)
+    return cfg
 
 
-def _silent_bg_harness(monkeypatch, tmp_path):
+def _silent_bg_harness(monkeypatch, tmp_path, extra=None):
     """Common test fixture: patch enough of terminal_tool to spawn a fake
     background process and capture the JSON result the agent sees."""
     import tools.terminal_tool as terminal_tool_module
     from tools import process_registry as process_registry_module
     from types import SimpleNamespace
 
-    config = _silent_bg_base_config(tmp_path)
+    config = _silent_bg_base_config(tmp_path, extra)
     spawn_kwargs = []
     dummy_env = SimpleNamespace(
         env={},
@@ -109,10 +112,10 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     return terminal_tool_module
 
 
-def _call_terminal_handler(monkeypatch, tmp_path, **args):
+def _call_terminal_handler(monkeypatch, tmp_path, extra=None, **args):
     from gateway import session_context
 
-    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    tt = _silent_bg_harness(monkeypatch, tmp_path, extra)
     monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
     try:
         result = json.loads(tt._handle_terminal({"command": "printf done", **args}))
@@ -208,4 +211,80 @@ def test_omitted_background_short_explicit_timeout_stays_foreground(monkeypatch,
     tt, result = _call_terminal_handler(monkeypatch, tmp_path, timeout=30)
 
     assert result["error"] is None
+    tt._test_env.execute.assert_called_once()
+
+
+def test_config_default_auto_background_timeout_threshold_is_200():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["terminal"]["auto_background_timeout_threshold"] == 200
+
+
+def test_auto_background_timeout_threshold_loader_defaults_to_200(monkeypatch):
+    import tools.terminal_tool as terminal_tool_module
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"terminal": {}},
+    )
+    assert terminal_tool_module._auto_background_timeout_threshold() == 200
+
+
+def test_omitted_background_timeout_exactly_at_threshold_stays_foreground(
+    monkeypatch, tmp_path
+):
+    tt, result = _call_terminal_handler(monkeypatch, tmp_path, timeout=200)
+
+    assert result["error"] is None
+    assert result.get("session_id") is None
+    tt._test_env.execute.assert_called_once()
+
+
+@pytest.mark.parametrize("timeout", [201, 300, 600])
+def test_omitted_background_timeout_above_threshold_auto_promotes(
+    monkeypatch, tmp_path, timeout
+):
+    tt, result = _call_terminal_handler(monkeypatch, tmp_path, timeout=timeout)
+
+    assert result.get("session_id") == "proc_silent_test"
+    assert result.get("notify_on_complete") is True
+    assert not tt._test_env.execute.called
+
+
+def test_custom_threshold_just_over_auto_promotes(monkeypatch, tmp_path):
+    tt, result = _call_terminal_handler(
+        monkeypatch,
+        tmp_path,
+        extra={"auto_background_timeout_threshold": 100},
+        timeout=150,
+    )
+
+    assert result.get("session_id") == "proc_silent_test"
+    assert result.get("notify_on_complete") is True
+    assert not tt._test_env.execute.called
+
+
+def test_custom_threshold_exact_stays_foreground(monkeypatch, tmp_path):
+    tt, result = _call_terminal_handler(
+        monkeypatch,
+        tmp_path,
+        extra={"auto_background_timeout_threshold": 100},
+        timeout=100,
+    )
+
+    assert result["error"] is None
+    assert result.get("session_id") is None
+    tt._test_env.execute.assert_called_once()
+
+
+def test_custom_threshold_at_official_cap_keeps_below_foreground(monkeypatch, tmp_path):
+    tt, result = _call_terminal_handler(
+        monkeypatch,
+        tmp_path,
+        extra={"auto_background_timeout_threshold": 600},
+        timeout=300,
+    )
+
+    assert result["error"] is None
+    assert result.get("session_id") is None
     tt._test_env.execute.assert_called_once()

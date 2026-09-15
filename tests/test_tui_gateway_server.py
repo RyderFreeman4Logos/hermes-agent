@@ -5091,6 +5091,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_args: False)
     monkeypatch.setattr(server, "_teardown_session", _slow_teardown)
     server._sessions["slow-orphan"] = _session(
         transport=server._detached_ws_transport,

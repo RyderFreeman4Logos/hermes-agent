@@ -160,7 +160,7 @@ def _linux_terminate_and_reap_descendants(
                 return 1
             for child_pid in children:
                 try:
-                    os.kill(int(child_pid), signal.SIGKILL)
+                    os.kill(int(child_pid), signal.SIGKILL)  # windows-footgun: ok
                 except ProcessLookupError:
                     pass
         except (OSError, ValueError, ChildProcessError):

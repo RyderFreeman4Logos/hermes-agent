@@ -7757,8 +7757,11 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     # (429 + "too many tokens per day") must fall back just like a 402 credit error.
     # Rate limits are included: after retries are exhausted, a 429 means the provider is at capacity. See
     # #52228. See #26803: daily token quota must fall back like a 402 credit error.
+    error_text = str(first_err).lower()
+    if any(marker in error_text for marker in ("content policy", "safety filter", "approval denied")):
+        return None
     is_auto = resolved_provider in {"auto", "", None}
-    reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
+    reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), "provider execution error")
     is_capacity_error = any(
         predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")
     task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
@@ -7766,7 +7769,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     explicit_auth_with_task_chain = (
         reason == "auth error" and not is_auto and has_task_fallback_chain
     )
-    if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
+    if reason == "provider execution error" and not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
         return None
     if reason == "payment error":
         # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip
@@ -7799,11 +7802,25 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
         route_info=route.route_info)
     attempted = {fb_label} if fb_label else set()
+
+    def _candidate_response(step: _LadderStep):
+        try:
+            return (yield step)
+        except Exception as candidate_error:
+            candidate_text = str(candidate_error).lower()
+            if any(marker in candidate_text for marker in ("content policy", "safety filter", "approval denied")):
+                raise
+            logger.warning(
+                "Auxiliary %s%s: fallback candidate failed (%s); advancing the configured chain",
+                task or "call", tag, type(candidate_error).__name__,
+            )
+            return None
+
     while fb_client is not None:
         _record_route_info(
             route.route_info, _fallback_provider_from_label(fb_label), fb_model, fallback_label=fb_label,
         )
-        fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
+        fb_resp = yield from _candidate_response(_LadderStep("fallback", (fb_client, fb_model, fb_label)))
         if fb_resp is not None:
             return fb_resp
         if _is_codex_provider(_fallback_provider_from_label(fb_label)):
@@ -7848,7 +7865,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         _record_route_info(
             route.route_info, _fallback_provider_from_label(fb_label), fb_model, fallback_label=fb_label,
         )
-        fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
+        fb_resp = yield from _candidate_response(_LadderStep("fallback", (fb_client, fb_model, fb_label)))
         if fb_resp is not None:
             return fb_resp
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(

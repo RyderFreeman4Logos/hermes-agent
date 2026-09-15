@@ -299,3 +299,83 @@ def test_chat_profile_and_legacy_first_send_coalesce_timing_without_mutation(mon
     assert sent[0]["content"] == "Stable instructions"
     assert sent[1]["content"].startswith("chat first send")
     assert sent[1]["content"].count("[Agent loop timing]") == 1
+
+
+class _ClassifiedPolicyError(Exception):
+    """Local non-retryable error that follows the configured fallback branch."""
+
+
+@pytest.mark.parametrize("fallback_mode", [
+    "anthropic_messages", "bedrock_converse", "codex_responses",
+])
+def test_chat_policy_fallback_keeps_timing_at_each_native_send(monkeypatch, fallback_mode):
+    """W4: an actual Chat retry restart preserves its event at every native edge."""
+    agent = _make_local_agent(
+        monkeypatch, api_mode="chat_completions", provider="unknown-profile", model="chat-test",
+    )
+    agent._fallback_chain = [{
+        "provider": "custom", "model": "fallback-test", "api_key": "fallback-key",
+        "base_url": "https://fallback.invalid/v1", "api_mode": fallback_mode,
+    }]
+    agent._fallback_index = 0
+    agent.client = MagicMock()
+    primary_client = agent.client
+    primary_client.chat.completions.create.side_effect = _ClassifiedPolicyError(
+        "This content was flagged for possible cybersecurity risk."
+    )
+    captured = []
+    resolved_client = MagicMock()
+    resolved_client.base_url = "https://fallback.invalid/v1"
+    resolved_client.api_key = "fallback-key"
+
+    if fallback_mode == "anthropic_messages":
+        native_client = MagicMock()
+        native_client.messages.create.side_effect = lambda **kwargs: (
+            captured.append(copy.deepcopy(kwargs)) or _completed_anthropic_response("fallback done")
+        )
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.build_anthropic_client", lambda *_args, **_kwargs: native_client,
+        )
+    elif fallback_mode == "bedrock_converse":
+        native_client = MagicMock()
+        native_client.converse.side_effect = lambda **kwargs: (
+            captured.append(copy.deepcopy(kwargs)) or _completed_bedrock_response("fallback done")
+        )
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._get_bedrock_runtime_client", lambda _region: native_client,
+        )
+    else:
+        resolved_client.responses.create.side_effect = lambda **kwargs: (
+            captured.append(copy.deepcopy(kwargs)) or _completed_responses_stream("fallback done")
+        )
+
+    monkeypatch.setattr(
+        "agent.chat_completion_helpers._fallback_entry_unavailable_without_network", lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client", lambda *_args, **_kwargs: (resolved_client, "fallback-test"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_normalize.normalize_model_for_provider", lambda model, _provider: model,
+    )
+
+    result = agent.run_conversation("retry on native fallback")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "fallback done"
+    # The public result counts completed calls only; both physical sends are
+    # instead established directly at their SDK boundaries below.
+    assert result["api_calls"] == 1
+    assert primary_client.chat.completions.create.call_count == 1
+    assert agent._fallback_activated is True
+    assert len(captured) == 1
+    timing = [row for row in result["messages"] if row.get("display_kind") == "hidden"]
+    assert len(timing) == 1
+    timing_text = timing[0]["content"]
+    primary_wire = primary_client.chat.completions.create.call_args.kwargs["messages"]
+    primary_matching = [row for row in primary_wire if timing_text in _wire_text(row)]
+    assert len(primary_matching) == 1
+    assert primary_matching[0]["role"] == "user"
+    matching = [row for row in _wire_rows(captured[0]) if timing_text in _wire_text(row)]
+    assert len(matching) == 1
+    assert matching[0]["role"] == "user"

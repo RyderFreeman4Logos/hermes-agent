@@ -1435,7 +1435,7 @@ class TestKillProcess:
             registry, monkeypatch, tmp_path, tail="FINAL-P1-41", waits_for_signal=False,
         )
 
-        def dead_probe_then_raise(pid, expected_start, on_direct_signal=None):
+        def dead_probe_then_raise(pid, expected_start, on_direct_signal=None, **_kwargs):
             assert _wait_until(lambda: session.process.poll() is not None), "direct child did not exit"
             assert not session._completion_event.is_set(), "reader was not held by its inherited pipe"
             raise RuntimeError("post-death host probe failure")
@@ -1474,17 +1474,56 @@ class TestKillProcess:
             assert result == {"status": "error", "error": "post-signal termination adapter failure"}
             assert session.id not in registry._completion_consumed
             assert session._completion_event.wait(timeout=3), "reader did not publish the delivered tail"
+            assert session.id not in registry._completion_consumed
             assert session.output_buffer.endswith("FINAL-P2-41\n")
             assert (session.exit_code, session.completion_reason, session.termination_source) == (0, "killed", "test.p2")
-            event = registry.completion_queue.get_nowait()
+            drained = registry.drain_notifications(skip_poll_observed=False)
+            assert len(drained) == 1
+            event, _text = drained[0]
             assert event["output"].endswith("FINAL-P2-41\n")
             assert (event["exit_code"], event["completion_reason"], event["termination_source"]) == (0, "killed", "test.p2")
-            assert registry.completion_queue.empty()
+            assert registry.drain_notifications(skip_poll_observed=False) == []
             repeat = registry.kill_process(session.id, source="test.p2", consume_output=False)
             assert repeat["status"] == "already_exited"
             assert repeat["output"].endswith("FINAL-P2-41\n")
-            assert registry.completion_queue.empty()
+            assert registry.drain_notifications(skip_poll_observed=False) == []
         finally:
+            self._reap_child(session.process)
+
+    @pytest.mark.linux_only
+    def test_pipe_stopping_does_not_consume_reader_completion(self, registry, monkeypatch, tmp_path):
+        """A stopping result has not returned the reader's final output."""
+        entered_finish = threading.Event()
+        release_finish = threading.Event()
+        original_finish = registry._finish_reader
+
+        def held_finish(*args, **kwargs):
+            entered_finish.set()
+            assert release_finish.wait(7)
+            return original_finish(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "_finish_reader", held_finish)
+        session = self._spawn_pipe_parent_with_detached_writer(
+            registry, monkeypatch, tmp_path, tail="FINAL-STOPPING-41", waits_for_signal=True,
+        )
+        try:
+            result = registry.kill_process(session.id, source="test.stopping", consume_output=True)
+            assert entered_finish.is_set()
+            assert result["status"] == "stopping"
+            assert session.id not in registry._completion_consumed
+            release_finish.set()
+            assert session._completion_event.wait(timeout=3)
+            assert session.id not in registry._completion_consumed
+            drained = registry.drain_notifications(skip_poll_observed=False)
+            assert len(drained) == 1
+            event, _text = drained[0]
+            assert event["output"].endswith("FINAL-STOPPING-41\n")
+            assert (event["exit_code"], event["completion_reason"], event["termination_source"]) == (
+                0, "killed", "test.stopping"
+            )
+            assert registry.drain_notifications(skip_poll_observed=False) == []
+        finally:
+            release_finish.set()
             self._reap_child(session.process)
 
     @pytest.mark.linux_only
@@ -1497,7 +1536,7 @@ class TestKillProcess:
         )
         observed_death = threading.Event()
 
-        def observe_death_then_raise(pid, expected_start, on_direct_signal=None):
+        def observe_death_then_raise(pid, expected_start, on_direct_signal=None, **_kwargs):
             assert _wait_until(lambda: session.process.poll() is not None), "observer never saw actual direct-child death"
             observed_death.set()
             if reader_finishes_first:
@@ -1926,11 +1965,12 @@ class TestKillProcess:
         failed_done = threading.Event()
         results = {}
 
-        def terminate(_pid, _start, on_direct_signal=None):
+        def terminate(_pid, _start, on_direct_signal=None, **_kwargs):
             if threading.current_thread().name == "success-kill":
                 success_entered.set()
                 assert failed_done.wait(2)
                 on_direct_signal()
+                session._reader_settlement_ready.set()
                 registry._finish_exited(session, 0)
                 return
             assert success_entered.wait(2)
@@ -1954,6 +1994,91 @@ class TestKillProcess:
         assert results["failed"]["status"] == "error"
         assert session.termination_source == "delivered"
         assert registry.completion_queue.get_nowait()["termination_source"] == "delivered"
+
+    @pytest.mark.linux_only
+    @pytest.mark.parametrize("signal_path", ["psutil", "posix_fallback"])
+    def test_direct_signal_and_provenance_are_atomic_for_reader_publication(
+        self, registry, monkeypatch, tmp_path, signal_path
+    ):
+        """The real signal and its provenance are one terminal-lock operation."""
+        import psutil
+
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        saved = []
+        monkeypatch.setattr(
+            "tools.process_registry.save_completed_result",
+            lambda session: saved.append((
+                session.exit_code, session.completion_reason, session.termination_source,
+                session.output_buffer,
+            )),
+        )
+        code = (
+            "import signal,time\n"
+            "def finish(_signum, _frame):\n"
+            " raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, finish)\n"
+            "print('ATOMIC-READY-41', flush=True)\n"
+            "while True: time.sleep(0.05)\n"
+        )
+        session = registry.spawn_local(
+            f"exec {shlex.quote(sys.executable)} -c {shlex.quote(code)}", cwd=str(tmp_path)
+        )
+        session.notify_on_complete = True
+        assert _wait_until(lambda: "ATOMIC-READY-41" in session.output_buffer)
+        if signal_path == "posix_fallback":
+            original_process = psutil.Process
+
+            def inaccessible_parent(pid):
+                if pid == session.pid:
+                    raise OSError("psutil unavailable")
+                return original_process(pid)
+
+            monkeypatch.setattr(psutil, "Process", inaccessible_parent)
+
+        delivered = threading.Event()
+        allow_record = threading.Event()
+        reader_attempted = threading.Event()
+        original_terminate = registry._terminate_host_pid
+        original_finish_exited = registry._finish_exited
+
+        def observe_reader(*args, **kwargs):
+            reader_attempted.set()
+            return original_finish_exited(*args, **kwargs)
+
+        def hold_between_signal_and_record(pid, expected_start, on_direct_signal=None, **kwargs):
+            def held_record(*callback_args):
+                delivered.set()
+                assert allow_record.wait(3)
+                on_direct_signal(*callback_args)
+
+            return original_terminate(pid, expected_start, held_record, **kwargs)
+
+        monkeypatch.setattr(registry, "_finish_exited", observe_reader)
+        monkeypatch.setattr(registry, "_terminate_host_pid", hold_between_signal_and_record)
+        result = {}
+        killer = threading.Thread(target=lambda: result.update(
+            registry.kill_process(session.id, source=f"test.atomic.{signal_path}", consume_output=False)
+        ))
+        killer.start()
+        try:
+            assert delivered.wait(2), "real direct signal was not delivered"
+            assert reader_attempted.wait(2), "reader did not attempt terminal publication"
+            published_before_record = session._completion_event.is_set()
+        finally:
+            allow_record.set()
+            killer.join(timeout=3)
+            self._reap_child(session.process)
+
+        assert not killer.is_alive()
+        assert not published_before_record
+        assert result["status"] == "killed"
+        expected = (0, "killed", f"test.atomic.{signal_path}")
+        assert (session.exit_code, session.completion_reason, session.termination_source) == expected
+        assert saved == [(*expected, session.output_buffer)]
+        event = registry.completion_queue.get_nowait()
+        assert (event["exit_code"], event["completion_reason"], event["termination_source"]) == expected
+        assert event["output"].endswith("ATOMIC-READY-41\n")
+        assert registry.completion_queue.empty()
 
     def test_pipe_stopping_result_still_stops_owned_scope(self, registry, monkeypatch):
         """R5 bounded-stopping return cannot bypass its cgroup obligation."""
@@ -2006,7 +2131,14 @@ class TestKillProcess:
     ):
         """R8: poll/wait cannot publish while a signalled reader owns cutoff."""
         monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
-        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        saved = []
+        monkeypatch.setattr(
+            "tools.process_registry.save_completed_result",
+            lambda session: saved.append((
+                session.exit_code, session.completion_reason, session.termination_source,
+                session.output_buffer,
+            )),
+        )
         entered_finish = threading.Event()
         release_finish = threading.Event()
         original_finish = registry._finish_reader
@@ -2037,20 +2169,40 @@ class TestKillProcess:
         observe = registry.poll if observer == "poll" else lambda sid: registry.wait(sid, timeout=2)
         poller = threading.Thread(target=lambda: observer_result.update(observe(session.id)))
         poller.start()
-        time.sleep(0.1)
-        assert poller.is_alive(), "poll stole terminal ownership before the reader cutoff"
-        release_finish.set()
-        poller.join(timeout=2)
-        killer.join(timeout=2)
+        try:
+            published_before_owner = session._completion_event.wait(timeout=1.0)
+            observer_returned_before_owner = not poller.is_alive()
+            observer_marked_exit = session.exited
+            observer_queued_completion = not registry.completion_queue.empty()
+        finally:
+            release_finish.set()
+            poller.join(timeout=3)
+            killer.join(timeout=3)
+            self._reap_child(session.process)
+
         assert not poller.is_alive()
         assert not killer.is_alive()
+        assert not published_before_owner
+        assert not observer_marked_exit
+        assert not observer_queued_completion
+        if observer == "poll":
+            assert observer_returned_before_owner
+            assert observer_result["status"] == "running"
+            observer_result = registry.poll(session.id)
+        else:
+            assert not observer_returned_before_owner
         assert observer_result["status"] == "exited"
-        assert (session.exit_code, session.completion_reason, session.termination_source) == (
+        expected = (
             0, "killed", "test.reader.owner"
         )
+        assert (session.exit_code, session.completion_reason, session.termination_source) == expected
         assert "final-tail" in observer_result.get("output", observer_result.get("output_preview", ""))
         assert kill_result["termination_source"] == "test.reader.owner"
-        assert registry.completion_queue.qsize() == 1
+        assert saved == [(*expected, session.output_buffer)]
+        event = registry.completion_queue.get_nowait()
+        assert (event["exit_code"], event["completion_reason"], event["termination_source"]) == expected
+        assert event["output"].endswith("final-tail\n")
+        assert registry.completion_queue.empty()
 
 
 # =========================================================================

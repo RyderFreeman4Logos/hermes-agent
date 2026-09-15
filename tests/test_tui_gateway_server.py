@@ -7083,7 +7083,8 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, *, turn_origin):
+        assert turn_origin == "background_completion"
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
 
@@ -7192,7 +7193,9 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, *, turn_origin: delivered.append(
+            (text, turn_origin)
+        ),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -7233,7 +7236,9 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, *, turn_origin: delivered.append(
+            (text, turn_origin)
+        ),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -7299,7 +7304,9 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, *, turn_origin: delivered.append(
+            (text, turn_origin)
+        ),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -7327,7 +7334,8 @@ def test_notification_poller_delivers_owned_events(
         assert len(status_calls) == 1
         assert status_calls[0][2]["kind"] == "process"
         assert len(delivered) == 1
-        assert "proc_mine" in delivered[0]
+        assert "proc_mine" in delivered[0][0]
+        assert delivered[0][1] == "background_completion"
     finally:
         server._sessions.pop("sid_a", None)
         while not process_registry.completion_queue.empty():
@@ -18457,10 +18465,12 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     from tools.process_registry import process_registry
 
     turns = []
+    origins = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, *, turn_origin):
         turns.append(text)
+        origins.append(turn_origin)
         with session["history_lock"]:
             session["running"] = False
 
@@ -18495,6 +18505,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         assert "READY on port 8000" in status_text
         assert "READY on port 9000" in status_text
         assert len(turns) == 3
+        assert origins == ["background_completion"] * 3
     finally:
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():
@@ -22406,3 +22417,544 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+@pytest.mark.parametrize(
+    "provider",
+    ["custom:mp-cpi", "custom:localrouter", "custom:zenmux", "custom:z2", "custom:z1", "custom:deepinfra.man"],
+)
+def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(monkeypatch, provider):
+    import httpx
+    from openai import OpenAI
+
+    from hermes_cli import heartbeat
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    class _Due:
+        def due_prompt(self):
+            return ""
+
+    class _Agent:
+        model = "test-model"
+        api_mode = "chat_completions"
+        base_url = "https://example.invalid/v1"
+        session_id = "stable-session"
+        _openai_transport_kind = "http_chat"
+        _openai_transport_generation = 7
+        _cache_disabled = False
+        _cache_ttl = "5m"
+        max_tokens = 4096
+        request_overrides = {"extra_body": {"route": "stable"}}
+        tools = [{"type": "function", "function": {"name": "must-not-leak"}}]
+        _ephemeral_max_output_tokens = 123
+        _ollama_num_ctx = None
+        openrouter_min_coding_score = None
+        _base_url_lower = base_url
+        _base_url_hostname = "example.invalid"
+        providers_allowed = None
+        providers_ignored = None
+        providers_order = None
+        provider_sort = None
+        provider_require_parameters = False
+        provider_data_collection = None
+
+        def __init__(self):
+            self.provider = provider
+            self.requests = []
+            self.wire = []
+            self._transport = ChatCompletionsTransport()
+
+            def record(request):
+                self.wire.append(json.loads(request.content))
+                return httpx.Response(200, json={
+                    "id": "warm", "object": "chat.completion", "created": 0,
+                    "model": self.model,
+                    "choices": [{
+                        "index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": ""},
+                    }],
+                })
+
+            self.client = OpenAI(
+                api_key="synthetic", base_url=self.base_url,
+                http_client=httpx.Client(transport=httpx.MockTransport(record)),
+            )
+
+        def _interruptible_api_call(self, request):
+            from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+            assert session["running"] is True
+            self.requests.append(request)
+            return _dispatch_nonstreaming_api_request(
+                self, request, make_client=lambda *_args, **_kwargs: self.client)
+
+        def _get_transport(self):
+            return self._transport
+
+        def _prepare_messages_for_non_vision_model(self, messages):
+            return messages
+
+        def _is_qwen_portal(self):
+            return False
+
+        def _is_openrouter_url(self):
+            return False
+
+        def _resolved_api_call_timeout(self):
+            return 17
+
+        def _max_tokens_param(self, _value):
+            raise AssertionError("warm projection must not add a completion budget")
+
+        def _supports_reasoning_extra_body(self):
+            return False
+
+        def _lmstudio_reasoning_options_cached(self):
+            return None
+
+    agent = _Agent()
+    route = f"{provider}:test-model"
+    session = _session(
+        agent=agent,
+        _cache_warm_route=route,
+        _cache_warm_identity=server._tui_cache_warm_identity(agent),
+    )
+    monkeypatch.setattr(heartbeat, "HeartbeatManager", lambda *_args, **_kwargs: _Due())
+
+    server._tui_cache_warm_due(
+        "cache-warm-sid", session, agent, route,
+        session["_cache_warm_identity"],
+    )
+
+    assert agent.requests == [{
+        "model": "test-model",
+        "messages": [],
+        "timeout": 17,
+        "extra_body": {"route": "stable"},
+    }]
+    assert agent._ephemeral_max_output_tokens == 123
+    assert agent.wire == [{
+        "messages": [], "model": "test-model", "route": "stable",
+    }]
+    assert session["running"] is False
+    assert session["history"] == []
+    agent.client.close()
+
+
+@pytest.mark.parametrize("transport_kind", ["provider", "gemini", "moa", None])
+def test_tui_cache_warm_non_http_chat_transport_makes_no_provider_call(monkeypatch, transport_kind):
+    from hermes_cli import heartbeat
+
+    class _Due:
+        def due_prompt(self):
+            raise AssertionError("unsupported route must not consume the due claim")
+
+    agent = types.SimpleNamespace(
+        provider="custom:strict", model="test-model", api_mode="chat_completions",
+        _openai_transport_kind=transport_kind,
+        requests=[], _interruptible_api_call=lambda request: agent.requests.append(request),
+    )
+    session = _session(
+        agent=agent,
+        _cache_warm_route="custom:strict:test-model",
+        _cache_warm_identity=server._tui_cache_warm_identity(agent),
+    )
+    monkeypatch.setattr(heartbeat, "HeartbeatManager", lambda *_args, **_kwargs: _Due())
+
+    server._tui_cache_warm_due(
+        "cache-warm-sid", session, agent, "custom:strict:test-model",
+        session["_cache_warm_identity"],
+    )
+
+    assert agent.requests == []
+    assert session["running"] is False
+
+
+def test_tui_cache_warm_stale_owner_cannot_release_successor(monkeypatch):
+    old = server._notif_claim_turn(_session(), owner="unused")
+    assert old is not None
+    session = _session(running=True, _turn_owner_token=old, _turn_owner_kind="cache_warm")
+    successor = object()
+    session["_turn_owner_token"] = successor
+    session["_turn_owner_kind"] = "user"
+
+    assert server._notif_release_turn(session, old) is False
+    assert session["running"] is True
+    assert session["_turn_owner_token"] is successor
+
+
+def test_tui_cache_warm_stale_runtime_identity_makes_zero_dispatch(monkeypatch):
+    from hermes_cli import heartbeat
+
+    agent = types.SimpleNamespace(
+        provider="custom:z1", model="m", api_mode="chat_completions",
+        base_url="https://old.invalid/v1", session_id="s",
+        _openai_transport_kind="http_chat", _openai_transport_generation=1,
+        requests=[], _interruptible_api_call=lambda request: agent.requests.append(request),
+    )
+    identity = server._tui_cache_warm_identity(agent)
+    session = _session(
+        agent=agent, _cache_warm_route="custom:z1:m", _cache_warm_identity=identity,
+    )
+    agent.base_url = "https://new.invalid/v1"
+    monkeypatch.setattr(
+        heartbeat, "HeartbeatManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale identity must retire before heartbeat access")
+        ),
+    )
+
+    server._tui_cache_warm_due("sid", session, agent, "custom:z1:m", identity)
+
+    assert agent.requests == []
+    assert session["running"] is False
+
+
+def test_tui_cache_warm_interval_honors_disabled_and_numeric_zero(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"prompt_caching": {"cache_ttl": "5m"}})
+    assert server._tui_cache_warm_interval_seconds(types.SimpleNamespace(
+        provider="custom", model="m", _cache_disabled=True, _cache_ttl=None,
+    )) is None
+    assert server._tui_cache_warm_interval_seconds(types.SimpleNamespace(
+        provider="custom", model="m", _cache_disabled=False, _cache_ttl=0,
+    )) == 300
+
+
+def test_prompt_lock_in_rechecks_cache_warm_ownership_atomically():
+    warm_token = object()
+    session = _session(
+        running=True, _turn_owner_token=warm_token, _turn_owner_kind="cache_warm",
+    )
+
+    err, fields, user_token = server._lock_in_submit_turn(
+        "rid", "sid", session, "hello", {}, False, None, None)
+    assert err is None and fields == {} and user_token is None
+    assert session["_turn_owner_token"] is warm_token
+    assert "inflight_turn" not in session
+
+    assert server._notif_release_turn(session, warm_token) is True
+    err, fields, user_token = server._lock_in_submit_turn(
+        "rid", "sid", session, "hello", {}, False, None, None)
+    assert err is None and fields == {} and user_token is not None
+    assert session["_turn_owner_token"] is user_token
+    assert session["inflight_turn"]["user"] == "hello"
+
+
+def test_busy_user_input_queues_instead_of_steering_into_cache_warm(monkeypatch):
+    interrupted = threading.Event()
+
+    class _Agent:
+        _supports_active_turn_redirect = True
+
+        def redirect(self, _text):
+            raise AssertionError("user text must not be redirected into cache warm")
+
+        def interrupt(self):
+            interrupted.set()
+
+    session = _session(
+        agent=_Agent(), running=True, _turn_owner_token=object(),
+        _turn_owner_kind="cache_warm",
+    )
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+
+    response = server._handle_busy_submit("rid", "sid", session, "hello", None)
+
+    assert response["result"]["status"] == "queued"
+    assert session["queued_prompt"]["text"] == "hello"
+    assert interrupted.wait(1)
+
+
+def test_process_completion_batch_submits_background_origin(monkeypatch):
+    import tools.async_delegation as delivery
+    import tools.process_registry_notifications as notifications
+
+    captured = {}
+
+    class _Batch:
+        def __init__(self, _items):
+            pass
+
+        def render(self, _registry):
+            return "process finished"
+
+    monkeypatch.setattr(notifications, "ProcessNotificationBatch", _Batch)
+    monkeypatch.setattr(delivery, "claim_event_delivery", lambda *_args: object())
+    monkeypatch.setattr(delivery, "complete_event_delivery", lambda *_args: None)
+    monkeypatch.setattr(server, "_notif_claim_turn", lambda _session: True)
+    monkeypatch.setattr(
+        server,
+        "_notif_submit",
+        lambda *_args, **kwargs: captured.update(kwargs),
+    )
+
+    server._notif_dispatch_completions(
+        "sid", _session(), [({"type": "completion"}, "done")], object(), None
+    )
+
+    assert captured["turn_origin"] == "background_completion"
+
+
+def test_tui_cache_warm_interval_uses_effective_qwen_ttl(monkeypatch):
+    agent = types.SimpleNamespace(provider="alibaba", model="qwen-max", _cache_ttl="1h")
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    assert server._tui_cache_warm_interval_seconds(agent) == 300
+
+
+def test_tui_cache_warm_user_turn_retains_arm_until_first_provider_response(monkeypatch, tmp_path):
+    class _Timer:
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _Agent:
+        provider = "openai"
+        model = "test-model"
+
+        def __init__(self):
+            self._tui_cache_callback = lambda *_args: None
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, _prompt, **_kwargs):
+            self._tui_cache_callback(
+                "miss", 0, 0, 2_000, {"state": "miss", "pct": 0}
+            )
+            return {"final_response": "reply", "messages": []}
+
+    agent = _Agent()
+    emitted = []
+    timer = _Timer()
+    session = _session(
+        agent=agent,
+        inflight_turn=None,
+        active_session_lease=object(),
+        _cache_warm_timer=timer,
+        _cache_warm_route="openai:test-model",
+        _cache_warm_armed_at=time.monotonic(),
+        _cache_warm_interval=300,
+    )
+    server._sessions["cache-warm-sid"] = session
+    try:
+        _configure_immediate_prompt_run(monkeypatch, tmp_path)
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, session: None)
+        monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+        monkeypatch.setattr(
+            server, "_start_usage_ticker",
+            lambda *_args: (threading.Event(), type("T", (), {"join": lambda self: None})()),
+        )
+        monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+        server._attach_tui_cache_callback(agent, "cache-warm-sid")
+
+        server._run_prompt_submit("rid", "cache-warm-sid", session, "user turn")
+    finally:
+        server._sessions.pop("cache-warm-sid", None)
+
+    assert timer.cancelled is True
+    assert "_cache_warm_previous_arm" not in session
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    assert cache_updates[0]["cache_record"]["classification"] == "cache_cold_idle_under_ttl"
+
+
+def test_tui_cache_warm_failed_user_turn_does_not_classify_next_turn(monkeypatch, tmp_path):
+    class _Timer:
+        def cancel(self):
+            pass
+
+    class _Agent:
+        provider = "openai"
+        model = "test-model"
+
+        def __init__(self):
+            self.turns = 0
+            self._tui_cache_callback = lambda *_args: None
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, _prompt, **_kwargs):
+            self.turns += 1
+            if self.turns == 1:
+                raise RuntimeError("provider failed")
+            self._tui_cache_callback(
+                "no_field", 0, 0, 2_000, {"state": "no_field", "pct": 0}
+            )
+            return {"final_response": "reply", "messages": []}
+
+    agent = _Agent()
+    emitted = []
+    session = _session(
+        agent=agent,
+        inflight_turn=None,
+        active_session_lease=object(),
+        _cache_warm_timer=_Timer(),
+        _cache_warm_route="openai:test-model",
+        _cache_warm_armed_at=time.monotonic(),
+        _cache_warm_interval=300,
+    )
+    server._sessions["cache-warm-sid"] = session
+    try:
+        _configure_immediate_prompt_run(monkeypatch, tmp_path)
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, session: None)
+        monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+        monkeypatch.setattr(
+            server, "_start_usage_ticker",
+            lambda *_args: (threading.Event(), type("T", (), {"join": lambda self: None})()),
+        )
+        monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+        server._attach_tui_cache_callback(agent, "cache-warm-sid")
+
+        server._run_prompt_submit("rid-1", "cache-warm-sid", session, "failed turn")
+        server._run_prompt_submit("rid-2", "cache-warm-sid", session, "next turn")
+    finally:
+        server._sessions.pop("cache-warm-sid", None)
+
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    assert "classification" not in cache_updates[0]["cache_record"]
+
+
+def test_tui_session_warm_arms_once_and_classifies_idle_miss(monkeypatch):
+    from hermes_cli import heartbeat
+
+    class _DB:
+        values = {}
+
+        def get_meta(self, key):
+            return self.values.get(key)
+
+        def set_meta(self, key, value):
+            self.values[key] = value
+
+    class _Timer:
+        timers = []
+
+        def __init__(self, interval, callback, args=()):
+            self.interval = interval
+            self.callback = callback
+            self.args = args
+            self.cancelled = False
+            self.started = False
+            self.timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _Agent:
+        provider = "openai"
+        model = "test-model"
+
+        def __init__(self):
+            self._tui_first_provider_response_record_enabled = False
+            self._tui_first_provider_response_recorded = False
+            self._tui_cache_callback = None
+
+    agent = _Agent()
+    emitted = []
+    session = _session(agent=agent)
+    server._sessions["cache-warm-sid"] = session
+    monkeypatch.setattr(heartbeat, "_get_session_db", lambda: _DB())
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_tui_cache_warm_request", lambda _agent: {"messages": []})
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"prompt_caching": {"cache_ttl": "5m"}})
+    monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+    try:
+        server._attach_tui_cache_callback(agent, "cache-warm-sid")
+        callback = agent._tui_cache_callback
+        assert callable(callback)
+        agent._tui_first_provider_response_record_enabled = True
+        agent._tui_first_provider_response_recorded = False
+        callback("hit", 95, 1_900, 2_000, {"state": "hit", "pct": 95})
+
+        assert len(_Timer.timers) == 1
+        assert _Timer.timers[0].interval == 300
+        assert _Timer.timers[0].started is True
+        assert session["_cache_warm_route"] == "openai:test-model"
+
+        agent._tui_first_provider_response_recorded = False
+        callback("no_field", 0, 0, 2_000, {"state": "no_field"})
+        agent.model = "other-model"
+        agent._tui_first_provider_response_recorded = False
+        callback("hit", 95, 1_900, 2_000, {"state": "hit", "pct": 95})
+        assert _Timer.timers[0].cancelled is True
+        assert len(_Timer.timers) == 1
+        server._cancel_tui_cache_warm(session)
+        assert "_cache_warm_route" not in session
+    finally:
+        server._sessions.pop("cache-warm-sid", None)
+
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    unavailable = next(
+        payload for payload in cache_updates
+        if payload["cache_record"].get("state") == "no_field"
+    )
+    assert "classification" not in unavailable["cache_record"]
+
+
+@pytest.mark.parametrize(
+    ("origin", "state", "pct", "text"),
+    [
+        ("user", "hit", 95, "cache 95%"),
+        ("background_completion", "no_field", 0, "cache unavailable"),
+        ("subagent_result", "hit", 95, "cache 95%"),
+    ],
+)
+def test_tui_cache_status_uses_first_provider_response_per_wake(
+    monkeypatch, origin, state, pct, text
+):
+    class _Agent:
+        def run_conversation(self, _prompt, *, turn_origin="user", **_kwargs):
+            record = {
+                "request_index": 1,
+                "state": state,
+                "pct": pct,
+                "timestamp": 1.0,
+                "turn_origin": turn_origin,
+            }
+            callback = getattr(self, "_tui_cache_callback")
+            callback(state, pct, 1_900, 2_000, record)
+            callback("hit", 99, 1_980, 2_000, {**record, "request_index": 2})
+            return {"final_response": "reply", "messages": []}
+
+        def clear_interrupt(self):
+            pass
+
+    class _StoppedTicker:
+        def join(self):
+            pass
+
+    agent = _Agent()
+    emitted = []
+    session = _session(agent=agent, inflight_turn=None, active_session_lease=object())
+    server._sessions["cache-sid"] = session
+    try:
+        _configure_immediate_prompt_run(monkeypatch, Path("."))
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, session: None)
+        monkeypatch.setattr(server, "_apply_pending_model_switch", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_agent_compression_with_config", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_voice_mode_enabled", lambda: False)
+        monkeypatch.setattr(
+            server, "_start_usage_ticker", lambda *_args: (threading.Event(), _StoppedTicker())
+        )
+        monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+        server._attach_tui_cache_callback(agent, "cache-sid")
+        server._run_prompt_submit("rid", "cache-sid", session, "wake", turn_origin=origin)
+    finally:
+        server._sessions.pop("cache-sid", None)
+
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    assert [payload["text"] for payload in cache_updates] == [text]
+    assert cache_updates[0]["cache_record"]["turn_origin"] == origin
+    assert session["first_provider_response"] == cache_updates[0]["cache_record"]

@@ -378,12 +378,14 @@ class ChatCompletionsTransport(ProviderTransport):
         is_lmstudio = params.get("is_lmstudio", False)
         supports_reasoning = params.get("supports_reasoning", False)
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
-        _apply_max_tokens(api_kwargs, model, reasoning_config, params)
+        bodyless_warm = bool(params.get("bodyless_warm"))
+        if not bodyless_warm:
+            _apply_max_tokens(api_kwargs, model, reasoning_config, params)
 
         # Kimi / TokenHub / LM Studio: top-level reasoning_effort (unless thinking disabled).
         thinking_off = isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False
         _e = requested_effort(reasoning_config)
-        if is_kimi and not thinking_off:
+        if is_kimi and not thinking_off and not bodyless_warm:
             # K3 = low/high/max (server default high), K2-era = low/medium/high (default medium).
             _supported = kimi_supported_efforts(model)
             is_k3 = _supported is KIMI_K3_EFFORTS
@@ -391,9 +393,9 @@ class ChatCompletionsTransport(ProviderTransport):
                 ("high" if is_k3 else "medium") if _e is None
                 else clamp_effort(_e, _supported, KIMI_K3_OVERRIDES if is_k3 else None)
             )
-        if params.get("is_tokenhub", False) and not thinking_off:
+        if params.get("is_tokenhub", False) and not thinking_off and not bodyless_warm:
             api_kwargs["reasoning_effort"] = "high" if _e is None else clamp_effort(_e, TOKENHUB_EFFORTS)
-        if is_lmstudio and supports_reasoning:
+        if is_lmstudio and supports_reasoning and not bodyless_warm:
             _lm_effort = resolve_lmstudio_effort(reasoning_config, params.get("lmstudio_reasoning_options"))
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
@@ -412,7 +414,7 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body["thinking"] = {"type": "disabled" if thinking_off else "enabled"}
 
         # LM Studio is handled above via top-level reasoning_effort.
-        if supports_reasoning and not is_lmstudio:
+        if supports_reasoning and not is_lmstudio and not bodyless_warm:
             if params.get("is_github_models", False):
                 if params.get("github_reasoning_extra") is not None:
                     extra_body["reasoning"] = params["github_reasoning_extra"]
@@ -422,7 +424,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 off = thinking_off or _effort == "none"
                 extra_body["reasoning"] = {"enabled": not off, "effort": "none" if off else _effort}
 
-        if str(params.get("provider_name") or "").strip().lower() == "gemini":
+        if not bodyless_warm and str(params.get("provider_name") or "").strip().lower() == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
             if _is_gemini_openai_compat_base_url(base_url):
                 thinking_config = _snake_case_gemini_thinking_config(raw_thinking_config)
@@ -448,17 +450,22 @@ class ChatCompletionsTransport(ProviderTransport):
         """Build API kwargs from a ProviderProfile — every quirk comes from the profile object."""
         sanitized = _swap_developer_role(profile.prepare_messages(sanitized), (model or "").lower())
         api_kwargs = _base_kwargs(model, sanitized, tools, params, profile=profile)
+        bodyless_warm = bool(params.get("bodyless_warm"))
 
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
         # Profiles fronting several backends override get_max_tokens() per model.
-        _apply_max_tokens(api_kwargs, model, reasoning_config, params, profile_max=profile.get_max_tokens(model))
+        if not bodyless_warm:
+            _apply_max_tokens(api_kwargs, model, reasoning_config, params, profile_max=profile.get_max_tokens(model))
 
-        extra_body_from_profile, top_level_from_profile = profile.build_api_kwargs_extras(
-            reasoning_config=reasoning_config, supports_reasoning=params.get("supports_reasoning", False),
-            qwen_session_metadata=params.get("qwen_session_metadata"), model=model,
-            base_url=params.get("base_url"), ollama_num_ctx=params.get("ollama_num_ctx"),
-            session_id=params.get("session_id"),
-        )
+        if bodyless_warm:
+            extra_body_from_profile, top_level_from_profile = {}, {}
+        else:
+            extra_body_from_profile, top_level_from_profile = profile.build_api_kwargs_extras(
+                reasoning_config=reasoning_config, supports_reasoning=params.get("supports_reasoning", False),
+                qwen_session_metadata=params.get("qwen_session_metadata"), model=model,
+                base_url=params.get("base_url"), ollama_num_ctx=params.get("ollama_num_ctx"),
+                session_id=params.get("session_id"),
+            )
         api_kwargs.update(top_level_from_profile)
 
         extra_body: dict[str, Any] = {}

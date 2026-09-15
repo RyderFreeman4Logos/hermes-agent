@@ -286,7 +286,9 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server,
             "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
+            lambda rid, sid, sess, text, *, turn_origin="user": submits.append(
+                (text, turn_origin)
+            ),
         )
         stop = threading.Event()
         thread = threading.Thread(
@@ -332,7 +334,8 @@ class TestNotificationPollerLoopKanbanWiring:
         status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
         assert any(tid in t for t in status_texts), status_texts
         assert any(e == "message.start" for e, _ in emits)
-        assert any(tid in text for text in submits), submits
+        assert any(tid in text for text, _origin in submits), submits
+        assert {origin for _text, origin in submits} == {"background_completion"}
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
@@ -359,6 +362,7 @@ class TestNotificationPollerLoopKanbanWiring:
             stop.set()
             thread.join(timeout=5)
 
-        assert any(tid in text for text in submits), submits
+        assert any(tid in text for text, _origin in submits), submits
+        assert {origin for _text, origin in submits} == {"background_completion"}
         assert session["_kanban_pending"] == []
         assert session["running"] is True

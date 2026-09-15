@@ -208,6 +208,38 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual(todos)
   })
 
+  it.each(['cache 95%', 'cache unavailable'])(
+    'keeps %s as telemetry while operational status advances',
+    cacheStatus => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      vi.useFakeTimers()
+
+      try {
+        onEvent({ payload: {}, type: 'message.start' } as any)
+        onEvent({ payload: { kind: 'cache_hit', text: cacheStatus }, type: 'status.update' } as any)
+        expect(getUiState().status).toBe(cacheStatus)
+        expect(getUiState().cacheStatus).toBe(cacheStatus)
+
+        vi.advanceTimersByTime(4000)
+        expect(getUiState().status).toBe(cacheStatus)
+
+        onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+        expect(getUiState().status).toBe('ready')
+        expect(getUiState().cacheStatus).toBe(cacheStatus)
+
+        onEvent({
+          payload: { choices: ['a'], question: 'pick', request_id: 'q-cache' },
+          type: 'clarify.request'
+        } as any)
+        expect(getUiState().status).toBe('waiting for input…')
+        expect(getUiState().cacheStatus).toBe(cacheStatus)
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  )
+
   it('prints compaction progress status into the transcript', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

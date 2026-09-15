@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.usage_pricing import (
     _OFFICIAL_DOCS_PRICING,
     CanonicalUsage,
@@ -861,6 +863,35 @@ def test_normalize_usage_nested_details_win_over_qwen_flat_top_level():
 
     assert normalized.cache_read_tokens == 900
     assert normalized.input_tokens == 1100
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5, float("nan"), "bad", [], {}])
+def test_normalize_usage_rejects_invalid_cache_evidence(value):
+    normalized = normalize_usage(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": value},
+        },
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_read_tokens == 0
+    assert normalized.cache_telemetry == "unavailable"
+
+
+def test_normalize_usage_accepts_integral_string_cache_evidence():
+    normalized = normalize_usage(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": "25"},
+        },
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_read_tokens == 25
+    assert normalized.cache_telemetry == "reported"
 
 
 # ── Context-tiered pricing (Gemini Pro >200k prompts, #93469) ─────────────

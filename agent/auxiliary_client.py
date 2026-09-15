@@ -4113,6 +4113,12 @@ def _call_fallback_candidate_sync(
     )
 
     def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
+        _record_route_info(
+            route_info, dest.provider, dest.model, fallback_label=fb_label,
+            base_url=dest.base_url,
+            api_key=str(getattr(client, "api_key", "") or ""), api_mode=dest.api_mode,
+            timeout=request_kwargs.get("timeout"),
+        )
         return _validate_llm_response(
             _relay_sync_completion(
                 client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
@@ -4169,6 +4175,12 @@ async def _call_fallback_candidate_async(
     )
 
     async def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
+        _record_route_info(
+            route_info, dest.provider, dest.model, fallback_label=fb_label,
+            base_url=dest.base_url,
+            api_key=str(getattr(client, "api_key", "") or ""), api_mode=dest.api_mode,
+            timeout=request_kwargs.get("timeout"),
+        )
         return _validate_llm_response(
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
             task,

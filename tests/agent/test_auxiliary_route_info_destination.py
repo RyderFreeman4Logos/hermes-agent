@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent import auxiliary_client as aux
 from agent.auxiliary_client import async_call_llm, call_llm
 import agent.context_compressor as context_compressor_module
 from agent.context_compressor import ContextCompressor
@@ -244,7 +245,7 @@ def test_overlapping_public_compress_attempts_keep_summary_routes_attempt_local(
         assert {key: digest_routes[name].get(key) for key in expected} == expected
 
 
-def test_call_llm_reports_complete_successful_custom_fallback_destination():
+def test_call_llm_reports_complete_successful_codex_fallback_destination():
     class CapacityUnavailable(Exception):
         status_code = 402
 
@@ -253,21 +254,39 @@ def test_call_llm_reports_complete_successful_custom_fallback_destination():
     primary.api_key = "synthetic-primary-key"
     primary.chat.completions.create.side_effect = CapacityUnavailable("payment required")
 
-    fallback = MagicMock()
-    fallback.base_url = "https://fallback.invalid/v1"
-    fallback.api_key = "synthetic-fallback-key"
-    fallback.chat.completions.create.return_value = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="fallback-ok"))]
+    physical_requests = []
+    completed = SimpleNamespace(
+        status="completed",
+        id="synthetic-codex-response",
+        output=[SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="fallback-ok")],
+        )],
+        usage=None,
     )
+    physical = SimpleNamespace(
+        base_url="https://physical-codex.invalid/backend-api/codex",
+        api_key="synthetic-physical-key",
+        responses=SimpleNamespace(
+            create=lambda **kwargs: physical_requests.append(kwargs) or completed,
+        ),
+        close=lambda: None,
+    )
+    fallback = aux.CodexAuxiliaryClient(physical, "fallback-model")
     fallback_entry = {
-        "provider": "custom",
+        "provider": "openai-codex",
         "model": "fallback-model",
-        "base_url": "https://fallback.invalid/v1",
-        "api_key": "synthetic-fallback-key",
+        "base_url": "https://ignored-entry.invalid/v1",
+        "api_key": "synthetic-ignored-entry-key",
         "api_mode": "anthropic_messages",
         "timeout": 37,
     }
     route_info = {}
+    cache_destinations = []
+
+    def plan_cache(messages, tools, **destination):
+        cache_destinations.append(destination)
+        return messages, tools or []
 
     with (
         patch(
@@ -282,10 +301,8 @@ def test_call_llm_reports_complete_successful_custom_fallback_destination():
             "agent.auxiliary_client._get_auxiliary_task_config",
             return_value={"fallback_chain": [fallback_entry]},
         ),
-        patch(
-            "agent.auxiliary_client._resolve_fallback_entry",
-            return_value=(fallback, "fallback-model"),
-        ),
+        patch("agent.auxiliary_client.resolve_provider_client", return_value=(fallback, "fallback-model")),
+        patch("agent.agent_runtime_helpers.plan_cache_sections_for_destination", side_effect=plan_cache),
     ):
         response = call_llm(
             task="compression",
@@ -294,12 +311,21 @@ def test_call_llm_reports_complete_successful_custom_fallback_destination():
         )
 
     assert response.choices[0].message.content == "fallback-ok"
-    assert route_info == {
-        "provider": "custom",
+    assert physical_requests
+    assert cache_destinations == [{
+        "provider": "openai-codex",
+        "base_url": "https://physical-codex.invalid/backend-api/codex",
+        "api_mode": "codex_responses",
         "model": "fallback-model",
-        "base_url": "https://fallback.invalid/v1",
-        "api_key": "synthetic-fallback-key",
-        "api_mode": "anthropic_messages",
+        "cache_ttl": cache_destinations[0]["cache_ttl"],
+    }]
+    assert route_info == {
+        "provider": "openai-codex",
+        "model": "fallback-model",
+        "fallback_label": "fallback_chain[0](openai-codex)",
+        "base_url": "https://physical-codex.invalid/backend-api/codex",
+        "api_key": "synthetic-physical-key",
+        "api_mode": "codex_responses",
         "timeout": 37.0,
     }
 

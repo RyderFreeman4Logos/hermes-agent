@@ -836,6 +836,10 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
         return True
+    if evt_type != "completion" and deferred is None:
+        with _completion_ownership_lock(session):
+            if session.get("_completion_transfer"):
+                session["_completion_transfer_barrier"] = dict(evt)
     if not _notif_claim_turn(session):
         queue.put(evt)
         if deferred is not None:
@@ -904,9 +908,6 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
             completions = []
             if deferred is None:
                 _flush_pending_completions_if_idle(sid, session, emitted)
-                with _completion_ownership_lock(session):
-                    if session.get("_completion_transfer"):
-                        session["_completion_transfer_barrier"] = dict(event)
         if not _notif_handle_event(sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned):
             for remaining in events[index + 1:]:
                 (deferred.append if deferred is not None else registry.completion_queue.put)(remaining)

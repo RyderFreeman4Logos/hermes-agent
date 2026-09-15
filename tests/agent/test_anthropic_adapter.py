@@ -729,6 +729,27 @@ class TestConvertMessages:
         assert isinstance(system, list)
         assert system[0]["cache_control"] == {"type": "ephemeral"}
 
+    def test_hidden_system_timing_projects_after_the_cached_system_blocks(self):
+        system, result = convert_messages_to_anthropic([
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "Stable system", "cache_control": {"type": "ephemeral"}},
+                ],
+            },
+            {"role": "user", "content": "Ping"},
+            {
+                "role": "system",
+                "content": "[Agent loop timing] Current loop start: now",
+                "display_kind": "hidden",
+            },
+        ])
+
+        assert system == [
+            {"type": "text", "text": "Stable system", "cache_control": {"type": "ephemeral"}},
+        ]
+        assert result[-1]["role"] == "user"
+        assert "[Agent loop timing]" in result[-1]["content"]
 
     def test_assistant_cache_control_blocks_are_preserved(self):
         messages = apply_anthropic_cache_control([

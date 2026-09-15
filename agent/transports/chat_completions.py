@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from agent.message_metadata import is_hidden_loop_timing
 from agent.reasoning_effort import (
     KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS, TOKENHUB_EFFORTS, clamp_effort,
     kimi_supported_efforts, requested_effort,
@@ -35,6 +36,7 @@ _XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
 _STRIP_MSG_KEYS = (
     "codex_reasoning_items", "codex_message_items", "tool_name", "effect_disposition", "timestamp",
     "platform_message_id", "api_content", "anthropic_content_blocks", "bedrock_content_blocks",
+    "display_kind", "display_metadata",
 )
 _STRIP_TC_KEYS = ("call_id", "response_item_id")
 _HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
@@ -349,10 +351,17 @@ class ChatCompletionsTransport(ProviderTransport):
         Returns the input list unchanged when nothing needs sanitizing.
         """
         strip_extra_content = not _model_consumes_thought_signature(kwargs.get("model"))
-        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content)) for m in messages]
+        sanitized_pairs = []
+        for index, message in enumerate(messages):
+            sanitized = _sanitize_message(message, strip_extra_content)
+            if index and is_hidden_loop_timing(message):
+                sanitized = dict(message) if sanitized is None else sanitized
+                sanitized["role"] = "user"
+            sanitized_pairs.append((message, sanitized))
         if all(s is None for _, s in sanitized_pairs):
             return messages
-        return [m if s is None else s for m, s in sanitized_pairs]
+        from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
+        return drop_thinking_only_and_merge_users([m if s is None else s for m, s in sanitized_pairs])
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Tools are already in OpenAI format — identity."""

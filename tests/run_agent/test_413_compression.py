@@ -436,10 +436,10 @@ class TestHTTP413Compression:
             "role": "system",
             "content": "compressed prompt",
         }
-        assert request_payloads[1]["messages"][1] == {
-            "role": "user",
-            "content": "compressed summary",
-        }
+        rebuilt = request_payloads[1]["messages"][1]
+        assert rebuilt["role"] == "user"
+        assert rebuilt["content"].startswith("compressed summary")
+        assert "[Agent loop timing]" in rebuilt["content"]
 
 
 

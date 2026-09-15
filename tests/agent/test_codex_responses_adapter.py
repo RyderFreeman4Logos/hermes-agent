@@ -48,6 +48,23 @@ def test_chat_content_keeps_images_on_user_role():
     }]
 
 
+def test_hidden_timing_is_not_dropped_as_a_late_system_message():
+    items = _chat_messages_to_responses_input([
+        {"role": "system", "content": "Stable system"},
+        {"role": "user", "content": "Ping"},
+        {
+            "role": "system",
+            "content": "[Agent loop timing] Current loop start: now",
+            "display_kind": "hidden",
+        },
+    ])
+
+    assert items[-1] == {
+        "role": "user",
+        "content": "[Agent loop timing] Current loop start: now",
+    }
+
+
 @pytest.mark.parametrize("part_type", ["video_url", "video", "input_video"])
 def test_chat_content_rejects_video_instead_of_sending_text_only(part_type):
     content = [

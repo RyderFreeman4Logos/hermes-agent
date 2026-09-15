@@ -901,7 +901,7 @@ class CLICommandsMixin:
             return print("  No running background processes.")
         if running:
             print(f"  Stopping {len(running)} background process(es)...")
-            print(f"  ✅ Stopped {process_registry.kill_all()} process(es).")
+            print(f"  ✅ Stop requested for {process_registry.kill_all()} process(es).")
         if n_async:
             from tools.async_delegation import interrupt_all
             print(f"  ✅ Interrupted {interrupt_all(reason='/stop')} background delegation(s).")

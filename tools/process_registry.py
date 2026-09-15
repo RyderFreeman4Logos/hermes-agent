@@ -1308,17 +1308,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             and session._pty is None
             and session._reader_thread is threading.current_thread()
         )
-        if reader_owns_settlement:
-            with session._lock:
-                wait_for_disposition = any(
-                    disposition is None
-                    for disposition in session._pending_kill_dispositions.values()
-                )
-                if wait_for_disposition:
-                    session._reader_settlement_ready.set()
-            if wait_for_disposition:
-                session._kill_disposition_event.wait()
-        with session._lock:
+
+        def publish_terminal() -> None:
             source = session._pending_termination_source
             session.mark_exited(
                 exit_code,
@@ -1331,6 +1322,24 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if any(session._pending_kill_dispositions.values()):
                 self._completion_consumed.add(session.id)
             session._pending_kill_dispositions.clear()
+
+        if reader_owns_settlement:
+            while True:
+                with session._lock:
+                    wait_for_disposition = any(
+                        disposition is None
+                        for disposition in session._pending_kill_dispositions.values()
+                    )
+                    if not wait_for_disposition:
+                        # The final check and terminal publication share this
+                        # lock, so a later kill joins the loop or sees exited.
+                        publish_terminal()
+                        break
+                    session._reader_settlement_ready.set()
+                session._kill_disposition_event.wait()
+        else:
+            with session._lock:
+                publish_terminal()
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -2250,7 +2259,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def kill_all(
         self, task_id: Optional[str] = None, *, exclude_ids: frozenset = frozenset(),
         source: str = "kill_all", consume_output: bool = False) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Stop running processes and return the count of accepted stop requests."""
         with self._lock:
             targets = [
                 s for s in self._running.values()
@@ -2258,7 +2267,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             ]
         return sum(
             self.kill_process(s.id, source=source, consume_output=consume_output).get("status")
-            in {"killed", "already_exited"}
+            in {"killed", "already_exited", "stopping"}
             for s in targets)
 
     # ----- Cleanup / Pruning -----

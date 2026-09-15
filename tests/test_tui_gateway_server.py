@@ -7352,6 +7352,204 @@ def test_process_kill_rpc_reserves_completion_without_first_signal_claim(
         child.process.wait()
 
 
+@pytest.mark.linux_only
+def test_process_kill_rpc_late_reservation_owns_output_before_live_poller(
+    monkeypatch, tmp_path
+):
+    """A consuming claim that arrives after reader wake still precedes publication."""
+    import shlex
+
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+    session_key = "rpc-late-reservation-owner"
+    runtime_id = "sid-rpc-late-reservation-owner"
+    runtime = _session(session_key=session_key)
+    server._sessions[runtime_id] = runtime
+    dispatched = []
+    dispatch_observed = threading.Event()
+    publication_observed = threading.Event()
+    reader_woke = threading.Event()
+    reader_rewaited = threading.Event()
+    late_reserved = threading.Event()
+    release_late_kill = threading.Event()
+    poll_stop = threading.Event()
+
+    def record_dispatch(_rid, _sid, _session, text, **_kwargs):
+        dispatched.append(text)
+        _session["running"] = False
+        dispatch_observed.set()
+        return True
+
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", record_dispatch)
+    monkeypatch.setattr(server, "_poll_bot_live_delivery_once", lambda *_args: False)
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
+    monkeypatch.setattr(server, "_maybe_fire_tui_heartbeat_tick", lambda *_args: None)
+    monkeypatch.setattr(server, "_notif_poll_kanban", lambda *_args: None)
+    code = (
+        "import signal,time\n"
+        "def finish(*_):\n"
+        " print('LATE-RESERVATION-TAIL-41', flush=True)\n"
+        " raise SystemExit(19)\n"
+        "signal.signal(signal.SIGTERM, finish)\n"
+        "print('LATE-RESERVATION-READY-41', flush=True)\n"
+        "while True: time.sleep(0.05)\n"
+    )
+    child = registry.spawn_local(
+        f"exec {shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+        cwd=str(tmp_path), session_key=session_key,
+    )
+    child.notify_on_complete = True
+    deadline = time.monotonic() + 5
+    while "LATE-RESERVATION-READY-41" not in child.output_buffer and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert "LATE-RESERVATION-READY-41" in child.output_buffer
+
+    real_disposition_event = child._kill_disposition_event
+
+    class ReaderWakeBarrier:
+        reader_waits = 0
+
+        def clear(self):
+            real_disposition_event.clear()
+
+        def set(self):
+            real_disposition_event.set()
+
+        def is_set(self):
+            return real_disposition_event.is_set()
+
+        def wait(self, timeout=None):
+            if threading.current_thread() is child._reader_thread:
+                self.reader_waits += 1
+                if self.reader_waits > 1:
+                    reader_rewaited.set()
+            result = real_disposition_event.wait(timeout)
+            if threading.current_thread() is child._reader_thread and self.reader_waits == 1:
+                reader_woke.set()
+                assert late_reserved.wait(4), "late consuming claim was not reserved"
+            return result
+
+    child._kill_disposition_event = ReaderWakeBarrier()
+    original_terminate = registry._terminate_host_pid
+
+    def terminate_with_late_noop(
+        pid, expected_start, on_direct_signal=None, on_direct_noop=None,
+        direct_signal_lock=None,
+    ):
+        if threading.current_thread().name == "late-consuming-rpc":
+            assert on_direct_noop is not None
+            on_direct_noop(False)
+            late_reserved.set()
+            assert release_late_kill.wait(6), "test did not release late public kill"
+            return
+        return original_terminate(
+            pid, expected_start, on_direct_signal,
+            on_direct_noop=on_direct_noop, direct_signal_lock=direct_signal_lock,
+        )
+
+    monkeypatch.setattr(registry, "_terminate_host_pid", terminate_with_late_noop)
+    original_put = registry.completion_queue.put
+    publications = []
+
+    def observe_publication(event):
+        publications.append(event)
+        publication_observed.set()
+        original_put(event)
+
+    monkeypatch.setattr(registry.completion_queue, "put", observe_publication)
+    poller = threading.Thread(
+        name="late-reservation-live-poller",
+        target=server._notification_poller_loop,
+        args=(poll_stop, runtime_id, runtime),
+    )
+    poller.start()
+    cleanup_result = {}
+    cleanup = threading.Thread(
+        name="non-consuming-cleanup",
+        target=lambda: cleanup_result.setdefault(
+            "count", registry.kill_all(source="test.cleanup", consume_output=False)
+        ),
+    )
+    cleanup.start()
+    response = {}
+    rpc = None
+    try:
+        assert reader_woke.wait(6), "reader did not wake after the first settled claim"
+
+        def invoke_rpc():
+            response.update(server.handle_request({
+                "id": "late-consuming-kill",
+                "method": "process.kill",
+                "params": {"session_id": runtime_id, "process_id": child.id},
+            }))
+
+        rpc = threading.Thread(name="late-consuming-rpc", target=invoke_rpc)
+        rpc.start()
+        assert late_reserved.wait(3), "public process.kill did not reserve its output claim"
+        deadline = time.monotonic() + 3
+        while (
+            not reader_rewaited.is_set()
+            and not publication_observed.is_set()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert reader_rewaited.is_set() or publication_observed.is_set()
+        if publication_observed.is_set():
+            assert dispatch_observed.wait(3), "live poller did not expose premature publication"
+        release_late_kill.set()
+        rpc.join(timeout=8)
+        cleanup.join(timeout=8)
+        assert not rpc.is_alive()
+        assert not cleanup.is_alive()
+        assert publication_observed.wait(3)
+        deadline = time.monotonic() + 3
+        while not registry.completion_queue.empty() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        result = response["result"]
+        assert result["status"] == "killed"
+        assert result["session_id"] == child.id
+        assert "LATE-RESERVATION-TAIL-41" in result["output"]
+        assert cleanup_result == {"count": 1}
+        assert len(publications) == 1
+        assert registry.is_completion_consumed(child.id)
+        assert dispatched == []
+        assert registry.completion_queue.empty()
+        assert child._pending_kill_dispositions == {}
+    finally:
+        release_late_kill.set()
+        poll_stop.set()
+        if rpc is not None:
+            rpc.join(timeout=2)
+        cleanup.join(timeout=2)
+        poller.join(timeout=2)
+        server._sessions.pop(runtime_id, None)
+        if child.process.poll() is None:
+            child.process.kill()
+        child.process.wait()
+
+
+def test_process_stop_rpc_counts_stopping_as_an_accepted_request(monkeypatch):
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    session = ProcessSession(id="proc-stopping-rpc", command="held pipe", task_id="session-a")
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "kill_process", lambda *_args, **_kwargs: {"status": "stopping"})
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+
+    response = server.handle_request({"id": "stop-all", "method": "process.stop", "params": {}})
+
+    assert response == {"jsonrpc": "2.0", "id": "stop-all", "result": {"killed": 1}}
+
+
 def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
     """A provenance lookup failure cannot turn an addressed event into ours."""
     import queue as _queue_mod

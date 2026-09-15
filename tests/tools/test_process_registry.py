@@ -137,6 +137,15 @@ def test_kill_all_backward_compat_and_exclude_ids(registry):
     assert sorted(c[0] for c in calls) == ["proc_a", "proc_b"]
 
 
+def test_kill_all_counts_stopping_as_an_accepted_request(registry):
+    """A bounded reader settlement is still a successfully requested stop."""
+    session = _make_session(sid="proc_stopping", task_id="session-a")
+    registry._running[session.id] = session
+    registry.kill_process = lambda *_args, **_kwargs: {"status": "stopping"}
+
+    assert registry.kill_all("session-a") == 1
+
+
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
     """Poll a predicate until it returns truthy or the timeout elapses."""
     deadline = time.monotonic() + timeout

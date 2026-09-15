@@ -137,7 +137,10 @@ class TestForegroundTimeoutCap:
         """Timeout exactly at FOREGROUND_MAX_TIMEOUT should execute normally."""
         from tools.terminal_tool import terminal_tool, FOREGROUND_MAX_TIMEOUT
 
-        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+        with patch("tools.terminal_tool._get_env_config",
+                    return_value=_make_env_config(
+                        auto_background_timeout_threshold=FOREGROUND_MAX_TIMEOUT,
+                    )), \
              patch("tools.terminal_tool._start_cleanup_thread"):
 
             mock_env = MagicMock()

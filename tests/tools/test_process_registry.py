@@ -105,6 +105,7 @@ def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry
             {
                 "source": "gateway_turn_timeout",
                 "consume_output": True,
+                "retain_completion_suppression": True,
             },
         )
     ]

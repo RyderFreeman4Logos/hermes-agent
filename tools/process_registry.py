@@ -1786,12 +1786,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def kill_process(
         self, session_id: str, *, source: str = "process.kill", consume_output: bool = True,
+        retain_completion_suppression: bool = False,
     ) -> dict:
         """Kill a background process and return its output snapshot.
         ``consume_output`` is true for explicit tool/RPC kills (the caller sees the
         output). Bulk cleanup passes false so it doesn't suppress an autonomous
         completion notification — except abandoned-turn reaping (``kill_started_since``),
-        which passes true so a killed abandoned process can't revive stopped work."""
+        which passes true so a killed abandoned process can't revive stopped work.
+        ``retain_completion_suppression`` is reserved for that abandoned-turn
+        cleanup: it keeps the reader disposition when bounded settlement returns
+        ``stopping`` even though no final output was returned to the caller."""
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
@@ -1843,6 +1847,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 # bounded for the Windows blocking-pipe fallback, where a caller gets
                 # an honest in-progress result instead of a competing decoder/drain.
                 if reserved_disposition and not session._reader_settlement_ready.wait(timeout=5):
+                    if retain_completion_suppression:
+                        self._commit_kill_disposition(session, kill_claim, True)
                     return {
                         "status": "stopping", "session_id": session.id,
                         "output": _output_tail(session, 2000),
@@ -1850,7 +1856,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 if reserved_disposition:
                     self._commit_kill_disposition(session, kill_claim, consume_output)
                 if not session._completion_event.wait(timeout=5):
-                    if reserved_disposition:
+                    if reserved_disposition and not retain_completion_suppression:
                         self._cancel_unpublished_kill_consumption(session, kill_claim)
                     return {
                         "status": "stopping", "session_id": session.id,
@@ -2254,19 +2260,30 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Kill ``task_id`` processes created after ``baseline_ids``. Output is
         consumed so an abandoned turn can't enqueue a follow-up reviving work the
         timeout deliberately stopped."""
-        return self.kill_all(task_id, exclude_ids=frozenset(baseline_ids or ()), source=source, consume_output=True)
+        return self.kill_all(
+            task_id,
+            exclude_ids=frozenset(baseline_ids or ()),
+            source=source,
+            consume_output=True,
+            retain_completion_suppression=True,
+        )
 
     def kill_all(
         self, task_id: Optional[str] = None, *, exclude_ids: frozenset = frozenset(),
-        source: str = "kill_all", consume_output: bool = False) -> int:
+        source: str = "kill_all", consume_output: bool = False,
+        retain_completion_suppression: bool = False,
+    ) -> int:
         """Stop running processes and return the count of accepted stop requests."""
         with self._lock:
             targets = [
                 s for s in self._running.values()
                 if (task_id is None or s.task_id == task_id) and s.id not in exclude_ids and not s.exited
             ]
+        kill_kwargs = {"source": source, "consume_output": consume_output}
+        if retain_completion_suppression:
+            kill_kwargs["retain_completion_suppression"] = True
         return sum(
-            self.kill_process(s.id, source=source, consume_output=consume_output).get("status")
+            self.kill_process(s.id, **kill_kwargs).get("status")
             in {"killed", "already_exited", "stopping"}
             for s in targets)
 

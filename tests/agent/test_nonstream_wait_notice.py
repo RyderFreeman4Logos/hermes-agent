@@ -30,6 +30,9 @@ def _request():
     )
     request.wait_notice_started_ts = None
     request.result = {"error": None, "response": None}
+    request.before_dispatch = None
+    request.on_worker_start = None
+    request.on_worker_retire = None
     return request, notices, touches
 
 

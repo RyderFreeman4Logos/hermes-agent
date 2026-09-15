@@ -17,6 +17,7 @@ POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import select
@@ -27,9 +28,21 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import NamedTuple
+from types import ModuleType
+from typing import NamedTuple, TextIO
 
 import pytest
+
+
+def _load_runner_module() -> ModuleType:
+    """Load the runner for a direct lifecycle seam test."""
+    runner = Path(__file__).resolve().parent.parent / "scripts" / "run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location("runner_lifecycle_test", runner)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 # Both tests share the same handoff file: the leaker writes here, the
@@ -128,6 +141,96 @@ def test_stale_process_identity_is_not_signalled(
         assert calls == []
     finally:
         os.close(identity.pidfd)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux systemd completion")
+def test_linux_normal_completion_never_signals_stale_process_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A reaped systemd-run client cannot authorize numeric-PGID cleanup."""
+    runner = _load_runner_module()
+    killpg_calls: list[tuple[int, int]] = []
+
+    class ReapedClient:
+        pid = 4242
+        returncode = 0
+        kill_calls = 0
+
+        def communicate(self, timeout: float) -> tuple[str, None]:
+            return "", None
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    client = ReapedClient()
+    monkeypatch.setattr(runner, "_spawn_test_process", lambda *args: (client, None))
+    monkeypatch.setattr(runner, "_read_linux_completion", lambda *args: (0, True, ""))
+    monkeypatch.setattr(runner.os, "getpgid", lambda pid: 4242)
+    monkeypatch.setattr(
+        runner.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)),
+    )
+
+    result = runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 1)
+
+    assert result.returncode == 0
+    assert killpg_calls == []
+    assert client.kill_calls == 0
+
+
+def test_environment_writer_failure_removes_secret_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A partial environment transport is removed before spawn can begin."""
+    runner = _load_runner_module()
+    root = tmp_path / "attempt-root"
+
+    def make_root(*args: object, **kwargs: object) -> str:
+        root.mkdir()
+        return str(root)
+
+    def fail_after_partial_write(value: object, target: TextIO) -> None:
+        target.write("partial-secret")
+        raise OSError("injected environment write failure")
+
+    monkeypatch.setattr(runner.tempfile, "mkdtemp", make_root)
+    monkeypatch.setattr(runner.json, "dump", fail_after_partial_write)
+
+    with pytest.raises(OSError, match="injected environment write failure"):
+        runner._run_one_file_once(tmp_path / "test_probe.py", [], tmp_path, 1)
+
+    assert not root.exists()
+
+
+def test_supervisor_removes_transport_after_watch_parent_loss(tmp_path: Path) -> None:
+    """The scope-side supervisor deletes secrets when its runner disappears."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    transport = tmp_path / "environment.json"
+    secret = "parent-loss-secret-sentinel"
+    transport.write_text(json.dumps({"PARENT_LOSS_SECRET": secret}), encoding="utf-8")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(runner),
+            "--_hermes-supervise",
+            str(repo_root),
+            str(tmp_path / "completion.json"),
+            str(transport),
+            sys.executable,
+            "-c",
+            "import time; time.sleep(0.2)",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert proc.stdin is not None
+    proc.stdin.close()
+    assert proc.wait(timeout=10) == 137
+    assert proc.stdout is not None
+    assert secret not in proc.stdout.read()
+    assert not transport.exists()
 
 
 def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> None:
@@ -553,7 +656,9 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
     assert "retry output" in proc.stdout
 
 
-def _fake_systemd_run(tmp_path: Path, tasksmax_event: bool = False) -> Path:
+def _fake_systemd_run(
+    tmp_path: Path, tasksmax_event: bool = False, late_descendant_event: bool = False,
+) -> Path:
     """Create a non-unit launcher with an optional fake cgroup event reader."""
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -630,31 +735,36 @@ def _fake_systemd_run(tmp_path: Path, tasksmax_event: bool = False) -> Path:
         encoding="utf-8",
     )
     launcher.chmod(0o755)
-    if tasksmax_event:
+    if tasksmax_event or late_descendant_event:
         site_dir = tmp_path / "fake-site"
         site_dir.mkdir()
         (site_dir / "sitecustomize.py").write_text(
             textwrap.dedent(
-                """
-                import pathlib
+                f"""
+                    import pathlib
+                    import subprocess
+                    import sys
 
-                _read_text = pathlib.Path.read_text
-                _pids_events_reads = 0
+                    _read_text = pathlib.Path.read_text
+                    _pids_events_reads = 0
 
-                def _fake_cgroup_read_text(self, *args, **kwargs):
-                    global _pids_events_reads
-                    if str(self) == "/proc/self/cgroup":
-                        return "0::/fake\\n"
-                    if str(self) == "/sys/fs/cgroup/fake/pids.events":
-                        _pids_events_reads += 1
-                        return f"max {_pids_events_reads - 1}\\n"
-                    if str(self) == "/sys/fs/cgroup/fake/memory.events":
-                        return "max 0\\noom 0\\noom_kill 0\\n"
-                    return _read_text(self, *args, **kwargs)
+                    def _fake_cgroup_read_text(self, *args, **kwargs):
+                        global _pids_events_reads
+                        if str(self) == "/proc/self/cgroup":
+                            return "0::/fake\\n"
+                        if str(self) == "/sys/fs/cgroup/fake/pids.events":
+                            _pids_events_reads += 1
+                            if _pids_events_reads == 2 and {late_descendant_event!r}:
+                                subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.5)"])
+                                return "max 0\\n"
+                            return f"max {{_pids_events_reads - 1}}\\n"
+                        if str(self) == "/sys/fs/cgroup/fake/memory.events":
+                            return "max 0\\noom 0\\noom_kill 0\\n"
+                        return _read_text(self, *args, **kwargs)
 
-                pathlib.Path.read_text = _fake_cgroup_read_text
-                """
-            ).lstrip(),
+                    pathlib.Path.read_text = _fake_cgroup_read_text
+                    """
+                ).lstrip(),
             encoding="utf-8",
         )
         env_binary = fake_bin / "env"
@@ -673,6 +783,7 @@ def _run_fake_systemd_retry(
     *,
     file_timeout: float = 30,
     tasksmax_event: bool = False,
+    late_descendant_event: bool = False,
     secret: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], int]:
     repo_root = Path(__file__).resolve().parent.parent
@@ -688,7 +799,7 @@ def _run_fake_systemd_retry(
         env["DIRECT_RUNNER_SECRET"] = secret
         env["FAKE_SYSTEMD_ARGV_RECORD"] = str(tmp_path / "launcher-argv.json")
     env["PATH"] = os.pathsep.join((
-        str(_fake_systemd_run(tmp_path, tasksmax_event)), "/usr/bin", "/bin",
+        str(_fake_systemd_run(tmp_path, tasksmax_event, late_descendant_event)), "/usr/bin", "/bin",
     ))
     try:
         proc = subprocess.run(
@@ -777,6 +888,34 @@ def test_tasksmax_event_cannot_retry_to_green(tmp_path: Path) -> None:
     assert proc.returncode == 1, proc.stdout
     assert attempts == 1, proc.stdout
     assert "fatal cgroup resource event" in proc.stdout
+    assert "FLAKY" not in proc.stdout
+
+
+def test_post_sample_descendant_event_cannot_retry_to_green(tmp_path: Path) -> None:
+    """A descendant created after the final counter sample is terminal."""
+    marker = tmp_path / "failed-once"
+    proc, attempts = _run_fake_systemd_retry(
+        tmp_path,
+        "pytest",
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+            import subprocess
+            import sys
+
+            def test_probe():
+                marker = Path({str(marker)!r})
+                if not marker.exists():
+                    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.5)"])
+                    marker.write_text("failed")
+                    assert False, "late cgroup event must be terminal"
+            """
+        ),
+        late_descendant_event=True,
+    )
+
+    assert proc.returncode == 1, proc.stdout
+    assert attempts == 1, proc.stdout
     assert "FLAKY" not in proc.stdout
 
 

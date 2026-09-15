@@ -123,6 +123,44 @@ def _read_cgroup_event_file(path: Path) -> dict[str, int]:
     return events
 
 
+def _linux_enable_subreaper() -> bool:
+    """Adopt orphaned test descendants so their exit is observable."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(36, 1, 0, 0, 0) == 0  # PR_SET_CHILD_SUBREAPER
+    except (AttributeError, OSError):
+        return False
+
+
+def _linux_terminate_and_reap_descendants() -> bool:
+    """Kill adopted test descendants, then prove that none remain."""
+    import signal
+
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if pid != 0:
+            continue
+        try:
+            children = Path(f"/proc/self/task/{threading.get_native_id()}/children").read_text(
+                encoding="utf-8"
+            ).split()
+            if not children:
+                return False
+            for child_pid in children:
+                try:
+                    os.kill(int(child_pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            os.waitpid(-1, 0)
+        except (OSError, ValueError, ChildProcessError):
+            return False
+
+
 def _linux_supervise(
     repo_root: str, completion_path: str, environment_path: str, cmd: List[str],
 ) -> int:
@@ -130,49 +168,61 @@ def _linux_supervise(
     import select
 
     try:
-        environment = json.loads(Path(environment_path).read_text(encoding="utf-8"))
-        if not isinstance(environment, dict) or not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in environment.items()
-        ):
-            return 1
-    except (OSError, ValueError):
-        return 1
-    before_events = _read_linux_resource_events()
-    child = subprocess.Popen(cmd, cwd=repo_root, env=environment, stdin=subprocess.DEVNULL)
-    stdin_fd = sys.stdin.fileno()
-    poller = select.poll()
-    poller.register(stdin_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
-    while child.poll() is None:
-        if not poller.poll(100):
-            continue
         try:
-            if os.read(stdin_fd, 1):
+            environment = json.loads(Path(environment_path).read_text(encoding="utf-8"))
+            if not isinstance(environment, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in environment.items()
+            ):
+                return 1
+        except (OSError, ValueError):
+            return 1
+        if not _linux_enable_subreaper():
+            return 1
+        before_events = _read_linux_resource_events()
+        child = subprocess.Popen(cmd, cwd=repo_root, env=environment, stdin=subprocess.DEVNULL)
+        stdin_fd = sys.stdin.fileno()
+        poller = select.poll()
+        poller.register(stdin_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        while child.poll() is None:
+            if not poller.poll(100):
                 continue
-        except OSError:
-            pass
-        # systemd KillMode=control-group terminates child descendants when
-        # this supervisor exits, including after the parent runner is SIGKILL'd.
-        return 137
-    rc = _normalize_returncode(child.returncode)
-    after_events = _read_linux_resource_events()
-    events = (
-        None
-        if before_events is None or after_events is None
-        else {
-            field: after_events[field] - before_events[field]
-            for field in _LINUX_RESOURCE_EVENT_FIELDS
-        }
-    )
-    Path(completion_path).write_text(
-        json.dumps({
-            "kind": "pytest",
-            "returncode": rc,
-            "resource_events": events,
-        }),
-        encoding="utf-8",
-    )
-    return rc
+            try:
+                if os.read(stdin_fd, 1):
+                    continue
+            except OSError:
+                pass
+            # systemd KillMode=control-group terminates child descendants when
+            # this supervisor exits, including after the parent runner is SIGKILL'd.
+            return 137
+        if not _linux_terminate_and_reap_descendants():
+            return 1
+        rc = _normalize_returncode(child.returncode)
+        after_events = _read_linux_resource_events()
+        if after_events is None:
+            return 1
+        if not _linux_terminate_and_reap_descendants():
+            return 1
+        final_events = _read_linux_resource_events()
+        events = (
+            None
+            if before_events is None or final_events is None
+            else {
+                field: final_events[field] - before_events[field]
+                for field in _LINUX_RESOURCE_EVENT_FIELDS
+            }
+        )
+        Path(completion_path).write_text(
+            json.dumps({
+                "kind": "pytest",
+                "returncode": rc,
+                "resource_events": events,
+            }),
+            encoding="utf-8",
+        )
+        return rc
+    finally:
+        Path(environment_path).unlink(missing_ok=True)
 
 
 def _linux_launcher_environment(env: dict[str, str]) -> dict[str, str]:
@@ -711,27 +761,26 @@ def _run_one_file_once(
     # version probe fall through to mise.
     env["PATH"] = _strip_mise_shims(env.get("PATH", ""), repo_root)
     temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
-    completion_path = Path(temproot) / "completion.json"
-    environment_path = Path(temproot) / "environment.json"
-    env["PYTEST_DEBUG_TEMPROOT"] = temproot
-    environment_fd = os.open(environment_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(environment_fd, "w", encoding="utf-8") as environment_file:
-        json.dump(env, environment_file)
-
-    subproc_start = time.monotonic()
-    watch_fd: int | None = None
     try:
+        completion_path = Path(temproot) / "completion.json"
+        environment_path = Path(temproot) / "environment.json"
+        env["PYTEST_DEBUG_TEMPROOT"] = temproot
+        environment_fd = os.open(environment_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(environment_fd, "w", encoding="utf-8") as environment_file:
+            json.dump(env, environment_file)
         proc, watch_fd = _spawn_test_process(cmd, repo_root, env, completion_path)
     except BaseException:
         shutil.rmtree(temproot, ignore_errors=True)
         raise
 
+    subproc_start = time.monotonic()
+
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
     # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+    # the whole cleanup. Linux delegates this lifecycle to systemd.
     pgid: int | None = None
-    if sys.platform != "win32":
+    if sys.platform not in ("win32", "linux"):
         try:
             pgid = os.getpgid(proc.pid)
         except (ProcessLookupError, PermissionError):
@@ -750,7 +799,11 @@ def _run_one_file_once(
         else:
             rc = wrapper_rc
     except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
+        if sys.platform == "linux" and watch_fd is not None:
+            os.close(watch_fd)
+            watch_fd = None
+        else:
+            _kill_tree(proc, pgid=pgid)
         try:
             output, _ = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
@@ -764,12 +817,14 @@ def _run_one_file_once(
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
+        if sys.platform == "linux" and watch_fd is not None:
+            os.close(watch_fd)
+            watch_fd = None
+        else:
+            _kill_tree(proc, pgid=pgid)
         raise
     else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
+        # systemd owns Linux scope collection after --wait --collect.
         output += "\n"
     finally:
         if watch_fd is not None:

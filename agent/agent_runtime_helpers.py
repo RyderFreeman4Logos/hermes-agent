@@ -901,9 +901,10 @@ def _copy_request_overrides(value: Any) -> Any:
         nonlocal remaining
         if item is _MISSING:
             return item
-        if isinstance(item, (dict, list)) and type(item) not in (dict, list):
-            raise ValueError("request_overrides containers must be plain built-in dict/list values")
-        if type(item) not in (dict, list):
+        item_type = type(item)
+        if item_type is not dict and item_type is not list:
+            if issubclass(item_type, (dict, list)):
+                raise ValueError("request_overrides containers must be plain built-in dict/list values")
             return item
         if depth >= 100:
             raise ValueError("request_overrides nesting exceeds 100 containers")
@@ -917,7 +918,7 @@ def _copy_request_overrides(value: Any) -> Any:
             raise ValueError("request_overrides exceeds 10000 containers")
         active.add(oid)
         try:
-            if type(item) is dict:
+            if item_type is dict:
                 copied: Any = {}
                 memo[oid] = copied
                 for key, child in dict.items(item):

@@ -208,6 +208,82 @@ def test_copy_request_overrides_never_invokes_hostile_nested_copy_hook():
     assert original["extra_body"]["sibling"]["mutated"] is False
 
 
+@pytest.mark.parametrize("hook_kind", ["class_property", "metaclass_equality"])
+def test_public_switch_snapshot_never_invokes_opaque_leaf_type_hooks(hook_kind):
+    """Opaque leaves cannot mutate the live graph before switch rollback starts."""
+    from unittest.mock import MagicMock, patch
+
+    from run_agent import AIAgent
+
+    sibling = {"mutated": False}
+    hook_calls = []
+
+    if hook_kind == "class_property":
+        class HostileLeaf:
+            @property
+            def __class__(self):
+                hook_calls.append("__class__")
+                sibling["mutated"] = True
+                raise ValueError("class hook ran")
+    else:
+        class HostileMeta(type):
+            def __eq__(cls, _other):
+                hook_calls.append("metaclass equality")
+                sibling["mutated"] = True
+                raise ValueError("metaclass equality ran")
+
+        class HostileLeaf(metaclass=HostileMeta):
+            pass
+
+    hostile = HostileLeaf()
+    original = {"extra_body": {"sibling": sibling, "hostile": hostile}}
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "openrouter"
+    agent.model = "x-ai/grok-4"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.api_key = "old-key"
+    agent.api_mode = "chat_completions"
+    agent.client = MagicMock()
+    agent._client_kwargs = {"api_key": "old-key", "base_url": agent.base_url}
+    agent.context_compressor = None
+    agent._anthropic_client = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = None
+    agent._is_anthropic_oauth = False
+    agent._cached_system_prompt = "cached"
+    agent._primary_runtime = {}
+    agent._fallback_activated = False
+    agent._fallback_index = 0
+    agent._fallback_chain = []
+    agent._fallback_model = None
+    agent._config_context_length = None
+    agent.runtime_capabilities = {"native_compaction": False}
+    agent.request_overrides = original
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("simulated client build failure")
+
+    agent._create_openai_client = boom
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        with pytest.raises(RuntimeError, match="simulated client build failure"):
+            agent.switch_model(
+                new_model="openai/gpt-5",
+                new_provider="openai-codex",
+                api_key="new-key",
+                base_url="https://chatgpt.com/backend-api/codex/responses",
+                api_mode="chat_completions",
+            )
+
+    assert hook_calls == []
+    assert sibling == {"mutated": False}
+    assert (agent.model, agent.provider, agent.base_url) == (
+        "x-ai/grok-4", "openrouter", "https://openrouter.ai/api/v1"
+    )
+    assert agent.request_overrides["extra_body"]["hostile"] is hostile
+    agent.request_overrides["extra_body"]["sibling"]["mutated"] = True
+    assert sibling == {"mutated": False}
+
+
 @pytest.mark.parametrize("container_kind", ["dict", "list"])
 def test_public_switch_rejects_container_hooks_before_mutating_route(container_kind):
     """A switch snapshot must not execute mapping/sequence subclass hooks."""

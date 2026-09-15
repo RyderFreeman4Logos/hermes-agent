@@ -407,6 +407,54 @@ def test_live_poller_prompt_submit_claim_keeps_completion_receipt_unconsumed(
         _clear_ids(event["session_id"])
 
 
+def test_public_user_core_row_does_not_ack_waiting_receipt_on_stop(monkeypatch, tmp_path):
+    """A completed public user turn cannot consume its waiting completion receipt."""
+    event = _completion("proc_user_core_stop_reclaim")
+    _clear_ids(event["session_id"])
+
+    class Agent:
+        model = "test-model"
+        provider = "test-provider"
+        session_id = "owner-session"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, prompt, **_kwargs):
+            return {"final_response": "user response", "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "user response"},
+            ]}
+
+    sid = "owner-user-core-stop"
+    session = _session(agent=Agent(), running=False, agent_ready=threading.Event())
+    session["agent_ready"].set()
+    try:
+        with _isolated_queue(monkeypatch) as isolated:
+            server._sessions[sid] = session
+            _patch_inline_turn(monkeypatch, tmp_path)
+            monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a: None)
+            monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a: None)
+            monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+            monkeypatch.setattr(server, "_wire_callbacks", lambda *_a: None)
+            monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_k: [])
+            monkeypatch.setattr(server, "_clear_session_context", lambda *_a: None)
+            monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+            monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a: False)
+            response = server.handle_request({"id": "user-core", "method": "prompt.submit", "params": {"session_id": sid, "text": "real user"}})
+            assert response["result"]["status"] == "streaming"
+            assert [row["role"] for row in session["history"]] == ["user", "assistant"]
+            session["_completion_active_receipt"] = {"events": [event]}
+            session.update(_closing=True, _finalized=True)
+            stop = threading.Event(); stop.set()
+            server._notification_poller_loop(stop, sid, session)
+            assert process_registry.is_completion_consumed(event["session_id"]) is False
+            assert _queued_ids(isolated) == [event["session_id"]]
+    finally:
+        server._sessions.pop(sid, None)
+        _clear_ids(event["session_id"])
+
+
 def test_idle_flush_keeps_suffix_pending_until_real_noncompletion_barrier_starts(monkeypatch):
     """C1/W/C2 must not merge C2 into C1 while W has not claimed its route."""
     c1, c2 = _completion("proc_barrier_first"), _completion("proc_barrier_later")

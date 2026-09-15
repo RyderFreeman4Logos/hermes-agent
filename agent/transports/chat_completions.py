@@ -556,7 +556,9 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs.update(params["request_overrides"])
         return _finish_kwargs(
             api_kwargs, sanitized, params,
-            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key")) or _is_openai_api_base_url(base_url),
+            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
+            or _is_openai_api_base_url(base_url)
+            or str(params.get("provider_name") or "").startswith("custom:"),
         )
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):

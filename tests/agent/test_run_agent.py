@@ -3381,6 +3381,7 @@ class TestRunConversation:
     ):
         """The first real request after compression must use the stable prefix."""
         from agent.transports.codex import _cache_scope_from_session_id, _content_cache_key
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=tmp_path / "state.db")
@@ -3407,7 +3408,6 @@ class TestRunConversation:
         agent._memory_manager.prefetch_all.return_value = ""
         agent._memory_manager.describe_recall.return_value = ""
         initial_prompt = agent._build_system_prompt()
-        stable_prefix = agent._cached_system_prompt_static
         agent._cached_system_prompt = initial_prompt
         agent._memory_manager.build_system_prompt.return_value = "rebuilt volatile suffix"
 
@@ -3433,12 +3433,14 @@ class TestRunConversation:
         assert agent.context_compressor.awaiting_real_usage_after_compression is True
         assert agent.session_id == session_id
         assert agent._memory_manager.build_system_prompt.call_count >= 2
+        stable_prefix = agent._cached_system_prompt_static
 
         agent.client.chat.completions.create.return_value = _mock_response(
             content="done",
             finish_reason="stop",
             usage={"prompt_tokens": 512, "completion_tokens": 1, "total_tokens": 513},
         )
+        scope = _cache_scope_from_session_id(resolve_prompt_cache_scope(agent))
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -3451,12 +3453,12 @@ class TestRunConversation:
         assert result["completed"] is True
         assert agent.client.chat.completions.create.call_count == 1
         request = agent.client.chat.completions.create.call_args_list[0].kwargs
-        scope = _cache_scope_from_session_id(session_id)
+        system = request["messages"][0]
+        assert system["content"][0]["text"] == stable_prefix
         assert request["prompt_cache_key"] == _content_cache_key(
-            stable_prefix, agent.tools, scope
+            stable_prefix, request["tools"], scope
         )
         assert request["prompt_cache_key"] != _content_cache_key("", agent.tools, scope)
-        system = request["messages"][0]
         assert system["role"] == "system"
         assert isinstance(system["content"], list)
         assert system["content"][0]["cache_control"] == {"type": "ephemeral"}

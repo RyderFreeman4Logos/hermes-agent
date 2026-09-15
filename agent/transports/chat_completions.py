@@ -611,7 +611,6 @@ class ChatCompletionsTransport(ProviderTransport):
             supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False))
             or str(params.get("provider_name") or "").strip().lower().startswith("custom:"),
         )
-        )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize an OpenAI ChatCompletion.

@@ -29,11 +29,17 @@ def _agent():
 
 
 def _spawn(agent, task_id, tmp_path):
+    import tools.process_registry as processes
+
     _bind_turn_identity(agent, task_id, None, None, None, None)
-    command = shlex.quote(sys.executable) + " -c " + shlex.quote("import time; time.sleep(60)")
+    ready = f"READY-{task_id}"
+    code = f"print({ready!r}, flush=True); import time; time.sleep(60)"
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote(code)
     result = json.loads(terminal_tool(command, background=True, task_id=task_id,
                                      workdir=str(tmp_path), notify_on_complete=True))
-    return result["session_id"]
+    session_id = result["session_id"]
+    assert _wait_until(lambda: ready in processes.process_registry.poll(session_id)["output_preview"])
+    return session_id
 
 
 def test_child_close_kills_only_its_processes(tmp_path, monkeypatch):
@@ -65,15 +71,45 @@ def test_close_reclaims_processes_from_previous_turns(tmp_path, monkeypatch):
     import tools.process_registry as processes
     registry = ProcessRegistry()
     monkeypatch.setattr(processes, "process_registry", registry)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(processes, "save_completed_result", lambda _session: None)
     agent = _agent()
+    entered_finish = {}
+    held_sessions = set()
+    release_finish = threading.Event()
+    original_finish = registry._finish_reader
+
+    def held_finish(session, *args, **kwargs):
+        if session.id in held_sessions:
+            entered_finish[session.id].set()
+            assert release_finish.wait(5), "test did not release terminal readers"
+        return original_finish(session, *args, **kwargs)
+
+    monkeypatch.setattr(registry, "_finish_reader", held_finish)
     try:
         first = _spawn(agent, "turn-one-owner", tmp_path)
         second = _spawn(agent, "turn-two-owner", tmp_path)
+        sessions = [registry.get(session_id) for session_id in (first, second)]
+        assert all(session is not None for session in sessions)
+        assert all(session.process.poll() is None for session in sessions)
+        held_sessions.update((first, second))
+        entered_finish.update({session_id: threading.Event() for session_id in held_sessions})
+        for session in sessions:
+            monkeypatch.setattr(session._reader_settlement_ready, "wait", lambda timeout=None: False)
+
         agent.close()
+
+        assert all(event.wait(2) for event in entered_finish.values())
+        assert all(session.process.wait(timeout=2) is not None for session in sessions)
+        assert all(registry.poll(session_id)["status"] == "running" for session_id in (first, second))
+
+        release_finish.set()
         assert _wait_until(
-            lambda: all(registry.poll(s)["status"] != "running" for s in (first, second))
+            lambda: all(session._completion_event.is_set() for session in sessions)
         )
+        assert all(registry.poll(session_id)["status"] != "running" for session_id in (first, second))
     finally:
+        release_finish.set()
         registry.kill_all()
         agent.close()
 

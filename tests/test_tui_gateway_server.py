@@ -7440,7 +7440,7 @@ def test_process_kill_rpc_late_reservation_owns_output_before_live_poller(
 
     def terminate_with_late_noop(
         pid, expected_start, on_direct_signal=None, on_direct_noop=None,
-        direct_signal_lock=None,
+        direct_signal_lock=None, owned_process_group=None,
     ):
         if threading.current_thread().name == "late-consuming-rpc":
             assert on_direct_noop is not None
@@ -7451,6 +7451,7 @@ def test_process_kill_rpc_late_reservation_owns_output_before_live_poller(
         return original_terminate(
             pid, expected_start, on_direct_signal,
             on_direct_noop=on_direct_noop, direct_signal_lock=direct_signal_lock,
+            owned_process_group=owned_process_group,
         )
 
     monkeypatch.setattr(registry, "_terminate_host_pid", terminate_with_late_noop)

@@ -1214,33 +1214,64 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
-        lock = self._advisory_write_lock() if not self.read_only else nullcontext()
-        with lock:
-            with self._lock:
-                if self._conn:
-                    quarantine_reason = self._quarantine_reason()
-                    if quarantine_reason is not None:
-                        logger.warning(
-                            "Skipping the close-time WAL checkpoint for %s: this "
-                            "handle observed %s. Take a snapshot of state.db, -wal and -shm "
-                            "before restarting, then run `hermes sessions recover --source %s --inspect-only`.",
-                            self.db_path, quarantine_reason, self.db_path,
-                        )
-                    elif not self.read_only:  # PASSIVE, not TRUNCATE (see docstring)
-                        try:
-                            # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
-                            # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
-                            # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
-                            # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
-                            # on a sole-opener/quiescent connection.
-                            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                        except Exception as exc:
-                            logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                    conn, self._conn = self._conn, None
-                    self._close_connection_quietly(conn)
-                    # A clean close lets SQLite unlink the sidecars (a legitimate end of the
-                    # generation, not a split): a teardown-race reopen must re-adopt.
-                    self._db_sidecar_identity = {}
+        # Teardown must not wait write patience. Checkpoint only while the sidecar
+        # flock is held; still close/clear the writer if flock or checkpoint fails.
+        closed = False
+        write_lock = (
+            _session_db_advisory_write_lock(
+                self.db_path, deadline=time.monotonic(), patience_s=0.0,
+            )
+            if not self.read_only
+            else nullcontext()
+        )
+        try:
+            with write_lock:
+                with self._lock:
+                    if self._conn:
+                        quarantine_reason = self._quarantine_reason()
+                        if quarantine_reason is not None:
+                            logger.warning(
+                                "Skipping the close-time WAL checkpoint for %s: this "
+                                "handle observed %s. Take a snapshot of state.db, -wal and -shm "
+                                "before restarting, then run `hermes sessions recover --source %s --inspect-only`.",
+                                self.db_path, quarantine_reason, self.db_path,
+                            )
+                        elif not self.read_only:
+                            try:
+                                # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
+                                # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
+                                # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
+                                # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
+                                # on a sole-opener/quiescent connection.
+                                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                            except Exception as extra:
+                                logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", extra)
+                        conn, self._conn = self._conn, None
+                        self._close_connection_quietly(conn)
+                        # A clean close lets SQLite unlink the sidecars (a legitimate end of the
+                        # generation, not a split): a teardown-race reopen must re-adopt.
+                        self._db_sidecar_identity = {}
+                    closed = True
+        except sqlite3.OperationalError:
+            logger.debug(
+                "Skipping the close-time WAL checkpoint for %s: write lock unavailable",
+                self.db_path,
+            )
+        finally:
+            if not closed:
+                with self._lock:
+                    if self._conn:
+                        quarantine_reason = self._quarantine_reason()
+                        if quarantine_reason is not None:
+                            logger.warning(
+                                "Skipping the close-time WAL checkpoint for %s: this "
+                                "handle observed %s. Take a snapshot of state.db, -wal and -shm "
+                                "before restarting, then run `hermes sessions recover --source %s --inspect-only`.",
+                                self.db_path, quarantine_reason, self.db_path,
+                            )
+                        conn, self._conn = self._conn, None
+                        self._close_connection_quietly(conn)
+                        self._db_sidecar_identity = {}
 
     def __del__(self) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays

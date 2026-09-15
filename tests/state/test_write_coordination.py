@@ -171,3 +171,71 @@ def test_transient_sqlite_busy_still_retries(db, process_ctx) -> None:
 
 def assert_lock_released(release) -> None:
     assert release.is_set(), "SessionDB write entered while another process held its lock"
+
+
+def test_close_clears_writer_conn_when_advisory_lock_held(db, process_ctx) -> None:
+    db._WRITE_PATIENCE_S = 0.2
+    writer = db._conn
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(f"{db.db_path}.write.lock", ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    started = time.monotonic()
+    try:
+        db.close()
+    finally:
+        elapsed = time.monotonic() - started
+        release.set()
+        holder.join(10)
+    assert holder.exitcode == 0
+    assert elapsed < 1.0
+    assert db._conn is None
+    with pytest.raises(sqlite3.ProgrammingError):
+        writer.execute("SELECT 1")
+
+
+def test_close_clears_writer_conn_when_checkpoint_raises(db) -> None:
+    writer = db._conn
+    original = writer.execute
+
+    def execute(sql, *args, **kwargs):
+        if "wal_checkpoint" in str(sql).lower():
+            raise sqlite3.OperationalError("checkpoint failed")
+        return original(sql, *args, **kwargs)
+
+    writer.execute = execute
+    db.close()
+    assert db._conn is None
+    with pytest.raises(sqlite3.ProgrammingError):
+        writer.execute("SELECT 1")
+
+
+def test_close_skips_checkpoint_without_advisory_lock(db, process_ctx) -> None:
+    db._WRITE_PATIENCE_S = 0.2
+    writer = db._conn
+    executed = []
+    original = writer.execute
+
+    def execute(sql, *args, **kwargs):
+        executed.append(sql)
+        return original(sql, *args, **kwargs)
+
+    writer.execute = execute
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(f"{db.db_path}.write.lock", ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    try:
+        db.close()
+    finally:
+        release.set()
+        holder.join(10)
+    assert holder.exitcode == 0
+    assert db._conn is None
+    assert not any("wal_checkpoint" in str(sql).lower() for sql in executed)

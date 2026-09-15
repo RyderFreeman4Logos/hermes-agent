@@ -1,5 +1,6 @@
 """Regression coverage for API-only loop timing context."""
 
+import copy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Callable
@@ -460,3 +461,83 @@ def test_output_cap_compression_rearms_missing_timing_once():
     assert len(persisted_timing) == 1
     assert "cache_control" not in retry_timing[0]
     assert persisted_timing[0]["display_metadata"]["loop_timing_turn_id"]
+
+
+def test_output_cap_real_compression_persists_retained_timing_in_place(tmp_path):
+    """W5: output-cap recovery reaches the real SQLite compaction boundary.
+
+    The provider error and successful response are local SDK objects.  The
+    compression itself uses the production facade and ``SessionDB`` rather
+    than replacing ``_compress_context``; its deterministic summary is only
+    the hermetic auxiliary-provider seam.
+    """
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "output-cap-real-compression"
+    db.create_session(sid, source="test")
+    agent._session_db = db
+    agent.session_id = sid
+    agent._session_db_created = True
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.model = "some/model"
+    agent.max_tokens = 65_536
+    agent.compression_enabled = True
+    agent.compression_in_place = True
+    agent._compression_feasibility_checked = True
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent._fallback_chain = []
+    agent.context_compressor.should_compress = MagicMock(return_value=False)
+    agent.context_compressor.compress = lambda messages, **_kwargs: [
+        {"role": "assistant", "content": "summary"},
+        *[
+            copy.deepcopy(row)
+            for row in messages
+            if row.get("content") == "hello" or row.get("display_kind") == "hidden"
+        ],
+    ]
+    exc = Exception(
+        "max_tokens: 65536 > context_window: 200000 "
+        "- input_tokens: 199000 = available_tokens: 1000"
+    )
+    exc.status_code = 400
+    exc.code = 400
+    done = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="done", tool_calls=None), finish_reason="stop")],
+        model="some/model", usage=None,
+    )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [exc, done]
+
+    try:
+        with (
+            patch.object(agent, "_build_system_prompt", return_value="You are helpful."),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.title_generator.maybe_auto_title"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=[
+                {"role": "user", "content": "x" * 4000},
+                {"role": "assistant", "content": "y" * 4000},
+            ])
+
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 2
+        assert agent._last_compaction_in_place is True
+        active = db.get_messages_as_conversation(sid)
+        timing = [row for row in active if row.get("display_kind") == "hidden"]
+        assert len(timing) == 1
+        assert "[Agent loop timing]" in timing[0]["content"]
+        assert timing[0]["display_metadata"]["loop_timing_turn_id"]
+    finally:
+        db.close()

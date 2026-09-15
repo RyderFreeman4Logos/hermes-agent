@@ -301,6 +301,67 @@ def test_chat_profile_and_legacy_first_send_coalesce_timing_without_mutation(mon
     assert sent[1]["content"].count("[Agent loop timing]") == 1
 
 
+def test_chat_send_keeps_two_hidden_timing_rows_through_mixed_content(monkeypatch):
+    """W6: the real Chat call demotes only timing rows through mixed blocks.
+
+    Empty string/list/``None`` neighbours are intentional public history
+    shapes.  Their presence must neither stringify into the payload nor make
+    either durable timing event disappear or reorder.
+    """
+    agent = _make_local_agent(
+        monkeypatch, api_mode="chat_completions", provider="unknown-profile", model="chat-test",
+    )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = _completed_chat_response()
+    timing_one = "[Agent loop timing] first durable timing"
+    timing_two = "[Agent loop timing] second durable timing"
+    history = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "Stable instructions", "cache_control": {"type": "ephemeral"}}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "marked user", "cache_control": {"type": "ephemeral"}}],
+        },
+        {"role": "user", "content": ""},
+        {"role": "assistant", "content": None},
+        {
+            "role": "system", "content": timing_one, "display_kind": "hidden",
+            "display_metadata": {"loop_timing_turn_id": "timing-one"},
+        },
+        {"role": "user", "content": []},
+        {
+            "role": "system", "content": timing_two, "display_kind": "hidden",
+            "display_metadata": {"loop_timing_turn_id": "timing-two"},
+        },
+    ]
+    original = copy.deepcopy(history)
+
+    result = agent.run_conversation("current user", conversation_history=history)
+
+    assert result["completed"] is True
+    assert history == original
+    wire = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    assert all(row["role"] != "system" or "[Agent loop timing]" not in _wire_text(row) for row in wire)
+    wire_text = "\n".join(_wire_text(row) for row in wire)
+    durable = [timing_one, timing_two]
+    current = [
+        row["content"] for row in result["messages"]
+        if row.get("display_kind") == "hidden" and "[Agent loop timing]" in _wire_text(row)
+    ]
+    assert len(current) == 3
+    durable.append(current[-1])
+    positions = []
+    for timing in durable:
+        matched = [row for row in wire if timing in _wire_text(row)]
+        assert len(matched) == 1
+        assert matched[0]["role"] == "user"
+        positions.append(wire_text.index(timing))
+    assert positions == sorted(positions)
+    assert "None" not in wire_text
+
+
 class _ClassifiedPolicyError(Exception):
     """Local non-retryable error that follows the configured fallback branch."""
 

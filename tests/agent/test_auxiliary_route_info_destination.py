@@ -244,7 +244,7 @@ def test_overlapping_public_compress_attempts_keep_summary_routes_attempt_local(
         assert {key: digest_routes[name].get(key) for key in expected} == expected
 
 
-def test_call_llm_reports_complete_successful_custom_fallback_destination():
+def test_call_llm_reports_complete_successful_codex_fallback_destination():
     class CapacityUnavailable(Exception):
         status_code = 402
 
@@ -260,7 +260,7 @@ def test_call_llm_reports_complete_successful_custom_fallback_destination():
         choices=[SimpleNamespace(message=SimpleNamespace(content="fallback-ok"))]
     )
     fallback_entry = {
-        "provider": "custom",
+        "provider": "openai-codex",
         "model": "fallback-model",
         "base_url": "https://fallback.invalid/v1",
         "api_key": "synthetic-fallback-key",
@@ -295,8 +295,9 @@ def test_call_llm_reports_complete_successful_custom_fallback_destination():
 
     assert response.choices[0].message.content == "fallback-ok"
     assert route_info == {
-        "provider": "custom",
+        "provider": "openai-codex",
         "model": "fallback-model",
+        "fallback_label": "fallback_chain[0](openai-codex)",
         "base_url": "https://fallback.invalid/v1",
         "api_key": "synthetic-fallback-key",
         "api_mode": "anthropic_messages",

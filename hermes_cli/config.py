@@ -1,6 +1,7 @@
 """Configuration management for Hermes Agent: config.yaml / .env loading, saving,
 validation, migration, and the ``hermes config`` command."""
 
+import codecs
 import copy
 import difflib
 import hashlib
@@ -208,20 +209,21 @@ def _digest_file(path: Path) -> bytes:
 
 
 class _DigestingConfigReader:
-    """Bounded read adapter that records exactly the bytes given to YAML."""
+    """Bounded UTF-8 reader that hashes the exact bytes given to YAML as text."""
 
     def __init__(self, source) -> None:
         self._source = source
         self._digest = hashlib.sha256()
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
 
-    def read(self, size: int = -1) -> bytes:
+    def read(self, size: int = -1) -> str:
         # The YAML loaders use finite requests; retain the bound if another
         # compatible loader asks for its usual "all" sentinel.
         size = _RAW_CONFIG_READ_CHUNK_BYTES if size is None or size < 0 else min(
             size, _RAW_CONFIG_READ_CHUNK_BYTES)
         chunk = self._source.read(size)
         self._digest.update(chunk)
-        return chunk
+        return self._decoder.decode(chunk, final=not chunk)
 
     def digest(self) -> bytes:
         return self._digest.digest()
@@ -1947,7 +1949,8 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             cached_copy = copy.deepcopy(data)
             _RAW_CONFIG_CACHE[path_key] = (digest, cached_copy)
             result = data if want_deepcopy else cached_copy
-        if valid_root and failure_at_start is not None and _CONFIG_PARSE_FAILURES.get(path_key) == failure_at_start:
+        if valid_root and failure_at_start is not None and _CONFIG_PARSE_FAILURES.get(path_key) is failure_at_start:
+            _LOAD_CONFIG_CACHE.pop(path_key, None)
             _CONFIG_PARSE_FAILURES.pop(path_key, None)
             _CONFIG_PARSE_WARNED.discard((path_key, failure_at_start[0], failure_at_start[1]))
         return result

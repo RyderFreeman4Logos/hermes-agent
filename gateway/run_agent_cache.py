@@ -54,7 +54,7 @@ def _read_honcho_snapshot(path) -> tuple[bytes, object, bool]:
     if overflow:
         return digest.digest(), _HONCHO_UNAVAILABLE, True
     try:
-        parsed = json.loads(retained)
+        parsed = json.loads(retained.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return digest.digest(), _HONCHO_UNAVAILABLE, False
     return digest.digest(), parsed if isinstance(parsed, dict) else _HONCHO_UNAVAILABLE, False

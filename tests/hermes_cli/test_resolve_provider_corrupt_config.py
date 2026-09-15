@@ -327,3 +327,156 @@ def test_later_corrupt_reader_survives_an_earlier_stale_valid_reader(tmp_path, m
     with pytest.raises(AuthError) as excinfo:
         resolve_provider("auto")
     assert excinfo.value.code == "corrupt_config"
+
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_validated_same_metadata_recovery_refreshes_merged_provider(
+    tmp_path, monkeypatch, reader_name
+):
+    """A raw recovery must refresh the merged config before releasing auth."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.auth import AuthError, resolve_provider
+
+    valid = "model:\n  provider: nous\n"
+    broken = "model:\n  provider: [no".ljust(len(valid))
+    _home, cfg = _setup_home(tmp_path, monkeypatch, broken)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-FAKE1234567890")
+
+    config_mod.load_config()
+    failed_stat = cfg.stat()
+    with pytest.raises(AuthError) as denied:
+        resolve_provider("auto")
+    assert denied.value.code == "corrupt_config"
+
+    cfg.write_text(valid, encoding="utf-8")
+    os.utime(cfg, ns=(failed_stat.st_atime_ns, failed_stat.st_mtime_ns))
+    assert getattr(config_mod, reader_name)()["model"]["provider"] == "nous"
+    assert config_mod.get_active_config_parse_failure() is None
+    assert resolve_provider("auto") == "nous"
+
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_equal_later_failure_survives_an_earlier_valid_reader(
+    tmp_path, monkeypatch, reader_name
+):
+    """Equal-valued failures are distinct observations under concurrent recovery."""
+    from pathlib import Path
+
+    from hermes_cli import config as config_mod
+    from hermes_cli.auth import AuthError, resolve_provider
+
+    valid = VALID_YAML
+    broken = "gateway:\n  enabled: [false"
+    assert len(valid) == len(broken)
+    _home, cfg = _setup_home(tmp_path, monkeypatch, broken)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-FAKE1234567890")
+    config_mod.load_config()
+    reader = getattr(config_mod, reader_name)
+    assert reader() == {}
+    initial_error = config_mod.get_active_config_parse_failure()
+    assert initial_error
+    fixed_stat = cfg.stat()
+
+    def replace_config(text):
+        replacement = cfg.with_suffix(".next")
+        replacement.write_text(text, encoding="utf-8")
+        replacement.replace(cfg)
+        os.utime(cfg, ns=(fixed_stat.st_atime_ns, fixed_stat.st_mtime_ns))
+
+    replace_config(valid)
+    first_digest_read = threading.Event()
+    release_first_digest = threading.Event()
+    first_parser_open = threading.Event()
+    release_first_parser = threading.Event()
+    original_open = Path.open
+    first_opens = 0
+    first_result = {}
+
+    class ForwardingBarrierReader:
+        def __init__(self, source, phase):
+            self._source = source
+            self._phase = phase
+            self._first_read = True
+
+        def read(self, size=-1):
+            if self._phase == "parser" and self._first_read:
+                first_parser_open.set()
+                assert release_first_parser.wait(5)
+            value = self._source.read(size)
+            if self._phase == "digest" and self._first_read and value:
+                first_digest_read.set()
+                assert release_first_digest.wait(5)
+            self._first_read = False
+            return value
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._source.close()
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
+    def barrier_open(self, *args, **kwargs):
+        nonlocal first_opens
+        source = original_open(self, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if self == cfg and mode == "rb" and threading.current_thread().name == "first-reader":
+            first_opens += 1
+            return ForwardingBarrierReader(source, "digest" if first_opens == 1 else "parser")
+        return source
+
+    monkeypatch.setattr(Path, "open", barrier_open)
+    first = threading.Thread(
+        target=lambda: first_result.setdefault("value", reader()),
+        name="first-reader",
+    )
+    first.start()
+    try:
+        assert first_digest_read.wait(5)
+
+        replace_config(broken)
+        assert reader() == {}
+        assert config_mod.get_active_config_parse_failure() == initial_error
+
+        replace_config(valid)
+        release_first_digest.set()
+        assert first_parser_open.wait(5)
+        replace_config(broken)
+        release_first_parser.set()
+    finally:
+        release_first_digest.set()
+        release_first_parser.set()
+        first.join(timeout=5)
+    assert not first.is_alive()
+    assert first_result["value"] == {"gateway": {"enabled": False}}
+
+    assert config_mod.get_active_config_parse_failure() == initial_error
+    with pytest.raises(AuthError) as denied:
+        resolve_provider("auto")
+    assert denied.value.code == "corrupt_config"
+
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_utf16_raw_snapshot_cannot_retire_utf8_parse_failure(
+    tmp_path, monkeypatch, reader_name
+):
+    """Raw readers admit exactly the UTF-8 text accepted by the merged reader."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.auth import AuthError, resolve_provider
+
+    home = tmp_path / "hermes"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    cfg = home / "config.yaml"
+    cfg.write_bytes("model:\n  provider: nous\n".encode("utf-16"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-FAKE1234567890")
+
+    config_mod.load_config()
+    assert config_mod.get_active_config_parse_failure()
+    assert getattr(config_mod, reader_name)() == {}
+    assert config_mod.get_active_config_parse_failure()
+    with pytest.raises(AuthError) as denied:
+        resolve_provider("auto")
+    assert denied.value.code == "corrupt_config"

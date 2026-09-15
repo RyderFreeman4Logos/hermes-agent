@@ -838,6 +838,44 @@ def test_cache_busting_same_metadata_honcho_rewrite_changes_identity_and_signatu
     assert first_signature != second_signature
 
 
+def test_cache_busting_utf8_bom_matches_live_honcho_rejection(tmp_path, monkeypatch):
+    """The cache observer must reject the same BOM-prefixed JSON as the live client."""
+    from gateway.run import GatewayRunner
+
+    path = tmp_path / "honcho.json"
+    payload = json.dumps({"apiKey": "k", "peerName": "Alice", "pinPeerName": True}).encode()
+    path.write_bytes(payload)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HONCHO_API_KEY", raising=False)
+    monkeypatch.delenv("HONCHO_BASE_URL", raising=False)
+    monkeypatch.delenv("HONCHO_URL", raising=False)
+    monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+    live_before = HonchoClientConfig.from_global_config(config_path=path)
+    keys_before = GatewayRunner._extract_cache_busting_config(
+        {"memory": {"provider": "honcho"}}
+    )
+    signature_before = GatewayRunner._agent_config_signature(
+        "test-model", {}, [], "", cache_keys=keys_before
+    )
+    assert live_before.peer_name == keys_before["honcho.peer_name"] == "Alice"
+
+    path.write_bytes(b"\xef\xbb\xbf" + payload)
+    live_after = HonchoClientConfig.from_global_config(config_path=path)
+    keys_after = GatewayRunner._extract_cache_busting_config(
+        {"memory": {"provider": "honcho"}}
+    )
+    signature_after = GatewayRunner._agent_config_signature(
+        "test-model", {}, [], "", cache_keys=keys_after
+    )
+
+    assert live_after.peer_name is None
+    assert live_after.pin_peer_name is False
+    assert keys_after["honcho.peer_name"] is None
+    assert keys_after["honcho.pin_peer_name"] is None
+    assert signature_after != signature_before
+
+
 def test_cache_busting_read_barrier_uses_the_already_read_small_snapshot(
     tmp_path, monkeypatch
 ):

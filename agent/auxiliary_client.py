@@ -1572,7 +1572,10 @@ class _CodexCompletionsAdapter:
             from agent.sdk_transform_bypass import bypass_sdk_request_transform
             # Keep bulk wire payload out of the SDK's GIL-holding request transform.
             stream_kwargs = bypass_sdk_request_transform({**resp_kwargs, "stream": True})
-            event_stream = self._client.responses.create(**stream_kwargs)
+            from agent import relay_llm
+            event_stream = relay_llm.physical_send(
+                stream_kwargs, lambda request: self._client.responses.create(**request)
+            )
             guard.adopt_stream(event_stream)
             # The timer may fire while responses.create() is blocked; if the cancelled attempt
             # had no stream to close then, close it now that it is attempt-owned — never the shared client.
@@ -2661,9 +2664,16 @@ def _relay_sync_stream(
     from agent import relay_llm
     from agent.auxiliary_hooks import run_with_aux_hooks
     model_name = str(kwargs.get("model") or fallback_model)
+    callback = (
+        create
+        if _client_streams_internally(client)
+        else lambda request: relay_llm.physical_send(
+            request, lambda final: create(final)
+        )
+    )
     return run_with_aux_hooks(
         lambda: relay_llm.stream_current(
-            kwargs, create, name=provider_name, model_name=model_name, finalizer=dict,
+            kwargs, callback, name=provider_name, model_name=model_name, finalizer=dict,
             metadata=metadata, completed_response_predicate=lambda value: hasattr(value, "choices"),
         ),
         aux_task=str(metadata.get("auxiliary_task") or ""), metadata=metadata, client=client, kwargs=kwargs,
@@ -6911,14 +6921,24 @@ def _create_with_progress_once(
     # reset the compression inactivity fence, or a zero-output attempt runs to the
     # total ceiling instead of idling out (#114938). Progress ticks only for
     # substantive stream payloads or a completed usable response.
-    if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
-        response = client.chat.completions.create(**kwargs)
-        if not _client_streams_internally(client):
+    internal_stream = _client_streams_internally(client)
+    if (not _aux_progress_active() and not force_stream) or internal_stream:
+        if internal_stream:
+            response = client.chat.completions.create(**kwargs)
+        else:
+            from agent import relay_llm
+            response = relay_llm.physical_send(
+                kwargs, lambda request: client.chat.completions.create(**request)
+            )
+        if not internal_stream:
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
     try:
-        chunks = client.chat.completions.create(**stream_kwargs)
+        from agent import relay_llm
+        chunks = relay_llm.physical_send(
+            stream_kwargs, lambda request: client.chat.completions.create(**request)
+        )
     except Exception as exc:
         # Genuine provider failures aren't streaming's fault — surface unchanged so the
         # recovery chains see the same error as a plain call.
@@ -6930,7 +6950,9 @@ def _create_with_progress_once(
         logger.debug("Auxiliary %s: streamed request failed (%s); retrying non-streaming",
                      task or "call", exc)
         _notify_aux_dispatch()
-        response = client.chat.completions.create(**kwargs)
+        response = relay_llm.physical_send(
+            kwargs, lambda request: client.chat.completions.create(**request)
+        )
         _notify_aux_provider_response()
         return response
     # Some shims (MoA quiet mode, defensive adapters) return a complete response despite
@@ -7118,7 +7140,10 @@ async def _aggregate_chat_stream_async(
 async def _acreate_with_stream(client: Any, kwargs: Dict[str, Any], task: Optional[str] = None) -> Any:
     """Async create() for stream-only providers: ``stream=True`` + aggregate the async chunks."""
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
-    chunks = await client.chat.completions.create(**stream_kwargs)
+    from agent import relay_llm
+    chunks = await relay_llm.physical_send_async(
+        stream_kwargs, lambda request: client.chat.completions.create(**request)
+    )
     if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
         return chunks
     return await _aggregate_chat_stream_async(chunks, model=model, total_ceiling=total_ceiling)
@@ -7137,14 +7162,24 @@ async def _acreate_with_progress(
     kwargs = bypass_chat_sdk_request_transform(kwargs, client)
     _notify_aux_dispatch()
     # Same contract as the sync twin (#114938): dispatch alone is not progress.
-    if (not _aux_progress_active() and not force_stream) or _async_client_streams_internally(client):
-        response = await client.chat.completions.create(**kwargs)
-        if not _async_client_streams_internally(client):
+    internal_stream = _async_client_streams_internally(client)
+    if (not _aux_progress_active() and not force_stream) or internal_stream:
+        if internal_stream:
+            response = await client.chat.completions.create(**kwargs)
+        else:
+            from agent import relay_llm
+            response = await relay_llm.physical_send_async(
+                kwargs, lambda request: client.chat.completions.create(**request)
+            )
+        if not internal_stream:
             _notify_aux_provider_response()
         return response
     stream_kwargs, model, total_ceiling = _stream_request_plan(kwargs)
     try:
-        chunks = await client.chat.completions.create(**stream_kwargs)
+        from agent import relay_llm
+        chunks = await relay_llm.physical_send_async(
+            stream_kwargs, lambda request: client.chat.completions.create(**request)
+        )
     except Exception as exc:
         # Only a rejected stream NEGOTIATION falls back to a plain call (mirrors the sync wrapper); a
         # failure mid-consumption below reaches the classified recovery ladder instead of silently
@@ -7155,7 +7190,9 @@ async def _acreate_with_progress(
         logger.debug("Auxiliary %s: streamed async request failed (%s); retrying non-streaming",
                      task or "call", exc)
         _notify_aux_dispatch()
-        response = await client.chat.completions.create(**kwargs)
+        response = await relay_llm.physical_send_async(
+            kwargs, lambda request: client.chat.completions.create(**request)
+        )
         _notify_aux_provider_response()
         return response
     if hasattr(chunks, "choices"):  # shims may hand back a complete response despite stream=True
@@ -7948,7 +7985,18 @@ def _call_llm_impl(
         if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
             # Responses-shim clients consume the stream internally and return a completed
             # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
-            return client.chat.completions.create(**kwargs)
+            route = _relay_auxiliary_metadata(
+                provider=request_provider, api_mode=req.resolved_api_mode
+            )
+            if route is None:
+                return client.chat.completions.create(**kwargs)
+            provider_name, fallback_model, metadata = route
+            from agent import relay_llm
+            return relay_llm.run_direct(
+                kwargs, lambda request: client.chat.completions.create(**request),
+                name=provider_name, model_name=str(kwargs.get("model") or fallback_model),
+                metadata=metadata,
+            )
         return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
 
     def _primary(**validate_kw: Any) -> Any:

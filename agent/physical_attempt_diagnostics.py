@@ -10,9 +10,12 @@ import secrets
 import stat
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import fcntl
 
 from hermes_constants import get_hermes_home
 
@@ -48,6 +51,7 @@ class Attempt:
     model: str
     loop: int
     retry: int
+    physical_send_ordinal: int
     correlation: str
     components: dict[str, str]
     byte_lengths: dict[str, int]
@@ -92,6 +96,7 @@ def start_attempt(
     loop: int | None,
     correlation: str,
     scope: dict[str, str] | None = None,
+    physical_send_ordinal: int = 0,
 ) -> Attempt | None:
     """Record an opt-in HMAC-only request identity and adjacent-loop pair."""
     if not enabled() or loop is None or loop < 0 or not correlation:
@@ -119,6 +124,7 @@ def start_attempt(
             model=_label(model, key),
             loop=loop,
             retry=max(0, int(retry)),
+            physical_send_ordinal=max(0, int(physical_send_ordinal)),
             correlation=correlation,
             components=components,
             byte_lengths=byte_lengths,
@@ -133,6 +139,7 @@ def start_attempt(
             "model": attempt.model,
             "loop": attempt.loop,
             "retry": attempt.retry,
+            "physical_send_ordinal": attempt.physical_send_ordinal,
             "digests": components,
             "byte_lengths": byte_lengths,
         })
@@ -165,6 +172,7 @@ def _pair(current: Attempt) -> None:
         "previous_loop": previous.loop,
         "current_loop": current.loop,
         "previous_attempt_retry": previous.retry,
+        "previous_physical_send_ordinal": previous.physical_send_ordinal,
         "digests": {
             name: current.components[name]
             for name in ("cache_scope", "later_history", "prefix", "tools")
@@ -256,27 +264,32 @@ def _key() -> bytes:
     if euid is not None and stat.S_IMODE(info.st_mode) != 0o700:
         root.chmod(0o700)
     path = root / _KEY_FILE
-    try:
-        fd = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-    except FileExistsError:
-        fd = _private_fd(path, os.O_RDONLY)
+    with _profile_lock(root / ".physical_attempt_key.lock"):
         try:
-            value = os.read(fd, 33)
-        finally:
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileExistsError:
+            fd = _private_fd(path, os.O_RDONLY)
+            try:
+                value = os.read(fd, 33)
+            finally:
+                os.close(fd)
+            if len(value) != 32:
+                raise ValueError("invalid physical attempt digest key")
+            return value
+        value = secrets.token_bytes(32)
+        try:
+            _write_all(fd, value)
+            os.fsync(fd)
+        except BaseException:
             os.close(fd)
-        if len(value) != 32:
-            raise ValueError("invalid physical attempt digest key")
-        return value
-    value = secrets.token_bytes(32)
-    try:
-        os.write(fd, value)
-    finally:
+            path.unlink(missing_ok=True)
+            raise
         os.close(fd)
-    return value
+        return value
 
 
 def _private_fd(path: Path, flags: int) -> int:
@@ -292,14 +305,44 @@ def _private_fd(path: Path, flags: int) -> int:
     return fd
 
 
+@contextmanager
+def _profile_lock(path: Path):
+    """Serialize one profile's persistence transaction across Linux processes."""
+    fd = _private_fd(path, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(fd, remaining.tobytes())
+        if written <= 0:
+            raise OSError("short physical attempt diagnostics write")
+        remaining = remaining[written:]
+
+
 def _append(record: dict[str, Any]) -> None:
     path = _root() / _RECORDS_FILE
     payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if len(payload) > _MAX_RECORDS_BYTES:
+        raise ValueError("physical attempt diagnostic record exceeds byte cap")
     with _LOCK:
-        fd = _private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-        try:
-            if os.fstat(fd).st_size + len(payload) > _MAX_RECORDS_BYTES:
-                os.ftruncate(fd, 0)
-            os.write(fd, payload)
-        finally:
-            os.close(fd)
+        with _profile_lock(_root() / ".physical_attempt_records.lock"):
+            fd = _private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+            previous_size = os.fstat(fd).st_size
+            start_size = previous_size
+            try:
+                if previous_size + len(payload) > _MAX_RECORDS_BYTES:
+                    os.ftruncate(fd, 0)
+                    start_size = 0
+                _write_all(fd, payload)
+            except BaseException:
+                os.ftruncate(fd, start_size)
+                raise
+            finally:
+                os.close(fd)

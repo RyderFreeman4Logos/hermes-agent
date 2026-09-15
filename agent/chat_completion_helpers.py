@@ -698,13 +698,18 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     api_kwargs.pop("__bedrock_converse__", None)
     client = _get_bedrock_runtime_client(region)
     method = client.converse_stream if stream else client.converse
+    from agent import relay_llm
+
+    def send(final_kwargs):
+        return relay_llm.physical_send(final_kwargs, lambda request: method(**request))
+
     finish = (lambda raw: raw.get("stream", [])) if stream else normalize_converse_response
     try:
-        raw_response = method(**api_kwargs)
+        raw_response = send(api_kwargs)
     except Exception as exc:
         retry_kwargs = recover_from_cache_point_rejection(exc, api_kwargs)
         if retry_kwargs is not None:
-            return finish(method(**retry_kwargs))
+            return finish(send(retry_kwargs))
         if on_stream_denied is not None and is_streaming_access_denied_error(exc):
             return on_stream_denied(client, api_kwargs, exc)
         if is_stale_connection_error(exc):
@@ -740,13 +745,19 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
-        return agent.client.chat.completions.create(**api_kwargs)
+        from agent import relay_llm
+        return relay_llm.physical_send(
+            api_kwargs, lambda request: agent.client.chat.completions.create(**request)
+        )
     request_client = make_client("chat_completion_request")
     # #93650: keep the bulk wire-format payload out of the SDK's GIL-holding
     # request transform. No-op unless this really is the OpenAI SDK, so the
     # MoA facade above and the suite's stand-in clients are unaffected.
     api_kwargs = bypass_chat_sdk_request_transform(api_kwargs, request_client)
-    return request_client.chat.completions.create(**api_kwargs)
+    from agent import relay_llm
+    return relay_llm.physical_send(
+        api_kwargs, lambda request: request_client.chat.completions.create(**request)
+    )
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2261,9 +2272,13 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
 
     def _attempt(retry_count: int) -> str:
         summary_client = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry" if retry_count else "iteration_limit_summary")
+        from agent import relay_llm
         response = _managed_summary_call(
             agent, api_request_id, summary_kwargs,
-            lambda request: summary_client.chat.completions.create(**bypass_chat_sdk_request_transform(request, summary_client)),
+            lambda request: relay_llm.physical_send(
+                bypass_chat_sdk_request_transform(request, summary_client),
+                lambda final: summary_client.chat.completions.create(**final),
+            ),
             retry_count=retry_count)
         return _summary_text(agent, response)
     return _attempt
@@ -2517,7 +2532,10 @@ class _BedrockStream:
             "   Grant that action to restore streaming output.\n", diagnostic=True)
         logger.info("bedrock: converse_stream denied by IAM (%s) — "
             "using non-streaming converse() for this session.", type(exc).__name__)
-        return normalize_converse_response(client.converse(**final_kwargs))
+        from agent import relay_llm
+        return normalize_converse_response(relay_llm.physical_send(
+            final_kwargs, lambda request: client.converse(**request)
+        ))
 
     def _worker(self):
         agent = self.agent
@@ -2917,7 +2935,10 @@ class _StreamingCall(StreamingWaitMonitor):
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
         stream_kwargs = bypass_chat_sdk_request_transform(stream_kwargs, request_client)
-        return request_client.chat.completions.create(**stream_kwargs)
+        from agent import relay_llm
+        return relay_llm.physical_send(
+            stream_kwargs, lambda request: request_client.chat.completions.create(**request)
+        )
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)

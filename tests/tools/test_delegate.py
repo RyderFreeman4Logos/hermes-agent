@@ -25,6 +25,7 @@ from tools.delegate_tool import (
     _load_config,
     delegate_task,
     _build_child_agent,
+    _build_children,
     _build_child_progress_callback,
     _build_child_system_prompt,
     _strip_blocked_tools,
@@ -1369,6 +1370,77 @@ class TestChildCredentialLeasing(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
+    def test_non_xai_child_drops_xai_billing_terminal(self):
+        """A DeepSeek child must not relay an xAI billing terminal from its parent (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "deepseek-v4-flash"
+        child.provider = "deepseek"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Billing or credits exhausted: xAI spending-limit body",
+            "error": "xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertNotIn("xAI spending-limit body", result.get("error", ""))
+        self.assertNotIn("billing_block", result)
+        self.assertEqual(
+            result["error"],
+            "Subagent failed with a provider error unrelated to its effective model.",
+        )
+
+    def test_standard_child_hides_unverified_xai_fallback_terminal(self):
+        """A standard child must not relay an xAI fallback's unverified terminal (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "grok-4.6"
+        child.provider = "xai-oauth"
+        child._delegate_model_profile = "standard"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Provider reported usage/credit exhaustion (unverified): xAI spending-limit body",
+            "error": "xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "billing_unverified": True,
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertNotIn("xAI spending-limit body", result.get("error", ""))
+        self.assertNotIn("billing_block", result)
+        self.assertEqual(
+            result["error"],
+            "Subagent failed after an unverified provider billing error.",
+        )
+        self.assertIsNone(result["model"])
+
 
 class TestDelegateHeartbeat(unittest.TestCase):
     """Heartbeat propagates child activity to parent during delegation.
@@ -2271,6 +2343,37 @@ class TestStandardProfileAttached(unittest.TestCase):
         child = MockAgent.return_value
         self.assertEqual(child._delegate_model_profile, "standard")
         self.assertIsNone(child._delegate_successful_llm_route)
+
+    def test_selected_route_is_frozen_at_child_batch_boundary(self):
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        creds = {
+            "provider": "selected-provider",
+            "model": "selected-model",
+            "base_url": "https://selected.invalid/v1",
+            "api_key": "synthetic-key",
+            "api_mode": "chat_completions",
+        }
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ):
+            children, error = _build_children(
+                [{"goal": "freeze selected route", "model_profile": "fast"}],
+                [None],
+                creds,
+                top_role="leaf",
+                max_iterations=10,
+                parent_agent=parent,
+                routing_cfg={},
+                live_deleg_id=None,
+                live_writers=[],
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(children[0][2]._delegate_selected_llm_route, ("selected-model", "selected-provider"))
+        child.model, child.provider = "fallback-model", "fallback-provider"
+        self.assertEqual(child._delegate_selected_llm_route, ("selected-model", "selected-provider"))
 
 
 if __name__ == "__main__":

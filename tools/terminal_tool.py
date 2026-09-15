@@ -1212,11 +1212,11 @@ def terminal_tool(
         process_task_id = str(task_id or "") if delegated_child else effective_task_id
         if delegated_child and background:
             # A native delegate shares this process registry with its parent.
-            # Keep its subprocesses addressable by the child task only; a child
-            # completion must not become a parent session notification.
+            # Keep its subprocesses addressable by the child task only. Retain
+            # requested completion/watch state for accounting or a later
+            # ownership handoff; owner routing and the typed completion
+            # classifier prevent a routine success from waking the parent.
             session_key = ""
-            notify_on_complete = False
-            watch_patterns = None
 
         _pre_exec_block(command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key)
         # Pre-exec security checks (tirith + dangerous command detection);
@@ -1230,7 +1230,6 @@ def terminal_tool(
             background, notify_on_complete, watch_patterns = True, True, None
             if delegated_child:
                 session_key = ""
-                notify_on_complete = False
                 watch_patterns = None
         if background:
             result = spawn_background_process(

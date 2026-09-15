@@ -9,6 +9,7 @@ named on the child's result as orphaned before teardown kills it.
 import json
 import time
 import weakref
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,6 +34,32 @@ def _register(sid, child):
                         "started_at": time.time(), "status": "running", "tool_count": 0, "agent": child})
 
 
+def _spawn_from_delegated_terminal(monkeypatch, tmp_path, *, sid, command):
+    """Use the public terminal entry while retaining a real registry session."""
+    from agent.delegation_context import delegated_child_context
+    from gateway import session_context
+    from tools import terminal_tool as tt
+
+    monkeypatch.setattr(tt, "_get_env_config", lambda: {
+        "env_type": "local", "docker_image": "", "singularity_image": "",
+        "modal_image": "", "daytona_image": "", "cwd": str(tmp_path), "timeout": 30,
+    })
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    monkeypatch.setitem(tt._active_environments, "default", SimpleNamespace(env={}))
+    monkeypatch.setitem(tt._last_activity, "default", 0.0)
+    try:
+        with delegated_child_context(sid):
+            result = json.loads(tt.terminal_tool(
+                command=command, background=True, notify_on_complete=True, task_id=sid,
+            ))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+    return result, process_registry.get(result["session_id"])
+
+
 @pytest.fixture(autouse=True)
 def _plain_spawn(monkeypatch):
     """Spawn plain children: the systemd-run --user --scope wrapper is irrelevant here and stalls under pytest."""
@@ -49,7 +76,31 @@ def clean_queue():
         process_registry.completion_queue.get_nowait()
 
 
-def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(clean_queue):
+@pytest.mark.parametrize(
+    ("command", "exit_code"),
+    (("printf unread-success", 0), ("printf child-failure; exit 7", 7)),
+    ids=("unread_success", "nonzero"),
+)
+def test_delegated_terminal_keeps_requested_notification_for_child_accounting(
+    monkeypatch, tmp_path, clean_queue, command, exit_code,
+):
+    sid = f"sa-0-notify-{exit_code}"
+    result, session = _spawn_from_delegated_terminal(
+        monkeypatch, tmp_path, sid=sid, command=command,
+    )
+
+    assert result.get("notify_on_complete") is not True
+    assert result.get("subagent_note")
+    assert session.delegated_child is True
+    assert session.notify_on_complete is True
+    assert session._completion_event.wait(10)
+    assert session.exit_code == exit_code
+    assert [s.id for s in process_registry.unread_completions_owned_by(sid)] == [session.id]
+
+
+def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(
+    monkeypatch, tmp_path, clean_queue,
+):
     """A real child-owned process handed off carries the parent's owner id (so the parent's drain accepts it, with the
     handoff purpose), while a sibling the child did not hand off is still owned by the child and is listed as orphaned
     on the child's result."""
@@ -58,8 +109,11 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
     child = _Child(parent)
     _register(sid, child)
     try:
-        handed = process_registry.spawn_local("sleep 0.4; echo ci-green", task_id=sid, owner_task_id=sid)
-        handed.notify_on_complete = True
+        spawn_result, handed = _spawn_from_delegated_terminal(
+            monkeypatch, tmp_path, sid=sid, command="sleep 0.4; echo ci-green",
+        )
+        assert spawn_result.get("notify_on_complete") is not True
+        assert handed.delegated_child is True and handed.notify_on_complete is True
         leftover = process_registry.spawn_local("sleep 30", task_id=sid, owner_task_id=sid)
 
         out = json.loads(_handle_process(

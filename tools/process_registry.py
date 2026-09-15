@@ -1338,6 +1338,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return (
             evt.get("type") == "completion"
             and evt.get("delegated_child") is True
+            and not evt.get("handoff_note")
             and type(evt.get("exit_code")) is int
             and evt["exit_code"] == 0
             and evt.get("completion_reason") == "exited"

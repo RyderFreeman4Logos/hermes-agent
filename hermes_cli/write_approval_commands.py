@@ -4,9 +4,76 @@
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+import logging
+from contextlib import contextmanager
+from typing import Callable, List, Optional
 
 from tools import write_approval as wa
+
+
+logger = logging.getLogger(__name__)
+
+
+def load_authoritative_memory_manager(
+    *, session_id: str, platform: str = "cli", identity: Optional[dict] = None,
+):
+    """Load the active profile's provider for a cold ``/memory approve`` command."""
+    try:
+        from agent.memory_manager import MemoryManager
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import get_hermes_home
+        from plugins.memory import load_memory_provider
+        from tools.memory_tool import get_builtin_memory_config
+
+        memory_config = get_builtin_memory_config(load_config_readonly())
+        provider_name = str(memory_config.get("provider") or "").strip()
+        provider = (
+            load_memory_provider(provider_name, register_skills=False)
+            if provider_name else None
+        )
+        if provider is None or not provider.is_available():
+            return None
+
+        manager = MemoryManager(provider_mode="authoritative")
+        manager.add_provider(provider)
+        init_kwargs = {
+            "platform": platform or "cli",
+            "hermes_home": str(get_hermes_home()),
+            "agent_context": "primary",
+        }
+        allowed_identity = {
+            "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type",
+            "thread_id", "gateway_session_key", "session_title",
+        }
+        init_kwargs.update({
+            key: value for key, value in (identity or {}).items()
+            if key in allowed_identity and value
+        })
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            init_kwargs.update(agent_identity=get_active_profile_name(), agent_workspace="hermes")
+        except Exception:
+            pass
+        manager.initialize_all(str(session_id or ""), **init_kwargs)
+        return manager
+    except Exception as exc:
+        logger.warning("Memory provider plugin init failed during approval: %s", exc)
+        return None
+
+
+@contextmanager
+def _approval_memory_manager(current, factory, *, required: bool):
+    """Yield the live manager, or a command-scoped manager when approval needs one."""
+    manager = current
+    owned = False
+    if manager is None and required and factory is not None:
+        manager = factory()
+        owned = manager is not None
+    try:
+        yield manager
+    finally:
+        if owned:
+            manager.shutdown_all()
 
 
 def _fmt_state(subsystem: str) -> str:
@@ -32,7 +99,7 @@ def _fmt_pending_list(subsystem: str) -> str:
 
 def handle_pending_subcommand(
     subsystem: str, args: List[str], *, memory_store=None, memory_manager=None,
-    set_mode_fn=None) -> Optional[str]:
+    memory_manager_factory: Optional[Callable] = None, set_mode_fn=None) -> Optional[str]:
     """Dispatch a /memory or /skills write-approval subcommand.
 
     ``memory_store`` applies approved memory writes (CLI passes its live store; gateway a freshly
@@ -46,7 +113,10 @@ def handle_pending_subcommand(
     if sub == "pending":
         return _fmt_pending_list(subsystem)
     if sub in {"approve", "apply"}:
-        return _approve(subsystem, rest, memory_store, memory_manager)
+        return _approve(
+            subsystem, rest, memory_store, memory_manager,
+            memory_manager_factory=memory_manager_factory,
+        )
     if sub in {"reject", "deny", "drop"}:
         return _reject(subsystem, rest)
     if sub == "diff" and subsystem == wa.SKILLS:
@@ -60,7 +130,10 @@ def _usage(subsystem: str) -> str:
     return f"Usage: /{subsystem} approve|reject <id>  (or 'all')"
 
 
-def _approve(subsystem: str, rest: List[str], memory_store, memory_manager=None) -> str:
+def _approve(
+    subsystem: str, rest: List[str], memory_store, memory_manager=None,
+    *, memory_manager_factory=None,
+) -> str:
     if not rest:
         return _usage(subsystem)
     target = rest[0]
@@ -75,14 +148,22 @@ def _approve(subsystem: str, rest: List[str], memory_store, memory_manager=None)
             return f"No pending {subsystem} write with id '{target}'."
         targets = [rec]
 
+    needs_authoritative = (
+        subsystem == wa.MEMORY
+        and any(rec.get("payload", {}).get("memory_provider_mode") == "authoritative"
+                for rec in targets)
+    )
     applied, failed = 0, []
-    for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store, memory_manager)
-        if ok:
-            wa.discard_pending(subsystem, rec["id"])
-            applied += 1
-        else:
-            failed.append(f"{rec['id']}: {msg}")
+    with _approval_memory_manager(
+        memory_manager, memory_manager_factory, required=needs_authoritative,
+    ) as resolved_manager:
+        for rec in targets:
+            ok, msg = _apply_one(subsystem, rec, memory_store, resolved_manager)
+            if ok:
+                wa.discard_pending(subsystem, rec["id"])
+                applied += 1
+            else:
+                failed.append(f"{rec['id']}: {msg}")
 
     out = [f"Approved {applied} {subsystem} write(s)."]
     if failed:

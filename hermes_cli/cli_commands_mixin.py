@@ -1843,7 +1843,9 @@ class CLICommandsMixin:
 
     def _handle_memory_command(self, cmd: str):
         """Handle /memory slash command — pending review + approval-gate toggle."""
-        from hermes_cli.write_approval_commands import handle_pending_subcommand
+        from hermes_cli.write_approval_commands import (
+            handle_pending_subcommand, load_authoritative_memory_manager,
+        )
         from tools import write_approval as wa
         args = cmd.strip().split()[1:]
         store = getattr(self.agent, "_memory_store", None) if getattr(self, "agent", None) else None
@@ -1859,6 +1861,9 @@ class CLICommandsMixin:
         out = handle_pending_subcommand(
             wa.MEMORY, args, memory_store=store,
             memory_manager=getattr(self.agent, "_memory_manager", None) if getattr(self, "agent", None) else None,
+            memory_manager_factory=lambda: load_authoritative_memory_manager(
+                session_id=str(getattr(self, "session_id", "") or ""), platform="cli",
+            ),
             set_mode_fn=lambda enabled: self._save_write_approval("memory", enabled))
         print(out if out is not None else
               "Unknown /memory subcommand. Use: pending, approve <id>, reject <id>, approval <on|off>.")

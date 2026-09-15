@@ -3286,6 +3286,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 for key in _PINNED_ROUTE_FIELDS
                 if route_info.get(key) not in (None, "")
             }
+            fallback_label = route_info.get("fallback_label")
+            if fallback_label:
+                selected_route["route_info"] = {
+                    "fallback_label": str(fallback_label),
+                }
 
         remaining = jobs[1:]
         if not remaining:

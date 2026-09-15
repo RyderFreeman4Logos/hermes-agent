@@ -292,7 +292,7 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
 
 
 def _usage_has(obj: Any, *path: str) -> bool:
-    """True when every hop exists (dict key or attribute), even if the value is 0."""
+    """True when every hop exists and the final value is not null (zero is reported)."""
     for hop in path:
         if obj is None:
             return False
@@ -304,7 +304,7 @@ def _usage_has(obj: Any, *path: str) -> bool:
             obj = getattr(obj, hop)
         else:
             return False
-    return True
+    return obj is not None
 
 
 def _usage_field(obj: Any, *path: str) -> int:
@@ -559,11 +559,15 @@ def normalize_usage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
     )
-    cache_telemetry = (
-        "reported"
-        if any(_usage_has(u, *path) for paths in shape[2:] for path in paths)
-        else "unavailable"
+    availability = (
+        u.get("_hermes_cache_read_reported")
+        if isinstance(u, dict)
+        else getattr(u, "_hermes_cache_read_reported", None)
     )
+    cache_telemetry = "reported" if (
+        availability is True
+        or availability is None and any(_usage_has(u, *path) for path in shape[2])
+    ) else "unavailable"
     try:
         from agent.cache_lowhit_request_dump import maybe_dump_on_usage
         maybe_dump_on_usage(usage, cache_telemetry=cache_telemetry)

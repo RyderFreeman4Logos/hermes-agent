@@ -920,7 +920,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**_bypass_sdk_request_transform(stream_kwargs))
+        from agent import relay_llm
+        final_kwargs = _bypass_sdk_request_transform(stream_kwargs)
+        return relay_llm.physical_send(
+            final_kwargs, lambda request: active_client.responses.create(**request)
+        )
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)

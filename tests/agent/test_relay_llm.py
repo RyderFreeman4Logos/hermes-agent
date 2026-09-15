@@ -83,13 +83,19 @@ async def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypat
         "model_name": "model",
         "metadata": {"api_mode": "chat_completions"},
     }
-    relay_llm.execute({"model": "model", "messages": []}, send, **common)
+    relay_llm.execute(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send(request, send),
+        **common,
+    )
     await relay_llm.execute_async(
-        {"model": "model", "messages": []}, send_async, **common
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send_async(request, send_async),
+        **common,
     )
     stream = relay_llm.stream_current(
         {"model": "model", "messages": [], "stream": True},
-        send_stream,
+        lambda request: relay_llm.physical_send(request, send_stream),
         name="provider",
         model_name="model",
         finalizer=dict,
@@ -110,7 +116,9 @@ def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
 
     relay_llm.execute(
         {"model": "model", "messages": []},
-        lambda request: sends.append(("sync", request)) or {"content": "sync"},
+        lambda request: relay_llm.physical_send(
+            request, lambda final: sends.append(("sync", final)) or {"content": "sync"}
+        ),
         session_id="session-1",
         name="provider",
         model_name="model",
@@ -118,8 +126,10 @@ def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
     )
     stream = relay_llm.stream(
         {"model": "model", "messages": [], "stream": True},
-        lambda request: sends.append(("stream", request))
-        or iter([{"delta": "stream"}]),
+        lambda request: relay_llm.physical_send(
+            request,
+            lambda final: sends.append(("stream", final)) or iter([{"delta": "stream"}]),
+        ),
         session_id="session-1",
         name="provider",
         model_name="model",
@@ -151,7 +161,7 @@ async def test_managed_async_retry_records_each_provider_callback(
     monkeypatch.setattr(relay.llm, "execute", retry_once)
     result = await relay_llm.execute_async(
         {"model": "model", "messages": []},
-        send,
+        lambda request: relay_llm.physical_send_async(request, send),
         session_id="session-1",
         name="provider",
         model_name="model",

@@ -123,6 +123,13 @@ for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT T
   fi
 done
 
+# POSIX tempfile.gettempdir() reads TMPDIR. env -i dropped it, so nested
+# runner probes landed in host /tmp and pytest collected that directory.
+TMP_ENV=()
+if [ -n "${TMPDIR:-}" ]; then
+  TMP_ENV+=("TMPDIR=$TMPDIR")
+fi
+
 # ── Test-runner knobs (computed before we drop env) ────────────────────────
 # The runner's own documented environment knobs must survive the hermetic
 # `env -i` below, or they are silent no-ops for anyone invoking this script:
@@ -149,6 +156,19 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   fi
 done
 
+# ── User-systemd session location (computed before we drop env) ─────────────
+# The Linux runner uses transient user services for cgroup containment. These
+# are session coordinates, not credentials; preserve them so `env -i` does not
+# turn an available user manager into an unexplained "Failed to connect"
+# failure.
+SYSTEMD_ENV=()
+for _systemd_var in XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS; do
+  if [ -n "${!_systemd_var:-}" ]; then
+    SYSTEMD_ENV+=("$_systemd_var=${!_systemd_var}")
+  fi
+done
+
+
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
@@ -169,7 +189,9 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${SYSTEMD_ENV[@]+"${SYSTEMD_ENV[@]}"} \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
+  ${TMP_ENV[@]+"${TMP_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \

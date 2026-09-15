@@ -75,6 +75,14 @@ _LINUX_CONTAINMENT_PROPERTIES = (
 )
 
 
+_LINUX_RESOURCE_EVENT_FIELDS = {
+    "pids.events": "max",
+    "memory.events": "max",
+    "memory.events.oom": "oom",
+    "memory.events.oom_kill": "oom_kill",
+}
+
+
 def _normalize_returncode(returncode: int | None) -> int:
     """Normalize Popen's negative signal codes to shell exit statuses."""
     if returncode is None:
@@ -82,11 +90,56 @@ def _normalize_returncode(returncode: int | None) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
 
-def _linux_supervise(repo_root: str, completion_path: str, cmd: List[str]) -> int:
+def _read_linux_resource_events() -> dict[str, int] | None:
+    """Read the fresh service cgroup's fatal-resource counters."""
+    try:
+        cgroup_path = next(
+            line.partition("::")[2]
+            for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+            if line.startswith("0::")
+        )
+        cgroup_root = Path("/sys/fs/cgroup") / cgroup_path.lstrip("/")
+        pids = _read_cgroup_event_file(cgroup_root / "pids.events")
+        memory = _read_cgroup_event_file(cgroup_root / "memory.events")
+        return {
+            "pids.events": pids["max"],
+            "memory.events": memory["max"],
+            "memory.events.oom": memory["oom"],
+            "memory.events.oom_kill": memory["oom_kill"],
+        }
+    except (OSError, StopIteration, ValueError, KeyError):
+        return None
+
+
+def _read_cgroup_event_file(path: Path) -> dict[str, int]:
+    """Parse one cgroup event file without accepting malformed counters."""
+    events: dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name, value = line.split(maxsplit=1)
+        count = int(value)
+        if count < 0:
+            raise ValueError("negative cgroup event counter")
+        events[name] = count
+    return events
+
+
+def _linux_supervise(
+    repo_root: str, completion_path: str, environment_path: str, cmd: List[str],
+) -> int:
     """Run one test and let its systemd cgroup die with this supervisor."""
     import select
 
-    child = subprocess.Popen(cmd, cwd=repo_root, stdin=subprocess.DEVNULL)
+    try:
+        environment = json.loads(Path(environment_path).read_text(encoding="utf-8"))
+        if not isinstance(environment, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            return 1
+    except (OSError, ValueError):
+        return 1
+    before_events = _read_linux_resource_events()
+    child = subprocess.Popen(cmd, cwd=repo_root, env=environment, stdin=subprocess.DEVNULL)
     stdin_fd = sys.stdin.fileno()
     poller = select.poll()
     poller.register(stdin_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
@@ -102,11 +155,33 @@ def _linux_supervise(repo_root: str, completion_path: str, cmd: List[str]) -> in
         # this supervisor exits, including after the parent runner is SIGKILL'd.
         return 137
     rc = _normalize_returncode(child.returncode)
+    after_events = _read_linux_resource_events()
+    events = (
+        None
+        if before_events is None or after_events is None
+        else {
+            field: after_events[field] - before_events[field]
+            for field in _LINUX_RESOURCE_EVENT_FIELDS
+        }
+    )
     Path(completion_path).write_text(
-        json.dumps({"kind": "pytest", "returncode": rc}),
+        json.dumps({
+            "kind": "pytest",
+            "returncode": rc,
+            "resource_events": events,
+        }),
         encoding="utf-8",
     )
     return rc
+
+
+def _linux_launcher_environment(env: dict[str, str]) -> dict[str, str]:
+    """Keep only user-systemd routing coordinates on the launcher process."""
+    return {
+        key: env[key]
+        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+        if env.get(key)
+    }
 
 
 def _spawn_test_process(
@@ -137,16 +212,17 @@ def _spawn_test_process(
 
     watch_r, watch_w = os.pipe()
     unit = f"hermes-pytest-{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}"
-    contained_cmd = [env_binary, "-i"]
-    contained_cmd.extend(f"{key}={value}" for key, value in env.items())
-    contained_cmd.extend([
+    contained_cmd = [
+        env_binary,
+        "-i",
         sys.executable,
         str(Path(__file__).resolve()),
         _LINUX_SUPERVISOR_ARG,
         str(repo_root),
         str(completion_path),
+        str(completion_path.with_name("environment.json")),
         *cmd,
-    ])
+    ]
     systemd_cmd = [
         systemd_run,
         "--user",
@@ -167,7 +243,7 @@ def _spawn_test_process(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
-            env=env,
+            env=_linux_launcher_environment(env),
             start_new_session=True,
         )
     except BaseException:
@@ -186,10 +262,11 @@ def _read_linux_completion(path: Path, wrapper_rc: int) -> Tuple[int, bool, str]
         return wrapper_rc or 1, False, f"missing/invalid pytest completion status: {exc}"
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"kind", "returncode"}
+        or set(payload) != {"kind", "returncode", "resource_events"}
         or payload.get("kind") != "pytest"
         or type(payload.get("returncode")) is not int
         or not 0 <= payload["returncode"] <= 255
+        or not _valid_resource_events(payload.get("resource_events"))
     ):
         return wrapper_rc or 1, False, "invalid pytest completion status schema"
     pytest_rc = payload["returncode"]
@@ -197,7 +274,19 @@ def _read_linux_completion(path: Path, wrapper_rc: int) -> Tuple[int, bool, str]
         return wrapper_rc or 1, False, (
             f"pytest completion status {pytest_rc} disagrees with systemd-run {wrapper_rc}"
         )
+    resource_events = payload["resource_events"]
+    if any(resource_events.values()):
+        return wrapper_rc or 1, False, "fatal cgroup resource event"
     return pytest_rc, True, ""
+
+
+def _valid_resource_events(value: object) -> bool:
+    """Accept only the exact cgroup-event receipt emitted by the supervisor."""
+    return (
+        isinstance(value, dict)
+        and set(value) == set(_LINUX_RESOURCE_EVENT_FIELDS)
+        and all(type(count) is int and count >= 0 for count in value.values())
+    )
 
 
 def _clamp_workers(requested: int) -> int:
@@ -224,7 +313,7 @@ def _resolve_path_candidate(path: Path) -> Tuple[Path | None, bool]:
         return None, True
 
 
-def _strip_mise_shims(path: str) -> str:
+def _strip_mise_shims(path: str, lookup_cwd: Path) -> str:
     """Remove mise shim directories and PATH entries exposing a shim."""
     suffixes = ["", ".exe"]
     for suffix in os.environ.get("PATHEXT", "").replace(os.pathsep, ";").split(";"):
@@ -235,7 +324,12 @@ def _strip_mise_shims(path: str) -> str:
 
     clean: List[str] = []
     for entry in path.split(os.pathsep):
-        entry_path = Path(entry or ".")
+        raw_entry_path = Path(entry or ".")
+        entry_path = (
+            raw_entry_path
+            if raw_entry_path.is_absolute()
+            else lookup_cwd / raw_entry_path
+        )
         if _is_mise_shim_path(entry):
             continue
         resolved_entry, uncertain = _resolve_path_candidate(entry_path)
@@ -615,10 +709,14 @@ def _run_one_file_once(
     # A shim can also be exposed by a broader PATH entry (for example
     # /usr/local/bin/rustup), so remove that entry instead of letting a
     # version probe fall through to mise.
-    env["PATH"] = _strip_mise_shims(env.get("PATH", ""))
+    env["PATH"] = _strip_mise_shims(env.get("PATH", ""), repo_root)
     temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
     completion_path = Path(temproot) / "completion.json"
+    environment_path = Path(temproot) / "environment.json"
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
+    environment_fd = os.open(environment_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(environment_fd, "w", encoding="utf-8") as environment_file:
+        json.dump(env, environment_file)
 
     subproc_start = time.monotonic()
     watch_fd: int | None = None
@@ -1496,6 +1594,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 3 and sys.argv[1] == _LINUX_SUPERVISOR_ARG:
-        sys.exit(_linux_supervise(sys.argv[2], sys.argv[3], sys.argv[4:]))
+    if len(sys.argv) > 4 and sys.argv[1] == _LINUX_SUPERVISOR_ARG:
+        sys.exit(_linux_supervise(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]))
     sys.exit(main())

@@ -879,8 +879,9 @@ class _ExecPlan:
     cwd: str
     host_cwd: Optional[str]
     effective_timeout: int
-    # Set when a foreground call asked for more than FOREGROUND_MAX_TIMEOUT and was promoted to a
-    # tracked background process instead of being refused (the requested seconds, for the note).
+    # Set when an omitted-background call asked for more than FOREGROUND_MAX_TIMEOUT
+    # and was promoted to a tracked background process instead of being refused
+    # (the requested seconds, for the note). Explicit background=false still rejects.
     promoted_from_foreground_timeout: Optional[int] = None
 
 
@@ -894,7 +895,7 @@ _PROMOTED_NOTE = (
 
 def _plan_execution(
     command: Any, *, task_id: Optional[str], timeout: Optional[int],
-    background: bool, _host_local: bool,
+    background: Optional[bool], _host_local: bool,
 ) -> _ExecPlan:
     """Resolve backend, env-cache key, image, cwd and timeout for one call.
 
@@ -953,19 +954,28 @@ def _plan_execution(
     # value is truthy and would fire an immediate "-Ns" timeout.
     if timeout is not None and timeout <= 0:
         raise _Rejected(tool_error(f"timeout must be a positive number of seconds (got {timeout})."))
+    background_was_omitted = background is None
+    background = False if background_was_omitted else bool(background)
     promoted = None
     if not background:
         # An over-cap foreground timeout is a bounded job the caller wants to wait for (test suites,
         # builds). Refusing it only bought a mechanical retry: 454 refusals in one run, every one
-        # re-sent lower/split/background. Promote to a tracked background process instead; the
-        # caller is told in the result. The `&`/nohup/server guidance below stays a refusal: those
-        # need the command itself rewritten, which the tool cannot do safely.
+        # re-sent lower/split/background. Promote omitted-background over-cap calls to a tracked
+        # background process instead; the caller is told in the result. Explicit background=false
+        # still refuses: the caller opted into the foreground cap. The `&`/nohup/server guidance
+        # below stays a refusal: those need the command itself rewritten, which the tool cannot do
+        # safely.
         # The detachment guidance applies whether or not the call is promoted: a promoted `cmd &`
         # would start a tracked shell that exits at once while its payload runs untracked.
         guidance = _foreground_background_guidance(command)
         if guidance:
             raise _Rejected(_error_json(guidance, status="error"))
         if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+            if not background_was_omitted:
+                raise _Rejected(tool_error(
+                    f"Foreground timeout {timeout}s exceeds the maximum of "
+                    f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true for long-running commands."
+                ))
             promoted = timeout
 
     return _ExecPlan(
@@ -1169,7 +1179,7 @@ def _degraded_result(e: EnvironmentConnectionError, task_id: Optional[str]) -> s
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = None,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
@@ -1266,12 +1276,11 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
-                "default": False
+                "description": "Run in the background, returning a session_id. When omitted, Hermes keeps the command in the foreground unless the timeout exceeds the foreground cap; then it uses managed background execution with completion notification. Explicit background=false always keeps the command in the foreground (subject to the foreground timeout cap). Pair background=true with notify=true for bounded work; leave notifications off only for servers, watchers, and daemons.",
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. A foreground timeout above {FOREGROUND_MAX_TIMEOUT}s runs the command as a tracked background process with notify_on_complete=true instead (the result says so; do not re-run it).",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When background is omitted, a timeout above {FOREGROUND_MAX_TIMEOUT}s runs the command as a tracked background process with notify_on_complete=true instead (the result says so; do not re-run it). Explicit background=false still rejects a foreground timeout above {FOREGROUND_MAX_TIMEOUT}s; use background=true for longer commands.",
                 "minimum": 1
             },
             "workdir": {
@@ -1343,7 +1352,7 @@ def _handle_terminal(args, **kw):
             )
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=args.get("background"),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),

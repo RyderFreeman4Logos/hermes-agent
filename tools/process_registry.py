@@ -451,7 +451,8 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "delegated_child", "watch_patterns")
+    "parent_session_id", "notify_on_complete", "delegated_child", "handoff_note",
+    "watch_patterns")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -471,7 +472,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
-        self._lock = threading.Lock()
+        # Ownership handoff persists its checkpoint before releasing this lock.
+        self._lock = threading.RLock()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -526,8 +528,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
         window, a match inside the window is one strike, WATCH_STRIKE_LIMIT consecutive
         strikes or WATCH_LIFETIME_MAX_HITS total deliveries disable watching and
         promote the session to notify_on_complete."""
-        if not session.watch_patterns or session._watch_disabled:
-            return
+        with self._lock:
+            if (
+                not session.watch_patterns
+                or session._watch_disabled
+                or (session.delegated_child and not session.handoff_note)
+            ):
+                return
         # Late chunks after the reader declared exit are post-exit noise; dropping them
         # avoids stale notifications minutes after the process ended.
         if session.exited:
@@ -615,6 +622,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             "task_id": session.task_id,
             "owner_task_id": session.owner_task_id or session.task_id,
             "command": session.command,
+            "delegated_child": session.delegated_child,
+            **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
             **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
         }
 
@@ -2016,6 +2025,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
+            self._write_checkpoint()
             return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:

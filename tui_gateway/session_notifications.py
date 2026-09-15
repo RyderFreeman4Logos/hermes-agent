@@ -200,18 +200,15 @@ def _ingest_completion_transfer(session: dict, insert) -> bool:
 
 
 def _filter_routine_delegated_child_completions(events: list) -> list:
-    """Consume silent child successes before completion fan-in projects them."""
+    """Suppress routine child successes locally before completion fan-in projects them."""
     from tools.process_registry import ProcessRegistry
 
     visible = []
-    silent = []
     for evt in events:
         if ProcessRegistry._is_routine_delegated_child_completion(evt):
-            silent.append(evt)
+            continue
         else:
             visible.append(evt)
-    if silent:
-        _mark_completion_events_consumed(silent)
     return visible
 
 

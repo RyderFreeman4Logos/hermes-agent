@@ -783,3 +783,118 @@ def test_slices_partition_the_suite_exactly_even_with_different_duration_caches(
     slices = [rtp._slice_files(list(reversed(files)) if i % 2 else files, i % 3 + 1, 3, caches[i % 3], root)
               for i in range(3)]
     assert sorted(f for s in slices for f in s) == sorted(files)
+
+def test_huge_requested_worker_count_is_capped(tmp_path: Path) -> None:
+    """A caller cannot turn the file runner into an unbounded process fanout."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    probe = probe_dir / "test_worker_cap.py"
+    probe.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+
+    repo_root = _probe_root(tmp_path)
+    env = os.environ.copy()
+    env.pop("HERMES_TEST_MAX_WORKERS", None)
+    env.pop("HERMES_TEST_WORKERS", None)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "run_tests_parallel.py"),
+            "--files",
+            str(probe),
+            "-j",
+            "40",
+            "--file-retries",
+            "0",
+            "-q",
+        ],
+        check=False,
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    expected = min(os.cpu_count() or 1, 8)
+    assert proc.returncode == 0, proc.stdout
+    assert f"with -j {expected}" in proc.stdout, proc.stdout
+
+
+def test_worker_path_excludes_mise_shims(tmp_path: Path) -> None:
+    """Pytest workers must not resolve version probes through mise shims."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    capture = tmp_path / "worker-env.json"
+    mise_shims = tmp_path / "mise" / "shims"
+    mise_exposing_bin = tmp_path / "mise-exposing-bin"
+    mise_executable = tmp_path / "mise-runtime" / "mise"
+    safe_bin = tmp_path / "safe-bin"
+    mise_shims.mkdir(parents=True)
+    mise_exposing_bin.mkdir()
+    mise_executable.parent.mkdir()
+    safe_bin.mkdir()
+    for rustup in (mise_shims / "rustup", safe_bin / "rustup"):
+        rustup.write_text("#!/bin/sh" + chr(10) + "exit 0" + chr(10), encoding="utf-8")
+        rustup.chmod(0o755)
+    mise_executable.write_text("#!/bin/sh" + chr(10) + "exit 0" + chr(10), encoding="utf-8")
+    mise_executable.chmod(0o755)
+    (mise_exposing_bin / "rustup").symlink_to(mise_executable)
+
+    probe = probe_dir / "test_worker_path.py"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+            import os
+            import shutil
+            from pathlib import Path
+
+            def test_worker_path_is_sanitized():
+                rustup = shutil.which("rustup")
+                Path({str(capture)!r}).write_text(json.dumps({{
+                    "path": os.environ.get("PATH", ""),
+                    "rustup": rustup,
+                    "rustup_real": str(Path(rustup).resolve()) if rustup else None,
+                }}))
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    repo_root = _probe_root(tmp_path)
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join(
+        (str(mise_shims), str(mise_exposing_bin), str(safe_bin), "/usr/bin", "/bin")
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "run_tests_parallel.py"),
+            "--files",
+            str(probe),
+            "-j",
+            "1",
+            "--file-retries",
+            "0",
+            "-q",
+        ],
+        check=False,
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    data = json.loads(capture.read_text(encoding="utf-8"))
+    path_entries = data["path"].split(os.pathsep)
+    assert not any(Path(entry).as_posix().rstrip("/").endswith("/mise/shims") for entry in path_entries)
+    assert str(mise_exposing_bin) not in path_entries
+    if data["rustup"]:
+        assert "/mise/shims/" not in Path(data["rustup_real"]).as_posix()
+    assert str(safe_bin / "rustup") == data["rustup"]

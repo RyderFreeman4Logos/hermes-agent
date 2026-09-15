@@ -204,9 +204,17 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
 def _attach_model_switch_after_compression(sid: str, session: dict, agent) -> None:
     """Attach this TUI session's deferred route to its live agent."""
     pending = session.get("after_compression_model_switch")
+    from hermes_cli.model_switch import (
+        get_model_switch_after_compression,
+        schedule_model_switch_after_compression,
+    )
+    if pending is None:
+        # A cold AIAgent restores the durable descriptor before its TUI record is attached.
+        pending = get_model_switch_after_compression(agent)
+        if pending is not None:
+            session["after_compression_model_switch"] = pending
     if pending is None:
         return
-    from hermes_cli.model_switch import schedule_model_switch_after_compression
 
     def _on_applied(result, old_model, _old_provider):
         if session.get("after_compression_model_switch") is not result:

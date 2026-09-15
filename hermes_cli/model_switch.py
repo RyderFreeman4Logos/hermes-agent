@@ -1446,7 +1446,12 @@ class _Switch:
 def _route_explicit_provider(st: _Switch) -> Optional[ModelSwitchResult]:
     """PATH A (``--provider`` given): resolve the provider, auto-detect a model from a local
     endpoint when none was typed, then resolve the alias on the TARGET provider."""
-    pdef = resolve_provider_full(st.explicit_provider, st.user_providers, st.custom_providers)
+    pdef = resolve_provider_full(
+        st.explicit_provider,
+        st.user_providers,
+        st.custom_providers,
+        allow_network=st.validate_live,
+    )
     if pdef is None and st.explicit_provider.strip().lower() == "custom":
         pdef = _bare_custom_provider_def(st.current_base_url)
     if pdef is None:
@@ -1624,11 +1629,16 @@ def _route_from_model_input(st: _Switch) -> Optional[ModelSwitchResult]:
 
 
 def _switch_provider_label(st: _Switch) -> str:
-    label = get_label(st.target_provider)
+    label = get_label(st.target_provider, allow_network=st.validate_live)
     if st.target_provider == "custom" and st.current_base_url:
         label = "Custom endpoint"
     if st.target_provider.startswith("custom:"):
-        custom_pdef = resolve_provider_full(st.target_provider, st.user_providers, st.custom_providers)
+        custom_pdef = resolve_provider_full(
+            st.target_provider,
+            st.user_providers,
+            st.custom_providers,
+            allow_network=st.validate_live,
+        )
         if custom_pdef is not None:
             label = custom_pdef.name
     return label
@@ -1816,12 +1826,18 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
     if opencode_provider_family(st.target_provider) is not None and isinstance(st.base_url, str):
         st.base_url = normalize_opencode_base_url(st.target_provider, st.api_mode, st.base_url)
 
-    capabilities = get_model_capabilities(st.target_provider, st.new_model, allow_network=True)
+    # Cold restoration passes ``validate_live=False`` and must be fully offline: metadata is useful
+    # when cached, but is not allowed to turn session reconstruction into a catalog request.
+    capabilities = get_model_capabilities(
+        st.target_provider, st.new_model, allow_network=st.validate_live
+    )
     from agent.native_compaction import resolve_native_compaction_capabilities
     runtime_capabilities = resolve_native_compaction_capabilities(
         model=st.new_model, base_url=st.base_url, provider=st.target_provider,
         is_codex_backend=st.target_provider.strip().lower() == "openai-codex")
-    model_info = get_model_info(st.target_provider, st.new_model, allow_network=True)
+    model_info = get_model_info(
+        st.target_provider, st.new_model, allow_network=st.validate_live
+    )
 
     warnings = [w for w in (st.validation.get("message"), _check_hermes_model_warning(st.new_model)) if w]
 

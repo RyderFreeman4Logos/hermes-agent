@@ -3353,9 +3353,19 @@ class GatewayRunner(
             return
         state = self._peek_session_state(session_key)
         pending = state.conversation.after_compression_model_switch if state is not None else None
+        from hermes_cli.model_switch import (
+            get_model_switch_after_compression,
+            schedule_model_switch_after_compression,
+        )
+        if pending is None:
+            # A cold AIAgent restores the durable, secret-free descriptor before the host attaches
+            # it. Adopt that exact result so the host callback and surface state survive recreation.
+            pending = get_model_switch_after_compression(agent)
+            if pending is not None:
+                state = self._session_state(session_key)
+                state.conversation.after_compression_model_switch = pending
         if pending is None:
             return
-        from hermes_cli.model_switch import schedule_model_switch_after_compression
 
         def _on_applied(result, old_model, _old_provider):
             current = self._peek_session_state(session_key)
@@ -3368,6 +3378,14 @@ class GatewayRunner(
             }
             if result.reasoning_config is not None:
                 current.conversation.model_override["reasoning_config"] = dict(result.reasoning_config)
+            store = getattr(self, "session_store", None)
+            if store is not None:
+                try:
+                    # SessionStore is the thread-safe synchronous authority at callback boundaries;
+                    # it sanitizes credentials and makes the committed route survive a restart.
+                    store.set_model_override(session_key, current.conversation.model_override)
+                except Exception:
+                    logger.debug("Failed to persist deferred session model override", exc_info=True)
             pending_notes = getattr(self, "_pending_model_notes", None)
             if pending_notes is not None:
                 pending_notes[session_key] = (

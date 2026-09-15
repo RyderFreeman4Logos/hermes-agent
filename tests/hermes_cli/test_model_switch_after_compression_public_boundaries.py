@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_cli.model_switch import ModelSwitchResult, get_model_switch_after_compression
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
+)
 from hermes_state import SessionDB
 
 
@@ -126,12 +130,29 @@ def _assert_secret_free_pending(db, session_id: str) -> None:
     assert BASE_URL not in json.dumps(stored)
 
 
+def _cold_rebuilt_agent(tmp_path, monkeypatch, session_id: str, *, platform: str):
+    db, agent, _calls = _compression_agent(tmp_path, session_id, platform=platform)
+    pending = _resolved(raw_input=NEW_MODEL, explicit_provider=NEW_PROVIDER)
+    pending.reasoning_config = dict(LOW)
+    schedule_model_switch_after_compression(agent, pending)
+    _assert_secret_free_pending(db, session_id)
+    db.close()
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: _resolved(**kwargs))
+    reopened = SessionDB(db_path=tmp_path / "state.db")
+    _db2, rebuilt, calls = _compression_agent(
+        tmp_path, session_id, platform=platform, db=reopened
+    )
+    assert get_model_switch_after_compression(rebuilt) is not None
+    return reopened, rebuilt, calls
+
+
 @pytest.mark.asyncio
 async def test_gateway_public_command_crosses_real_compression_commit(tmp_path, monkeypatch):
-    from gateway.config import Platform
+    from gateway.config import GatewayConfig, Platform
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session import SessionSource
+    from gateway.session import SessionSource, SessionStore
 
     db, agent, calls = _compression_agent(tmp_path, "gateway-session", platform="telegram")
     runner = object.__new__(GatewayRunner)
@@ -142,13 +163,15 @@ async def test_gateway_public_command_crosses_real_compression_commit(tmp_path, 
     runner._pending_model_notes = {}
     runner._running_agents = {}
     runner._session_db = db
-    runner.session_store = None
+    sessions_dir = tmp_path / "gateway-routing"
+    runner.session_store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
     runner._normalize_source_for_session_key = lambda source: source
     runner._model_selection_guard_reply = AsyncMock(return_value=(False, None))
     source = SessionSource(
         platform=Platform.TELEGRAM, user_id="user", chat_id="chat", chat_type="dm"
     )
     session_key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
     runner._agent_cache[session_key] = (agent, "signature", 0, "gateway-session")
     monkeypatch.setattr("gateway.run._load_gateway_config", lambda **_kwargs: {
         "model": {"default": OLD_MODEL, "provider": OLD_PROVIDER}
@@ -182,6 +205,12 @@ async def test_gateway_public_command_crosses_real_compression_commit(tmp_path, 
         "api_key": SECRET,
         "base_url": BASE_URL,
         "api_mode": "chat_completions",
+    }
+    reloaded_store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
+    assert reloaded_store.get_model_override(session_key) == {
+        "model": NEW_MODEL,
+        "provider": NEW_PROVIDER,
+        "base_url": BASE_URL,
     }
 
 
@@ -410,3 +439,111 @@ def test_cold_sessiondb_recreation_restores_secret_free_pending_intent(
     assert (rebuilt.model, rebuilt.provider, calls) == (OLD_MODEL, OLD_PROVIDER, [])
     _compress(rebuilt)
     assert calls == [(NEW_MODEL, NEW_PROVIDER, SECRET, BASE_URL, "chat_completions")]
+
+
+def test_cold_restore_never_reaches_models_dev_network(tmp_path, monkeypatch):
+    from agent import models_dev
+
+    db, agent, _calls = _compression_agent(tmp_path, "offline-cold-session")
+    pending = _resolved(raw_input="synthetic/offline", explicit_provider=OLD_PROVIDER)
+    pending.reasoning_config = dict(LOW)
+    schedule_model_switch_after_compression(agent, pending)
+    db.close()
+
+    monkeypatch.setattr(models_dev, "_models_dev_cache", {})
+    monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
+    monkeypatch.setattr(models_dev, "_models_dev_retry_after", 0)
+    monkeypatch.setattr(models_dev, "_load_disk_cache", lambda: {})
+
+    network_calls = []
+
+    def reject_network(*args, **kwargs):
+        network_calls.append((args, kwargs))
+        raise AssertionError("cold restore attempted models.dev network I/O")
+
+    monkeypatch.setattr(models_dev.requests, "get", reject_network)
+    reopened = SessionDB(db_path=tmp_path / "state.db")
+    _db2, rebuilt, calls = _compression_agent(
+        tmp_path, "offline-cold-session", platform="cli", db=reopened
+    )
+
+    restored = get_model_switch_after_compression(rebuilt)
+    assert restored is not None
+    assert (restored.new_model, restored.target_provider) == (
+        "synthetic/offline", OLD_PROVIDER
+    )
+    assert network_calls == []
+    assert calls == []
+
+
+def test_gateway_cold_rebuild_adopts_pending_and_persists_applied_route(
+    tmp_path, monkeypatch
+):
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource, SessionStore
+
+    db, rebuilt, calls = _cold_rebuilt_agent(
+        tmp_path, monkeypatch, "gateway-cold-session", platform="telegram"
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._sessions = {}
+    runner._pending_model_notes = {}
+    sessions_dir = tmp_path / "gateway-cold-routing"
+    runner.session_store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
+    source = SessionSource(
+        platform=Platform.TELEGRAM, user_id="user", chat_id="cold-chat", chat_type="dm"
+    )
+    session_key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
+
+    runner._attach_model_switch_after_compression(session_key, rebuilt)
+    assert runner._session_state(
+        session_key
+    ).conversation.after_compression_model_switch is get_model_switch_after_compression(rebuilt)
+
+    _compress(rebuilt)
+
+    state = runner._session_state(session_key).conversation
+    assert calls == [(NEW_MODEL, NEW_PROVIDER, SECRET, BASE_URL, "chat_completions")]
+    assert state.after_compression_model_switch is None
+    assert state.model_override["reasoning_config"] == LOW
+    assert SessionStore(sessions_dir=sessions_dir, config=GatewayConfig()).get_model_override(
+        session_key
+    ) == {"model": NEW_MODEL, "provider": NEW_PROVIDER, "base_url": BASE_URL}
+    db.close()
+
+
+def test_tui_cold_rebuild_adopts_pending_and_updates_rebuild_surface(
+    tmp_path, monkeypatch
+):
+    from tui_gateway import server
+
+    db, rebuilt, calls = _cold_rebuilt_agent(
+        tmp_path, monkeypatch, "tui-cold-session", platform="tui"
+    )
+    session = {
+        "session_key": "tui-cold-session",
+        "resume_session_id": "tui-cold-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+    }
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *_args, **_kwargs: None)
+
+    server._attach_built_agent("public-tui-cold", session, rebuilt)
+    assert session["after_compression_model_switch"] is get_model_switch_after_compression(
+        rebuilt
+    )
+
+    _compress(rebuilt)
+
+    assert calls == [(NEW_MODEL, NEW_PROVIDER, SECRET, BASE_URL, "chat_completions")]
+    assert "after_compression_model_switch" not in session
+    assert session["model_override"]["reasoning_config"] == LOW
+    rebuilt_kwargs = server._deferred_build_agent_kwargs(session, db)
+    assert rebuilt_kwargs["model_override"]["model"] == NEW_MODEL
+    assert rebuilt_kwargs["model_override"]["provider"] == NEW_PROVIDER

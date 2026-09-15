@@ -6,6 +6,7 @@ import importlib
 import os
 import sys
 from datetime import datetime, timedelta
+from types import MethodType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -173,6 +174,36 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     assert cli.session_start > old_session_start
     assert cli.agent.session_start == cli.session_start
     cli.agent._invalidate_system_prompt.assert_called_once()
+
+
+def test_new_command_clears_production_loop_timing_state(tmp_path):
+    """The public /new route clears timestamps owned by the prior session."""
+    from agent.conversation_loop import _loop_timing_context
+    from run_agent import AIAgent
+
+    cli = _prepare_cli_with_active_session(tmp_path)
+    agent = cli.agent
+    old_start = datetime.fromisoformat("2026-09-14T10:00:00-07:00")
+    old_stop = datetime.fromisoformat("2026-09-14T10:00:03-07:00")
+    agent._loop_timing_last_start = old_start
+    agent._loop_timing_last_stop = old_stop
+    agent._transition_context_engine_session = MagicMock()
+    agent.reset_session_state = MethodType(AIAgent.reset_session_state, agent)
+
+    cli.process_command("/new")
+
+    assert agent._loop_timing_last_start is None
+    assert agent._loop_timing_last_stop is None
+    next_start = datetime.fromisoformat("2026-09-14T11:00:00-07:00")
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"agent": {"loop_timing_context": True}},
+    ):
+        context = _loop_timing_context(agent, now=next_start)
+    assert context == (
+        "[Agent loop timing]\n"
+        "Current loop start: 2026-09-14T11:00:00-07:00"
+    )
 
 
 def test_new_command_persists_resolved_memory_mode(tmp_path):

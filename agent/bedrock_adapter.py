@@ -566,6 +566,7 @@ def convert_messages_to_converse(messages: List[Dict]) -> Tuple[Optional[List[Di
     same-role neighbours merge, placeholder user turns pad the ends."""
     system_blocks: List[Dict] = []
     converse_msgs: List[Dict] = []
+    from agent.message_metadata import is_hidden_loop_timing
 
     def append_turn(role: str, blocks: List[Dict]) -> None:
         if converse_msgs and converse_msgs[-1]["role"] == role:
@@ -575,6 +576,8 @@ def convert_messages_to_converse(messages: List[Dict]) -> Tuple[Optional[List[Di
 
     for msg in messages:
         role = msg.get("role", "")
+        if is_hidden_loop_timing(msg):
+            role = "user"
         content = msg.get("content")
         if role == "system":
             system_blocks.extend(_system_blocks(content))

@@ -2922,6 +2922,32 @@ class TestHandleMaxIterations:
         assert messages[2]["name"] == "execute_code"
         assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
 
+    def test_summary_projects_hidden_timing_at_real_chat_wire(self, agent):
+        """The direct terminal-summary call uses the normal Chat projection."""
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        timing = {
+            "role": "system",
+            "content": (
+                "[Agent loop timing]\n"
+                "Current loop start: 2026-09-14T10:00:00-07:00"
+            ),
+            "display_kind": "hidden",
+            "display_metadata": {"loop_timing_turn_id": "turn-final"},
+        }
+        messages = [{"role": "user", "content": "do stuff"}, timing]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Summary"
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert all("display_kind" not in row for row in sent)
+        assert all("display_metadata" not in row for row in sent)
+        timing_rows = [row for row in sent if "[Agent loop timing]" in str(row.get("content", ""))]
+        assert len(timing_rows) == 1
+        assert timing_rows[0]["role"] == "user"
+        assert messages[1] == timing
+
 
 
 
@@ -3169,6 +3195,7 @@ class TestRunConversation:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
         ):
             result = agent.run_conversation("hello")
 
@@ -3187,6 +3214,13 @@ class TestRunConversation:
                 "cache_control": {"type": "ephemeral"},
             },
         ]
+        timing = agent.client.chat.completions.create.call_args.kwargs["messages"][-1]
+        assert timing["role"] == "user"
+        assert any(
+            "[Agent loop timing]\nCurrent loop start:" in block.get("text", "")
+            for block in timing["content"]
+        )
+        assert "cache_control" not in timing
 
     def test_first_main_route_after_in_place_compression_keeps_cache_key(
         self, agent, tmp_path
@@ -3434,7 +3468,12 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        assert any(
+            msg.get("role") == "user"
+            and str(msg.get("content", "")).startswith("search something")
+            and "[Agent loop timing]" in str(msg.get("content", ""))
+            for msg in pre_request_calls[0]["request_messages"]
+        )
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
@@ -4120,7 +4159,14 @@ class TestRunConversation:
         assert result["final_response"] == "Using Postgres instead."
         assert len(requests) == 2
 
-        replay = requests[1]["messages"]
+        replay = [
+            message
+            for message in requests[1]["messages"]
+            if not (
+                message.get("role") == "system"
+                and "[Agent loop timing]" in str(message.get("content", ""))
+            )
+        ]
         assert [m["role"] for m in replay[-3:]] == [
             "user",
             "assistant",
@@ -5136,7 +5182,7 @@ class TestRunConversation:
             "You are helpful.",
         ))
         with (
-            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_persist_session") as mock_persist,
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch.object(agent.context_compressor, "update_model"),
@@ -5152,15 +5198,34 @@ class TestRunConversation:
         # The retry honored the reduced max_tokens (available_out - 64).
         second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
         assert second_call["max_tokens"] <= 936
+        wire_timing = [
+            message
+            for message in second_call.get("messages", [])
+            if "[Agent loop timing]" in str(message.get("content", ""))
+        ]
+        assert len(wire_timing) == 1
+        assert wire_timing[0]["role"] == "user"
+        history_timing = [
+            message
+            for message in mock_persist.call_args_list[-1].args[0]
+            if "[Agent loop timing]" in str(message.get("content", ""))
+        ]
+        assert len(history_timing) == 1
+        assert history_timing[0]["role"] == "system"
+        assert history_timing[0]["display_kind"] == "hidden"
         # LOCK IN THE FIX: the retry must actually SEND the compressed history
         # (the 1-message payload from _compress_context + its new system
         # prompt), not the original multi-message window. Without this, the
         # output-cap retry would call the compressor but re-transmit the same
         # oversized request forever.
-        second_messages = second_call.get("messages", [])
-        assert second_messages[-1].get("content") == "hello"
-        assert len(second_messages) == 2
-        assert second_messages[0]["role"] == "system"
+        rebuilt_user = next(
+            message
+            for message in second_call.get("messages", [])
+            if message.get("role") == "user" and "[Agent loop timing]" in str(message.get("content", ""))
+        )
+        assert rebuilt_user["content"].startswith("hello")
+        assert len(second_call["messages"]) == 2
+        assert second_call["messages"][0]["role"] == "system"
         # context_length was NOT mutated by an output-cap error.
         assert agent.context_compressor.context_length == 200_000
 

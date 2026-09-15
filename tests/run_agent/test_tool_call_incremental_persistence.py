@@ -208,22 +208,31 @@ def test_interim_assistant_is_durable_before_ui_projection_on_abnormal_exit(tmp_
     finally:
         db.close()
 
-    assert roles_seen_by_ui == ["user", "assistant"]
+    assert roles_seen_by_ui == ["user", "system", "assistant"]
     durable = _durable_messages(db_path, session_id)
-    assert [message["role"] for message in durable] == ["user", "assistant"]
-    assert durable[1]["content"] == "I'll inspect the repository now."
-    assert durable[1]["tool_calls"][0]["id"] == "visible-call"
+    assert [message["role"] for message in durable] == [
+        "user",
+        "system",
+        "assistant",
+    ]
+    timing = durable[1]
+    assert timing["display_kind"] == "hidden"
+    assert timing["content"].startswith("[Agent loop timing]")
+    assistant = durable[2]
+    assert assistant["content"] == "I'll inspect the repository now."
+    assert assistant["tool_calls"][0]["id"] == "visible-call"
 
     # Cold-resume reconciliation closes the interrupted call in the provider
     # payload without mutating or duplicating the canonical transcript.
     resumed = sanitize_api_messages(durable)
     assert [message["role"] for message in resumed] == [
         "user",
+        "system",
         "assistant",
         "tool",
     ]
-    assert resumed[2]["tool_call_id"] == "visible-call"
-    assert len(_durable_messages(db_path, session_id)) == 2
+    assert resumed[3]["tool_call_id"] == "visible-call"
+    assert len(_durable_messages(db_path, session_id)) == 3
 
 
 def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():

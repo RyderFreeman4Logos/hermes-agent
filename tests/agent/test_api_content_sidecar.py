@@ -503,7 +503,8 @@ class TestWireInvariant:
         assert len(reqs) == 2
         sent_1 = _user_messages(reqs[0])[0]["content"]
         sent_2 = _user_messages(reqs[1])[0]["content"]
-        assert sent_1 == "hello please\n\nPLUGIN-CTX"
+        assert sent_1.startswith("hello please\n\nPLUGIN-CTX")
+        assert "[Agent loop timing]" in sent_1
         assert sent_2 == sent_1  # repeated builds: identical bytes
 
         # The sidecar never reaches the provider.
@@ -514,7 +515,7 @@ class TestWireInvariant:
         # Persisted row: clean content + exact sent bytes in the sidecar.
         user_rows = [r for r in db.get_messages(sid) if r["role"] == "user"]
         assert user_rows[0]["content"] == "hello please"
-        assert user_rows[0]["api_content"] == sent_1
+        assert user_rows[0]["api_content"] == "hello please\n\nPLUGIN-CTX"
 
     def test_next_turn_replays_previous_turn_bytes(self, wire_env):
         """The cache invariant: the serialized user message replayed in turn
@@ -531,7 +532,7 @@ class TestWireInvariant:
         history = db.get_messages_as_conversation(sid)
         # The stored history carries the sidecar, not the injected content.
         assert history[0]["content"] == "hello please"
-        assert history[0]["api_content"] == turn_n_user["content"]
+        assert history[0]["api_content"] == "hello please\n\nPLUGIN-CTX"
 
         handler.captured_requests = []
         agent2 = make_agent()
@@ -544,7 +545,8 @@ class TestWireInvariant:
 
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
-        assert current["content"] == "second question\n\nPLUGIN-CTX"
+        assert current["content"].startswith("second question\n\nPLUGIN-CTX")
+        assert "[Agent loop timing]" in current["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1014,97 @@ class TestSessionRowExistsBeforePreflightCompaction:
             parent_row = db.get_session(sid)
             assert parent_row is not None
             assert parent_row["end_reason"] == "compression"
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("in_place", [True, False], ids=["in-place", "rotation"])
+    def test_real_compaction_keeps_retained_timing_out_of_removed_generation(self, tmp_path, in_place):
+        """W5: a real compression boundary preserves only the retained timing row.
+
+        ``compress`` supplies a deterministic local summary, but the public
+        turn-context path still calls the real ``_compress_context`` and its
+        SQLite archive/rotation publication.  This distinguishes the active
+        transcript generation from the compacted-away timing row without an
+        auxiliary provider.
+        """
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = f"sess-timing-{'inplace' if in_place else 'rotation'}"
+        retained = {
+            "role": "system", "content": "[Agent loop timing] retained",
+            "display_kind": "hidden",
+            "display_metadata": {"loop_timing_turn_id": "retained-turn"},
+        }
+        removed = {
+            "role": "system", "content": "[Agent loop timing] removed",
+            "display_kind": "hidden",
+            "display_metadata": {"loop_timing_turn_id": "removed-turn"},
+        }
+        try:
+            agent, seen = self._make_agent(db, sid, in_place=in_place)
+
+            def _compress(messages, **_kwargs):
+                seen["row_at_compress"] = db.get_session(sid)
+                copied = next(row for row in messages if row.get("content") == retained["content"])
+                return [
+                    {"role": "assistant", "content": "[CONTEXT COMPACTION] summary"},
+                    dict(copied),
+                    dict(messages[-1]),
+                ]
+
+            agent.context_compressor.compress = _compress
+            history = self._oversized_history() + [retained, removed]
+            db.create_session(sid, source="test")
+            db.append_messages_batch(sid, history)
+            agent._session_db_created = True
+            with (
+                patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+                patch("agent.title_generator.maybe_auto_title"),
+            ):
+                _build(agent, conversation_history=history)
+
+            assert seen["row_at_compress"] is not None
+            active_sid = agent.session_id
+            active = db.get_messages_as_conversation(active_sid)
+            active_timing = [row for row in active if "[Agent loop timing]" in str(row.get("content", ""))]
+            assert [row["content"] for row in active_timing] == [retained["content"]]
+            assert active_timing[0]["display_metadata"] == retained["display_metadata"]
+            assert removed["content"] not in [row["content"] for row in active]
+            if in_place:
+                all_rows = db.get_messages(sid, include_inactive=True)
+                assert removed["content"] in [row["content"] for row in all_rows]
+                assert agent._last_compaction_in_place is True
+            else:
+                assert active_sid != sid
+                assert db.get_session(active_sid)["parent_session_id"] == sid
+                parent_rows = db.get_messages_as_conversation(sid)
+                assert removed["content"] in [row["content"] for row in parent_rows]
+        finally:
+            db.close()
+
+    def test_real_compaction_no_op_does_not_replace_timing_generation(self, tmp_path):
+        """W5 control: an unchanged summary cannot archive or rotate timing rows."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "sess-timing-noop"
+        timing = {
+            "role": "system", "content": "[Agent loop timing] unchanged",
+            "display_kind": "hidden",
+            "display_metadata": {"loop_timing_turn_id": "unchanged-turn"},
+        }
+        try:
+            agent, _seen = self._make_agent(db, sid, in_place=False)
+            agent.context_compressor.compress = lambda messages, **_kwargs: list(messages)
+            db.create_session(sid, source="test")
+            db.append_messages_batch(sid, self._oversized_history() + [timing])
+            agent._session_db_created = True
+            with (
+                patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+                patch("agent.title_generator.maybe_auto_title"),
+            ):
+                _build(agent, conversation_history=self._oversized_history() + [timing])
+
+            assert agent.session_id == sid
+            assert db.get_session(sid)["end_reason"] is None
+            assert timing["content"] in [row["content"] for row in db.get_messages(sid)]
         finally:
             db.close()
 

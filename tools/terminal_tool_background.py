@@ -91,7 +91,9 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
            notify_on_complete: bool = False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
-                  persist_on_release=persist_on_release, notify_on_complete=notify_on_complete)
+                  persist_on_release=persist_on_release)
+    if notify_on_complete:
+        common["notify_on_complete"] = True
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)

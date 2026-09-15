@@ -157,7 +157,7 @@ def test_unsupported_immediate_exit_does_not_enqueue_completion(monkeypatch, tmp
         session = ProcessSession(
             id="proc_unsupported_immediate",
             command=kwargs["command"],
-            notify_on_complete=kwargs["notify_on_complete"],
+            notify_on_complete=kwargs.get("notify_on_complete", False),
         )
         registry._running[session.id] = session
         session.exited = True

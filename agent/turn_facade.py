@@ -26,6 +26,7 @@ class TurnFacadeMixin:
         persist_user_timestamp: Optional[float]=None, persist_user_display_kind: Optional[str]=None,
         persist_user_display_metadata: Optional[Dict[str, Any]]=None,
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
+        turn_origin: str = "user",
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
@@ -86,6 +87,10 @@ class TurnFacadeMixin:
                 return admission.early_result
             lease = admission.lease
             conversation_history = admission.conversation_history
+            # The accepted turn owns its observation latch before any later
+            # relay/profile/request preparation can fail.  A rejected lease
+            # must not erase the admitted owner's record.
+            self._first_turn_usage = None
 
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -128,6 +133,7 @@ class TurnFacadeMixin:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
+                        turn_origin=turn_origin,
                     )
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;

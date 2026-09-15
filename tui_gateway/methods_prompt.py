@@ -464,7 +464,9 @@ def _persist_session_row_for_submit(rid, session):
     return None
 
 
-def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback):
+def _run_after_agent_ready(
+    rid, sid, session, text, display_kind, hosted_terminal_callback, turn_token,
+):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
@@ -472,20 +474,32 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
     # expires. See #63078.
     err = _wait_agent_for_prompt(session, rid, sid)
     if err:
+        with session["history_lock"]:
+            owns_turn = session.get("_turn_owner_token") is turn_token
+            if owns_turn:
+                session["running"] = False
+                session.pop("_turn_owner_token", None)
+                session.pop("_turn_owner_kind", None)
+                session["last_active"] = time.time()
+        if not owns_turn:
+            return
         # Terminal frame + retained snapshot (not a bare "error" event): the snapshot is
         # the only way resume shows this to a disconnected client.
         _emit_terminal_turn_error(
             sid, session, (err.get("error") or {}).get("message", "agent initialization failed"),
             error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
-        with session["history_lock"]:
-            session["running"] = False
-            session["last_active"] = time.time()
         _emit("session.info", sid, _session_info(session.get("agent"), session))
         return
     with session["history_lock"]:
         if session.get("_turn_cancel_requested") or not session.get("running"):
-            session["running"] = False
-            _clear_inflight_turn(session)
+            owns_turn = session.get("_turn_owner_token") is turn_token
+            if owns_turn:
+                session["running"] = False
+                session.pop("_turn_owner_token", None)
+                session.pop("_turn_owner_kind", None)
+                _clear_inflight_turn(session)
+            if not owns_turn:
+                return
             # Without this emit the turn vanishes silently after {"status": "streaming"}.
             _emit("error", sid, {"message": (
                 "Turn cancelled before the agent was ready"
@@ -494,7 +508,7 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
-        terminal_callback=hosted_terminal_callback)
+        terminal_callback=hosted_terminal_callback, turn_token=turn_token)
 
 
 _TRUNCATION_PARAMS = (
@@ -504,30 +518,37 @@ _TRUNCATION_PARAMS = (
 def _lock_in_submit_turn(
     rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task):
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
-    cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
+    cut, atomically claim the turn + mark it in flight.  Returns
+    ``(err, survivor_fields, turn_token)``; a None token means the caller raced
+    another owner and must apply the normal busy-input policy."""
     fields = {}
     with session["history_lock"]:
+        if session.get("running"):
+            return None, fields, None
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
-            return _err(rid, 4009, "subagent still running — wait for it to finish"), fields
+            return _err(rid, 4009, "subagent still running — wait for it to finish"), fields, None
         if is_truthy_value(params.get("confirm_truncate")) and not has_truncation:
             return _err(
                 rid, 4004,
                 "confirm_truncate requires truncate_before_user_ordinal, truncate_before_message_id, or truncate_before_row_id",
-            ), fields
+            ), fields, None
         if has_truncation:
             err, fields = _truncate_history_for_submit(
                 rid, sid, session, params, requested_rebind_ids)
             if err is not None:
-                return err, {}
+                return err, {}, None
+        turn_token = object()
         session["running"] = True
+        session["_turn_owner_token"] = turn_token
+        session["_turn_owner_kind"] = "user"
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         if hosted_task is not None:
             session["_hosted_room_task"] = dict(hosted_task)
         _start_inflight_turn(session, text)
-    return None, fields
+    return None, fields, turn_token
 
 
 @method("prompt.submit")
@@ -584,25 +605,28 @@ def _(rid, params: dict) -> dict:
     # history_lock is released (a non-interruptible tool may hold it); if the old turn
     # finished between the two acquisitions, retry the claim rather than strand this
     # prompt in a queue whose drain already ran.
-    while True:
-        with session["history_lock"]:
-            if not session.get("running"):
-                break
-            if internal_hosted_submit:
-                return _err(rid, 4091, "hosted room member session is busy")
-            busy_transport = t or session.get("transport")
-        busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")))
-        if busy_response is not None:
-            return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
     requested_rebind_ids = (
         {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
         if isinstance(raw_rebind_ids, list) else None)
-    err, survivor_fields = _lock_in_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task)
-    if err is not None:
-        return err
+    while True:
+        err, survivor_fields, turn_token = _lock_in_submit_turn(
+            rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task)
+        if err is not None:
+            return err
+        if turn_token is not None:
+            break
+        if internal_hosted_submit:
+            if session.get("_turn_owner_kind") != "cache_warm":
+                return _err(rid, 4091, "hosted room member session is busy")
+            _interrupt_busy_session(sid, session, session.get("agent"))
+            time.sleep(0.01)
+            continue
+        busy_response = _handle_busy_submit(
+            rid, sid, session, text, t or session.get("transport"),
+            queued=bool(params.get("queued")))
+        if busy_response is not None:
+            return busy_response
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
             rid, sid, session, text, display_kind=display_kind)
@@ -628,7 +652,7 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, hosted_terminal_callback),
+            rid, sid, session, text, display_kind, hosted_terminal_callback, turn_token),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

@@ -1700,6 +1700,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # re-wires the reference relay, see #53802).
     if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
         from agent.moa_loop import build_moa_facade
+        agent._openai_transport_kind = "moa"
+        if shared:
+            agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
         return build_moa_facade(agent, getattr(agent, "model", None) or "default")
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
@@ -1713,6 +1716,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # provider possible). None (the default) falls through, so existing providers are unaffected.
     provider_client = _provider_supplied_client(agent, client_kwargs)
     if provider_client is not None:
+        agent._openai_transport_kind = "provider"
+        if shared:
+            agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
         _ra().logger.info(
             "%s client created from provider profile (%s, shared=%s) %s",
             agent.provider, reason, shared, agent._client_log_context(),
@@ -1722,6 +1728,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     if agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
         client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
+            agent._openai_transport_kind = "gemini"
+            if shared:
+                agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
             return client
     # TCP keepalives so dead provider connections are detected (~60s) instead of hanging in
     # CLOSE-WAIT. Injected into the local copy only, so each client gets its own httpx.Client;
@@ -1768,6 +1777,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
     client = process_bootstrap.OpenAI(**client_kwargs)
+    agent._openai_transport_kind = "http_chat"
+    if shared:
+        agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
     _ra().logger.info("OpenAI client created (%s, shared=%s) %s", reason, shared, agent._client_log_context())
     return client
 
@@ -1802,7 +1814,8 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
-    "_credential_pool", "_credential_pool_entry_id",
+    "_credential_pool", "_credential_pool_entry_id", "_openai_transport_kind",
+    "_openai_transport_generation",
 )
 _MISSING = object()
 

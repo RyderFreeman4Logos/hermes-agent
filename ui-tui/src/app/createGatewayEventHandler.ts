@@ -606,7 +606,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     thinkingStatusTimer = setTimeout(() => {
       thinkingStatusTimer = null
-      patchUiState({ status: pendingThinkingStatus || statusFromBusy() })
+      setStatus(pendingThinkingStatus || statusFromBusy())
     }, STREAM_BATCH_MS)
   }
 
@@ -614,7 +614,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     turnController.clearStatusTimer()
     turnController.statusTimer = setTimeout(() => {
       turnController.statusTimer = null
-      patchUiState({ status: statusFromBusy() })
+      setStatus(statusFromBusy())
     }, ms)
   }
 
@@ -863,6 +863,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
           setStatus(brief)
           restoreStatusAfter(6000)
+
+          return
+        }
+
+        if (p.kind === 'cache_hit') {
+          patchUiState({ cacheStatus: p.text })
+          setStatus(p.text)
 
           return
         }

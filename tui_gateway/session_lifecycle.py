@@ -291,6 +291,9 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     slash-worker is closed in ``_finalize_session`` (the single chokepoint), NOT here. Idempotent via ``_finalized``."""
     if not session:
         return
+    with contextlib.suppress(Exception):
+        from tui_gateway.cache_telemetry import _cancel_tui_cache_warm
+        _cancel_tui_cache_warm(session)
     _finalize_session(session, end_reason=end_reason)
     _announce_session_reclaimed(session, end_reason)
     with contextlib.suppress(Exception):

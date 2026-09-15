@@ -76,6 +76,23 @@ def test_an_out_of_tree_profile_supplies_the_client_through_create_openai_client
     assert isinstance(_build("openai-api", "https://api.example/v1"), OpenAI)
 
 
+def test_client_factory_records_physical_transport_provenance(registered):
+    from agent.agent_runtime_helpers import create_openai_client
+
+    registered(_SeamProfile(name="seam-test", base_url="acp://seam-test"))
+    external = _agent("seam-test")
+    create_openai_client(
+        external, {"api_key": "k", "base_url": "acp://seam-test"}, reason="t", shared=True)
+    assert external._openai_transport_kind == "provider"
+    assert external._openai_transport_generation == 1
+
+    http = _agent("openai-api")
+    create_openai_client(
+        http, {"api_key": "k", "base_url": "https://api.example/v1"}, reason="t", shared=True)
+    assert http._openai_transport_kind == "http_chat"
+    assert http._openai_transport_generation == 1
+
+
 def test_a_broken_plugin_falls_through_instead_of_taking_the_turn_down(registered):
     from agent.agent_runtime_helpers import _provider_supplied_client
 

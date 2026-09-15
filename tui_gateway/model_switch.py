@@ -55,6 +55,15 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
 @contextlib.contextmanager
 def _session_profile_runtime_scope(session: dict):
     """Bind model resolution to the session's profile config and secrets."""
+    from pathlib import Path
+
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
     profile_home = session.get("profile_home")
     if not profile_home:
         yield
@@ -185,6 +194,8 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
         logger.warning("In-place model switch failed for TUI agent: %s", exc)
         raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
+    from tui_gateway.cache_telemetry import _cancel_tui_cache_warm
+    _cancel_tui_cache_warm(session)
     _restart_slash_worker(sid, session)
     _persist_live_session_runtime(session)
     _persist_live_session_system_prompt(session)

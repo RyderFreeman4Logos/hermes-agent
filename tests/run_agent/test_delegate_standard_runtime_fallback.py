@@ -12,6 +12,7 @@ import pytest
 
 from agent.error_classifier import ClassifiedError, FailoverReason
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+from hermes_constants import FINISH_REASON_LENGTH, PARTIAL_STREAM_STUB_ID
 from run_agent import AIAgent
 from tools.delegate_tool import _build_child_agent, _run_single_child, delegate_task
 from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
@@ -925,6 +926,123 @@ def test_standard_child_forbidden_fallback_is_terminal_after_one_request():
     assert result["failed"] is True
     assert calls == [(PRIMARY["provider"], PRIMARY["model"])]
     assert agent._fallback_index == 0
+
+
+@pytest.mark.parametrize(
+    ("policy_response", "model_profile", "fallback_expected"),
+    [
+        pytest.param("http-200", "standard", False, id="standard-http-200"),
+        pytest.param("stream", "standard", False, id="standard-stream"),
+        pytest.param("http-200", None, True, id="ordinary-http-200-control"),
+        pytest.param("stream", None, True, id="ordinary-stream-control"),
+    ],
+)
+def test_delegate_task_content_policy_respects_profile_fallback_boundary(
+    monkeypatch, policy_response, model_profile, fallback_expected
+):
+    """The public child path cannot move a standard policy refusal to another provider."""
+    import tools.delegate_tool as delegate_mod
+
+    attempts = []
+    parent = _delegate_parent([])
+    parent._fallback_chain = FALLBACK_CHAIN
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
+    monkeypatch.setattr(delegate_mod, "_load_config", lambda: {"max_iterations": 2})
+
+    def policy_result():
+        if policy_response == "http-200":
+            return SimpleNamespace(
+                id="policy-refusal",
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=None,
+                            tool_calls=None,
+                            reasoning_content=None,
+                            reasoning=None,
+                            reasoning_details=None,
+                            refusal="request blocked by policy",
+                            model_extra={},
+                        ),
+                        finish_reason="content_filter",
+                    )
+                ],
+                model=PRIMARY["model"],
+                usage=None,
+            )
+        return SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="partial policy-filtered stream",
+                        tool_calls=None,
+                        reasoning_content=None,
+                        reasoning=None,
+                        reasoning_details=None,
+                        model_extra={},
+                    ),
+                    finish_reason=FINISH_REASON_LENGTH,
+                )
+            ],
+            model=PRIMARY["model"],
+            usage=None,
+            _content_filter_terminated=True,
+        )
+
+    def stream_call(agent, _kwargs, **_ignored):
+        attempts.append((agent.provider, agent.model))
+        if len(attempts) == 1:
+            return policy_result()
+        return _response("response after policy handling")
+
+    task = {"goal": "handle the synthetic policy response"}
+    if model_profile is not None:
+        task["model_profile"] = model_profile
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+        patch.object(AIAgent, "_interruptible_streaming_api_call", stream_call),
+        patch.object(AIAgent, "_persist_session"),
+        patch.object(AIAgent, "_save_trajectory"),
+        patch.object(AIAgent, "_cleanup_task_resources"),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, FALLBACK_CHAIN[0]["model"]),
+        ),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, _provider: model,
+        ),
+        patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        patch("agent.turn_recovery.time.sleep"),
+        patch("agent.retry_utils.jittered_backoff", return_value=0),
+    ):
+        result = json.loads(
+            delegate_task(
+                tasks=[task],
+                parent_agent=parent,
+                credentials_cfg={},
+                background=False,
+            )
+        )
+
+    fallback_route = (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"])
+    assert (fallback_route in attempts) is fallback_expected
+    if fallback_expected:
+        assert result["results"][0]["status"] == "completed"
+        assert attempts == [
+            (PRIMARY["provider"], PRIMARY["model"]),
+            fallback_route,
+        ]
+    else:
+        assert attempts
+        assert all(route == (PRIMARY["provider"], PRIMARY["model"]) for route in attempts)
 
 
 def test_nonstandard_child_records_its_successful_primary_route():

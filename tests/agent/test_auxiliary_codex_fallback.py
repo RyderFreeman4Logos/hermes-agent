@@ -261,23 +261,64 @@ def test_vision_auto_order_is_codex_only():
     assert aux._VISION_AUTO_PROVIDER_ORDER == ("openai-codex",)
 
 
-def test_lean_digest_workers_reuse_selected_codex_route_settings():
-    """Parallel lean workers carry the selected entry-owned route controls."""
-    calls = []
+def test_lean_digest_workers_keep_independent_real_call_receipts():
+    """Each lean sibling owns the fallback receipt refreshed by real call_llm."""
+    class CapacityUnavailable(Exception):
+        status_code = 402
 
-    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
-        assert task == "compression"
-        calls.append(kwargs)
-        route_info = kwargs.get("route_info")
-        if route_info is not None and not route_info:
-            route_info.update(
-                provider="openai-codex",
-                model="codex-model",
-                fallback_label="fallback_chain[1](openai-codex)",
-            )
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="DIGEST"))]
-        )
+    def primary(**_kwargs):
+        raise CapacityUnavailable("payment required")
+
+    primary_client = _chat_client(primary, "https://primary.invalid/v1")
+    primary_client.api_key = "synthetic-primary-key"
+    physical_requests = []
+    completed = SimpleNamespace(
+        status="completed",
+        id="synthetic-codex-response",
+        output=[SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="DIGEST")],
+        )],
+        usage=None,
+    )
+    physical = SimpleNamespace(
+        base_url="https://physical-codex.invalid/backend-api/codex",
+        api_key="synthetic-physical-key",
+        responses=SimpleNamespace(
+            create=lambda **kwargs: physical_requests.append(kwargs) or completed,
+        ),
+        close=lambda: None,
+    )
+    fallback = aux.CodexAuxiliaryClient(physical, "codex-model")
+    config = {
+        "provider": "custom",
+        "model": "primary-model",
+        "base_url": "https://primary.invalid/v1",
+        "api_key": "synthetic-primary-key",
+        "api_mode": "chat_completions",
+        "fallback_chain": [{
+            "provider": "openai-codex",
+            "model": "codex-model",
+            "base_url": "https://ignored-entry.invalid/v1",
+            "api_key": "synthetic-ignored-entry-key",
+            "api_mode": "anthropic_messages",
+            "timeout": 37,
+        }],
+    }
+    real_call_llm = aux.call_llm
+    sibling_receipts = []
+
+    def cached_client(provider, model=None, **_kwargs):
+        if provider == "openai-codex":
+            return fallback, model or "codex-model"
+        return primary_client, model or "primary-model"
+
+    def observed_call_llm(**kwargs):
+        response = real_call_llm(**kwargs)
+        if kwargs.get("provider") == "openai-codex":
+            receipt = kwargs["route_info"]
+            sibling_receipts.append((receipt, dict(receipt)))
+        return response
 
     turns = [
         {"role": "user", "content": "MARKER-A " + ("a" * 70)},
@@ -287,18 +328,30 @@ def test_lean_digest_workers_reuse_selected_codex_route_settings():
     compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
     with (
         patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", 88),
-        patch("agent.auxiliary_client.call_llm", fake_call_llm),
-        patch("agent.auxiliary_client._get_task_max_concurrency", return_value=3),
+        patch("agent.auxiliary_client.call_llm", observed_call_llm),
+        patch("agent.auxiliary_client._get_task_max_concurrency", return_value=1),
+        patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+        patch("agent.auxiliary_client._get_cached_client", side_effect=cached_client),
+        patch("agent.auxiliary_client.resolve_provider_client", return_value=(fallback, "codex-model")),
+        patch(
+            "agent.agent_runtime_helpers.plan_cache_sections_for_destination",
+            side_effect=lambda messages, tools, **_kwargs: (messages, tools or []),
+        ),
     ):
         compressor._build_chunk_digests(turns)
 
-    assert len(calls) == 3
-    assert calls[0]["route_info"]["fallback_label"] == "fallback_chain[1](openai-codex)"
-    for call in calls[1:]:
-        assert call["provider"] == "openai-codex"
-        assert call["model"] == "codex-model"
-        assert call["route_info"] == {
-            "fallback_label": "fallback_chain[1](openai-codex)"
+    assert len(physical_requests) == 3
+    assert len(sibling_receipts) == 2
+    assert sibling_receipts[0][0] is not sibling_receipts[1][0]
+    for _receipt_object, receipt in sibling_receipts:
+        assert receipt == {
+            "provider": "openai-codex",
+            "model": "codex-model",
+            "fallback_label": "fallback_chain[0](openai-codex)",
+            "base_url": "https://physical-codex.invalid/backend-api/codex",
+            "api_key": "synthetic-physical-key",
+            "api_mode": "codex_responses",
+            "timeout": 37.0,
         }
 
 

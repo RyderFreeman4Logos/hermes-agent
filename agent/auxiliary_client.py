@@ -2562,12 +2562,44 @@ def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode
 
 
 def _record_route_info(
-    route_info: Optional[Dict[str, str]], provider: Optional[str], model: Optional[str]
+    route_info: Optional[Dict[str, Any]], provider: Optional[str], model: Optional[str], *,
+    fallback_label: Optional[str] = None,
+    base_url: Optional[str] = None, api_key: Optional[str] = None,
+    api_mode: Optional[str] = None, timeout: Optional[float] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
-        route_info["provider"] = provider or "auto"
-        route_info["model"] = model or "default"
+        route_info.clear()
+        route_info.update(provider=provider or "auto", model=model or "default")
+        if fallback_label and str(fallback_label).startswith("fallback_chain["):
+            route_info["fallback_label"] = fallback_label
+        for key, value in (
+            ("base_url", base_url), ("api_key", api_key),
+            ("api_mode", api_mode), ("timeout", timeout),
+        ):
+            if value not in (None, ""):
+                route_info[key] = value
+
+
+
+def _record_physical_route(
+    route_info: Optional[Dict[str, Any]], provider: Optional[str], client: Any,
+    request_kwargs: Dict[str, Any], api_mode: Optional[str],
+) -> None:
+    """Publish the concrete destination immediately before a physical retry."""
+    concrete_provider = _fallback_provider_from_label(
+        _effective_provider_for_client(client, provider or "auto")
+    )
+    model = request_kwargs.get("model")
+    _set_relay_auxiliary_route(concrete_provider, model, api_mode)
+    _record_route_info(
+        route_info, concrete_provider, model,
+        base_url=str(getattr(client, "base_url", "") or ""),
+        api_key=str(getattr(client, "api_key", "") or ""),
+        api_mode=api_mode,
+        timeout=request_kwargs.get("timeout"),
+    )
+
 
 
 def _relay_auxiliary_metadata(
@@ -3882,6 +3914,26 @@ def _fallback_provider_from_label(label: str) -> str:
     return match.group(1).strip() if match else str(label or "").strip()
 
 
+def _is_codex_provider(provider: Optional[str]) -> bool:
+    return _normalize_aux_provider(provider) == "openai-codex"
+
+
+def _record_codex_skip(route_info: Optional[Dict[str, Any]], reason: str) -> None:
+    """Keep one scalar reason when a configured Codex candidate is skipped."""
+    if route_info is not None and "codex_skip_reason" not in route_info:
+        route_info["codex_skip_reason"] = reason
+
+
+def _next_configured_fallback_index(label: str) -> Optional[int]:
+    """Return the entry after a configured-chain label, if it has one."""
+    if not str(label).startswith("fallback_chain["):
+        return None
+    try:
+        return int(label.split("[", 1)[1].split("]", 1)[0]) + 1
+    except (IndexError, ValueError):
+        return None
+
+
 class _FallbackDestination(NamedTuple):
     provider: str
     base_url: str
@@ -4156,10 +4208,12 @@ async def _call_fallback_candidate_async(
 
 def _try_payment_fallback(
     failed_provider: str, task: str = None, reason: str = "payment error", *,
-    failed_base_url: str = "", failure_scope: Any = None, main_runtime: Optional[Dict[str, Any]] = None,
+    failed_base_url: str = "", failure_scope: Any = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try the auto-detection chain after a payment/credit or connection error, skipping the failed
-    provider (and the main-provider path when it maps to the same backend). Returns (client, model, label) or (None, None, "")."""
+    """Try remaining Codex providers after a payment/credit or connection error.
+    Non-Codex destinations are skipped (#160). Returns (client, model, label) or (None, None, "")."""
     skip = failed_provider.lower().strip()
     # The SESSION's provider decides whether discovery is allowed: a live `/model xai-oauth` session
     # over a persisted ``provider: auto`` is a selection, so the disk value alone is not the answer.
@@ -4177,6 +4231,10 @@ def _try_payment_fallback(
         candidate_base_url = _custom_health_base_url(label)
         if (not failed_base_url and label in skip_chain_labels) or skip_backend(
                 label, None, candidate_base_url):
+            continue
+        if not _is_codex_provider(label):
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
             continue
         if _is_provider_unhealthy(label, candidate_base_url):
             _log_skip_unhealthy(label, task, base_url=candidate_base_url)
@@ -4216,6 +4274,7 @@ def _failed_backend_skip(
 def _try_main_agent_model_fallback(
     failed_provider: str, task: str = None, reason: str = "error",
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the main agent provider + model after the configured chain is exhausted.
     ``failed_model`` scoping per ``_failed_backend_skip``; same-URL custom endpoints serve many models,
@@ -4236,6 +4295,9 @@ def _try_main_agent_model_fallback(
         # text-only main model turns a transient 429 into a guaranteed 400 (#108349).
         logger.info("Auxiliary vision: %s on %s — main agent provider %s accepts no image input, not falling back",
                     reason, failed_provider, main_provider)
+        return None, None, ""
+    if not _is_codex_provider(main_provider):
+        _record_codex_skip(route_info, "unavailable")
         return None, None, ""
     main_base_url = _custom_health_base_url(main_provider)
     if _failed_backend_skip(
@@ -4312,10 +4374,11 @@ def _context_too_small(
 def _try_configured_fallback_chain(
     task: str, failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
     failed_base_url: str = "", failure_scope: Any = None,
+    start_index: int = 0, route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
-    ``failed_model`` scoping per ``_failed_backend_skip`` (sibling models on the same provider still
-    run after a model-scoped failure). Returns (client, model, provider_label) or (None, None, "")."""
+    """Try remaining Codex entries on auxiliary.<task>.fallback_chain.
+    Non-Codex destinations fail closed (#160). ``failed_model`` scoping per
+    ``_failed_backend_skip``. Returns (client, model, provider_label) or (None, None, "")."""
     if not task:
         return None, None, ""
     chain = _get_auxiliary_task_config(task).get("fallback_chain")
@@ -4325,9 +4388,15 @@ def _try_configured_fallback_chain(
         failed_provider, failed_model, failed_base_url=failed_base_url, failure_scope=failure_scope)
     tried = []
     min_ctx = _task_minimum_context_length(task)
-    for i, entry in enumerate(chain):
-        if not isinstance(entry, dict):
-            continue
+    candidate_indices = [
+        i for i in range(start_index, len(chain))
+        if isinstance(chain[i], dict) and _is_codex_provider(chain[i].get("provider"))
+    ]
+    if not candidate_indices:
+        _record_codex_skip(route_info, "unavailable")
+        return None, None, ""
+    for i in candidate_indices:
+        entry = chain[i]
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
             continue
@@ -4351,25 +4420,30 @@ def _try_configured_fallback_chain(
             ) if resolved_model else None
             if too_small:
                 tried.append(too_small)
+                _record_codex_skip(route_info, "too_small")
                 continue
             logger.info("Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                         task, reason, failed_provider, label, resolved_model or fb_model or "default")
+            _record_route_info(route_info, fb_provider, resolved_model or fb_model, fallback_label=label)
             return fb_client, resolved_model or fb_model, label
         tried.append(label)
+        _record_codex_skip(route_info, "unavailable")
     if tried:
         logger.debug("Auxiliary %s: configured fallback_chain exhausted (tried: %s)", task, ", ".join(tried))
     return None, None, ""
 
 
 def _try_configured_fallback_for_unavailable_client(
-    task: Optional[str], failed_provider: str
+    task: Optional[str], failed_provider: str, route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Task fallback_chain when an explicit aux provider cannot build a client (no key/OAuth/pool creds);
     stops at the per-task chain — the main-agent model stays the runtime last resort."""
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
-    return _try_configured_fallback_chain(task, explicit, reason="provider unavailable")
+    return _try_configured_fallback_chain(
+        task, explicit, reason="provider unavailable", route_info=route_info,
+    )
 
 
 def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
@@ -4398,6 +4472,7 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
 def _try_main_fallback_chain(
     task: Optional[str], failed_provider: str = "", reason: str = "error", *,
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Top-level main-agent fallback chain for a ``provider: auto`` auxiliary call: auto tasks honour the
     user's main fallback policy before the built-in discovery chain; read via ``get_fallback_chain`` so
@@ -4424,6 +4499,10 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
+        if not _is_codex_provider(fb_provider):
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
@@ -4562,9 +4641,12 @@ def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> 
 
 
 def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
-    """Step 3: hardcoded aggregator/fallback chain, skipping unhealthy providers."""
+    """Step 3: Codex-only discovery, skipping unhealthy and non-Codex destinations (#160)."""
     tried = []
     for label, try_fn in _get_provider_chain():
+        if not _is_codex_provider(label) and label != "local/custom":
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         candidate_base_url = _custom_health_base_url(label)
         if _is_provider_unhealthy(label, candidate_base_url):
             _log_skip_unhealthy(label, base_url=candidate_base_url)
@@ -4572,12 +4654,16 @@ def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
             continue
         client, model = try_fn()
         if client is not None:
+            if not _is_codex_provider(label) and not isinstance(client, CodexAuxiliaryClient):
+                tried.append(f"{label} (non-Codex destination)")
+                continue
+            effective_label = "openai-codex" if isinstance(client, CodexAuxiliaryClient) else label
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
-                            label, model or "default", ", ".join(tried))
+                            effective_label, model or "default", ", ".join(tried))
             else:
-                logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
-            return client, model, label
+                logger.info("Auxiliary auto-detect: using %s (%s)", effective_label, model or "default")
+            return client, model, effective_label
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
@@ -5435,7 +5521,7 @@ def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str
     )
 
 
-_VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
+_VISION_AUTO_PROVIDER_ORDER = ("openai-codex",)
 
 
 def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
@@ -5485,7 +5571,7 @@ def _resolve_strict_vision_backend(provider: str, model: Optional[str] = None) -
 
 
 def get_available_vision_backends() -> List[str]:
-    """Available vision backends in auto-selection order (active provider → OpenRouter → Nous → DeepInfra).
+    """Available vision backends in auto-selection order (active provider → OpenAI Codex).
 
     Single source of truth for setup, tool gating, and runtime auto-routing.
     """
@@ -5570,7 +5656,7 @@ def _vision_auto_route(
     runtime: Dict[str, Any], resolved_model: Optional[str], resolved_api_mode: Optional[str],
     async_mode: bool,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
-    """Auto-detect order: 1. main provider + model, 2. OpenRouter, 3. Nous Portal, 4. DeepInfra, 5. stop."""
+    """Auto-detect order: 1. main provider + model when it supports vision, 2. OpenAI Codex, 3. stop."""
     main_provider = str(runtime.get("provider") or _read_main_provider())
     main_model = str(runtime.get("model") or _read_main_model())
     if main_provider.strip().lower() == "moa":
@@ -7595,7 +7681,8 @@ def _next_fallback_after_quarantine(
     if fb[0] is None:
         fb = _try_payment_fallback(
             resolved_provider, task, reason=reason, failed_base_url=route.base_info,
-            failure_scope=failure_scope, main_runtime=route.main_runtime)
+            failure_scope=failure_scope, main_runtime=route.main_runtime,
+            route_info=route.route_info)
     return fb
 
 
@@ -7652,19 +7739,44 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     )
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
-        failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+        failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+        route_info=route.route_info)
+    attempted = {fb_label} if fb_label else set()
+    while fb_client is not None:
+        _record_route_info(
+            route.route_info, _fallback_provider_from_label(fb_label), fb_model, fallback_label=fb_label,
+        )
+        fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
+        if fb_resp is not None:
+            return fb_resp
+        if _is_codex_provider(_fallback_provider_from_label(fb_label)):
+            _record_codex_skip(route.route_info, "rejected")
+        next_index = _next_configured_fallback_index(fb_label)
+        if next_index is None:
+            break
+        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+            task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
+            failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+            start_index=next_index, route_info=route.route_info)
+        if not fb_label or fb_label in attempted:
+            fb_client = None
+            break
+        attempted.add(fb_label)
     if fb_client is None and is_auto:
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
-            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+            failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+            route_info=route.route_info)
         if fb_client is None:
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
-                failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
+                failure_scope=_chain_failure_scope, main_runtime=route.main_runtime,
+                route_info=route.route_info)
     elif fb_client is None and not explicit_auth_with_task_chain:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
-            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+            failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+            route_info=route.route_info)
     # Ordered walk: a candidate that returns None was quarantined (dead credential or a capacity
     # error such as a quota 429) and is now unhealthy, so re-walking the CONFIGURED chains first
     # lands on the next entry, then discovery where the selection policy allows it (#106367).
@@ -7676,7 +7788,9 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         if lane in tried_lanes:
             break
         tried_lanes.add(lane)
-        _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
+        _record_route_info(
+            route.route_info, _fallback_provider_from_label(fb_label), fb_model, fallback_label=fb_label,
+        )
         fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
         if fb_resp is not None:
             return fb_resp

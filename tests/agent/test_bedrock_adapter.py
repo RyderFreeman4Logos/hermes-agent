@@ -197,6 +197,23 @@ class TestConvertMessagesToConverse:
         assert len(msgs) == 1
         assert msgs[0]["role"] == "user"
 
+    def test_hidden_timing_is_not_promoted_to_bedrock_system(self):
+        from agent.bedrock_adapter import convert_messages_to_converse
+
+        system, messages = convert_messages_to_converse([
+            {"role": "system", "content": "Stable system"},
+            {"role": "user", "content": "Ping"},
+            {
+                "role": "system",
+                "content": "[Agent loop timing] Current loop start: now",
+                "display_kind": "hidden",
+            },
+        ])
+
+        assert [block["text"] for block in system] == ["Stable system"]
+        assert messages[-1]["role"] == "user"
+        assert "[Agent loop timing]" in messages[-1]["content"][-1]["text"]
+
 
     def test_assistant_with_tool_calls(self):
         from agent.bedrock_adapter import convert_messages_to_converse

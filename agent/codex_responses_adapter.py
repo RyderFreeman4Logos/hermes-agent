@@ -462,6 +462,7 @@ def _chat_messages_to_responses_input(
     # directly — the converted `item` can be a lossy shape (stale exact-replay, or a typed
     # `function_call_output` wrapper) that no longer carries it (#90976).
     item_sources: List[Optional[Dict[str, Any]]] = []
+    from agent.message_metadata import is_hidden_loop_timing
     seen_item_ids: set = set()
     def emit(new_items: List[Dict[str, Any]], msg: Dict[str, Any]) -> None:
         items.extend(new_items)
@@ -470,6 +471,8 @@ def _chat_messages_to_responses_input(
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
+        if is_hidden_loop_timing(msg):
+            role = "user"
         if role == "tool":
             emit(_tool_output_items(msg), msg)
             continue

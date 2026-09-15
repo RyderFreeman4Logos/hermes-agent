@@ -1319,6 +1319,71 @@ class TestInvalidateSystemPrompt:
 
 
 class TestBuildApiKwargs:
+    def test_named_custom_profile_request_reuses_stable_prefix_key(
+        self, agent, monkeypatch
+    ):
+        """The resolved named-custom route emits a stable cache key on the wire."""
+        from hermes_cli import runtime_provider
+        from providers import get_provider_profile
+
+        custom_provider = {
+            "name": "localrouter",
+            "base_url": "https://localrouter.invalid/v1",
+            "api_key": "localrouter-test-key",
+        }
+        monkeypatch.setattr(
+            runtime_provider,
+            "_get_named_custom_provider",
+            lambda requested: (
+                custom_provider if requested == "custom:localrouter" else None
+            ),
+        )
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+
+        runtime = runtime_provider.resolve_runtime_provider(
+            requested="custom:localrouter", target_model="local-model"
+        )
+        assert runtime["provider"] == "custom"
+        assert runtime["requested_provider"] == "custom:localrouter"
+        assert get_provider_profile(runtime["provider"]) is not None
+
+        agent.provider = runtime["provider"]
+        agent.requested_provider = runtime["requested_provider"]
+        agent.base_url = runtime["base_url"]
+        agent.api_mode = runtime["api_mode"]
+        agent.model = "local-model"
+        agent.session_id = "same-route-session"
+        stable = {
+            "type": "text",
+            "text": "stable prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+
+        def emitted_request(user_text, stable_text="stable prefix"):
+            request = agent._build_api_kwargs(
+                [
+                    {
+                        "role": "system",
+                        "content": [
+                            {**stable, "text": stable_text},
+                            {"type": "text", "text": "volatile"},
+                        ],
+                    },
+                    {"role": "user", "content": user_text},
+                ]
+            )
+            agent.client.chat.completions.create(**request)
+            return agent.client.chat.completions.create.call_args_list[-1].kwargs
+
+        first = emitted_request("first request")
+        second = emitted_request("second request")
+        changed_prefix = emitted_request("third request", stable_text="changed prefix")
+
+        assert second["prompt_cache_key"].startswith("pck_")
+        assert len(second["prompt_cache_key"]) == len("pck_") + 24
+        assert second["prompt_cache_key"] == first["prompt_cache_key"]
+        assert changed_prefix["prompt_cache_key"] != second["prompt_cache_key"]
+
     def test_basic_kwargs(self, agent):
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
@@ -2857,6 +2922,32 @@ class TestHandleMaxIterations:
         assert messages[2]["name"] == "execute_code"
         assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
 
+    def test_summary_projects_hidden_timing_at_real_chat_wire(self, agent):
+        """The direct terminal-summary call uses the normal Chat projection."""
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        timing = {
+            "role": "system",
+            "content": (
+                "[Agent loop timing]\n"
+                "Current loop start: 2026-09-14T10:00:00-07:00"
+            ),
+            "display_kind": "hidden",
+            "display_metadata": {"loop_timing_turn_id": "turn-final"},
+        }
+        messages = [{"role": "user", "content": "do stuff"}, timing]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Summary"
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert all("display_kind" not in row for row in sent)
+        assert all("display_metadata" not in row for row in sent)
+        timing_rows = [row for row in sent if "[Agent loop timing]" in str(row.get("content", ""))]
+        assert len(timing_rows) == 1
+        assert timing_rows[0]["role"] == "user"
+        assert messages[1] == timing
+
 
 
 
@@ -3104,6 +3195,7 @@ class TestRunConversation:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
         ):
             result = agent.run_conversation("hello")
 
@@ -3122,6 +3214,102 @@ class TestRunConversation:
                 "cache_control": {"type": "ephemeral"},
             },
         ]
+        timing = agent.client.chat.completions.create.call_args.kwargs["messages"][-1]
+        assert timing["role"] == "user"
+        assert any(
+            "[Agent loop timing]\nCurrent loop start:" in block.get("text", "")
+            for block in timing["content"]
+        )
+        assert "cache_control" not in timing
+
+    def test_first_main_route_after_in_place_compression_keeps_cache_key(
+        self, agent, tmp_path
+    ):
+        """The first real request after compression must use the stable prefix."""
+        from agent.transports.codex import _cache_scope_from_session_id, _content_cache_key
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "production-boundary-session"
+        db.create_session(session_id, source="cli", model=agent.model)
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = session_id
+        agent._last_flushed_db_idx = 0
+        agent._flushed_db_message_ids = set()
+        agent._flushed_db_message_session_id = session_id
+        agent.compression_in_place = True
+        agent.compression_enabled = False
+        agent._use_prompt_caching = True
+        agent._use_native_cache_layout = False
+        agent._cache_ttl = "5m"
+        agent.provider = "boundary-test"
+        agent.base_url = "https://api.openai.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.openai.com"
+
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = "old volatile suffix"
+        agent._memory_manager.prefetch_all.return_value = ""
+        agent._memory_manager.describe_recall.return_value = ""
+        initial_prompt = agent._build_system_prompt()
+        agent._cached_system_prompt = initial_prompt
+        agent._memory_manager.build_system_prompt.return_value = "rebuilt volatile suffix"
+
+        def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
+            return [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "assistant", "content": "recent reply"},
+            ]
+
+        agent.context_compressor.compress = _fake_compress
+        agent.context_compressor._last_compress_aborted = False
+        agent.context_compressor._last_summary_error = None
+        agent.context_compressor.compression_count = 1
+        source_messages = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": f"m{index}"}
+            for index in range(8)
+        ]
+        compressed, _rebuilt_prompt = agent._compress_context(
+            source_messages, None, approx_tokens=100_000
+        )
+
+        assert agent._last_compaction_in_place is True
+        assert agent.context_compressor.awaiting_real_usage_after_compression is True
+        assert agent.session_id == session_id
+        assert agent._memory_manager.build_system_prompt.call_count >= 2
+        stable_prefix = agent._cached_system_prompt_static
+
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="done",
+            finish_reason="stop",
+            usage={"prompt_tokens": 512, "completion_tokens": 1, "total_tokens": 513},
+        )
+        scope = _cache_scope_from_session_id(resolve_prompt_cache_scope(agent))
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "next request", conversation_history=compressed, task_id="post-compress"
+            )
+
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 1
+        request = agent.client.chat.completions.create.call_args_list[0].kwargs
+        system = request["messages"][0]
+        assert system["content"][0]["text"] == stable_prefix
+        assert request["prompt_cache_key"] == _content_cache_key(
+            stable_prefix, request["tools"], scope
+        )
+        assert request["prompt_cache_key"] != _content_cache_key("", agent.tools, scope)
+        assert system["role"] == "system"
+        assert isinstance(system["content"], list)
+        assert system["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert len(system["content"][0]["text"]) == len(stable_prefix)
+        db.close()
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)
@@ -3184,7 +3372,9 @@ class TestRunConversation:
 
         assert result["final_response"] == "Recovered on fallback"
         assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
+        mock_try_activate_fallback.assert_called_once_with(
+            FailoverReason.content_policy_blocked
+        )
         assert mock_run_codex_stream.call_count == 2
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
@@ -3278,7 +3468,12 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        assert any(
+            msg.get("role") == "user"
+            and str(msg.get("content", "")).startswith("search something")
+            and "[Agent loop timing]" in str(msg.get("content", ""))
+            for msg in pre_request_calls[0]["request_messages"]
+        )
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
@@ -3964,7 +4159,14 @@ class TestRunConversation:
         assert result["final_response"] == "Using Postgres instead."
         assert len(requests) == 2
 
-        replay = requests[1]["messages"]
+        replay = [
+            message
+            for message in requests[1]["messages"]
+            if not (
+                message.get("role") == "system"
+                and "[Agent loop timing]" in str(message.get("content", ""))
+            )
+        ]
         assert [m["role"] for m in replay[-3:]] == [
             "user",
             "assistant",
@@ -3993,9 +4195,29 @@ class TestRunConversation:
     def test_redirect_wins_race_with_response_completion(self, agent):
         """If the provider returns as redirect lands, discard the stale answer."""
         self._setup_agent(agent)
-        stale = _mock_response(content="Using SQLite.", finish_reason="stop")
-        corrected = _mock_response(content="Using Postgres.", finish_reason="stop")
+        stale = _mock_response(
+            content="Using SQLite.",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 2_000,
+                "completion_tokens": 10,
+                "total_tokens": 2_010,
+                "prompt_tokens_details": SimpleNamespace(cached_tokens=0),
+            },
+        )
+        corrected = _mock_response(
+            content="Using Postgres.",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 2_000,
+                "completion_tokens": 10,
+                "total_tokens": 2_010,
+                "prompt_tokens_details": SimpleNamespace(cached_tokens=1_900),
+            },
+        )
         calls = 0
+        cache_events = []
+        agent._tui_cache_callback = lambda *args: cache_events.append(args)
 
         def _fake_api_call(_api_kwargs):
             nonlocal calls
@@ -4015,6 +4237,9 @@ class TestRunConversation:
 
         assert calls == 2
         assert result["final_response"] == "Using Postgres."
+        assert [event[0] for event in cache_events] == ["miss"]
+        assert cache_events[0][4]["request_index"] == 1
+        assert agent._first_turn_usage["cache_read_tokens"] == 0
         assert all(
             message.get("content") != "Using SQLite."
             for message in result["messages"]
@@ -4957,7 +5182,7 @@ class TestRunConversation:
             "You are helpful.",
         ))
         with (
-            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_persist_session") as mock_persist,
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch.object(agent.context_compressor, "update_model"),
@@ -4973,15 +5198,34 @@ class TestRunConversation:
         # The retry honored the reduced max_tokens (available_out - 64).
         second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
         assert second_call["max_tokens"] <= 936
+        wire_timing = [
+            message
+            for message in second_call.get("messages", [])
+            if "[Agent loop timing]" in str(message.get("content", ""))
+        ]
+        assert len(wire_timing) == 1
+        assert wire_timing[0]["role"] == "user"
+        history_timing = [
+            message
+            for message in mock_persist.call_args_list[-1].args[0]
+            if "[Agent loop timing]" in str(message.get("content", ""))
+        ]
+        assert len(history_timing) == 1
+        assert history_timing[0]["role"] == "system"
+        assert history_timing[0]["display_kind"] == "hidden"
         # LOCK IN THE FIX: the retry must actually SEND the compressed history
         # (the 1-message payload from _compress_context + its new system
         # prompt), not the original multi-message window. Without this, the
         # output-cap retry would call the compressor but re-transmit the same
         # oversized request forever.
-        second_messages = second_call.get("messages", [])
-        assert second_messages[-1].get("content") == "hello"
-        assert len(second_messages) == 2
-        assert second_messages[0]["role"] == "system"
+        rebuilt_user = next(
+            message
+            for message in second_call.get("messages", [])
+            if message.get("role") == "user" and "[Agent loop timing]" in str(message.get("content", ""))
+        )
+        assert rebuilt_user["content"].startswith("hello")
+        assert len(second_call["messages"]) == 2
+        assert second_call["messages"][0]["role"] == "system"
         # context_length was NOT mutated by an output-cap error.
         assert agent.context_compressor.context_length == 200_000
 

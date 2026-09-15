@@ -566,6 +566,7 @@ def convert_messages_to_converse(messages: List[Dict]) -> Tuple[Optional[List[Di
     same-role neighbours merge, placeholder user turns pad the ends."""
     system_blocks: List[Dict] = []
     converse_msgs: List[Dict] = []
+    from agent.message_metadata import is_hidden_loop_timing
 
     def append_turn(role: str, blocks: List[Dict]) -> None:
         if converse_msgs and converse_msgs[-1]["role"] == role:
@@ -575,6 +576,8 @@ def convert_messages_to_converse(messages: List[Dict]) -> Tuple[Optional[List[Di
 
     for msg in messages:
         role = msg.get("role", "")
+        if is_hidden_loop_timing(msg):
+            role = "user"
         content = msg.get("content")
         if role == "system":
             system_blocks.extend(_system_blocks(content))
@@ -639,7 +642,10 @@ class _ResponseParts:
             self.reasoning_details.append({"type": "redacted_thinking", "data": encoded})
             block["redactedContentBase64"] = encoded
 
-    def build(self, ordered_blocks: List[Dict[str, Any]], usage_data: Dict[str, int], stop_reason: str, model: str) -> SimpleNamespace:
+    def build(
+        self, ordered_blocks: List[Dict[str, Any]], usage_data: Dict[str, int],
+        stop_reason: str, model: str, *, cache_read_reported: bool | None = None,
+    ) -> SimpleNamespace:
         """Assemble the OpenAI-shaped response. Converse's inputTokens EXCLUDES cache read/write tokens
         (OpenAI's prompt_tokens includes them), so they are added back."""
         msg = SimpleNamespace(
@@ -648,14 +654,26 @@ class _ResponseParts:
             reasoning_content="\n\n".join(self.reasoning_parts) if self.reasoning_parts else None,
             bedrock_content_blocks=ordered_blocks or None,
         )
+        def count(key: str) -> int:
+            value = usage_data.get(key, 0)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
         cache_read_tokens, cache_write_tokens, output_tokens = (
-            usage_data.get(k, 0) for k in ("cacheReadInputTokens", "cacheWriteInputTokens", "outputTokens")
+            count(k) for k in ("cacheReadInputTokens", "cacheWriteInputTokens", "outputTokens")
         )
         prompt_tokens = usage_data.get("inputTokens", 0) + cache_read_tokens + cache_write_tokens
-        usage = SimpleNamespace(
+        usage_fields = dict(
             prompt_tokens=prompt_tokens, completion_tokens=output_tokens, total_tokens=prompt_tokens + output_tokens,
-            cache_read_input_tokens=cache_read_tokens, cache_creation_input_tokens=cache_write_tokens,
+            _hermes_cache_read_reported=(
+                "cacheReadInputTokens" in usage_data
+                if cache_read_reported is None else cache_read_reported
+            ),
         )
+        if "cacheReadInputTokens" in usage_data:
+            usage_fields["cache_read_input_tokens"] = usage_data["cacheReadInputTokens"]
+        if "cacheWriteInputTokens" in usage_data:
+            usage_fields["cache_creation_input_tokens"] = usage_data["cacheWriteInputTokens"]
+        usage = SimpleNamespace(**usage_fields)
         finish_reason = _STOP_REASON_TO_FINISH_REASON.get(stop_reason, "stop")
         if self.tool_calls and finish_reason == "stop":
             finish_reason = "tool_calls"
@@ -710,6 +728,8 @@ def stream_converse_with_callbacks(
     has_tool_use = False
     stop_reason = "end_turn"
     usage_data: Dict[str, int] = {}
+    cache_read_reported = False
+    cache_read_reported = False
 
     def current_block(default: Dict[str, Any]) -> Dict[str, Any]:
         idx = current_block_index if current_block_index is not None else len(stream_blocks)
@@ -766,9 +786,17 @@ def stream_converse_with_callbacks(
             stop_reason = event["messageStop"].get("stopReason", "end_turn")
         elif "metadata" in event:
             meta_usage = event["metadata"].get("usage", {})
-            usage_data = {key: meta_usage.get(key, 0) for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheWriteInputTokens")}
+            cache_read_reported = "cacheReadInputTokens" in meta_usage
+            usage_data = {
+                key: meta_usage[key]
+                for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheWriteInputTokens")
+                if key in meta_usage
+            }
     flush_text()
-    return parts.build([stream_blocks[i] for i in sorted(stream_blocks)], usage_data, stop_reason, "")
+    return parts.build(
+        [stream_blocks[i] for i in sorted(stream_blocks)], usage_data, stop_reason, "",
+        cache_read_reported=cache_read_reported,
+    )
 
 
 # --- High-level API: call Bedrock Converse ---
@@ -822,12 +850,17 @@ def call_converse(
     placement; evicts the cached client on stale-connection errors."""
     client = _get_bedrock_runtime_client(region)
     kwargs = build_converse_kwargs(model, messages, tools, max_tokens, temperature, top_p, stop_sequences, guardrail_config)
+    from agent import relay_llm
+
+    def send(final_kwargs):
+        return relay_llm.physical_send(final_kwargs, lambda request: client.converse(**request))
+
     try:
-        response = client.converse(**kwargs)
+        response = send(kwargs)
     except Exception as exc:
         retry_kwargs = recover_from_cache_point_rejection(exc, kwargs)
         if retry_kwargs is not None:
-            return normalize_converse_response(client.converse(**retry_kwargs))
+            return normalize_converse_response(send(retry_kwargs))
         if is_stale_connection_error(exc):
             logger.warning(
                 "bedrock: stale-connection error on converse(region=%s, model=%s): "
@@ -1050,14 +1083,20 @@ def call_converse_stream(
         stop_sequences=stop_sequences,
         guardrail_config=guardrail_config,
     )
+    from agent import relay_llm
+
+    def send_stream(final_kwargs):
+        return relay_llm.physical_send(
+            final_kwargs, lambda request: client.converse_stream(**request)
+        )
 
     try:
-        response = client.converse_stream(**kwargs)
+        response = send_stream(kwargs)
     except Exception as exc:
         retry_kwargs = recover_from_cache_point_rejection(exc, kwargs)
         if retry_kwargs is not None:
             return normalize_converse_stream_events(
-                client.converse_stream(**retry_kwargs)
+                send_stream(retry_kwargs)
             )
         if is_streaming_access_denied_error(exc):
             # IAM allows bedrock:InvokeModel but not
@@ -1068,7 +1107,9 @@ def call_converse_stream(
                 "falling back to non-streaming converse().",
                 region, model,
             )
-            return normalize_converse_response(client.converse(**kwargs))
+            return normalize_converse_response(relay_llm.physical_send(
+                kwargs, lambda request: client.converse(**request)
+            ))
         if is_stale_connection_error(exc):
             logger.warning(
                 "bedrock: stale-connection error on converse_stream(region=%s, "

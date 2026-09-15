@@ -882,6 +882,64 @@ def recover_with_credential_pool(
     return False, has_retried_429
 
 
+_MISSING = object()
+
+
+def _copy_request_overrides(value: Any) -> Any:
+    """Structurally copy supported override containers without invoking value hooks.
+
+    Request overrides are plain configuration data.  Calling arbitrary ``__deepcopy__``
+    hooks while a switch snapshot is being made lets a rejected switch mutate the live
+    graph before there is anything safe to restore.  Copy only dict/list structure and
+    retain opaque leaves as values; route configuration does not promise to clone them.
+    """
+    memo: Dict[int, Any] = {}
+    active: set[int] = set()
+    remaining = 10_000
+
+    def copy_plain(item: Any, depth: int = 0) -> Any:
+        nonlocal remaining
+        if item is _MISSING:
+            return item
+        item_type = type(item)
+        if item_type is not dict and item_type is not list:
+            if issubclass(item_type, (dict, list)):
+                raise ValueError("request_overrides containers must be plain built-in dict/list values")
+            return item
+        if depth >= 100:
+            raise ValueError("request_overrides nesting exceeds 100 containers")
+        oid = id(item)
+        if oid in active:
+            raise ValueError("request_overrides contains a cyclic container graph")
+        if oid in memo:
+            return memo[oid]
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError("request_overrides exceeds 10000 containers")
+        active.add(oid)
+        try:
+            if item_type is dict:
+                copied: Any = {}
+                memo[oid] = copied
+                for key, child in dict.items(item):
+                    if type(key) is not str:
+                        raise ValueError("request_overrides mapping keys must be plain strings")
+                    copied[key] = copy_plain(child, depth + 1)
+            else:
+                copied = []
+                memo[oid] = copied
+                for child in list.__iter__(item):
+                    copied.append(copy_plain(child, depth + 1))
+            return copied
+        except Exception:
+            memo.pop(oid, None)
+            raise
+        finally:
+            active.remove(oid)
+
+    return copy_plain(value)
+
+
 def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
     """Copy the identity/transport fields of a ``_primary_runtime`` snapshot onto ``agent``
     (shared by transport recovery and turn-start restore; the caller rebuilds the client)."""
@@ -894,7 +952,7 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]
     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
-    agent.request_overrides = dict(rt.get("request_overrides") or {})
+    agent.request_overrides = _copy_request_overrides(rt.get("request_overrides") or {})
     agent._client_kwargs = dict(rt["client_kwargs"])
 
 
@@ -916,8 +974,8 @@ def _rebuild_primary_client(agent, rt: Dict[str, Any], *, reason: str) -> None:
     if (agent.provider or "").strip().lower() == "moa":
         # MoA has empty client_kwargs; rebuild via the shared facade factory so the
         # reference_callback relay survives recovery.
-        from agent.moa_loop import build_moa_facade
-        agent.client = build_moa_facade(agent, agent.model)
+        from agent.moa_loop import install_shared_moa_facade
+        install_shared_moa_facade(agent, agent.model)
         # MoA is a virtual chat-completions provider. It never has real OpenAI client kwargs; restoring it
         # after a fallback must recreate the facade, not call OpenAI() with an empty api_key. Use the shared
         # factory so the restored facade keeps the reference_callback relay wired at init — a bare
@@ -963,8 +1021,8 @@ def try_recover_primary_transport(
             # MoA is a virtual provider with empty client_kwargs — rebuilding via _create_openai_client
             # would raise "api_key client option must be set". Recreate the facade through the shared
             # factory so the reference_callback relay survives recovery (#53802).
-            from agent.moa_loop import build_moa_facade
-            agent.client = build_moa_facade(agent, agent.model)
+            from agent.moa_loop import install_shared_moa_facade
+            install_shared_moa_facade(agent, agent.model)
         else:
             agent.client = agent._create_openai_client(dict(rt["client_kwargs"]), reason="primary_recovery", shared=True)
         wait_time = min(3 + retry_count, 8)
@@ -1699,8 +1757,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # base_url, leaks the request to a foreign gateway. Rebuild the facade instead (build_moa_facade also
     # re-wires the reference relay, see #53802).
     if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
-        from agent.moa_loop import build_moa_facade
-        return build_moa_facade(agent, getattr(agent, "model", None) or "default")
+        from agent.moa_loop import build_moa_facade, install_shared_moa_facade
+        preset = getattr(agent, "model", None) or "default"
+        return install_shared_moa_facade(agent, preset) if shared else build_moa_facade(agent, preset)
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
@@ -1713,6 +1772,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # provider possible). None (the default) falls through, so existing providers are unaffected.
     provider_client = _provider_supplied_client(agent, client_kwargs)
     if provider_client is not None:
+        agent._openai_transport_kind = "provider"
+        if shared:
+            agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
         _ra().logger.info(
             "%s client created from provider profile (%s, shared=%s) %s",
             agent.provider, reason, shared, agent._client_log_context(),
@@ -1722,6 +1784,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     if agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
         client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
+            agent._openai_transport_kind = "gemini"
+            if shared:
+                agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
             return client
     # TCP keepalives so dead provider connections are detected (~60s) instead of hanging in
     # CLOSE-WAIT. Injected into the local copy only, so each client gets its own httpx.Client;
@@ -1768,6 +1833,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
     client = process_bootstrap.OpenAI(**client_kwargs)
+    agent._openai_transport_kind = "http_chat"
+    if shared:
+        agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
     _ra().logger.info("OpenAI client created (%s, shared=%s) %s", reason, shared, agent._client_log_context())
     return client
 
@@ -1793,7 +1861,7 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     overrides = dict(getattr(agent, "request_overrides", {}) or {})
     overrides.pop("extra_body", None)  # always drop the previous provider's extra_body
     if new_extra_body:
-        overrides["extra_body"] = dict(new_extra_body)
+        overrides["extra_body"] = _copy_request_overrides(new_extra_body)
     agent.request_overrides = overrides
 
 
@@ -1802,9 +1870,9 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
-    "_credential_pool", "_credential_pool_entry_id",
+    "_credential_pool", "_credential_pool_entry_id", "_openai_transport_kind",
+    "_openai_transport_generation",
 )
-_MISSING = object()
 
 
 def _snapshot_switch_state(agent) -> Dict[str, Any]:
@@ -1814,6 +1882,11 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
     snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
     # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
     snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    # Override provenance is not in _SWITCH_SNAPSHOT_FIELDS: official re-derives extra_body on
+    # success, but a failed swap must restore the original nested graph, not an aliased dict.
+    snapshot["request_overrides"] = _copy_request_overrides(
+        getattr(agent, "request_overrides", _MISSING)
+    )
     return snapshot
 
 
@@ -1864,7 +1937,7 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
 def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm) -> None:
     """Build the client for the switched-to destination (MoA facade / native Anthropic / OpenAI wire)."""
     if new_norm == "moa":
-        from agent.moa_loop import build_moa_facade
+        from agent.moa_loop import install_shared_moa_facade
         # MoA speaks only chat.completions via the MoAClient facade; the aggregator's real transport
         # is applied inside the fan-out. Pin api_mode so the loop never dispatches
         # client.responses.create against the facade (matches agent_init.py).
@@ -1872,7 +1945,7 @@ def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new
         agent.api_key = api_key or "moa-virtual-provider"
         agent.base_url = "moa://local"
         agent._client_kwargs = {}
-        agent.client = build_moa_facade(agent, agent.model)
+        install_shared_moa_facade(agent, agent.model)
         return
     if api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client
@@ -1974,6 +2047,10 @@ def _swap_switch_runtime(agent, new_model, new_provider, api_key, base_url, api_
 
 def _resolve_switch_context_length(agent, snapshot):
     """Resolve the destination context length (LM Studio preload first); returns ``(custom_providers, effective_len)``."""
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        intent = getattr(agent, "_deferred_model_switch_context_length", None)
+        agent._config_context_length = intent
+        return None, intent
     custom_providers = None
     try:
         from hermes_cli.config import (
@@ -2007,6 +2084,17 @@ def _resolve_switch_context_length(agent, snapshot):
 
 def _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot) -> None:
     """Point the context compressor at the new model (rolls back the switch on failure)."""
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        new_context_length = effective_context_length or getattr(
+            agent.context_compressor, "context_length", None)
+        try:
+            agent.context_compressor.update_model(
+                model=agent.model, context_length=new_context_length, base_url=agent.base_url,
+                api_key=agent.api_key, provider=agent.provider, api_mode=agent.api_mode)
+        except Exception:
+            _restore_switch_snapshot(agent, snapshot)
+            raise
+        return
     from agent.model_metadata import get_model_context_length
     if custom_providers is None:
         try:
@@ -2052,8 +2140,10 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         # Overrides must travel with the switched-to identity or a later recovery/restore resurrects
         # PRE-switch overrides from the stale init snapshot.
-        # See #75091.
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        # See #75091. Deep-copy so later mutation of agent.request_overrides cannot poison restore.
+        "request_overrides": _copy_request_overrides(
+            getattr(agent, "request_overrides", {}) or {}
+        ),
         "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
         "compressor_model": getattr(cc, "model", agent.model),
         "compressor_base_url": getattr(cc, "base_url", agent.base_url),
@@ -2117,7 +2207,23 @@ def switch_model(
     """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
     compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
     the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
-    snapshot and re-raises (callers catch)."""
+    snapshot and re-raises (callers catch). Immediate swaps cancel a pending deferred switch."""
+    from hermes_cli.model_switch import (
+        _emit_deferred_model_switch_status, clear_model_switch_after_compression,
+        model_switch_transaction_lock)
+    with model_switch_transaction_lock(agent):
+        _switch_model_unlocked(
+            agent, new_model, new_provider, api_key, base_url, api_mode, capabilities)
+        if not getattr(agent, "_applying_model_switch_after_compression", False):
+            cancelled = clear_model_switch_after_compression(agent)
+            if cancelled is not None:
+                _emit_deferred_model_switch_status(
+                    agent, "Pending after-compression model switch cancelled by the immediate model switch.")
+
+
+def _switch_model_unlocked(
+    agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None
+):
     old_model = agent.model
     old_provider = agent.provider
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
@@ -2150,16 +2256,21 @@ def switch_model(
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot)
     # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
-    # YAML False = disabled).
-    try:
-        from hermes_constants import resolve_reasoning_config
-        from hermes_cli.config import load_config as _sm_load_config
-        agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
-        logger.info(
-            "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
-        )
-    except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+    # YAML False = disabled). A deferred compression-boundary switch keeps the already-resolved
+    # destination config and must not probe config.yaml again.
+    if getattr(agent, "_applying_model_switch_after_compression", False):
+        agent.reasoning_config = copy.deepcopy(
+            getattr(agent, "_deferred_model_switch_reasoning_config", None))
+    else:
+        try:
+            from hermes_constants import resolve_reasoning_config
+            from hermes_cli.config import load_config as _sm_load_config
+            agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+            logger.info(
+                "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
+            )
+        except Exception as _reasoning_err:
+            logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
     # Invalidate the cached system prompt so it rebuilds next turn.
     agent._cached_system_prompt = None
     # Publish the destination capability map only after every runtime setup above has succeeded.
@@ -3179,22 +3290,29 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()
-    if not steer_text:
+    ingest_completion = getattr(agent, "_completion_steer_ingest", None)
+    if not steer_text and not callable(ingest_completion):
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
     target = next((messages[j] for j in tail if isinstance(messages[j], dict) and messages[j].get("role") == "tool"), None)
     if target is None:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # requeue so the fallback path delivers it as a normal next-turn
-        # user message (which persists like any other user turn).
-        _requeue_pending_steer(agent, steer_text)
+        # No tool result in this batch (e.g. all skipped by interrupt); true user
+        # steer returns to its rail and a structured completion keeps its owner.
+        if steer_text:
+            _requeue_pending_steer(agent, steer_text)
+        return
+
+    def insert(completion_text: str, _events: list) -> str:
+        text = f"{completion_text}\n{steer_text}" if steer_text else completion_text
+        messages.append(steer_user_row(text))
+        return "inserted"
+
+    if callable(ingest_completion) and ingest_completion(insert):
+        return
+    if not steer_text:
         return
     messages.append(steer_user_row(steer_text))
-    _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
-        steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
-    )
 
 
 def force_close_tcp_sockets(client: Any) -> int:

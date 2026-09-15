@@ -61,6 +61,7 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
 
     @property
     def prompt_tokens(self) -> int:
@@ -76,10 +77,18 @@ class CanonicalUsage:
         combined figure covers."""
         if not isinstance(other, CanonicalUsage):
             return NotImplemented
-        return CanonicalUsage(**{
+        summed = {
             f.name: getattr(self, f.name) + getattr(other, f.name)
-            for f in fields(CanonicalUsage) if f.name != "raw_usage"
-        })
+            for f in fields(CanonicalUsage) if f.name not in ("raw_usage", "cache_telemetry")
+        }
+        return CanonicalUsage(
+            **summed,
+            cache_telemetry=(
+                "reported"
+                if self.cache_telemetry == "reported" or other.cache_telemetry == "reported"
+                else "unavailable"
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -291,6 +300,22 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         return None
 
 
+def _usage_has(obj: Any, *path: str) -> bool:
+    """True when every hop exists and the final value is not null (zero is reported)."""
+    for hop in path:
+        if obj is None:
+            return False
+        if isinstance(obj, dict):
+            if hop not in obj:
+                return False
+            obj = obj[hop]
+        elif hasattr(obj, hop):
+            obj = getattr(obj, hop)
+        else:
+            return False
+    return obj is not None
+
+
 def _usage_field(obj: Any, *path: str) -> int:
     """Non-negative int at ``obj.path[0].path[1]...``; 0 if any hop is falsy or
     non-numeric. Hops read dicts and attribute objects alike (the Responses API
@@ -309,6 +334,57 @@ def _usage_field(obj: Any, *path: str) -> int:
 def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> int:
     """First non-zero ``_usage_field`` across candidate paths, else 0."""
     return next((v for v in (_usage_field(obj, *path) for path in paths) if v), 0)
+
+
+def _usage_present(obj: Any, *path: str) -> bool:
+    """True when ``obj.path`` exists and is not None (explicit 0 still counts)."""
+    for hop in path:
+        if obj is None:
+            return False
+        if isinstance(obj, dict):
+            if hop not in obj:
+                return False
+            obj = obj[hop]
+        else:
+            if not hasattr(obj, hop):
+                return False
+            obj = getattr(obj, hop)
+        if obj is None:
+            return False
+    return True
+
+
+def _cache_evidence(obj: Any, *paths: tuple[str, ...]) -> tuple[int, bool]:
+    """Return the established positive alias, or a valid all-zero observation."""
+    saw_valid_zero = False
+    for path in paths:
+        value = obj
+        present = True
+        for hop in path:
+            if isinstance(value, dict):
+                if hop not in value:
+                    present = False
+                    break
+                value = value[hop]
+            elif value is not None and hasattr(value, hop):
+                value = getattr(value, hop)
+            else:
+                present = False
+                break
+        if not present:
+            continue
+        if value is None or isinstance(value, (bool, list, tuple, dict, set)):
+            continue
+        try:
+            number = Decimal(str(value))
+        except Exception:
+            continue
+        if not number.is_finite() or number < 0 or number != number.to_integral_value():
+            continue
+        if number:
+            return int(number), True
+        saw_valid_zero = True
+    return 0, saw_valid_zero
 
 
 # Picker slugs → snapshot provider key ("openai-api" is the slug for direct
@@ -508,8 +584,12 @@ def normalize_usage(
         shape = _CODEX_USAGE_SHAPE
     else:
         shape = _CHAT_USAGE_SHAPE
-    prompt_total, output_tokens, cache_read_tokens, cache_write_tokens = (
-        _first_nonzero(u, *paths) for paths in shape
+    prompt_total = _first_nonzero(u, *shape[0])
+    output_tokens = _first_nonzero(u, *shape[1])
+    cache_read_tokens, cache_read_valid = _cache_evidence(u, *shape[2])
+    cache_write_tokens, cache_write_valid = _cache_evidence(u, *shape[3])
+    cache_telemetry: Literal["reported", "unavailable"] = (
+        "reported" if cache_read_valid or cache_write_valid else "unavailable"
     )
     # Anthropic reports uncached input directly; Codex/Chat totals INCLUDE
     # cached tokens, so the cache buckets are subtracted back out.
@@ -539,10 +619,26 @@ def normalize_usage(
             cache_read_tokens, cache_write_tokens,
         )
 
-    return CanonicalUsage(
+    usage = CanonicalUsage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
+        cache_telemetry=cache_telemetry,
     )
+    availability = (
+        u.get("_hermes_cache_read_reported")
+        if isinstance(u, dict)
+        else getattr(u, "_hermes_cache_read_reported", None)
+    )
+    cache_telemetry = "reported" if (
+        availability is True
+        or availability is None and any(_usage_has(u, *path) for path in shape[2])
+    ) else "unavailable"
+    try:
+        from agent.cache_lowhit_request_dump import maybe_dump_on_usage
+        maybe_dump_on_usage(usage, cache_telemetry=cache_telemetry)
+    except Exception:
+        logger.debug("cache low-hit dump failed", exc_info=True)
+    return usage
 
 
 def _unknown_cost(source: CostSource, *notes: str) -> CostResult:

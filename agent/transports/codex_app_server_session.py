@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
 from agent.redact import redact_sensitive_text
+from agent.stream_payload_bound import StreamPayloadBoundExceeded, stream_payload_error_text
 from agent.transports.codex_app_server import CodexAppServerClient, CodexAppServerError
 from agent.transports.codex_event_projector import CodexEventProjector, ProjectionResult
 
@@ -49,6 +50,7 @@ class TurnResult:
     # Exact turn/start text distinguishes the input echo from a new user event.
     submitted_user_text: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
+    token_usage_first: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
     # Codex likely wedged (turn timeout, watchdog, token refresh failure): caller respawns next turn.
@@ -304,6 +306,8 @@ class CodexAppServerSession:
         if self._on_event is not None:
             try:
                 self._on_event(note)
+            except StreamPayloadBoundExceeded:
+                raise
             except Exception:  # pragma: no cover - display callback
                 logger.debug("on_event callback raised", exc_info=True)
         _apply_accounting_notification(result, note)
@@ -411,13 +415,21 @@ class CodexAppServerSession:
                 self._set_classified_error(result, f"turn ended status={turn_status}", err_msg, err_msg)
             return True
 
-        self._drive_turn(
-            result, turn_timeout=turn_timeout, notification_poll_timeout=notification_poll_timeout,
-            timeout_label="turn", before_poll=watchdog_tripped, on_server_request=on_server_request,
-            on_note=on_note, accept_final_text_at_deadline=True,
-        )
-        with self._active_turn_lock:
-            self._active_turn_id = None
+        try:
+            self._drive_turn(
+                result, turn_timeout=turn_timeout, notification_poll_timeout=notification_poll_timeout,
+                timeout_label="turn", before_poll=watchdog_tripped, on_server_request=on_server_request,
+                on_note=on_note, accept_final_text_at_deadline=True,
+            )
+        except StreamPayloadBoundExceeded as exc:
+            self._issue_interrupt(result.turn_id)
+            result.interrupted = True
+            result.should_retire = True
+            result.error = result.final_text = stream_payload_error_text(exc.size, exc.bound)
+            result.projected_messages.append({"role": "assistant", "content": result.final_text})
+        finally:
+            with self._active_turn_lock:
+                self._active_turn_id = None
 
     def _drive_turn(
         self, result: TurnResult, *, turn_timeout: float, notification_poll_timeout: float,
@@ -665,6 +677,8 @@ def _apply_accounting_notification(result: TurnResult, note: dict) -> None:
         if isinstance(token_usage, dict):
             last, window = token_usage.get("last"), token_usage.get("modelContextWindow")
             if isinstance(last, dict):
+                if result.token_usage_first is None:
+                    result.token_usage_first = dict(last)
                 result.token_usage_last = dict(last)
             if isinstance(window, int) and window > 0:
                 result.model_context_window = window

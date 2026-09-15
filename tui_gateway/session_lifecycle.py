@@ -209,6 +209,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         _release_active_session_slot(session)
     if (stop_event := session.get("_notif_stop")) is not None:
         stop_event.set()
+        for _stop, thread in list(_notification_pollers):
+            if _stop is stop_event and thread is not threading.current_thread():
+                thread.join(timeout=0.3)
     agent = session.get("agent")
     with (session.get("history_lock") or contextlib.nullcontext()):
         history = list(session.get("history", []))
@@ -291,6 +294,9 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     slash-worker is closed in ``_finalize_session`` (the single chokepoint), NOT here. Idempotent via ``_finalized``."""
     if not session:
         return
+    with contextlib.suppress(Exception):
+        from tui_gateway.cache_telemetry import _cancel_tui_cache_warm
+        _cancel_tui_cache_warm(session)
     _finalize_session(session, end_reason=end_reason)
     _announce_session_reclaimed(session, end_reason)
     with contextlib.suppress(Exception):
@@ -386,8 +392,14 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
             _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
     else:
         run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
+        if session.get("_turn_owner_kind") == "cache_warm":
+            with contextlib.suppress(Exception):
+                from tui_gateway.cache_telemetry import _cancel_tui_cache_warm
+                _cancel_tui_cache_warm(session)
+            run_thread_alive = bool(session.get("_cache_warm_worker_token"))
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
+        _reclaim_queued_completion_receipts(session)
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1

@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from agent.message_metadata import is_hidden_loop_timing
 from agent.reasoning_effort import (
     KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS, TOKENHUB_EFFORTS, clamp_effort,
     kimi_supported_efforts, requested_effort,
@@ -35,6 +36,7 @@ _XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
 _STRIP_MSG_KEYS = (
     "codex_reasoning_items", "codex_message_items", "tool_name", "effect_disposition", "timestamp",
     "platform_message_id", "api_content", "anthropic_content_blocks", "bedrock_content_blocks",
+    "display_kind", "display_metadata",
 )
 _STRIP_TC_KEYS = ("call_id", "response_item_id")
 _HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
@@ -61,6 +63,16 @@ def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
     content = first.get("content")
     if isinstance(content, str):
         return content
+    if isinstance(content, list) and content:
+        # A cache plan marks the stable system prefix in the first block and
+        # leaves the rebuilt volatile suffix outside the routing key.
+        first_block = content[0]
+        if (
+            isinstance(first_block, dict)
+            and "cache_control" in first_block
+            and isinstance(first_block.get("text"), str)
+        ):
+            return first_block["text"]
     try:
         return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
@@ -349,10 +361,17 @@ class ChatCompletionsTransport(ProviderTransport):
         Returns the input list unchanged when nothing needs sanitizing.
         """
         strip_extra_content = not _model_consumes_thought_signature(kwargs.get("model"))
-        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content)) for m in messages]
+        sanitized_pairs = []
+        for index, message in enumerate(messages):
+            sanitized = _sanitize_message(message, strip_extra_content)
+            if index and is_hidden_loop_timing(message):
+                sanitized = dict(message) if sanitized is None else sanitized
+                sanitized["role"] = "user"
+            sanitized_pairs.append((message, sanitized))
         if all(s is None for _, s in sanitized_pairs):
             return messages
-        return [m if s is None else s for m, s in sanitized_pairs]
+        from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
+        return drop_thinking_only_and_merge_users([m if s is None else s for m, s in sanitized_pairs])
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Tools are already in OpenAI format — identity."""
@@ -378,12 +397,14 @@ class ChatCompletionsTransport(ProviderTransport):
         is_lmstudio = params.get("is_lmstudio", False)
         supports_reasoning = params.get("supports_reasoning", False)
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
-        _apply_max_tokens(api_kwargs, model, reasoning_config, params)
+        bodyless_warm = bool(params.get("bodyless_warm"))
+        if not bodyless_warm:
+            _apply_max_tokens(api_kwargs, model, reasoning_config, params)
 
         # Kimi / TokenHub / LM Studio: top-level reasoning_effort (unless thinking disabled).
         thinking_off = isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False
         _e = requested_effort(reasoning_config)
-        if is_kimi and not thinking_off:
+        if is_kimi and not thinking_off and not bodyless_warm:
             # K3 = low/high/max (server default high), K2-era = low/medium/high (default medium).
             _supported = kimi_supported_efforts(model)
             is_k3 = _supported is KIMI_K3_EFFORTS
@@ -391,9 +412,9 @@ class ChatCompletionsTransport(ProviderTransport):
                 ("high" if is_k3 else "medium") if _e is None
                 else clamp_effort(_e, _supported, KIMI_K3_OVERRIDES if is_k3 else None)
             )
-        if params.get("is_tokenhub", False) and not thinking_off:
+        if params.get("is_tokenhub", False) and not thinking_off and not bodyless_warm:
             api_kwargs["reasoning_effort"] = "high" if _e is None else clamp_effort(_e, TOKENHUB_EFFORTS)
-        if is_lmstudio and supports_reasoning:
+        if is_lmstudio and supports_reasoning and not bodyless_warm:
             _lm_effort = resolve_lmstudio_effort(reasoning_config, params.get("lmstudio_reasoning_options"))
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
@@ -412,7 +433,7 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body["thinking"] = {"type": "disabled" if thinking_off else "enabled"}
 
         # LM Studio is handled above via top-level reasoning_effort.
-        if supports_reasoning and not is_lmstudio:
+        if supports_reasoning and not is_lmstudio and not bodyless_warm:
             if params.get("is_github_models", False):
                 if params.get("github_reasoning_extra") is not None:
                     extra_body["reasoning"] = params["github_reasoning_extra"]
@@ -422,7 +443,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 off = thinking_off or _effort == "none"
                 extra_body["reasoning"] = {"enabled": not off, "effort": "none" if off else _effort}
 
-        if str(params.get("provider_name") or "").strip().lower() == "gemini":
+        if not bodyless_warm and str(params.get("provider_name") or "").strip().lower() == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
             if _is_gemini_openai_compat_base_url(base_url):
                 thinking_config = _snake_case_gemini_thinking_config(raw_thinking_config)
@@ -441,24 +462,31 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs.update(params["request_overrides"])
         return _finish_kwargs(
             api_kwargs, sanitized, params,
-            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key")) or _is_openai_api_base_url(base_url),
+            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
+            or _is_openai_api_base_url(base_url)
+            or str(params.get("provider_name") or "").startswith("custom:"),
         )
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
         """Build API kwargs from a ProviderProfile — every quirk comes from the profile object."""
         sanitized = _swap_developer_role(profile.prepare_messages(sanitized), (model or "").lower())
         api_kwargs = _base_kwargs(model, sanitized, tools, params, profile=profile)
+        bodyless_warm = bool(params.get("bodyless_warm"))
 
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
         # Profiles fronting several backends override get_max_tokens() per model.
-        _apply_max_tokens(api_kwargs, model, reasoning_config, params, profile_max=profile.get_max_tokens(model))
+        if not bodyless_warm:
+            _apply_max_tokens(api_kwargs, model, reasoning_config, params, profile_max=profile.get_max_tokens(model))
 
-        extra_body_from_profile, top_level_from_profile = profile.build_api_kwargs_extras(
-            reasoning_config=reasoning_config, supports_reasoning=params.get("supports_reasoning", False),
-            qwen_session_metadata=params.get("qwen_session_metadata"), model=model,
-            base_url=params.get("base_url"), ollama_num_ctx=params.get("ollama_num_ctx"),
-            session_id=params.get("session_id"),
-        )
+        if bodyless_warm:
+            extra_body_from_profile, top_level_from_profile = {}, {}
+        else:
+            extra_body_from_profile, top_level_from_profile = profile.build_api_kwargs_extras(
+                reasoning_config=reasoning_config, supports_reasoning=params.get("supports_reasoning", False),
+                qwen_session_metadata=params.get("qwen_session_metadata"), model=model,
+                base_url=params.get("base_url"), ollama_num_ctx=params.get("ollama_num_ctx"),
+                session_id=params.get("session_id"),
+            )
         api_kwargs.update(top_level_from_profile)
 
         extra_body: dict[str, Any] = {}
@@ -490,7 +518,9 @@ class ChatCompletionsTransport(ProviderTransport):
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
         return _finish_kwargs(
-            api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
+            api_kwargs, sanitized, params,
+            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False))
+            or str(params.get("provider_name") or "").strip().lower().startswith("custom:"),
         )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

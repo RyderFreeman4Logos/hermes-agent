@@ -178,6 +178,46 @@ def test_concurrent_requests_do_not_break_each_other_when_one_client_closes(monk
     assert len(factory.calls) == 2
 
 
+def test_abort_resistant_nonstream_worker_retires_only_after_physical_return(monkeypatch):
+    dispatched = threading.Event()
+    release_transport = threading.Event()
+    worker_started = threading.Event()
+    worker_retired = threading.Event()
+
+    def responder(**_kwargs):
+        dispatched.set()
+        assert release_transport.wait(timeout=3)
+        return {"stale": True}
+
+    request_client = FakeRequestClient(responder)
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", OpenAIFactory([request_client]))
+    agent = _build_agent()
+    outcome = []
+
+    caller = threading.Thread(target=lambda: outcome.append(
+        pytest.raises(InterruptedError, agent._interruptible_api_call,
+            {"model": agent.model, "messages": []},
+            _before_dispatch=lambda: True,
+            _on_worker_start=worker_started.set,
+            _on_worker_retire=worker_retired.set,
+        )
+    ))
+    caller.start()
+    try:
+        assert worker_started.wait(timeout=2)
+        assert dispatched.wait(timeout=2)
+        agent._interrupt_requested = True
+        caller.join(timeout=2)
+        assert not caller.is_alive()
+        assert not worker_retired.is_set()
+    finally:
+        release_transport.set()
+        caller.join(timeout=2)
+
+    assert worker_retired.wait(timeout=2)
+    assert outcome
+
+
 
 def test_streaming_call_recreates_closed_shared_client_before_request(monkeypatch):
     chunks = iter([

@@ -11,12 +11,14 @@ state_lost/state_reset reporting, fail-open, and owner isolation.
 import json
 import os
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.code_kernel_remote import (
+    _REGISTRY,
     _REMOTE_KERNELS,
     RemoteKernel,
     execute_in_remote_kernel,
@@ -278,8 +280,14 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
             worker = threading.Thread(target=_run, args=(busy_env,), kwargs={"task": "busy"})
             worker.start()
-            while not any(k.attached for k in _REMOTE_KERNELS.values()):
-                pass
+            deadline = time.monotonic() + 5
+            attached = False
+            while time.monotonic() < deadline:
+                with _REGISTRY.lock:
+                    attached = any(k.attached for k in _REMOTE_KERNELS.values())
+                if attached:
+                    break
+            self.assertTrue(attached, "busy kernel never attached")
             env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
             _run(env, task="settled")
             owners = {key[0] for key in _REMOTE_KERNELS}

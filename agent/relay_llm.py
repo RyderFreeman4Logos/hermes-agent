@@ -9,11 +9,12 @@ import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
-from agent import relay_runtime
+from agent import cache_lowhit_request_dump, physical_attempt_diagnostics, relay_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,21 @@ logger = logging.getLogger(__name__)
 _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset({"reasoning_content", "reasoning_details"})
 _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset({"x-dynamo-parent-session-id", "x-dynamo-session-id"})
 _LogicalCall = tuple[relay_runtime.RelayTurnContext, Any, str]
+
+
+@dataclass
+class _PhysicalDiagnosticContext:
+    name: str
+    model_name: str
+    metadata: dict[str, Any] | None
+    ordinal: int = 0
+    scope: dict[str, str] | None = None
+    latest_event: Any = None
+
+
+_PHYSICAL_DIAGNOSTICS: contextvars.ContextVar[_PhysicalDiagnosticContext | None] = (
+    contextvars.ContextVar("hermes_physical_diagnostics", default=None)
+)
 
 
 # api_mode -> (Relay operation name, codec class name on ``relay.codecs``)
@@ -48,6 +64,119 @@ def _relay_metadata(provider_name: str, metadata: dict[str, Any] | None) -> dict
     return relay_metadata
 
 
+def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
+    request_id = str((metadata or {}).get("api_request_id") or "")
+    correlation, marker, loop = request_id.rpartition(":api:")
+    if not marker or not correlation:
+        return None, ""
+    try:
+        return int(loop), correlation
+    except ValueError:
+        return None, ""
+
+
+def _record_attempt(
+    request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None,
+    physical_send_ordinal: int = 0, scope: dict[str, str] | None = None,
+) -> Any:
+    loop, correlation = _attempt_loop(metadata)
+    try:
+        event = cache_lowhit_request_dump.remember_sent_request(
+            request, api_mode=str((metadata or {}).get("api_mode") or "unknown"),
+            correlation=correlation,
+        )
+    except Exception:
+        logger.debug("cache low-hit remember failed", exc_info=True)
+        event = None
+    request_scope = physical_attempt_diagnostics.take_cache_scope(request)
+    physical_attempt_diagnostics.start_attempt(
+        request,
+        api_mode=str((metadata or {}).get("api_mode") or "unknown"),
+        route=str((metadata or {}).get("api_mode") or "unknown"),
+        provider=name,
+        model=str(request.get("model") or model_name),
+        retry=int((metadata or {}).get("retry_count") or 0),
+        loop=loop,
+        correlation=correlation,
+        scope=request_scope or scope,
+        physical_send_ordinal=physical_send_ordinal,
+    )
+    return event
+
+
+@contextlib.contextmanager
+def _diagnostic_scope(context: _PhysicalDiagnosticContext):
+    token = _PHYSICAL_DIAGNOSTICS.set(context)
+    try:
+        yield
+    finally:
+        _PHYSICAL_DIAGNOSTICS.reset(token)
+
+
+def physical_send(request: dict[str, Any], callback: Callable[[dict[str, Any]], Any]) -> Any:
+    """Record final public-SDK kwargs exactly once, then perform that physical send."""
+    context = _PHYSICAL_DIAGNOSTICS.get()
+    if context is None:
+        return callback(request)
+    scope = physical_attempt_diagnostics.take_cache_scope(request)
+    if scope is not None:
+        context.scope = scope
+    event = _record_attempt(
+        request, name=context.name, model_name=context.model_name, metadata=context.metadata,
+        physical_send_ordinal=context.ordinal, scope=context.scope,
+    )
+    context.ordinal += 1
+    context.latest_event = event
+    try:
+        return callback(request)
+    except BaseException:
+        cache_lowhit_request_dump.activate_event(None)
+        raise
+
+
+async def physical_send_async(
+    request: dict[str, Any], callback: Callable[[dict[str, Any]], Any]
+) -> Any:
+    """Async counterpart to :func:`physical_send`."""
+    result = physical_send(request, callback)
+    try:
+        return await result if inspect.isawaitable(result) else result
+    except BaseException:
+        cache_lowhit_request_dump.activate_event(None)
+        raise
+
+
+def run_direct(
+    request: dict[str, Any], callback: Callable[[dict[str, Any]], Any], *,
+    name: str, model_name: str, metadata: dict[str, Any] | None = None,
+) -> Any:
+    """Run a Relay-bypassed facade while its inner SDK adapter records real sends."""
+    request = _request_with_cache_scope(request, _current_session_id())
+    diagnostics = _PhysicalDiagnosticContext(
+        name, model_name, metadata,
+        scope=physical_attempt_diagnostics.take_cache_scope(request),
+    )
+    with _diagnostic_scope(diagnostics):
+        result = callback(request)
+    cache_lowhit_request_dump.activate_event(diagnostics.latest_event)
+    return result
+
+
+def _request_with_cache_scope(request: dict[str, Any], session_id: str | None) -> dict[str, Any]:
+    """Attach a diagnostic-only cache scope before Relay sees the request."""
+    extra_body = request.get("extra_body")
+    cache_scope = request.get("prompt_cache_key")
+    if cache_scope is None and isinstance(extra_body, dict):
+        cache_scope = extra_body.get("prompt_cache_key")
+    if cache_scope is None:
+        cache_scope = session_id
+    scope = physical_attempt_diagnostics.prepare_cache_scope(cache_scope)
+    return request if scope is None else {
+        **request,
+        "_hermes_physical_attempt_cache_scope": scope,
+    }
+
+
 class _ManagedAttempt:
     """Relay request state shared by the sync, async, and streaming adapters."""
 
@@ -64,6 +193,7 @@ class _ManagedAttempt:
         runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
         if runtime is None or session is None or not runtime.managed_execution_enabled():
             return None
+        request = _request_with_cache_scope(request, session_id)
         return cls(runtime, session, parent, request, metadata, name=name, model_name=model_name)
 
     def __init__(
@@ -71,6 +201,8 @@ class _ManagedAttempt:
         request: dict[str, Any], metadata: dict[str, Any] | None, *, name: str, model_name: str,
     ) -> None:
         self.runtime, self.session, self.request, self.metadata = runtime, session, request, metadata
+        self.name, self.model_name = name, model_name
+        self.diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
         self.logical = _logical_parent(runtime, session, parent, metadata)
         self.parent = self.logical[1] if self.logical is not None else parent
         self.body = _relay_request_body(request, metadata)
@@ -102,7 +234,7 @@ class _ManagedAttempt:
             # See #77244.
             # Hermes-side callbacks run while the native pipeline drives this stream; nested relay calls
             # they make must bypass managed execution (#77244).
-            with relay_runtime.managed_callback_guard():
+            with relay_runtime.managed_callback_guard(), _diagnostic_scope(self.diagnostics):
                 return callback(*args)
 
         return self.context.copy().run(guarded)
@@ -123,12 +255,13 @@ class _ManagedAttempt:
     def invoke(self, callback: Callable[..., Any], next_request: Any) -> Any:
         """Provider callback handed to Relay: run ``callback`` on Relay's (possibly rewritten) request."""
         with self._recording_errors():
-            raw = self.run_callback(callback, self.provider_request(next_request))
+            final_request = self.provider_request(next_request)
+            raw = self.run_callback(callback, final_request)
         return self._record(raw)
 
     async def invoke_async(self, callback: Callable[..., Any], next_request: Any) -> Any:
         async def call_provider() -> Any:
-            with relay_runtime.managed_callback_guard():  # nested relay calls run unmanaged
+            with relay_runtime.managed_callback_guard(), _diagnostic_scope(self.diagnostics):
                 return await callback(final_request)
 
         with self._recording_errors():
@@ -158,6 +291,7 @@ class _ManagedAttempt:
         return self.raw_response["value"]
 
     def result(self, managed: Any, defer_logical_completion: bool) -> Any:
+        cache_lowhit_request_dump.activate_event(self.diagnostics.latest_event)
         self._complete(defer_logical_completion)
         if "value" in self.raw_response and _json_equal(managed, self.raw_response["json"]):
             return self.raw_response["value"]
@@ -182,7 +316,12 @@ def execute(
     ``session_id`` defaults to the inherited Hermes turn's session (unmanaged when there is none)."""
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
-        return callback(request)
+        request = _request_with_cache_scope(request, session_id or _current_session_id())
+        diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+        with _diagnostic_scope(diagnostics):
+            result = callback(request)
+        cache_lowhit_request_dump.activate_event(diagnostics.latest_event)
+        return result
     try:
         managed = _run_awaitable(attempt.run_managed(
             attempt.runtime.relay.llm.execute, partial(attempt.invoke, callback)
@@ -199,7 +338,12 @@ async def execute_async(
     """Async ``execute``."""
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
-        return await callback(request)
+        request = _request_with_cache_scope(request, session_id or _current_session_id())
+        diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+        with _diagnostic_scope(diagnostics):
+            result = await callback(request)
+        cache_lowhit_request_dump.activate_event(diagnostics.latest_event)
+        return result
     try:
         managed = await attempt.run_managed(attempt.runtime.relay.llm.execute, partial(attempt.invoke_async, callback))
     except BaseException as exc:
@@ -239,7 +383,12 @@ def stream_current(
     # Inside a managed callback (on the Relay session's loop) a nested ManagedLlmStream would be
     # iterated synchronously on that loop, which asyncio forbids; the outer stream tracks this attempt.
     if session_id is None or _has_running_event_loop():
-        return stream_factory(request)
+        request = _request_with_cache_scope(request, session_id)
+        diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+        with _diagnostic_scope(diagnostics):
+            result = stream_factory(request)
+        cache_lowhit_request_dump.activate_event(diagnostics.latest_event)
+        return result
     managed = stream(
         request, stream_factory, session_id=session_id, name=name, model_name=model_name,
         finalizer=finalizer, metadata=metadata, defer_logical_completion=defer_logical_completion,
@@ -294,8 +443,12 @@ class ManagedLlmStream(Iterator[Any]):
         self._prefetched_chunks: list[Any] = []
         attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
         if attempt is None:
-            self._start_unmanaged(request)
+            request = _request_with_cache_scope(request, session_id)
+            self._diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+            with _diagnostic_scope(self._diagnostics):
+                self._start_unmanaged(request)
             return
+        self._diagnostics = attempt.diagnostics
         self._logical = attempt.logical
         self._start_managed(attempt)
 
@@ -316,7 +469,8 @@ class ManagedLlmStream(Iterator[Any]):
         run_callback = attempt.run_callback
         raw_stream = None
         try:
-            raw_stream = run_callback(self._stream_factory, attempt.provider_request(next_request))
+            with _diagnostic_scope(attempt.diagnostics):
+                raw_stream = run_callback(self._stream_factory, attempt.provider_request(next_request))
             predicate = self._completed_response_predicate
             if predicate is not None and run_callback(predicate, raw_stream):
                 self.final_response = raw_stream
@@ -424,6 +578,7 @@ class ManagedLlmStream(Iterator[Any]):
         self._logical = None
 
     def __next__(self) -> Any:
+        cache_lowhit_request_dump.activate_event(self._diagnostics.latest_event)
         if self._closed:
             raise StopIteration
         if self._prefetched_chunks:
@@ -456,6 +611,7 @@ class ManagedLlmStream(Iterator[Any]):
                 return next(self)
             self._close(logical_outcome="cancelled" if _is_cancellation(exc) else "failed")
             raise
+        cache_lowhit_request_dump.activate_event(self._diagnostics.latest_event)
         for index, (encoded, raw) in enumerate(self._raw_chunks):
             if _json_equal(chunk, encoded):
                 if index > 0:
@@ -763,6 +919,7 @@ def _relay_request_body(request: dict[str, Any], metadata: dict[str, Any] | None
     body = _jsonable_dict(request)
     # ``timeout`` configures the SDK client, not the wire: never expose it to intercepts.
     body.pop("timeout", None)
+    body.pop("_hermes_physical_attempt_cache_scope", None)
     normalize = _CODEC_TOOL_NORMALIZERS.get(_api_mode(metadata))
     if normalize is not None:
         normalize(body)

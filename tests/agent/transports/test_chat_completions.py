@@ -1,6 +1,7 @@
 """Tests for the ChatCompletionsTransport."""
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import httpx
@@ -115,6 +116,73 @@ class TestChatCompletionsBasic:
                              "extra_content": {"google": {"thought_signature": "SIG_123"}},
                              "function": {"name": "t", "arguments": "{}"}}]},
         ]
+
+    def test_build_kwargs_normalizes_late_system_without_mutating_history(self, transport):
+        """Strict Chat Completions accepts the persisted loop-timing suffix."""
+        history = [
+            {"role": "system", "content": "stable instructions"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {
+                "role": "system",
+                "content": (
+                    "[Agent loop timing]\n"
+                    "Previous loop stop: 2026-09-14T12:34:56-07:00\n"
+                    "Current loop start: 2026-09-14T12:35:00-07:00"
+                ),
+            },
+        ]
+
+        payload = transport.build_kwargs(model="test/model", messages=history)
+
+        assert [message["role"] for message in payload["messages"]] == [
+            "system", "user", "assistant", "user",
+        ]
+        assert payload["messages"][-1]["content"] == history[-1]["content"]
+        assert history[-1]["role"] == "system"
+        assert payload["messages"] is not history
+
+    def test_build_kwargs_coalesces_demoted_timing_with_adjacent_user(self, transport):
+        history = [
+            {"role": "system", "content": "stable instructions"},
+            {"role": "user", "content": "hello"},
+            {
+                "role": "system",
+                "content": "[Agent loop timing] Current loop start: current",
+            },
+        ]
+        payload = transport.build_kwargs(model="test/model", messages=history)
+        assert [message["role"] for message in payload["messages"]] == ["system", "user"]
+        assert payload["messages"][-1]["content"] == (
+            "hello\n\n[Agent loop timing] Current loop start: current"
+        )
+        assert history[-1]["role"] == "system"
+
+    def test_build_kwargs_keeps_marked_blocks_when_coalescing_timing(self, transport):
+        history = [
+            {"role": "system", "content": "stable instructions"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+                ],
+            },
+            {
+                "role": "system",
+                "content": "[Agent loop timing] Current loop start: current",
+                "display_kind": "hidden",
+            },
+        ]
+        original = deepcopy(history)
+
+        payload = transport.build_kwargs(model="test/model", messages=history)
+
+        assert [message["role"] for message in payload["messages"]] == ["system", "user"]
+        assert payload["messages"][-1]["content"] == [
+            {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "[Agent loop timing] Current loop start: current"},
+        ]
+        assert history == original
 
 
 
@@ -801,6 +869,41 @@ class TestPromptCacheKeyCapability:
                 list(result)
         return captured
 
+    def test_post_compress_request_reuses_unchanged_stable_prefix_key(self, transport):
+        """Compression may rebuild only the volatile system-prompt suffix."""
+        marker = {"type": "ephemeral"}
+
+        def key(volatile_suffix):
+            return transport.build_kwargs(
+                model="cache-model",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "stable prefix",
+                                "cache_control": marker,
+                            },
+                            {
+                                "type": "text",
+                                "text": volatile_suffix,
+                                "cache_control": marker,
+                            },
+                        ],
+                    },
+                    {"role": "user", "content": "next request"},
+                ],
+                tools=[],
+                session_id="session-after-compress",
+                supports_prompt_cache_key=True,
+            )["prompt_cache_key"]
+
+        before_compress = key("volatile before compression")
+        first_after_compress = key("rebuilt volatile suffix")
+
+        assert first_after_compress == before_compress
+
     def test_profile_capability_emits_content_key_in_nonstream_request_body(self, transport):
         from providers.base import ProviderProfile
 
@@ -879,6 +982,36 @@ class TestPromptCacheKeyCapability:
 
         assert "prompt_cache_key" not in kwargs
         assert "prompt_cache_key" not in body
+
+    def test_named_custom_same_route_reuses_stable_prefix_key(self, transport):
+        """Short-gap main requests keep one cache bucket for a stable prefix."""
+        stable = {
+            "type": "text",
+            "text": "stable prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+
+        def key(user_text):
+            return transport.build_kwargs(
+                model="grok-4.6",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [stable, {"type": "text", "text": "volatile"}],
+                    },
+                    {"role": "user", "content": user_text},
+                ],
+                tools=self._tools(),
+                session_id="same-route-session",
+                provider_name="custom:localrouter",
+                base_url="https://localrouter.invalid/v1",
+            )["prompt_cache_key"]
+
+        first = key("first request")
+        second = key("second request")
+
+        assert first.startswith("pck_")
+        assert second == first
 
     def test_explicit_top_level_and_extra_body_overrides_are_preserved(self, transport):
         from providers.base import ProviderProfile

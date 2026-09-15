@@ -33,6 +33,7 @@ class TestSwitchModelReasoningOverride:
         agent._transport_cache = {}
         agent.context_compressor = None
         agent._cached_system_prompt = None
+        agent._applying_model_switch_after_compression = False
         agent._anthropic_api_key = ""
         agent._anthropic_base_url = None
         agent._is_anthropic_oauth = False
@@ -60,20 +61,15 @@ class TestSwitchModelReasoningOverride:
         }
 
         with patch("hermes_cli.config.load_config", return_value=fake_cfg):
-            try:
-                switch_model(
-                    agent,
-                    new_model="claude-opus-4.5",
-                    new_provider="anthropic",
-                    base_url="https://api.anthropic.com",
-                    api_mode="anthropic_messages",
-                )
-            except Exception:
-                # Client creation may fail in test env; check _primary_runtime was set
-                pass
+            switch_model(
+                agent,
+                new_model="claude-opus-4.5",
+                new_provider="anthropic",
+                base_url="https://api.anthropic.com",
+                api_mode="anthropic_messages",
+            )
 
-        assert hasattr(agent, "_primary_runtime")
-        assert "reasoning_config" in agent._primary_runtime
+        assert agent._primary_runtime["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
 
 

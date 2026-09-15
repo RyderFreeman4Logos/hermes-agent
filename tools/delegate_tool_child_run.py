@@ -30,11 +30,22 @@ def _num(value: Any, default: int = 0) -> int:
 def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
+
+def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return only a route proven by an accepted child response."""
+    route = getattr(child, "_delegate_successful_llm_route", None)
+    if not (isinstance(route, tuple) and len(route) == 2):
+        return None, None
+    return _str_or_none(route[0]), _str_or_none(route[1])
+
+
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
+    model, provider = _accepted_route_identity(child)
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
-        "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
+        "duration_seconds": duration, "model": model, "provider": provider,
+        "_child_role": getattr(child, "_delegate_role", None),
     }
 
 def _append_missed_steer(entry: Dict[str, Any], late_steer: Optional[str]) -> None:
@@ -425,6 +436,20 @@ def _validate_child_output_schema(
         if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
             result["messages"] = result["messages"] + _retry_messages
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
+        if _schema_valid:
+            # The accepted answer and its terminal provenance are one result.
+            # Keeping failure/billing fields from the rejected turn can make
+            # result assembly erase a valid retry or attribute it to that old
+            # provider. Calls and messages above intentionally remain summed.
+            for key in (
+                "completed", "interrupted", "failed", "error",
+                "failure_reason", "failure_retryable",
+                "billing_block", "billing_unverified", "codex_turn_id",
+            ):
+                if key in _retry_result:
+                    result[key] = _retry_result[key]
+                else:
+                    result.pop(key, None)
     return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
 
 def _build_tool_trace(messages: Any) -> list[Dict[str, Any]]:
@@ -466,6 +491,29 @@ def _build_result_entry(
     ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
     wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
     summary = result.get("final_response") or ""
+    _result_billing = result.get("billing_block")
+    _child_model = getattr(child, "model", "")
+    _xai_billing_leak = (
+        isinstance(_result_billing, dict)
+        and _result_billing.get("provider") in {"xai", "xai-oauth"}
+        and (
+            "grok" not in str(_child_model).lower()
+            or (
+                getattr(child, "_delegate_model_profile", None) == "standard"
+                and result.get("billing_unverified", False)
+            )
+        )
+    )
+    if _xai_billing_leak:
+        # Do not attach a parent xAI terminal to a child routed elsewhere (#209).
+        summary = (
+            "Subagent failed after an unverified provider billing error."
+            if result.get("billing_unverified", False)
+            else "Subagent failed with a provider error unrelated to its effective model."
+        )
+        safe_error = summary
+    else:
+        safe_error = None
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
@@ -486,13 +534,29 @@ def _build_result_entry(
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
     # Result entry contract: see the _run_single_child docstring.
+    accepted_model, accepted_provider = _accepted_route_identity(child)
+    app_server_success = (
+        getattr(child, "api_mode", None) == "codex_app_server"
+        and result.get("completed", False)
+        and not (result.get("failed") or result.get("error") or result.get("interrupted"))
+        and "codex_turn_id" in result
+    )
+    # The app-server result has no selected model/provider field. Retain the
+    # child's last positively known route for later failures, but never assign
+    # it to this newly successful yet unidentified turn.
+    model, provider = (
+        (None, None)
+        if app_server_success
+        else (accepted_model, accepted_provider)
+    )
     entry: Dict[str, Any] = {
         "task_index": task_index,
         "status": status,
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
-        "model": _str_or_none(getattr(child, "model", None)),
+        "model": _str_or_none(model),
+        "provider": _str_or_none(provider),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -518,11 +582,18 @@ def _build_result_entry(
                 "Final answer does not satisfy the declared output_schema" + (" (after 1 retry)." if schema.retries else ".")
             )
         else:
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            entry["error"] = (
+                safe_error
+                if safe_error is not None
+                else result.get("error", "Subagent did not produce a response.")
+            )
         # Classified reason from the child loop (e.g. "rate_limit", "billing")
         # lets the parent tell a quota wall from a task error without parsing prose.
         _failure_reason = result.get("failure_reason")
-        if isinstance(_failure_reason, str) and _failure_reason:
+        # The same leak guard that replaces xAI billing prose must also own
+        # its structured classification.  Otherwise a last accepted non-xAI
+        # route (or an unknown route) is paired with xAI's billing reason.
+        if not _xai_billing_leak and isinstance(_failure_reason, str) and _failure_reason:
             entry["failure_reason"] = _failure_reason
 
     # Schema-validation outcome — emitted ONLY when a schema was requested, so
@@ -621,6 +692,7 @@ class _ChildRun:
         _safe_progress(
             self.child_progress_cb, "subagent.complete", preview=preview, status=status or entry["status"],
             duration_seconds=entry["duration_seconds"], summary=summary,
+            model=entry.get("model"), provider=entry.get("provider"),
         )
         _append_missed_steer(entry, late_steer)
         return self.attach_worktree(entry)
@@ -705,9 +777,11 @@ class _ChildRun:
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
         status = "timeout" if is_timeout else "error"
+        model, provider = _accepted_route_identity(child)
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
+            "model": model, "provider": provider,
             "timeout_seconds": child_timeout if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,
@@ -783,6 +857,8 @@ class _ChildRun:
             "output_tokens": _num(getattr(child, "session_completion_tokens", 0)),
             "reasoning_tokens": _num(getattr(child, "session_reasoning_tokens", 0)),
             "api_calls": _num(entry["api_calls"]),
+            "model": entry.get("model"),
+            "provider": entry.get("provider"),
             "files_read": _files_read,
             "files_written": sorted({p for tid, paths in _files_written_map.items() if tid == self.child_task_id for p in paths})[:40],
             "output_tail": _extract_output_tail(result, max_entries=8, max_chars=600),

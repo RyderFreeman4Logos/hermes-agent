@@ -10,7 +10,15 @@ class _NonStreamRequest:
     instance; ``_abort_request`` may run from the poll (stranger) thread.
     """
 
-    def __init__(self, agent, api_kwargs: dict):
+    def __init__(
+        self,
+        agent,
+        api_kwargs: dict,
+        *,
+        before_dispatch=None,
+        on_worker_start=None,
+        on_worker_retire=None,
+    ):
         self.agent = agent
         self.api_kwargs = api_kwargs
         self.result = {"response": None, "error": None}
@@ -41,6 +49,9 @@ class _NonStreamRequest:
         self.call_start = h.time.time()
         self.wait_notice_started_ts = None
         self.thread = None
+        self.before_dispatch = before_dispatch
+        self.on_worker_start = on_worker_start
+        self.on_worker_retire = on_worker_retire
 
     def _install_codex_request_token(self) -> None:
         if self.codex_token is not None and not self.codex_retired:  # retired before start: don't re-publish
@@ -65,6 +76,8 @@ class _NonStreamRequest:
     def _call(self):
         watchdog_state_var = watchdog_context_token = None
         try:
+            if callable(self.before_dispatch) and not self.before_dispatch():
+                return
             self._install_codex_request_token()
             if self.codex_watchdog_state is not None:
                 from agent.codex_runtime import _codex_watchdog_state_var
@@ -74,6 +87,11 @@ class _NonStreamRequest:
             self.result["response"] = h._dispatch_nonstreaming_api_request(
                 self.agent, self.api_kwargs, make_client=self._make_client)
         except Exception as e:
+            from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+            if isinstance(e, StreamPayloadBoundExceeded):
+                self.result["error"] = e
+                return
             # Our own force-close caused this error: swallow it, the main
             # thread raises InterruptedError (#6600). Retirement logs at info
             # (a watchdog discarded output the provider already sent — what an
@@ -96,8 +114,12 @@ class _NonStreamRequest:
             self._retire_codex_request_token()
             # Reuse reason only on a clean response; error or cancel-swallow
             # really closes so the next attempt builds a fresh pool.
-            self.clients.close_once(
-                "request_complete" if self.result["response"] is not None else "request_error_cleanup")
+            try:
+                self.clients.close_once(
+                    "request_complete" if self.result["response"] is not None else "request_error_cleanup")
+            finally:
+                if callable(self.on_worker_retire):
+                    self.on_worker_retire()
 
     def _abort_request(self, reason: str) -> None:
         """Watchdog/interrupt kill: abort the request client (kind-aware, #67142)
@@ -221,6 +243,10 @@ class _NonStreamRequest:
 
     def _interrupt(self, elapsed: float) -> None:
         agent = self.agent
+        from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+        if isinstance(self.result.get("error"), StreamPayloadBoundExceeded):
+            raise self.result["error"]
         last_event_ts, _, _ = self._codex_watchdog_snapshot()
         h._record_interrupted_provider_wait(agent, elapsed,
             response_started=self.wd.codex and last_event_ts is not None
@@ -247,7 +273,14 @@ class _NonStreamRequest:
         agent._touch_activity("waiting for non-streaming API response")
 
         self.thread = t = h.threading.Thread(target=h._context_thread_target(self._call), daemon=True)
-        t.start()
+        if callable(self.on_worker_start):
+            self.on_worker_start()
+        try:
+            t.start()
+        except BaseException:
+            if callable(self.on_worker_retire):
+                self.on_worker_retire()
+            raise
         poll_count = 0
         while t.is_alive():
             t.join(timeout=0.3)

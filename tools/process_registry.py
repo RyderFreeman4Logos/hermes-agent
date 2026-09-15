@@ -370,6 +370,14 @@ def _output_tail(session: "ProcessSession", n: int) -> str:
     return strip_ansi(session.output_buffer[-n:])
 
 
+@dataclass(frozen=True)
+class _OwnedProcessGroup:
+    """A local group whose leader generation is pinned until final signalling."""
+
+    leader_pid: int
+    identity_fence: threading.Lock
+
+
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -428,6 +436,10 @@ class ProcessSession:
     _pending_kill_dispositions: Dict[Any, Optional[bool]] = field(default_factory=dict, repr=False)
     _kill_disposition_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _reader_settlement_ready: threading.Event = field(default_factory=threading.Event, repr=False)
+    # POSIX process groups have only a numeric identity.  Keep the original
+    # leader unreaped while a verified final group signal is in flight, so the
+    # kernel cannot recycle that number onto an unrelated process group.
+    _process_group_identity_fence: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
 
     def append_output(self, text: str) -> None:
@@ -731,6 +743,42 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return False
 
     @staticmethod
+    def _local_process_exited_without_reaping(session: ProcessSession) -> bool:
+        """Observe a local child exit without releasing its POSIX PID/PGID identity.
+
+        ``Popen.poll()`` calls ``waitpid(WNOHANG)`` and reaps an exited leader.  A
+        delayed owned-group signal must keep that zombie as its kernel identity
+        fence until delivery.  Sessions without a captured start time cannot
+        authorize such a group signal, so they retain the compatibility poll.
+        """
+        proc = session.process
+        if proc is None:
+            return False
+        if _IS_WINDOWS or session.host_start_time is None:
+            try:
+                return proc.poll() is not None
+            except Exception:
+                return False
+        if proc.returncode is not None:
+            return True
+        try:
+            # WNOWAIT observes the real child transition while deliberately
+            # retaining the zombie (and therefore its PID/PGID generation).
+            return os.waitid(
+                os.P_PID,
+                proc.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            ) is not None
+        except ChildProcessError:
+            # Another owner already reaped it.  This is an exit observation,
+            # while the later start-time check will refuse any group signal.
+            return True
+        except (AttributeError, OSError, PermissionError):
+            # Unreadable is not proof of exit.  The reader can still finish on
+            # true pipe EOF, while a killer will revalidate pid/start time.
+            return False
+
+    @staticmethod
     def _config_value(section: str, key: str, fallback):
         """``config.yaml`` value for ``section.key``, else the DEFAULT_CONFIG value.
         Raises if config is unreadable; callers wrap with their own hard fallback so
@@ -759,7 +807,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         on_direct_signal: Optional[Callable[[bool], None]] = None,
         on_direct_noop: Optional[Callable[[bool], None]] = None,
         direct_signal_lock: Optional[Any] = None,
-        owned_process_group: Optional[int] = None,
+        owned_process_group: Optional[Any] = None,
     ) -> None:
         """Terminate a host-visible PID and its descendants.
         ``expected_start`` (kernel start time at spawn) is re-validated first: a mismatch
@@ -771,6 +819,27 @@ class ProcessRegistry(ProcessCheckpointMixin):
         Windows:
         ``taskkill /T /F`` (psutil's stale PPID links miss orphans there); ``os.kill``
         is the fallback."""
+        if isinstance(owned_process_group, _OwnedProcessGroup):
+            # Capture and use the numeric PGID while the reader is unable to
+            # reap the original leader.  If the start identity or group proof
+            # is already gone, the recursive call retains direct-PID refusal
+            # and receives no authority to issue killpg.
+            with owned_process_group.identity_fence:
+                verified_group = None
+                if cls._host_pid_is_ours(pid, expected_start):
+                    with suppress(ProcessLookupError, PermissionError, OSError):
+                        pgid = os.getpgid(owned_process_group.leader_pid)
+                        if pgid == owned_process_group.leader_pid:
+                            verified_group = pgid
+                return cls._terminate_host_pid(
+                    pid,
+                    expected_start,
+                    on_direct_signal,
+                    on_direct_noop,
+                    direct_signal_lock,
+                    verified_group,
+                )
+
         identity_lock = direct_signal_lock or nullcontext()
         with identity_lock:
             if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
@@ -1143,7 +1212,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             orphan_drain_deadline = None
             while True:
                 try:
-                    direct_exit_observed = proc.poll() is not None
+                    direct_exit_observed = self._local_process_exited_without_reaping(session)
                 except Exception:
                     direct_exit_observed = False
                 if direct_exit_observed:
@@ -1180,11 +1249,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
             tail = decoder.decode(b"", final=True)
             if tail:
                 append(tail)
-        try:
-            wait()
-        except Exception as e:
-            logger.debug("%s wait timed out or failed: %s", label, e)
-        self._finish_exited(session, exit_code())
+        self._finish_exited(
+            session,
+            None,
+            reader_wait=wait,
+            exit_code_getter=exit_code,
+            wait_label=label,
+        )
 
     @staticmethod
     def _log_delta_command(quoted_log_path: str, offset: int) -> str:
@@ -1305,13 +1376,35 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._check_watch_patterns(session, text)
         self._emit_output(session, text)
 
-    def _finish_exited(self, session: ProcessSession, exit_code) -> None:
+    def _finish_exited(
+        self,
+        session: ProcessSession,
+        exit_code,
+        *,
+        reader_wait=None,
+        exit_code_getter=None,
+        wait_label="Process",
+    ) -> None:
         """Let the stream owner publish after its final decoder flush.
 
         A direct local kill records delivered-signal provenance only. The pipe reader
         owns the final bytes and the one terminal publication, so a graceful SIGTERM
         handler can report its actual exit code without losing that provenance.
         """
+        if reader_wait is not None:
+            reap_fence = (
+                session._process_group_identity_fence
+                if not _IS_WINDOWS and session.process is not None
+                else nullcontext()
+            )
+            with reap_fence:
+                try:
+                    reader_wait()
+                except Exception as e:
+                    logger.debug("%s wait timed out or failed: %s", wait_label, e)
+                if exit_code_getter is not None:
+                    exit_code = exit_code_getter()
+
         reader_owns_settlement = (
             session.process is not None
             and session._pty is None
@@ -1635,15 +1728,23 @@ class ProcessRegistry(ProcessCheckpointMixin):
         proc = getattr(session, "process", None)
         if proc is None:
             return
-        try:
-            rc = proc.poll()
-        except Exception:
-            return
-        if rc is None:
+        if not self._local_process_exited_without_reaping(session):
             return  # Direct child still running — reader block is legitimate.
         reader = getattr(session, "_reader_thread", None)
         if reader is not None and reader.is_alive():
             return
+        reap_fence = (
+            session._process_group_identity_fence if not _IS_WINDOWS else nullcontext()
+        )
+        with reap_fence:
+            if session.exited:
+                return
+            try:
+                rc = proc.poll()
+            except Exception:
+                return
+            if rc is None:
+                return
         # Best-effort non-blocking drain of whatever the reader hasn't consumed.
         stdout = getattr(proc, "stdout", None)
         if stdout is not None and not _IS_WINDOWS:
@@ -1965,11 +2066,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 self._record_kill_noop(session, lock_held=lock_held)
 
             owned_process_group = None
-            if not _IS_WINDOWS:
-                with suppress(ProcessLookupError, PermissionError, OSError):
-                    pgid = os.getpgid(session.process.pid)
-                    if pgid == session.process.pid:
-                        owned_process_group = pgid
+            # A group signal is authorized only with the captured leader
+            # generation.  `_terminate_host_pid` resolves the numeric PGID and
+            # keeps this fence through the final signal.
+            if not _IS_WINDOWS and session.host_start_time is not None:
+                owned_process_group = _OwnedProcessGroup(
+                    session.process.pid, session._process_group_identity_fence
+                )
             self._terminate_host_pid(
                 session.process.pid, session.host_start_time, record_direct_signal,
                 on_direct_noop=record_direct_noop,

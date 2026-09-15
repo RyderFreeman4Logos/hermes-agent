@@ -1360,6 +1360,164 @@ class TestKillProcess:
         assert event["completion_reason"] == "exited"
         assert event["termination_source"] == ""
 
+    @pytest.mark.linux_only
+    def test_public_kill_keeps_original_group_identity_until_final_signal(
+        self, registry, monkeypatch
+    ):
+        """A reaped leader cannot let delayed killpg hit a reused numeric PGID."""
+        import psutil
+
+        leader_exited = threading.Event()
+        leader_reaped = threading.Event()
+        final_group_signals = []
+
+        class FakeRaw:
+            def read1(self, _size):
+                assert leader_exited.wait(2), "synthetic leader was not terminated"
+                return b""
+
+        class FakeStdout:
+            buffer = FakeRaw()
+
+            def fileno(self):
+                raise OSError("synthetic stream has no fd")
+
+        class FakePopen:
+            pid = 424242
+            stdout = FakeStdout()
+            returncode = None
+
+            def poll(self):
+                if not leader_exited.is_set():
+                    return None
+                self.returncode = 0
+                leader_reaped.set()
+                return self.returncode
+
+            def wait(self, timeout=None):
+                assert leader_exited.wait(timeout), "synthetic leader never exited"
+                self.returncode = 0
+                leader_reaped.set()
+                return self.returncode
+
+        process = FakePopen()
+
+        class FakePsutilProcess:
+            pid = process.pid
+
+            def children(self, recursive=True):
+                return []
+
+            def terminate(self):
+                leader_exited.set()
+                # On the vulnerable path, reader-side Popen.poll() reaps the
+                # leader during this deterministic window.  The candidate's
+                # identity fence retains the zombie until final killpg.
+                leader_reaped.wait(0.25)
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return psutil.STATUS_ZOMBIE if leader_exited.is_set() else psutil.STATUS_RUNNING
+
+        session = _make_session(sid="proc_pgid_generation")
+        session.process = process
+        session.pid = process.pid
+        session.host_start_time = 777
+        registry._running[session.id] = session
+        monkeypatch.setattr(
+            ProcessRegistry, "_host_pid_is_ours", classmethod(lambda _cls, _pid, _start: True)
+        )
+        monkeypatch.setattr(
+            ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 0.01)
+        )
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        monkeypatch.setattr(psutil, "Process", lambda _pid: FakePsutilProcess())
+        monkeypatch.setattr(os, "getpgid", lambda _pid: process.pid)
+
+        def fake_killpg(_pgid, _signal):
+            # This is a safe kernel-allocation model: no real signal is sent.
+            # Once Popen has reaped the leader, the same numeric PGID represents
+            # a stranger generation.
+            final_group_signals.append(
+                "unrelated" if leader_reaped.is_set() else "owned"
+            )
+
+        monkeypatch.setattr(os, "killpg", fake_killpg)
+        reader = threading.Thread(target=registry._reader_loop, args=(session,))
+        session._reader_thread = reader
+        reader.start()
+
+        try:
+            result = registry.kill_process(
+                session.id, source="test.pgid.identity", consume_output=True
+            )
+            reader.join(timeout=2)
+        finally:
+            leader_exited.set()
+            reader.join(timeout=2)
+
+        assert not reader.is_alive()
+        assert final_group_signals == ["owned"]
+        assert result["status"] == "killed"
+        assert result["exit_code"] == 0
+        assert result["termination_source"] == "test.pgid.identity"
+
+    @pytest.mark.linux_only
+    def test_public_kill_without_leader_generation_never_signals_group(
+        self, registry, monkeypatch
+    ):
+        """Missing start-time proof permits direct cleanup, not numeric killpg."""
+        import psutil
+
+        class FakePopen:
+            pid = 424243
+            returncode = None
+
+            def poll(self):
+                return None
+
+        class FakePsutilProcess:
+            pid = FakePopen.pid
+
+            def children(self, recursive=True):
+                return []
+
+            def terminate(self):
+                return None
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return psutil.STATUS_ZOMBIE
+
+        session = _make_session(sid="proc_pgid_without_generation")
+        session.process = FakePopen()
+        session.pid = session.process.pid
+        session.host_start_time = None
+        registry._running[session.id] = session
+        monkeypatch.setattr(
+            ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 0.01)
+        )
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        monkeypatch.setattr(psutil, "Process", lambda _pid: FakePsutilProcess())
+        getpgid = MagicMock(return_value=session.pid)
+        killpg = MagicMock()
+        monkeypatch.setattr(os, "getpgid", getpgid)
+        monkeypatch.setattr(os, "killpg", killpg)
+
+        result = registry.kill_process(
+            session.id, source="test.pgid.no-generation", consume_output=True
+        )
+
+        assert result["status"] == "killed"
+        getpgid.assert_not_called()
+        killpg.assert_not_called()
+
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX local-pipe reader ownership")
     def test_direct_kill_waits_for_pipe_reader_final_tail(self, registry, monkeypatch, tmp_path):
         """A delivered signal is provenance; the real reader publishes the tail once."""
@@ -2153,8 +2311,11 @@ class TestKillProcess:
         monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
         monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
         session = registry.spawn_local(
-            f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(60)'", cwd=str(tmp_path)
+            f"{shlex.quote(sys.executable)} -c "
+            "'import time; print(\"FALLBACK-READY-41\", flush=True); time.sleep(60)'",
+            cwd=str(tmp_path),
         )
+        assert _wait_until(lambda: "FALLBACK-READY-41" in session.output_buffer)
         original_process = psutil.Process
 
         def inaccessible_parent(pid):

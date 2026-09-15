@@ -15,6 +15,20 @@ pytest.importorskip("nemo_relay")
 from agent import relay_llm, relay_runtime
 
 
+def _capture_attempt_diagnostics(monkeypatch):
+    contexts = []
+    real_send = relay_llm.physical_send
+
+    def capture(request, callback):
+        context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        if context is not None and context not in contexts:
+            contexts.append(context)
+        return real_send(request, callback)
+
+    monkeypatch.setattr(relay_llm, "physical_send", capture)
+    return contexts
+
+
 @pytest.fixture()
 def relay_turn(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
@@ -37,6 +51,121 @@ def relay_turn(tmp_path, monkeypatch):
         relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
         relay_runtime.SESSION_COORDINATOR.release_conversation(lease)
         relay_runtime._reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypatch):
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    def send(request):
+        sends.append(("sync", request))
+        return {"content": "sync"}
+
+    async def send_async(request):
+        sends.append(("async", request))
+        return {"content": "async"}
+
+    def send_stream(request):
+        sends.append(("stream", request))
+        return iter([{"delta": "stream"}])
+
+    common = {
+        "session_id": "",
+        "name": "provider",
+        "model_name": "model",
+        "metadata": {"api_mode": "chat_completions"},
+    }
+    relay_llm.execute(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send(request, send),
+        **common,
+    )
+    await relay_llm.execute_async(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send_async(request, send_async),
+        **common,
+    )
+    stream = relay_llm.stream_current(
+        {"model": "model", "messages": [], "stream": True},
+        lambda request: relay_llm.physical_send(request, send_stream),
+        name="provider",
+        model_name="model",
+        finalizer=dict,
+        metadata={"api_mode": "chat_completions"},
+    )
+    assert list(stream) == [{"delta": "stream"}]
+
+    assert [kind for kind, _request in sends] == ["sync", "async", "stream"]
+    assert [context.ordinals for context in contexts] == [[0], [0], [0]]
+    assert [context.requests for context in contexts] == [[request] for _kind, request in sends]
+
+
+def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
+    relay_turn, monkeypatch
+):
+    del relay_turn
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    relay_llm.execute(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send(
+            request, lambda final: sends.append(("sync", final)) or {"content": "sync"}
+        ),
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        metadata={"api_mode": "chat_completions"},
+    )
+    stream = relay_llm.stream(
+        {"model": "model", "messages": [], "stream": True},
+        lambda request: relay_llm.physical_send(
+            request,
+            lambda final: sends.append(("stream", final)) or iter([{"delta": "stream"}]),
+        ),
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        finalizer=dict,
+        metadata={"api_mode": "chat_completions"},
+    )
+    assert list(stream) == [{"delta": "stream"}]
+
+    assert [kind for kind, _request in sends] == ["sync", "stream"]
+    assert [context.ordinals for context in contexts] == [[0], [0]]
+    assert [context.requests for context in contexts] == [[request] for _kind, request in sends]
+
+
+@pytest.mark.asyncio
+async def test_managed_async_retry_records_each_provider_callback(
+    relay_turn, monkeypatch
+):
+    relay, _turn = relay_turn
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    async def retry_once(_name, request, callback, **_kwargs):
+        await callback(request)
+        return await callback(request)
+
+    async def send(request):
+        sends.append(request)
+        return {"content": f"attempt-{len(sends)}"}
+
+    monkeypatch.setattr(relay.llm, "execute", retry_once)
+    result = await relay_llm.execute_async(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send_async(request, send),
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        metadata={"api_mode": "chat_completions", "retry_count": 1},
+    )
+
+    assert result == {"content": "attempt-2"}
+    assert [context.ordinals for context in contexts] == [[0, 1]]
+    assert len(contexts[0].requests) == len(sends) == 2
 
 
 @pytest.mark.parametrize(

@@ -566,3 +566,246 @@ def test_background_agent_kwargs_carry_frozen_memory_mode(monkeypatch):
     monkeypatch.setattr(server, "_cfg_max_turns", lambda *_a, **_kw: 25)
     kwargs = server._background_agent_kwargs(agent, "task-id")
     assert kwargs["memory_provider_mode_override"] == "authoritative"
+
+
+class _PublicBoundaryProvider:
+    name = "synthetic-memory-provider"
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def get_tool_schemas(self):
+        return []
+
+    def authoritative_memory_write(self, request, **_kwargs):
+        self.sink.append(("authoritative", request["content"]))
+        return json.dumps({"success": True, "operation_id": "synthetic"})
+
+    def on_memory_write(self, _action, _target, content, **_kwargs):
+        self.sink.append(("hybrid", content))
+
+
+class _PublicBoundaryAgent:
+    model = "synthetic-model"
+    provider = "synthetic-provider"
+    tools = []
+
+    def __init__(self, session_id, mode, store, manager, session_db=None):
+        self.session_id = session_id
+        self._memory_provider_mode = mode
+        self._session_init_model_config = {"memory_provider_mode": mode}
+        self._memory_store = store
+        self._memory_manager = manager
+        self._session_db = session_db
+
+    def clear_interrupt(self):
+        return None
+
+    def close(self):
+        return None
+
+    def _build_memory_write_metadata(self, **kwargs):
+        return kwargs
+
+    def run_conversation(self, prompt, conversation_history=None, **_kwargs):
+        messages = [
+            *(conversation_history or []),
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "synthetic answer"},
+        ]
+        if self._session_db is not None:
+            self._session_db.append_message(self.session_id, role="user", content=str(prompt))
+            self._session_db.append_message(
+                self.session_id, role="assistant", content="synthetic answer"
+            )
+        return {"final_response": "synthetic answer", "messages": messages}
+
+
+def _install_public_tui_runtime(monkeypatch, tmp_path, build_modes, write_sink):
+    from agent.memory_manager import MemoryManager
+    from hermes_constants import get_hermes_home
+    from tests.test_tui_gateway_server import _configure_immediate_prompt_run
+    from tools.memory_tool import MemoryStore
+
+    launch_home = tmp_path / "hermes"
+    selected_home = launch_home / "profiles" / "B"
+    selected_home.mkdir(parents=True)
+    launch_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: launch_home / "profiles" / name,
+    )
+
+    def config():
+        selected = get_hermes_home() == selected_home
+        mode = "hybrid" if selected else "authoritative"
+        return {
+            "model": {"default": "synthetic-model"},
+            "memory": {
+                "provider_mode": mode,
+                "memory_enabled": True,
+                "user_profile_enabled": True,
+            },
+        }
+
+    monkeypatch.setattr(server, "_load_cfg", config)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "synthetic-model")
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_load_cfg", config)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_announce_built_agent", lambda *_args: None)
+    monkeypatch.setattr(server, "_wire_session_agent", lambda *_args: False)
+    monkeypatch.setattr(server, "_start_session_services", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda agent, db: setattr(agent, "_session_db", db) or True)
+    monkeypatch.setattr("tui_gateway.entry.ensure_mcp_discovery_started", lambda: None)
+
+    def make_agent(_sid, key, session_db=None, memory_provider_mode_override=None, **_kwargs):
+        mode = memory_provider_mode_override or config()["memory"]["provider_mode"]
+        store = MemoryStore()
+        store.load_from_disk()
+        manager = MemoryManager(provider_mode=mode)
+        manager.add_provider(_PublicBoundaryProvider(write_sink))
+        agent = _PublicBoundaryAgent(key, mode, store, manager, session_db)
+        build_modes.append((key, mode))
+        return agent
+
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    server._sessions.clear()
+    return launch_home, selected_home
+
+
+def test_public_tui_profile_row_resume_and_core_write(monkeypatch, tmp_path):
+    """Create, first submit, close, and eager resume stay within selected profile B."""
+    from agent.inline_tool_executors import InlineToolContext, _memory
+    from hermes_state import SessionDB
+
+    builds, writes = [], []
+    _launch, selected = _install_public_tui_runtime(monkeypatch, tmp_path, builds, writes)
+    try:
+        created = server.handle_request({
+            "id": "create", "method": "session.create", "params": {"profile": "B"}
+        })
+        runtime_id = created["result"]["session_id"]
+        stored_id = created["result"]["stored_session_id"]
+        submitted = server.handle_request({
+            "id": "turn", "method": "prompt.submit",
+            "params": {"session_id": runtime_id, "text": "synthetic question"},
+        })
+        assert submitted["result"]["status"] == "streaming"
+        live = server._sessions[runtime_id]["agent"]
+        assert live._memory_provider_mode == "hybrid"
+        with SessionDB(selected / "state.db") as db:
+            row = db.get_session(stored_id)
+            assert json.loads(row["model_config"])["memory_provider_mode"] == "hybrid"
+
+        closed = server.handle_request({
+            "id": "close", "method": "session.close", "params": {"session_id": runtime_id}
+        })
+        assert closed["result"]["closed"] is True
+        resumed = server.handle_request({
+            "id": "resume", "method": "session.resume",
+            "params": {"session_id": stored_id, "profile": "B", "eager_build": True},
+        })
+        assert "error" not in resumed, resumed
+        resumed_agent = server._sessions[resumed["result"]["session_id"]]["agent"]
+        result = json.loads(_memory(
+            resumed_agent,
+            {"action": "add", "target": "memory", "content": "profile-B fact"},
+            InlineToolContext(effective_task_id="tui", tool_call_id="memory"),
+        ))
+        assert result["success"] is True
+        assert resumed_agent._memory_provider_mode == "hybrid"
+        assert writes == [("hybrid", "profile-B fact")]
+    finally:
+        server._sessions.clear()
+
+
+def test_public_tui_deferred_and_eager_resume_keep_memory_mode(monkeypatch, tmp_path):
+    """LLM-provider absence must not remove a durable memory-mode override."""
+    from hermes_state import SessionDB
+
+    builds, writes = [], []
+    launch, _selected = _install_public_tui_runtime(monkeypatch, tmp_path, builds, writes)
+    db = SessionDB(launch / "state.db")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    db.create_session(
+        "durable-hybrid", source="tui", model="synthetic-model",
+        model_config={"memory_provider_mode": "hybrid"},
+    )
+    db.append_message("durable-hybrid", role="user", content="stored question")
+    db.append_message("durable-hybrid", role="assistant", content="stored answer")
+    try:
+        deferred = server.handle_request({
+            "id": "deferred", "method": "session.resume",
+            "params": {"session_id": "durable-hybrid"},
+        })
+        deferred_sid = deferred["result"]["session_id"]
+        server._start_agent_build(deferred_sid, server._sessions[deferred_sid])
+        assert server._sessions[deferred_sid]["agent"]._memory_provider_mode == "hybrid"
+        server.handle_request({
+            "id": "close", "method": "session.close", "params": {"session_id": deferred_sid}
+        })
+
+        eager = server.handle_request({
+            "id": "eager", "method": "session.resume",
+            "params": {"session_id": "durable-hybrid", "eager_build": True},
+        })
+        assert "error" not in eager, eager
+        eager_sid = eager["result"]["session_id"]
+        assert server._sessions[eager_sid]["agent"]._memory_provider_mode == "hybrid"
+        assert [mode for key, mode in builds if key == "durable-hybrid"] == ["hybrid", "hybrid"]
+    finally:
+        server._sessions.clear()
+        db.close()
+
+
+def test_public_tui_seeded_create_and_direct_branch_keep_parent_mode(monkeypatch, tmp_path):
+    """Both public branch forms must bind their first agent to the durable parent mode."""
+    from hermes_state import SessionDB
+
+    builds, writes = [], []
+    launch, _selected = _install_public_tui_runtime(monkeypatch, tmp_path, builds, writes)
+    db = SessionDB(launch / "state.db")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    db.create_session(
+        "branch-parent", source="tui", model="synthetic-model",
+        model_config={"memory_provider_mode": "hybrid"},
+    )
+    db.append_message("branch-parent", role="user", content="parent question")
+    db.append_message("branch-parent", role="assistant", content="parent answer")
+    try:
+        parent = server.handle_request({
+            "id": "parent", "method": "session.resume",
+            "params": {"session_id": "branch-parent", "eager_build": True},
+        })
+        assert "error" not in parent, parent
+        parent_sid = parent["result"]["session_id"]
+
+        seeded = server.handle_request({
+            "id": "seeded", "method": "session.create",
+            "params": {
+                "parent_session_id": "branch-parent",
+                "messages": [{"role": "user", "content": "seeded question"}],
+            },
+        })
+        seeded_sid = seeded["result"]["session_id"]
+        server._start_agent_build(seeded_sid, server._sessions[seeded_sid])
+        seeded_key = seeded["result"]["stored_session_id"]
+        assert server._sessions[seeded_sid]["agent"]._memory_provider_mode == "hybrid"
+        assert json.loads(db.get_session(seeded_key)["model_config"])["memory_provider_mode"] == "hybrid"
+
+        direct = server.handle_request({
+            "id": "direct", "method": "session.branch",
+            "params": {"session_id": parent_sid, "name": "direct child"},
+        })
+        direct_sid = direct["result"]["session_id"]
+        direct_key = direct["result"]["stored_session_id"]
+        assert server._sessions[direct_sid]["agent"]._memory_provider_mode == "hybrid"
+        assert json.loads(db.get_session(direct_key)["model_config"])["memory_provider_mode"] == "hybrid"
+    finally:
+        server._sessions.clear()
+        db.close()

@@ -1076,6 +1076,8 @@ class TestSessionRowExistsBeforePreflightCompaction:
             else:
                 assert active_sid != sid
                 assert db.get_session(active_sid)["parent_session_id"] == sid
+                parent_rows = db.get_messages_as_conversation(sid)
+                assert removed["content"] in [row["content"] for row in parent_rows]
         finally:
             db.close()
 

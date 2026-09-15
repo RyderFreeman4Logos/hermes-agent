@@ -332,7 +332,9 @@ def test_chat_send_keeps_two_hidden_timing_rows_through_mixed_content(monkeypatc
         },
         {"role": "user", "content": []},
         {
-            "role": "system", "content": timing_two, "display_kind": "hidden",
+            "role": "system",
+            "content": [{"type": "text", "text": timing_two}],
+            "display_kind": "hidden",
             "display_metadata": {"loop_timing_turn_id": "timing-two"},
         },
     ]
@@ -347,11 +349,11 @@ def test_chat_send_keeps_two_hidden_timing_rows_through_mixed_content(monkeypatc
     wire_text = "\n".join(_wire_text(row) for row in wire)
     durable = [timing_one, timing_two]
     current = [
-        row["content"] for row in result["messages"]
+        row for row in result["messages"]
         if row.get("display_kind") == "hidden" and "[Agent loop timing]" in _wire_text(row)
     ]
     assert len(current) == 3
-    durable.append(current[-1])
+    durable.append(_wire_text(current[-1]))
     positions = []
     for timing in durable:
         matched = [row for row in wire if timing in _wire_text(row)]
@@ -360,6 +362,13 @@ def test_chat_send_keeps_two_hidden_timing_rows_through_mixed_content(monkeypatc
         positions.append(wire_text.index(timing))
     assert positions == sorted(positions)
     assert "None" not in wire_text
+    assert all(
+        block.get("text")
+        for row in wire
+        if isinstance(row.get("content"), list)
+        for block in row["content"]
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
 
 
 class _ClassifiedPolicyError(Exception):

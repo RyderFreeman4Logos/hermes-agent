@@ -724,7 +724,12 @@ def _is_stream_unavailable_error(exc: Exception) -> bool:
 
 def _stream_final_message(stream_fn, api_kwargs, log_prefix, on_stream_event, on_response):
     """``messages.stream()`` -> final Message, ticking the best-effort callbacks."""
-    with stream_fn(**{k: v for k, v in api_kwargs.items() if k != "stream"}) as stream:
+    from agent import relay_llm
+    final_kwargs = {k: v for k, v in api_kwargs.items() if k != "stream"}
+    raw_stream = relay_llm.physical_send(
+        final_kwargs, lambda request: stream_fn(**request)
+    )
+    with raw_stream as stream:
         if callable(on_response):
             try:
                 on_response(getattr(stream, "response", None))
@@ -785,7 +790,11 @@ def create_anthropic_message(
             logger.debug(
                 "%sAnthropic Messages stream unavailable; falling back to messages.create(): %s", log_prefix, exc
             )
-    return messages_api.create(**{k: v for k, v in api_kwargs.items() if k != "stream"})
+    from agent import relay_llm
+    final_kwargs = {k: v for k, v in api_kwargs.items() if k != "stream"}
+    return relay_llm.physical_send(
+        final_kwargs, lambda request: messages_api.create(**request)
+    )
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

@@ -153,11 +153,14 @@ def test_unsupported_immediate_exit_does_not_enqueue_completion(monkeypatch, tmp
     monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
     monkeypatch.setattr(session_context, "async_delivery_supported", lambda: False)
 
+    spawn_kwargs = {}
+
     def finish_immediately(**kwargs):
+        spawn_kwargs.update(kwargs)
         session = ProcessSession(
             id="proc_unsupported_immediate",
             command=kwargs["command"],
-            notify_on_complete=kwargs["notify_on_complete"],
+            notify_on_complete=kwargs.get("notify_on_complete", False),
         )
         registry._running[session.id] = session
         session.exited = True
@@ -179,6 +182,7 @@ def test_unsupported_immediate_exit_does_not_enqueue_completion(monkeypatch, tmp
 
     assert result["notify_on_complete"] is False
     assert result["notify_unsupported"]
+    assert "notify_on_complete" not in spawn_kwargs
     assert registry.completion_queue.empty()
 
 

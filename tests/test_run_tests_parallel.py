@@ -5,14 +5,11 @@ Setup
 A test in this file spawns a long-lived Python grandchild that writes
 its PID + a nonce to a tempfile, then exits without cleaning up.
 With the old ``subprocess.run`` runner, that grandchild would orphan
-and outlive the test (and the whole runner). With the current Popen +
-``start_new_session`` + ``_kill_tree`` runner, the grandchild gets
-SIGKILL'd via process-group kill when its file's pytest exits.
-
-The leaker test always passes — its only job is to spawn a grandchild
-and walk away. The verifier runs the runner over the leaker file in a
-subprocess, then waits for the grandchild PID to disappear from the
-kernel's process table.
+and outlive the test (and the whole runner). On Linux the runner now puts
+that subprocess in a transient user-systemd service with a task budget and
+``KillMode=control-group``; other POSIX platforms use the captured process
+group. The verifier runs the runner over the leaker file in a subprocess,
+then waits for the grandchild PID to vanish from the kernel's process table.
 
 POSIX-only: Windows has its own grandchild lifecycle (no shared session,
 ``taskkill /F /T`` semantics). Marked accordingly.
@@ -22,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -226,6 +224,113 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
             f"diag={diag!r} test_pid={test_pid} test_pgid={test_pgid}; "
             f"runner output:\n{proc.stdout}"
         )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
+@pytest.mark.live_system_guard_bypass
+def test_runner_sigkill_contains_descendant_tree(tmp_path: Path) -> None:
+    """A SIGKILL'd runner must not orphan a bounded descendant tree."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = repo_root / f".runner-sigkill-probe-{os.getpid()}"
+    probe_dir.mkdir()
+    handoff = tmp_path / "tree.json"
+    release = tmp_path / "release"
+    output_path = tmp_path / "runner.out"
+    probe = probe_dir / "test_probe_tree.py"
+    leaf_code = textwrap.dedent(
+        f"""
+        import json, os, subprocess, sys, time
+        from pathlib import Path
+        leaf = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        Path({str(handoff)!r}).write_text(json.dumps({{
+            "tree": os.getpid(), "leaf": leaf.pid, "pgid": os.getpgrp()
+        }}))
+        time.sleep(600)
+        """
+    )
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            import os, subprocess, sys, time
+            from pathlib import Path
+
+            HANDOFF = Path({str(handoff)!r})
+            RELEASE = Path({str(release)!r})
+
+            def test_tree_waits_for_runner():
+                subprocess.Popen(
+                    [sys.executable, "-c", {leaf_code!r}],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                deadline = time.monotonic() + 10
+                while not HANDOFF.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert HANDOFF.exists(), "descendant tree never started"
+                while not RELEASE.exists():
+                    time.sleep(0.01)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with output_path.open("wb") as output:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(runner),
+                "--paths",
+                str(probe),
+                "--file-retries",
+                "0",
+                "-j",
+                "1",
+                "--file-timeout",
+                "30",
+                "-q",
+                f"--rootdir={repo_root}",
+            ],
+            cwd=repo_root,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        data = None
+        try:
+            deadline = time.monotonic() + 10
+            while not handoff.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert handoff.exists(), "runner did not start the synthetic tree"
+            data = json.loads(handoff.read_text(encoding="utf-8"))
+            assert data is not None
+            os.kill(proc.pid, 9)
+            proc.wait(timeout=10)
+            assert proc.returncode in (-9, 137)
+            assert "=== Summary:" not in output_path.read_text(encoding="utf-8")
+            pids = (data["tree"], data["leaf"])
+            deadline = time.monotonic() + 5
+            while any(_pid_alive(pid) for pid in pids) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not any(_pid_alive(pid) for pid in pids), f"descendants survived: {pids}"
+        finally:
+            if proc.poll() is None:
+                os.kill(proc.pid, 9)
+                proc.wait(timeout=10)
+            if data is not None:
+                try:
+                    if any(_pid_alive(pid) for pid in (data["tree"], data["leaf"])):
+                        os.killpg(data["pgid"], 9)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            probe.unlink(missing_ok=True)
+            shutil.rmtree(probe_dir, ignore_errors=True)
 
 
 # ── Bare pytest-flag passthrough ─────────────────────────────────────────────
@@ -499,25 +604,32 @@ def test_huge_requested_worker_count_is_capped(tmp_path: Path) -> None:
     assert f"with -j {expected}" in proc.stdout, proc.stdout
 
 
-def test_worker_path_excludes_mise_shims(tmp_path: Path) -> None:
-    """Pytest workers must not resolve version probes through mise shims."""
-    probe_dir = tmp_path / "probe"
+def test_worker_path_excludes_mise_tool_shims(tmp_path: Path) -> None:
+    """A normal worker cannot resolve or execute mise's Rust-tool shims."""
+    repo_root = Path(__file__).resolve().parent.parent
+    probe_dir = repo_root / f".runner-mise-probe-{os.getpid()}"
     probe_dir.mkdir()
     capture = tmp_path / "worker-env.json"
+    executions = tmp_path / "mise-tool-executions"
     mise_shims = tmp_path / "mise" / "shims"
-    mise_exposing_bin = tmp_path / "mise-exposing-bin"
     mise_executable = tmp_path / "mise-runtime" / "mise"
     safe_bin = tmp_path / "safe-bin"
     mise_shims.mkdir(parents=True)
-    mise_exposing_bin.mkdir()
     mise_executable.parent.mkdir()
     safe_bin.mkdir()
-    for rustup in (mise_shims / "rustup", safe_bin / "rustup"):
-        rustup.write_text("#!/bin/sh" + chr(10) + "exit 0" + chr(10), encoding="utf-8")
-        rustup.chmod(0o755)
-    mise_executable.write_text("#!/bin/sh" + chr(10) + "exit 0" + chr(10), encoding="utf-8")
+    mise_executable.write_text(
+        "#!/bin/sh" + chr(10) + f"echo \"$0\" >> {executions!s}" + chr(10),
+        encoding="utf-8",
+    )
     mise_executable.chmod(0o755)
-    (mise_exposing_bin / "rustup").symlink_to(mise_executable)
+    exposed_bins = []
+    for tool in ("rustup", "cargo", "rustc"):
+        exposed = tmp_path / f"mise-exposing-{tool}"
+        exposed.mkdir()
+        (exposed / tool).symlink_to(mise_executable)
+        (safe_bin / tool).write_text("#!/bin/sh" + chr(10) + "exit 0" + chr(10), encoding="utf-8")
+        (safe_bin / tool).chmod(0o755)
+        exposed_bins.append(exposed)
 
     probe = probe_dir / "test_worker_path.py"
     probe.write_text(
@@ -529,21 +641,18 @@ def test_worker_path_excludes_mise_shims(tmp_path: Path) -> None:
             from pathlib import Path
 
             def test_worker_path_is_sanitized():
-                rustup = shutil.which("rustup")
                 Path({str(capture)!r}).write_text(json.dumps({{
                     "path": os.environ.get("PATH", ""),
-                    "rustup": rustup,
-                    "rustup_real": str(Path(rustup).resolve()) if rustup else None,
+                    "tools": {{tool: shutil.which(tool) for tool in ("rustup", "cargo", "rustc")}},
                 }}))
             """
         ),
         encoding="utf-8",
     )
 
-    repo_root = Path(__file__).resolve().parent.parent
     env = os.environ.copy()
     env["PATH"] = os.pathsep.join(
-        (str(mise_shims), str(mise_exposing_bin), str(safe_bin), "/usr/bin", "/bin")
+        (str(mise_shims), *(str(path) for path in exposed_bins), str(safe_bin), "/usr/bin", "/bin")
     )
     proc = subprocess.run(
         [
@@ -556,6 +665,7 @@ def test_worker_path_excludes_mise_shims(tmp_path: Path) -> None:
             "--file-retries",
             "0",
             "-q",
+            f"--rootdir={repo_root}",
         ],
         cwd=repo_root,
         env=env,
@@ -570,7 +680,7 @@ def test_worker_path_excludes_mise_shims(tmp_path: Path) -> None:
     data = json.loads(capture.read_text(encoding="utf-8"))
     path_entries = data["path"].split(os.pathsep)
     assert not any(Path(entry).as_posix().rstrip("/").endswith("/mise/shims") for entry in path_entries)
-    assert str(mise_exposing_bin) not in path_entries
-    if data["rustup"]:
-        assert "/mise/shims/" not in Path(data["rustup_real"]).as_posix()
-    assert str(safe_bin / "rustup") == data["rustup"]
+    assert not any(str(path) in path_entries for path in exposed_bins)
+    assert data["tools"] == {tool: str(safe_bin / tool) for tool in ("rustup", "cargo", "rustc")}
+    assert not executions.exists(), "ordinary worker executed a mise Rust-tool shim"
+    shutil.rmtree(probe_dir, ignore_errors=True)

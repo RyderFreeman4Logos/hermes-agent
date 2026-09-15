@@ -537,6 +537,17 @@ class SessionMessagesMixin:
         return int(self._read_one(
             "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ? AND active = 1", (session_id,))[0])
 
+    def get_active_message_baseline(self, session_id: str) -> Tuple[int, float]:
+        """Return active max ID and timestamp from one snapshot for event startup."""
+        if not session_id:
+            return 0, 0.0
+        row = self._read_one(
+            "SELECT COALESCE(MAX(id), 0), COALESCE(MAX(timestamp), 0.0) "
+            "FROM messages WHERE session_id = ? AND active = 1",
+            (session_id,),
+        )
+        return int(row[0]), float(row[1])
+
     def _tail_rows_after_watermark(self, conn, sql: str, params) -> Tuple[List[int], int]:
         """``(ids, tool_call_count)`` of the concurrent-tail rows selected by *sql* (``SELECT id, tool_calls``)."""
         rows = conn.execute(sql, params).fetchall()

@@ -2118,21 +2118,26 @@ def test_event_bridge_baseline_rewrite_does_not_replay_carried_history(monkeypat
         monkeypatch.setattr(db, "close", lambda: None)
         monkeypatch.setattr(bridge, "_refresh_index_and_watermark", lambda _path: (entries, (1.0, 1)))
 
-        active_watermark = db.get_active_message_watermark
+        snapshot_name = (
+            "get_active_message_baseline"
+            if hasattr(db, "get_active_message_baseline")
+            else "get_active_message_watermark"
+        )
+        active_snapshot = getattr(db, snapshot_name)
         rewritten = False
 
         def rewrite_after_cutoff(sid):
             nonlocal rewritten
-            cutoff = active_watermark(sid)
+            snapshot = active_snapshot(sid)
             if not rewritten:
                 rewritten = True
                 db.replace_messages(sid, [
                     {"role": "user", "content": "carried question", "timestamp": 1},
                     {"role": "assistant", "content": "carried answer", "timestamp": 2},
                 ], active_only=True)
-            return cutoff
+            return snapshot
 
-        monkeypatch.setattr(db, "get_active_message_watermark", rewrite_after_cutoff)
+        monkeypatch.setattr(db, snapshot_name, rewrite_after_cutoff)
         assert bridge._establish_baseline() is True
         assert rewritten
         assert bridge._last_poll_timestamps[session_key] == 2
@@ -2141,6 +2146,119 @@ def test_event_bridge_baseline_rewrite_does_not_replay_carried_history(monkeypat
 
         assert [event["content"] for event in bridge.poll_events()["events"]] == ["new after startup"]
     finally:
+        close()
+
+
+@pytest.mark.parametrize(
+    ("require_retryable_composite", "fail_body_read"),
+    [(False, False), (True, True)],
+    ids=["undo", "retry-after-body-read-failure"],
+)
+def test_event_bridge_startup_partial_gateway_rewind_keeps_handoff_historical(
+    monkeypatch, tmp_path, require_retryable_composite, fail_body_read
+):
+    """Gateway /undo and composite /retry cannot publish a copied startup handoff."""
+    import hermes_state
+    import mcp_serve
+    from agent.context_compressor import (
+        HISTORICAL_TASK_HEADING,
+        SUMMARY_PREFIX,
+        _SUMMARY_END_MARKER,
+    )
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    db = store._db
+    close = db.close
+    session_id = f"startup-partial-{require_retryable_composite}"
+    session_key = f"agent:main:telegram:dm:{require_retryable_composite}"
+    try:
+        db.create_session(session_id, "telegram", session_key=session_key)
+        db.append_message(session_id, "user", "older ask", timestamp=1)
+        db.append_message(
+            session_id,
+            "assistant",
+            None,
+            tool_calls=[{"id": "call-1", "function": {"name": "terminal"}}],
+            timestamp=2,
+        )
+        db.append_message(
+            session_id, "tool", "tool result", tool_call_id="call-1", timestamp=3
+        )
+        carrier = (
+            f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n"
+            f"{_SUMMARY_END_MARKER}\n\nREAL ASK"
+        )
+        db.append_message(session_id, "user", carrier, timestamp=4)
+        db.append_message(session_id, "assistant", "failed answer", timestamp=5)
+
+        snapshot_captured = threading.Event()
+        release_snapshot = threading.Event()
+        snapshot_name = (
+            "get_active_message_baseline"
+            if hasattr(db, "get_active_message_baseline")
+            else "get_active_message_watermark"
+        )
+        snapshot_read = getattr(db, snapshot_name)
+
+        def pause_after_snapshot(sid):
+            result = snapshot_read(sid)
+            snapshot_captured.set()
+            assert release_snapshot.wait(timeout=3)
+            return result
+
+        monkeypatch.setattr(db, snapshot_name, pause_after_snapshot)
+        monkeypatch.setattr(db, "close", lambda: None)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: db)
+        worker_release = threading.Event()
+        bridge = mcp_serve.EventBridge()
+        monkeypatch.setattr(bridge, "_poll_loop", lambda: worker_release.wait(timeout=3))
+        start_result = []
+        starter = threading.Thread(target=lambda: start_result.append(bridge.start()))
+        starter.start()
+        assert snapshot_captured.wait(timeout=2)
+
+        rewind = store.rewind_session(
+            session_id,
+            require_retryable_composite=require_retryable_composite,
+        )
+        assert rewind is not None
+        assert rewind["target_text"] == "REAL ASK"
+        active = db.get_messages_as_conversation(session_id, include_row_ids=True)
+        assert [message["_row_id"] for message in active] == [1, 2, 3, 6]
+        assert active[-1]["display_kind"] == "hidden"
+        if fail_body_read:
+            read_messages = db.get_messages
+            fail_next_read = True
+
+            def fail_startup_body_once(sid):
+                nonlocal fail_next_read
+                if fail_next_read:
+                    fail_next_read = False
+                    raise sqlite3.OperationalError("startup body read interrupted")
+                return read_messages(sid)
+
+            monkeypatch.setattr(db, "get_messages", fail_startup_body_once)
+        release_snapshot.set()
+        starter.join(timeout=3)
+        assert not starter.is_alive()
+        assert start_result == [True]
+
+        expected = []
+        if fail_body_read:
+            db.append_message(
+                session_id, "assistant", "new after startup", timestamp=6
+            )
+            expected = ["new after startup"]
+        bridge._poll_once(db)
+        assert [event["content"] for event in bridge.poll_events()["events"]] == expected
+    finally:
+        release_snapshot.set()
+        worker_release.set()
+        if "bridge" in locals():
+            bridge.stop()
         close()
 
 

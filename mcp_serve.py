@@ -498,8 +498,15 @@ class EventBridge:
                     session_id = entry.get("session_id", "")
                     if not session_id:
                         continue
-                    getter = getattr(db, "get_active_message_watermark", None)
-                    cutoffs[session_key] = getter(session_id) if callable(getter) else None
+                    getter = getattr(db, "get_active_message_baseline", None)
+                    if callable(getter):
+                        cutoff, latest = getter(session_id)
+                        cutoffs[session_key] = cutoff
+                        if latest > 0.0:
+                            self._last_poll_timestamps[session_key] = latest
+                    else:
+                        getter = getattr(db, "get_active_message_watermark", None)
+                        cutoffs[session_key] = getter(session_id) if callable(getter) else None
             except Exception:
                 # Never invent a zero cutoff when the real active-row query
                 # cannot establish the startup boundary.
@@ -540,7 +547,7 @@ class EventBridge:
                         or int(message["id"]) <= cutoff
                     ]
                 latest = _latest_ts(messages)
-                if latest > 0.0:
+                if latest > self._last_poll_timestamps.get(session_key, 0.0):
                     self._last_poll_timestamps[session_key] = latest
             if reads_succeeded:
                 self._state_db_mtime, self._state_db_version = watermark

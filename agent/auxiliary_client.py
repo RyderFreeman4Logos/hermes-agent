@@ -3980,8 +3980,14 @@ def _fallback_destination_from_entry(
     entry: Dict[str, Any], fb_client: Any, fb_model: Optional[str]
 ) -> _FallbackDestination:
     provider = str(entry.get("provider") or "").strip()
-    base_url = str(entry.get("base_url") or getattr(fb_client, "base_url", "") or "").strip()
-    api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
+    if _is_codex_provider(provider) and isinstance(
+        fb_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)
+    ):
+        base_url = str(getattr(fb_client, "base_url", "") or "").strip()
+        api_mode = "codex_responses"
+    else:
+        base_url = str(entry.get("base_url") or getattr(fb_client, "base_url", "") or "").strip()
+        api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
     model = fb_model or str(entry.get("model") or "").strip() or None
     return _complete_fallback_destination(provider, base_url, api_mode, model)
 
@@ -7404,6 +7410,7 @@ def _prepare_aux_request(
     """Shared head of call_llm/async_call_llm: resolve route + client, publish it, build request kwargs.
     Sync-only: compression fast lane, per-request ``extra_headers``, and ``base_info`` falling
     back to the resolved base_url when the client exposes none."""
+    fallback_label = route_info.get("fallback_label") if route_info is not None else None
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -7442,6 +7449,14 @@ def _prepare_aux_request(
             logger.info("Auxiliary %s: using %s (%s)%s",
                          task, request_provider or "auto", final_model or "default",
                          f" at {base_info}" if base_info and "openrouter" not in base_info else "")
+    _record_route_info(
+        route_info, _fallback_provider_from_label(request_provider), final_model,
+        fallback_label=fallback_label,
+        base_url=base_info or resolved_base_url,
+        api_key=str(getattr(client, "api_key", resolved_api_key) or ""),
+        api_mode=resolved_api_mode,
+        timeout=effective_timeout,
+    )
     # Client's actual base_url so endpoint-specific temperature overrides work on
     # auto-detected routes (api.moonshot.ai vs api.kimi.com/coding).
     kwargs = _build_call_kwargs(
@@ -8075,7 +8090,10 @@ def _plan_aux_call(
         route_info=route_info,
     )
     retry_kwargs = dict(
-        candidate_kwargs, resolved_base_url=req.resolved_base_url,
+        task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
+        tools=tools, effective_timeout=req.effective_timeout,
+        effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
+        resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
         route_info=route_info,

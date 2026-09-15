@@ -1145,15 +1145,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
         from contextvars import copy_context
 
         # Reader completion must retain the producer's multiplex profile scope.
+        # Register first so a spawn-advertised notification survives an immediate
+        # reader exit (the reader may finish before start() returns).
         reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
                                   daemon=True, name=reader_name)
         session._reader_thread = reader
         with self._lock:
             self._prune_if_needed()
-            # Completion takes this lock too. Starting here also leaves no
-            # ghost entry if the interpreter cannot start another thread.
-            reader.start()
             self._running[session.id] = session
+        reader.start()
         self._write_checkpoint()
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
@@ -1181,7 +1181,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def spawn_local(
         self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "") -> ProcessSession:
+        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
+        notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing."""
@@ -1192,7 +1193,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
-        session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()))
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
+            notify_on_complete=notify_on_complete,
+        )
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -1279,12 +1283,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "") -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
         the correct sandbox context."""
-        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox")
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
+        )
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -1401,9 +1408,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
         one U+FFFD instead of vanishing), reap the child (no zombies), record the exit.
 
-        A process may close stdout long before it exits.  The reader owns a dedicated
-        daemon thread, so it must keep waiting rather than publish a false completion
-        and discard the only ``Popen`` handle that can reap the child.
+        Pipe EOF is not completion: a long child can close stdout and stay alive.
+        The reader owns a dedicated daemon thread, so it must keep waiting rather
+        than publish a false completion and discard the only ``Popen`` handle that
+        can reap the child.
         """
         with suppress(Exception):
             tail = decoder.decode(b"", final=True)
@@ -1418,7 +1426,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 logger.warning("%s wait failed; leaving process tracked: %s", label, e)
                 return
             logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        self._finish_exited(session, exit_code())
+        rc = exit_code()
+        if rc is None:
+            proc = getattr(session, "process", None)
+            poll = getattr(proc, "poll", None) if proc is not None else None
+            if callable(poll):
+                with suppress(Exception):
+                    rc = poll()
+            if rc is None:
+                return
+        self._finish_exited(session, rc)
 
     @staticmethod
     def _log_delta_command(quoted_log_path: str, offset: int) -> str:

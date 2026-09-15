@@ -476,19 +476,22 @@ def _run_after_agent_ready(
     if err:
         with session["history_lock"]:
             owns_turn = session.get("_turn_owner_token") is turn_token
-            if owns_turn:
-                session["running"] = False
-                session.pop("_turn_owner_token", None)
-                session.pop("_turn_owner_kind", None)
-                session["last_active"] = time.time()
         if not owns_turn:
             return
-        # Terminal frame + retained snapshot (not a bare "error" event): the snapshot is
-        # the only way resume shows this to a disconnected client.
-        _emit_terminal_turn_error(
-            sid, session, (err.get("error") or {}).get("message", "agent initialization failed"),
-            error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
-        _emit("session.info", sid, _session_info(session.get("agent"), session))
+        try:
+            # Keep A's owner token through the retained snapshot and terminal frame.
+            # Otherwise a successor can enter and this unscoped sink mutates B.
+            _emit_terminal_turn_error(
+                sid, session, (err.get("error") or {}).get("message", "agent initialization failed"),
+                error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
+            _emit("session.info", sid, _session_info(session.get("agent"), session))
+        finally:
+            with session["history_lock"]:
+                if session.get("_turn_owner_token") is turn_token:
+                    session["running"] = False
+                    session.pop("_turn_owner_token", None)
+                    session.pop("_turn_owner_kind", None)
+                    session["last_active"] = time.time()
         return
     with session["history_lock"]:
         if session.get("_turn_cancel_requested") or not session.get("running"):

@@ -4,6 +4,7 @@ import { renderSync, stringWidth } from '@hermes/ink'
 import React from 'react'
 import { describe, expect, it } from 'vitest'
 
+import { patchDelegationState, resetDelegationState } from '../app/delegationStore.js'
 import { StatusRule } from '../components/appChrome.js'
 import { stripAnsi } from '../lib/text.js'
 import { DEFAULT_THEME } from '../theme.js'
@@ -74,6 +75,63 @@ describe('status-rule narrow reflow', () => {
     } finally {
       instance.unmount()
       instance.cleanup()
+    }
+  })
+
+  it.each([
+    [44, ['spawn_hud', 'model'], 'paused', 'qwen'],
+    [44, ['model', 'spawn_hud'], 'qwen', 'paused'],
+    [120, ['spawn_hud', 'model'], 'paused', 'qwen'],
+    [120, ['model', 'spawn_hud'], 'qwen', 'paused']
+  ] as const)('honors spawn HUD legacy order at %i columns', async (cols, segments, first, second) => {
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+    let output = ''
+
+    Object.assign(stdout, { columns: cols, isTTY: false, rows: 24 })
+    Object.assign(stdin, { isTTY: false })
+    Object.assign(stderr, { isTTY: false })
+    stdout.on('data', chunk => {
+      output += chunk.toString()
+    })
+    patchDelegationState({ paused: true })
+
+    const instance = renderSync(
+      <StatusRule
+        bgCount={0}
+        busy={false}
+        cols={cols}
+        cwdLabel="~/repo"
+        liveSessionCount={0}
+        model="qwen"
+        sessionStartedAt={null}
+        status="ready"
+        statusBarSegments={[...segments]}
+        statusColor={DEFAULT_THEME.color.ok}
+        t={DEFAULT_THEME}
+        turnStartedAt={null}
+        usage={{ context_max: 0, context_percent: 0, context_used: 0, total: 0 }}
+        voiceLabel=""
+      />,
+      {
+        patchConsole: false,
+        stderr: stderr as NodeJS.WriteStream,
+        stdin: stdin as NodeJS.ReadStream,
+        stdout: stdout as NodeJS.WriteStream
+      }
+    )
+
+    try {
+      await flush()
+      const rendered = stripAnsi(output)
+      expect(rendered.match(/paused/g)).toHaveLength(1)
+      expect(rendered.indexOf(first)).toBeLessThan(rendered.indexOf(second))
+      expect(rendered.split('\n').filter(Boolean).every(line => stringWidth(line) <= cols)).toBe(true)
+    } finally {
+      instance.unmount()
+      instance.cleanup()
+      resetDelegationState()
     }
   })
 })

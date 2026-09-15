@@ -339,7 +339,8 @@ def _usage_present(obj: Any, *path: str) -> bool:
 
 
 def _cache_evidence(obj: Any, *paths: tuple[str, ...]) -> tuple[int, bool]:
-    """Return the first present cache counter and whether it is valid evidence."""
+    """Return the established positive alias, or a valid all-zero observation."""
+    saw_valid_zero = False
     for path in paths:
         value = obj
         present = True
@@ -357,15 +358,17 @@ def _cache_evidence(obj: Any, *paths: tuple[str, ...]) -> tuple[int, bool]:
         if not present:
             continue
         if value is None or isinstance(value, (bool, list, tuple, dict, set)):
-            return 0, False
+            continue
         try:
             number = Decimal(str(value))
         except Exception:
-            return 0, False
+            continue
         if not number.is_finite() or number < 0 or number != number.to_integral_value():
-            return 0, False
-        return int(number), True
-    return 0, False
+            continue
+        if number:
+            return int(number), True
+        saw_valid_zero = True
+    return 0, saw_valid_zero
 
 
 # Picker slugs → snapshot provider key ("openai-api" is the slug for direct

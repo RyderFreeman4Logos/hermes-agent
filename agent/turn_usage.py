@@ -37,10 +37,10 @@ def _turn_usage_snapshot(canonical_usage) -> dict[str, int | str]:
     }
 
 
-def _capture_first_turn_usage(agent, canonical_usage=None) -> None:
+def _capture_first_turn_usage(agent, canonical_usage=None) -> bool:
     """Latch the first completed provider response, including no-usage responses."""
     if getattr(agent, "_first_turn_usage", None) is not None:
-        return
+        return False
     if canonical_usage is None:
         agent._first_turn_usage = {
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
@@ -50,6 +50,7 @@ def _capture_first_turn_usage(agent, canonical_usage=None) -> None:
         }
     else:
         agent._first_turn_usage = _turn_usage_snapshot(canonical_usage)
+    return True
 
 
 @dataclass
@@ -111,6 +112,19 @@ def _notify_tui_cache(agent, canonical_usage=None, *, no_usage: bool = False) ->
         logger.debug("TUI provider-response cache callback failed", exc_info=True)
 
 
+def observe_response_usage(agent: Any, response: Any) -> None:
+    """Latch and publish the first provider observation before response recovery."""
+    raw_usage = getattr(response, "usage", None)
+    canonical_usage = (
+        normalize_usage(raw_usage, provider=agent.provider, api_mode=agent.api_mode)
+        if raw_usage
+        else None
+    )
+    if not _capture_first_turn_usage(agent, canonical_usage):
+        return
+    _notify_tui_cache(agent, canonical_usage, no_usage=canonical_usage is None)
+
+
 def _fold_moa_usage(agent, canonical_usage):
     """MoA: fold advisor fan-out usage into REPORTED token counts (only aggregator usage is
     returned, so advisor spend would be invisible) and flush the full-turn trace when
@@ -150,8 +164,7 @@ def record_response_usage(
     # must remain observable.
     agent.session_api_calls += 1
     if not (hasattr(response, 'usage') and response.usage):
-        _capture_first_turn_usage(agent)
-        _notify_tui_cache(agent, no_usage=True)
+        observe_response_usage(agent, response)
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the
             # pending verdict so later readings aren't charged to it and
@@ -170,8 +183,7 @@ def record_response_usage(
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage
-    _capture_first_turn_usage(agent, aggregator_usage)
-    _notify_tui_cache(agent, aggregator_usage)
+    observe_response_usage(agent, response)
     _moa_client, canonical_usage, _moa_ref_cost = _fold_moa_usage(agent, canonical_usage)
     prompt_tokens = canonical_usage.prompt_tokens
     completion_tokens = canonical_usage.output_tokens

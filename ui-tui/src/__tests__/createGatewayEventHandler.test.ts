@@ -240,6 +240,15 @@ describe('createGatewayEventHandler', () => {
     }
   )
 
+  it('clears prior-session cache telemetry when a new turn starts', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    patchUiState({ cacheStatus: 'cache 95%', sid: 'session-b' })
+    onEvent({ session_id: 'session-b', payload: {}, type: 'message.start' } as any)
+
+    expect(getUiState().cacheStatus).toBeNull()
+  })
+
   it('prints compaction progress status into the transcript', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

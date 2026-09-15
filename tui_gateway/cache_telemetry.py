@@ -120,6 +120,38 @@ def _tui_cache_warm_due(sid: str, session: dict, agent, route: str, identity=Non
         if token is None:
             return
         manager = HeartbeatManager(session_key, purpose="cache_warm")
+        worker_started = threading.Event()
+        worker_retired = threading.Event()
+
+        def retire_worker() -> None:
+            if worker_retired.is_set():
+                return
+            worker_retired.set()
+            with session["history_lock"]:
+                if session.get("_cache_warm_worker_token") is token:
+                    session.pop("_cache_warm_worker_token", None)
+            if _notif_release_turn(session, token) and not session.get("_closing"):
+                _drain_queued_prompt(f"__cache_warm__{int(time.time() * 1000)}", sid, session)
+
+        def register_worker() -> None:
+            worker_started.set()
+            with session["history_lock"]:
+                if session.get("_turn_owner_token") is token:
+                    session["_cache_warm_worker_token"] = token
+
+        def still_owned_at_dispatch() -> bool:
+            with session["history_lock"]:
+                return bool(
+                    session.get("_turn_owner_token") is token
+                    and session.get("running")
+                    and session.get("agent") is agent
+                    and not session.get("_closing")
+                    and session.get("_cache_warm_route") == route
+                    and _tui_cache_warm_route(agent) == route
+                    and session.get("_cache_warm_identity") == identity
+                    and _tui_cache_warm_identity(agent) == identity
+                )
+
         try:
             if (
                 session.get("agent") is not agent
@@ -132,12 +164,19 @@ def _tui_cache_warm_due(sid: str, session: dict, agent, route: str, identity=Non
                 return
             if manager.due_prompt() is not None:
                 session["_cache_warm_due_at"] = time.monotonic()
-                agent._interruptible_api_call(request)
+                agent._interruptible_api_call(
+                    request,
+                    _before_dispatch=still_owned_at_dispatch,
+                    _on_worker_start=register_worker,
+                    _on_worker_retire=retire_worker,
+                )
         except Exception:
             logger.debug("bodyless TUI cache warm failed", exc_info=True)
         finally:
-            if _notif_release_turn(session, token):
-                _drain_queued_prompt(f"__cache_warm__{int(time.time() * 1000)}", sid, session)
+            # Interruptible calls may return while an abort-resistant physical
+            # worker is still retiring. That worker keeps the admission token.
+            if not worker_started.is_set() or worker_retired.is_set():
+                retire_worker()
 
 
 def _arm_tui_cache_warm(sid: str, session: dict, agent, record: dict) -> None:

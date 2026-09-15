@@ -1142,7 +1142,14 @@ def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
 
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    _before_dispatch=None,
+    _on_worker_start=None,
+    _on_worker_retire=None,
+):
     """Run the API call on a worker thread so the caller can detect interrupts
     without waiting for the full HTTP round-trip. Each worker gets its own
     per-request client (interrupts close only that one); a stale-call detector
@@ -1151,11 +1158,25 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
+        if callable(_on_worker_start):
+            _on_worker_start()
+        try:
+            if callable(_before_dispatch) and not _before_dispatch():
+                return None
+            return direct_api_call(agent, api_kwargs)
+        finally:
+            if callable(_on_worker_retire):
+                _on_worker_retire()
     _check_stale_giveup(agent)  # cross-turn stale breaker (#58962), non-streaming sibling
     from agent.chat_completion_nonstream import _NonStreamRequest
 
-    return _NonStreamRequest(agent, api_kwargs).run()
+    return _NonStreamRequest(
+        agent,
+        api_kwargs,
+        before_dispatch=_before_dispatch,
+        on_worker_start=_on_worker_start,
+        on_worker_retire=_on_worker_retire,
+    ).run()
 
 
 def _consume_ephemeral_reasoning_off(agent) -> bool:
@@ -1386,10 +1407,24 @@ def build_chat_cache_warm_kwargs(agent) -> dict | None:
         key: value for key, value in dict(getattr(agent, "request_overrides", {}) or {}).items()
         if key not in reserved
     }
+    nested = request_overrides.get("extra_body")
+    if isinstance(nested, dict):
+        request_overrides["extra_body"] = {
+            key: value for key, value in nested.items() if key not in reserved
+        }
     kwargs = _build_chat_completions_kwargs(
         agent, [], [], None, request_overrides, _prompt_cache_scope_for_agent(agent),
         bodyless_warm=True,
     )
+    final_extra_body = kwargs.get("extra_body")
+    if isinstance(final_extra_body, dict):
+        final_extra_body = {
+            key: value for key, value in final_extra_body.items() if key not in reserved
+        }
+        if final_extra_body:
+            kwargs["extra_body"] = final_extra_body
+        else:
+            kwargs.pop("extra_body", None)
     from agent.opencode_affinity import merge_opencode_session_headers
     return merge_opencode_session_headers(
         kwargs,

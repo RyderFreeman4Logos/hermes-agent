@@ -469,6 +469,7 @@ const modelLabel = (model: string, effort?: string, fast?: boolean) =>
 interface StatusRenderItem {
   id: string
   node: ReactNode
+  ownRow?: boolean
   width: number
 }
 
@@ -480,6 +481,15 @@ function packStatusRows(items: readonly StatusRenderItem[], cols: number): Statu
   let used = stringWidth('─ ')
 
   for (const item of items) {
+    if (item.ownRow) {
+      if (row.length) {
+        rows.push(row)
+        row = []
+      }
+      rows.push([item])
+      used = 0
+      continue
+    }
     const itemWidth = Math.min(item.width, width)
     const next = used + (row.length ? separatorWidth : 0) + itemWidth
 
@@ -900,6 +910,15 @@ export function StatusRule({
               </Text>,
               narrowRightLabel
             )
+          : null,
+      spawn_hud:
+        legacy('spawn_hud')
+          ? {
+              id: 'spawn_hud',
+              node: <SpawnHud cols={Math.max(1, cols - 2)} standalone t={t} />,
+              ownRow: true,
+              width: cols
+            }
           : null
     }
 
@@ -923,7 +942,8 @@ export function StatusRule({
       'subagents',
       'resume',
       'dev_credits',
-      'cwd'
+      'cwd',
+      'spawn_hud'
     ]
 
     const ordered = (configuredStatusBarSegments ?? defaultOrder)
@@ -933,7 +953,6 @@ export function StatusRule({
     return (
       <Box flexDirection="column" flexShrink={0}>
         {StatusRows({ cols, items: ordered, t })}
-        {legacy('spawn_hud') ? <SpawnHud cols={cols} standalone t={t} /> : null}
       </Box>
     )
   }

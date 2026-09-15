@@ -516,6 +516,20 @@ def _validate_child_output_schema(
         if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
             result["messages"] = result["messages"] + _retry_messages
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
+        if _schema_valid:
+            # The accepted answer and its terminal provenance are one result.
+            # Keeping failure/billing fields from the rejected turn can make
+            # result assembly erase a valid retry or attribute it to that old
+            # provider. Calls and messages above intentionally remain summed.
+            for key in (
+                "completed", "interrupted", "failed", "error",
+                "failure_reason", "failure_retryable",
+                "billing_block", "billing_unverified", "codex_turn_id",
+            ):
+                if key in _retry_result:
+                    result[key] = _retry_result[key]
+                else:
+                    result.pop(key, None)
     return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
 
 def _build_tool_trace(messages: Any) -> list[Dict[str, Any]]:

@@ -424,8 +424,8 @@ class ProcessSession:
     # A successful direct signal is provenance for the reader-owned terminal record;
     # it is not terminal publication itself.
     _pending_termination_source: str = field(default="", repr=False)
-    _pending_consume_output: Optional[bool] = field(default=None, repr=False)
     _pending_kill_claim: Any = field(default=None, repr=False)
+    _pending_kill_dispositions: Dict[Any, Optional[bool]] = field(default_factory=dict, repr=False)
     _kill_disposition_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _reader_settlement_ready: threading.Event = field(default_factory=threading.Event, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
@@ -757,6 +757,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _terminate_host_pid(
         cls, pid: int, expected_start: Optional[int] = None,
         on_direct_signal: Optional[Callable[[bool], None]] = None,
+        on_direct_noop: Optional[Callable[[bool], None]] = None,
         direct_signal_lock: Optional[Any] = None,
     ) -> None:
         """Terminate a host-visible PID and its descendants.
@@ -767,11 +768,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
         SIGKILLs survivors after ``terminal.daemon_term_grace_seconds``. Windows:
         ``taskkill /T /F`` (psutil's stale PPID links miss orphans there); ``os.kill``
         is the fallback."""
-        if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
-            logger.warning(
-                "Refusing to terminate host pid %d: start-time mismatch — "
-                "PID was recycled onto an unrelated process.", pid)
-            return
+        identity_lock = direct_signal_lock or nullcontext()
+        with identity_lock:
+            if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
+                logger.warning(
+                    "Refusing to terminate host pid %d: start-time mismatch — "
+                    "PID was recycled onto an unrelated process.", pid)
+                if on_direct_noop is not None:
+                    on_direct_noop(direct_signal_lock is not None)
+                return
 
         def _sigterm_quietly():
             lock = direct_signal_lock or nullcontext()
@@ -779,6 +784,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 try:
                     os.kill(pid, signal.SIGTERM)
                 except (OSError, ProcessLookupError, PermissionError):
+                    if on_direct_noop is not None:
+                        on_direct_noop(direct_signal_lock is not None)
                     return
                 if on_direct_signal is not None:
                     on_direct_signal(direct_signal_lock is not None)
@@ -796,6 +803,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         try:
             parent = psutil.Process(pid)
         except psutil.NoSuchProcess:
+            lock = direct_signal_lock or nullcontext()
+            with lock:
+                if on_direct_noop is not None:
+                    on_direct_noop(direct_signal_lock is not None)
             return
         except (OSError, PermissionError):
             _sigterm_quietly()
@@ -808,9 +819,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
         targets.append(parent)
         for proc in targets:
             if proc.pid == pid and on_direct_signal is not None and direct_signal_lock is not None:
-                with direct_signal_lock, suppress(gone):
-                    proc.terminate()
-                    on_direct_signal(True)
+                with direct_signal_lock:
+                    try:
+                        proc.terminate()
+                    except gone:
+                        if on_direct_noop is not None:
+                            on_direct_noop(True)
+                    else:
+                        on_direct_signal(True)
                 continue
             with suppress(gone):
                 proc.terminate()
@@ -1112,8 +1128,20 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 fd = None
             if fd is not None:
                 import select as _select
-            idle_after_exit = 0
+            # The existing silent-orphan contract allows three 0.2s select cycles
+            # after direct-child death. Track that same 0.6s grace independently of
+            # descendant writes so a busy inherited pipe cannot extend it forever.
+            orphan_drain_deadline = None
             while True:
+                try:
+                    direct_exit_observed = proc.poll() is not None
+                except Exception:
+                    direct_exit_observed = False
+                if direct_exit_observed:
+                    if orphan_drain_deadline is None:
+                        orphan_drain_deadline = time.monotonic() + 0.6
+                    elif time.monotonic() >= orphan_drain_deadline:
+                        break
                 if fd is not None:
                     try:
                         ready, _, _ = _select.select([fd], [], [], 0.2)
@@ -1123,18 +1151,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         # Direct child gone and pipe idle ~200ms: a few more cycles for a
                         # buffered tail, then stop rather than wait forever on an orphaned
                         # grandchild's pipe.
-                        if proc.poll() is not None:
-                            # See #68915.
-                            idle_after_exit += 1
-                        if idle_after_exit >= 3:
-                            break
                         continue
                 chunk = _read_once()
                 if chunk is None:
                     break  # true EOF — all writers closed
                 if chunk:
                     _append_chunk(chunk)
-                idle_after_exit = 0
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
@@ -1288,9 +1310,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         )
         if reader_owns_settlement:
             with session._lock:
-                wait_for_disposition = (
-                    session._pending_kill_claim is not None
-                    and not session._kill_disposition_event.is_set()
+                wait_for_disposition = any(
+                    disposition is None
+                    for disposition in session._pending_kill_dispositions.values()
                 )
                 if wait_for_disposition:
                     session._reader_settlement_ready.set()
@@ -1306,8 +1328,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Commit an output-bearing kill's disposition before the terminal
             # notification becomes visible.  A failed operation never installs
             # this claim, so its error-only return cannot hide the completion.
-            if session._pending_consume_output:
+            if any(session._pending_kill_dispositions.values()):
                 self._completion_consumed.add(session.id)
+            session._pending_kill_dispositions.clear()
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -1783,6 +1806,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return result
         try:
             kill_claim = object()
+            reserved_disposition = False
             self._kill_context.source = source
             self._kill_context.claim = kill_claim
             self._kill_context.consume_output = consume_output
@@ -1794,6 +1818,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         delattr(self._kill_context, name)
             if early is not None:
                 return early
+            with session._lock:
+                reserved_disposition = kill_claim in session._pending_kill_dispositions
             # Scope ownership is independent of decoder ownership.  Stop it
             # before either reader result can return so reparented descendants
             # cannot outlive a completed main child.
@@ -1804,20 +1830,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # final tail and observed return code before exposing a terminal result.
             reader = getattr(session, "_reader_thread", None)
             if session.process is not None and session._pty is None and reader is not None:
-                with session._lock:
-                    owns_kill_claim = session._pending_kill_claim is kill_claim
                 # POSIX readers bound descendant-held pipes themselves. Keep this
                 # bounded for the Windows blocking-pipe fallback, where a caller gets
                 # an honest in-progress result instead of a competing decoder/drain.
-                if owns_kill_claim and not session._reader_settlement_ready.wait(timeout=5):
-                    self._commit_kill_disposition(session, kill_claim, False)
+                if reserved_disposition and not session._reader_settlement_ready.wait(timeout=5):
                     return {
                         "status": "stopping", "session_id": session.id,
                         "output": _output_tail(session, 2000),
                     }
-                if owns_kill_claim:
+                if reserved_disposition:
                     self._commit_kill_disposition(session, kill_claim, consume_output)
                 if not session._completion_event.wait(timeout=5):
+                    if reserved_disposition:
+                        self._cancel_unpublished_kill_consumption(session, kill_claim)
                     return {
                         "status": "stopping", "session_id": session.id,
                         "output": _output_tail(session, 2000),
@@ -1846,7 +1871,6 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source, "output": output}
         except Exception as e:
-            self._commit_kill_disposition(session, locals().get("kill_claim"), False)
             # Pre-signal / failed kill: leave running so close()/kill_all can retry.
             # Post-death: waitable poll() (including 0) is authoritative. Host
             # identity is gone only when positively known: ESRCH/not-alive, or a
@@ -1892,6 +1916,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         self._move_to_finished(session)
                         self._write_checkpoint()
             return {"status": "error", "error": str(e)}
+        finally:
+            self._commit_kill_disposition(session, locals().get("kill_claim"), False)
 
     def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
@@ -1911,8 +1937,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
             def record_direct_signal(lock_held: bool = False) -> None:
                 self._record_kill_delivery(session, lock_held=lock_held)
 
+            def record_direct_noop(lock_held: bool = False) -> None:
+                self._record_kill_noop(session, lock_held=lock_held)
+
             self._terminate_host_pid(
                 session.process.pid, session.host_start_time, record_direct_signal,
+                on_direct_noop=record_direct_noop,
                 direct_signal_lock=session._lock,
             )
         elif session.env_ref and session.pid:
@@ -1939,6 +1969,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             self._terminate_host_pid(
                 session.pid, session.host_start_time,
                 lambda lock_held=False: self._record_kill_delivery(session, lock_held=lock_held),
+                on_direct_noop=lambda lock_held=False: self._record_kill_noop(
+                    session, lock_held=lock_held
+                ),
                 direct_signal_lock=session._lock,
             )
         else:
@@ -1957,18 +1990,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Bind first successful signal delivery to its immutable invocation."""
         source = getattr(self._kill_context, "source", "")
         claim = getattr(self._kill_context, "claim", None)
-        consume_output = bool(getattr(self._kill_context, "consume_output", False))
 
         def record() -> None:
+            self._reserve_kill_disposition(session, claim, lock_held=True)
             if not session._pending_termination_source:
                 session._pending_termination_source = source
                 session._pending_kill_claim = claim
-                if session.process is not None and session._pty is None and session._reader_thread is not None:
-                    session._pending_consume_output = None
-                    session._kill_disposition_event.clear()
-                else:
-                    session._pending_consume_output = consume_output
-                    session._kill_disposition_event.set()
 
         if lock_held:
             record()
@@ -1976,13 +2003,51 @@ class ProcessRegistry(ProcessCheckpointMixin):
             with session._lock:
                 record()
 
+    def _record_kill_noop(self, session: ProcessSession, *, lock_held: bool = False) -> None:
+        """Arm output ownership once the direct signal path proves a no-op."""
+        claim = getattr(self._kill_context, "claim", None)
+        self._reserve_kill_disposition(session, claim, lock_held=lock_held)
+
+    @staticmethod
+    def _reserve_kill_disposition(
+        session: ProcessSession, claim: Any, *, lock_held: bool = False
+    ) -> bool:
+        """Reserve one live pipe kill's output decision at the reader boundary."""
+        def reserve() -> bool:
+            if (
+                session.exited
+                or session.process is None
+                or session._pty is not None
+                or session._reader_thread is None
+            ):
+                return False
+            session._pending_kill_dispositions[claim] = None
+            session._kill_disposition_event.clear()
+            return True
+
+        if lock_held:
+            return reserve()
+        with session._lock:
+            return reserve()
+
     @staticmethod
     def _commit_kill_disposition(session: ProcessSession, claim: Any, consume_output: bool) -> None:
-        """Publish the output disposition of the invocation that delivered the signal."""
+        """Settle only this invocation's reserved reader output decision."""
         with session._lock:
-            if session._pending_kill_claim is claim and not session._kill_disposition_event.is_set():
-                session._pending_consume_output = consume_output
+            if session._pending_kill_dispositions.get(claim, False) is None:
+                session._pending_kill_dispositions[claim] = consume_output
+            if session._pending_kill_dispositions and all(
+                disposition is not None
+                for disposition in session._pending_kill_dispositions.values()
+            ):
                 session._kill_disposition_event.set()
+
+    @staticmethod
+    def _cancel_unpublished_kill_consumption(session: ProcessSession, claim: Any) -> None:
+        """A stopping caller cannot consume output the reader has not published."""
+        with session._lock:
+            if not session.exited and session._pending_kill_dispositions.get(claim) is True:
+                session._pending_kill_dispositions[claim] = False
 
     def _stdin_op(self, session_id: str, pty_op, pipe_op, ok: dict) -> dict:
         """Run a stdin operation on a running session — ``pty_op(pty)`` under PTY mode,

@@ -1491,6 +1491,43 @@ class TestKillProcess:
             self._reap_child(session.process)
 
     @pytest.mark.linux_only
+    def test_pipe_reader_settles_kill_disposition_after_keyboard_interrupt(
+        self, registry, monkeypatch, tmp_path
+    ):
+        """A caller interruption cannot leave the terminal reader parked forever."""
+        session = self._spawn_pipe_parent_with_detached_writer(
+            registry, monkeypatch, tmp_path, tail="FINAL-INTERRUPT-41", waits_for_signal=True,
+        )
+        original_terminate = registry._terminate_host_pid
+
+        def deliver_then_interrupt(*args, **kwargs):
+            original_terminate(*args, **kwargs)
+            assert not session._completion_event.is_set()
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", deliver_then_interrupt)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                registry.kill_process(session.id, source="test.interrupt", consume_output=True)
+
+            assert session.id not in registry._completion_consumed
+            assert session._completion_event.wait(timeout=3), "interrupted caller abandoned reader disposition"
+            assert session.output_buffer.endswith("FINAL-INTERRUPT-41\n")
+            assert (session.exit_code, session.completion_reason, session.termination_source) == (
+                0, "killed", "test.interrupt"
+            )
+            event = registry.completion_queue.get_nowait()
+            assert event["output"].endswith("FINAL-INTERRUPT-41\n")
+            assert (event["exit_code"], event["completion_reason"], event["termination_source"]) == (
+                0, "killed", "test.interrupt"
+            )
+            assert registry.completion_queue.empty()
+            repeat = registry.kill_process(session.id, source="test.interrupt.retry", consume_output=False)
+            assert repeat["status"] == "already_exited"
+        finally:
+            self._reap_child(session.process)
+
+    @pytest.mark.linux_only
     def test_pipe_stopping_does_not_consume_reader_completion(self, registry, monkeypatch, tmp_path):
         """A stopping result has not returned the reader's final output."""
         entered_finish = threading.Event()
@@ -2806,6 +2843,90 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+
+    def test_normal_eof_retains_large_direct_child_tail(self, registry, monkeypatch, tmp_path):
+        """The orphan deadline cannot truncate a direct child's normal EOF tail."""
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        payload = "DIRECT-LARGE-TAIL-41:" + ("x" * 32_768) + ":END-41\n"
+        code = f"import sys; sys.stdout.write({payload!r}); sys.stdout.flush(); raise SystemExit(9)"
+        session = registry.spawn_local(
+            f"exec {shlex.quote(sys.executable)} -c {shlex.quote(code)}", cwd=str(tmp_path)
+        )
+        session.notify_on_complete = True
+
+        assert session._completion_event.wait(timeout=5), "normal EOF reader did not finish"
+        result = registry.wait(session.id, timeout=1)
+
+        assert result["status"] == "exited"
+        assert result["exit_code"] == 9
+        assert session.output_buffer == payload
+        assert result["output"].endswith(":END-41\n")
+        event = registry.completion_queue.get_nowait()
+        assert event["exit_code"] == 9
+        assert event["output"].endswith(":END-41\n")
+        assert registry.completion_queue.empty()
+
+    @pytest.mark.parametrize("public_entry", ["spawn_local", "adopt_local"])
+    def test_public_poll_wait_finishes_while_orphan_keeps_writing(
+        self, registry, monkeypatch, tmp_path, public_entry
+    ):
+        """A busy inherited pipe cannot extend the direct command's lifetime."""
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+        code = (
+            "import os,time\n"
+            "child=os.fork()\n"
+            "if child == 0:\n"
+            " for i in range(100):\n"
+            "  print(f'ORPHAN-WRITE-{i}', flush=True)\n"
+            "  time.sleep(0.05)\n"
+            " os._exit(0)\n"
+            "print(f'DESCENDANT={child}', flush=True)\n"
+            "print('DIRECT-DONE-41', flush=True)\n"
+            "raise SystemExit(7)\n"
+        )
+        if public_entry == "spawn_local":
+            session = registry.spawn_local(
+                f"exec {shlex.quote(sys.executable)} -c {shlex.quote(code)}", cwd=str(tmp_path)
+            )
+            proc = session.process
+        else:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", code], cwd=str(tmp_path), text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+            session = registry.adopt_local(
+                proc, command="writing orphan", cwd=str(tmp_path), notify_on_complete=True,
+            )
+        session.notify_on_complete = True
+        try:
+            assert _wait_until(lambda: proc.poll() is not None, timeout=3), "direct child did not exit"
+            assert _wait_until(
+                lambda: "ORPHAN-WRITE-8" in session.output_buffer, timeout=2
+            ), "descendant did not exercise ready reads"
+            assert proc.stdout is not None and proc.stdout.closed is False
+
+            started = time.monotonic()
+            polled = registry.poll(session.id)
+            waited = registry.wait(session.id, timeout=3)
+            elapsed = time.monotonic() - started
+
+            assert polled["status"] in {"running", "exited"}
+            assert waited["status"] == "exited", waited
+            assert elapsed < 2.5
+            assert waited["exit_code"] == 7
+            assert "DIRECT-DONE-41" in waited["output"]
+            assert "ORPHAN-WRITE-" in waited["output"]
+            assert session._reader_thread is not None and not session._reader_thread.is_alive()
+            event = registry.completion_queue.get_nowait()
+            assert event["exit_code"] == 7
+            assert event["output"] == waited["output"]
+            assert registry.completion_queue.empty()
+        finally:
+            with suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait()
 
 # =========================================================================
 # systemd cgroup isolation for gateway-spawned local executors (#70716)

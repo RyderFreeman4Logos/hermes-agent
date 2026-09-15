@@ -7201,6 +7201,157 @@ def test_process_kill_rpc_hides_consumed_completion_before_idle_poller_delivery(
         child.process.wait()
 
 
+@pytest.mark.linux_only
+@pytest.mark.parametrize("prior_owner", ["natural", "error", "bulk"])
+def test_process_kill_rpc_reserves_completion_without_first_signal_claim(
+    monkeypatch, tmp_path, prior_owner
+):
+    """A consuming RPC owns terminal output even when another path owns the signal."""
+    import shlex
+
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr("tools.process_registry.save_completed_result", lambda _s: None)
+    session_key = f"rpc-retry-owner-{prior_owner}"
+    runtime_id = f"sid-rpc-retry-owner-{prior_owner}"
+    runtime = _session(session_key=session_key)
+    server._sessions[runtime_id] = runtime
+    emitted = []
+    dispatched = []
+    rpc_done = threading.Event()
+    rpc_entered_signal_path = threading.Event()
+    entered_finish = threading.Event()
+    release_finish = threading.Event()
+    publications = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    def record_dispatch(_rid, _sid, _session, text, **_kwargs):
+        dispatched.append(text)
+        _session["running"] = False
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", record_dispatch)
+    monkeypatch.setattr(server, "_poll_bot_live_delivery_once", lambda *_args: False)
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
+    monkeypatch.setattr(server, "_maybe_fire_tui_heartbeat_tick", lambda *_args: None)
+    monkeypatch.setattr(server, "_notif_poll_kanban", lambda *_args: None)
+    original_finish = registry._finish_reader
+
+    def held_finish(*args, **kwargs):
+        entered_finish.set()
+        assert release_finish.wait(8)
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_finish_reader", held_finish)
+    if prior_owner == "natural":
+        code = "print('NATURAL-RPC-TAIL-41', flush=True); raise SystemExit(7)"
+    else:
+        code = (
+            "import signal,time\n"
+            "def finish(*_):\n"
+            " print('SIGNALLED-RPC-TAIL-41', flush=True)\n"
+            " raise SystemExit(23)\n"
+            "signal.signal(signal.SIGTERM, finish)\n"
+            "print('RPC-READY-41', flush=True)\n"
+            "while True: time.sleep(0.05)\n"
+        )
+    child = registry.spawn_local(
+        f"exec {shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+        cwd=str(tmp_path), session_key=session_key,
+    )
+    child.notify_on_complete = True
+    original_terminate = registry._terminate_host_pid
+
+    def observe_terminate(*args, **kwargs):
+        source = getattr(registry._kill_context, "source", "")
+        if threading.current_thread().name == "rpc-kill":
+            rpc_entered_signal_path.set()
+        result = original_terminate(*args, **kwargs)
+        if source == "test.first.error":
+            raise RuntimeError("first kill failed after signal")
+        return result
+
+    monkeypatch.setattr(registry, "_terminate_host_pid", observe_terminate)
+    original_put = registry.completion_queue.put
+
+    def deliver_while_rpc_waits(event):
+        assert not rpc_done.is_set(), "process.kill RPC returned before terminal publication"
+        publications.append(event)
+        original_put(event)
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), runtime_id, runtime
+        )
+
+    monkeypatch.setattr(registry.completion_queue, "put", deliver_while_rpc_waits)
+    bulk_thread = None
+    response = {}
+    try:
+        if prior_owner == "natural":
+            assert entered_finish.wait(3), "natural child did not reach held reader finish"
+        else:
+            ready_deadline = time.monotonic() + 5
+            while "RPC-READY-41" not in child.output_buffer and time.monotonic() < ready_deadline:
+                time.sleep(0.02)
+            assert "RPC-READY-41" in child.output_buffer
+            if prior_owner == "error":
+                first = registry.kill_process(
+                    child.id, source="test.first.error", consume_output=False
+                )
+                assert first == {"status": "error", "error": "first kill failed after signal"}
+                assert entered_finish.is_set()
+            else:
+                bulk_thread = threading.Thread(
+                    name="bulk-cleanup", target=lambda: registry.kill_all(
+                        source="test.bulk.first", consume_output=False
+                    ),
+                )
+                bulk_thread.start()
+                assert entered_finish.wait(5), "bulk cleanup did not deliver the first signal"
+
+        def invoke_rpc():
+            response.update(server.handle_request({
+                "id": f"kill-rpc-{prior_owner}",
+                "method": "process.kill",
+                "params": {"session_id": runtime_id, "process_id": child.id},
+            }))
+            rpc_done.set()
+
+        rpc_thread = threading.Thread(name="rpc-kill", target=invoke_rpc)
+        rpc_thread.start()
+        assert rpc_entered_signal_path.wait(3), "RPC did not enter the public kill path"
+        release_finish.set()
+        rpc_thread.join(timeout=8)
+        assert not rpc_thread.is_alive(), "process.kill RPC did not return"
+        if bulk_thread is not None:
+            bulk_thread.join(timeout=8)
+            assert not bulk_thread.is_alive(), "non-consuming bulk cleanup did not return"
+
+        result = response["result"]
+        assert result["status"] == "killed"
+        assert result["session_id"] == child.id
+        expected = (
+            (7, "exited", "") if prior_owner == "natural"
+            else (23, "killed", "test.first.error" if prior_owner == "error" else "test.bulk.first")
+        )
+        assert (result["exit_code"], result["completion_reason"], result["termination_source"]) == expected
+        assert "RPC-TAIL-41" in result["output"]
+        assert len(publications) == 1
+        assert registry.is_completion_consumed(child.id)
+        assert emitted == []
+        assert dispatched == []
+        assert registry.completion_queue.empty()
+    finally:
+        release_finish.set()
+        server._sessions.pop(runtime_id, None)
+        if child.process.poll() is None:
+            child.process.kill()
+        child.process.wait()
+
+
 def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
     """A provenance lookup failure cannot turn an addressed event into ours."""
     import queue as _queue_mod

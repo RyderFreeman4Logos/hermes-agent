@@ -39,9 +39,23 @@ def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
     return _str_or_none(route[0]), _str_or_none(route[1])
 
 
+def _selected_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return a route selected by the model-pool resolver before the child ran."""
+    profile = getattr(child, "_delegate_model_profile", None)
+    if not (isinstance(profile, str) and profile.strip()):
+        return None, None
+    return _str_or_none(getattr(child, "model", None)), _str_or_none(getattr(child, "provider", None))
+
+
+def _result_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
+    """Prefer an accepted route, then an explicitly selected model-pool route."""
+    accepted = _accepted_route_identity(child)
+    return accepted if any(value is not None for value in accepted) else _selected_route_identity(child)
+
+
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
-    model, provider = _accepted_route_identity(child)
+    model, provider = _result_route_identity(child)
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
         "duration_seconds": duration, "model": model, "provider": provider,
@@ -493,16 +507,29 @@ def _build_result_entry(
     summary = result.get("final_response") or ""
     _result_billing = result.get("billing_block")
     _child_model = getattr(child, "model", "")
+    accepted_model, accepted_provider = _accepted_route_identity(child)
+    selected_model, selected_provider = _selected_route_identity(child)
+    route_model, route_provider = (
+        (accepted_model, accepted_provider)
+        if accepted_model is not None or accepted_provider is not None
+        else (selected_model, selected_provider)
+    )
+    if route_provider is not None:
+        _route_owns_xai = route_provider in {"xai", "xai-oauth"}
+    elif route_model is not None:
+        _route_owns_xai = "grok" in route_model.lower()
+    else:
+        # Legacy/no-profile children have no selected-route authority. Preserve
+        # verified configured-xAI failures, but never trust that hint for a
+        # result explicitly marked unverified.
+        _route_owns_xai = (
+            "grok" in str(_child_model).lower()
+            and not result.get("billing_unverified", False)
+        )
     _xai_billing_leak = (
         isinstance(_result_billing, dict)
         and _result_billing.get("provider") in {"xai", "xai-oauth"}
-        and (
-            "grok" not in str(_child_model).lower()
-            or (
-                getattr(child, "_delegate_model_profile", None) == "standard"
-                and result.get("billing_unverified", False)
-            )
-        )
+        and not _route_owns_xai
     )
     if _xai_billing_leak:
         # Do not attach a parent xAI terminal to a child routed elsewhere (#209).
@@ -534,7 +561,6 @@ def _build_result_entry(
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
     # Result entry contract: see the _run_single_child docstring.
-    accepted_model, accepted_provider = _accepted_route_identity(child)
     app_server_success = (
         getattr(child, "api_mode", None) == "codex_app_server"
         and result.get("completed", False)
@@ -777,7 +803,7 @@ class _ChildRun:
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
         status = "timeout" if is_timeout else "error"
-        model, provider = _accepted_route_identity(child)
+        model, provider = _result_route_identity(child)
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,

@@ -14,6 +14,7 @@ from tools.delegate_tool import delegate_task
 
 
 ACCEPTED = ("configured-model", "configured-provider")
+SELECTED = ("selected-model", "selected-provider")
 _REAL_RUN_CONVERSATION = AIAgent.run_conversation
 
 
@@ -85,16 +86,23 @@ def _delegate_patches(run_conversation, *, timeout):
     return stack
 
 
-@pytest.mark.parametrize("accepted", [True, False], ids=("accepted", "not-accepted"))
-def test_public_sync_outer_exception_reports_only_accepted_identity(monkeypatch, tmp_path, accepted):
+@pytest.mark.parametrize(
+    ("identity", "expected"),
+    [("accepted", ACCEPTED), ("selected", SELECTED), ("none", (None, None))],
+    ids=("accepted-over-selected", "selected", "not-accepted"),
+)
+def test_public_sync_outer_exception_reports_only_accepted_identity(monkeypatch, tmp_path, identity, expected):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     events = []
 
     def accepted_then_raise(child, **_kwargs):
-        if accepted:
+        if identity == "accepted":
             result = _REAL_RUN_CONVERSATION(child, **_kwargs)
             assert result["completed"] is True
             assert child._delegate_successful_llm_route == ACCEPTED
+        if identity in {"accepted", "selected"}:
+            child._delegate_model_profile = "fast"
+            child.model, child.provider = SELECTED
         raise RuntimeError("synthetic outer child failure")
 
     with _delegate_patches(accepted_then_raise, timeout=None):
@@ -106,7 +114,6 @@ def test_public_sync_outer_exception_reports_only_accepted_identity(monkeypatch,
             )
         )
 
-    expected = ACCEPTED if accepted else (None, None)
     entry = payload["results"][0]
     assert entry["status"] == "error"
     assert (entry["model"], entry["provider"]) == expected
@@ -115,8 +122,12 @@ def test_public_sync_outer_exception_reports_only_accepted_identity(monkeypatch,
     assert (complete[-1]["model"], complete[-1]["provider"]) == expected
 
 
-@pytest.mark.parametrize("accepted", [True, False], ids=("accepted", "not-accepted"))
-def test_public_background_timeout_persists_only_accepted_identity(monkeypatch, tmp_path, accepted):
+@pytest.mark.parametrize(
+    ("identity", "expected"),
+    [("accepted", ACCEPTED), ("selected", SELECTED), ("none", (None, None))],
+    ids=("accepted-over-selected", "selected", "not-accepted"),
+)
+def test_public_background_timeout_persists_only_accepted_identity(monkeypatch, tmp_path, identity, expected):
     from tools import async_delegation
     from tools.process_registry import process_registry
 
@@ -124,10 +135,13 @@ def test_public_background_timeout_persists_only_accepted_identity(monkeypatch, 
     release = threading.Event()
 
     def accepted_then_block(child, **_kwargs):
-        if accepted:
+        if identity == "accepted":
             result = _REAL_RUN_CONVERSATION(child, **_kwargs)
             assert result["completed"] is True
             assert child._delegate_successful_llm_route == ACCEPTED
+        if identity in {"accepted", "selected"}:
+            child._delegate_model_profile = "fast"
+            child.model, child.provider = SELECTED
         release.wait(5)
         return {"completed": True, "final_response": "released too late", "api_calls": 1}
 
@@ -153,7 +167,6 @@ def test_public_background_timeout_persists_only_accepted_identity(monkeypatch, 
                 time.sleep(0.02)
 
         assert event is not None
-        expected = ACCEPTED if accepted else (None, None)
         entry = event["results"][0]
         assert entry["status"] == "timeout"
         assert (entry["model"], entry["provider"]) == expected

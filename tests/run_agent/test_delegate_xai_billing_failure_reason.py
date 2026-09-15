@@ -113,7 +113,7 @@ def test_public_sync_drops_unaccepted_xai_billing_reason_from_non_xai_identity()
     child = _BillingChild(
         accepted_route=("accepted-model", "accepted-provider"),
         model="grok-4.6",
-        profile="standard",
+        profile=None,
         result=_failed_result(
             reason="billing",
             billing_block={"provider": "xai-oauth"},
@@ -141,7 +141,7 @@ def test_public_background_durably_drops_unaccepted_xai_billing_reason(monkeypat
     child = _BillingChild(
         accepted_route=None,
         model="grok-4.6",
-        profile="standard",
+        profile=None,
         result=_failed_result(
             reason="billing",
             billing_block={"provider": "xai-oauth"},
@@ -218,3 +218,32 @@ def test_public_sync_keeps_owned_failure_reason(
     assert (entry["model"], entry["provider"]) == accepted_route
     assert entry["status"] == "failed"
     assert entry["failure_reason"] == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("model", "profile", "owns_xai"),
+    [
+        pytest.param("grok-4.6", "premium", True, id="selected-xai"),
+        pytest.param("selected-model", "fast", False, id="selected-non-xai"),
+    ],
+)
+def test_public_sync_billing_uses_explicit_selected_route(model, profile, owns_xai):
+    child = _BillingChild(
+        accepted_route=None,
+        model=model,
+        profile=profile,
+        result=_failed_result(
+            reason="billing",
+            billing_block={"provider": "xai-oauth"},
+            billing_unverified=True,
+        ),
+    )
+
+    entry = _public_delegate(child, background=False)["results"][0]
+
+    # A structured child result still publishes accepted identity only.  The
+    # selected route is authoritative for billing ownership, not a substitute
+    # for an accepted response on this surface.
+    assert (entry["model"], entry["provider"]) == (None, None)
+    assert ("spending-limit" in entry["summary"]) is owns_xai
+    assert (entry.get("failure_reason") == "billing") is owns_xai

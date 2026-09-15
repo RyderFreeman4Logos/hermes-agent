@@ -407,37 +407,34 @@ def test_lean_harvest_cancel_keeps_slots_and_lean_recovery():
     assert "session_id='sess-137-harvest'" in out
 
 
-def test_lean_chunk_digests_keep_slots_when_worker_raises_baseexception():
-    """Worker BaseException / AuxiliaryExplicitCancellation still emit every slot."""
-    from agent.auxiliary_client import AuxiliaryExplicitCancellation
-
+def test_lean_chunk_digests_keep_slots_when_worker_raises_unrelated_baseexception():
+    """An unrelated worker BaseException remains isolated to its digest slot."""
     class WorkerFatal(BaseException):
         pass
 
-    for boom in (AuxiliaryExplicitCancellation(), WorkerFatal("worker-fatal")):
-        def fake_call_llm(*, messages, task, max_tokens, _boom=boom, **kwargs):
-            assert task == "compression"
-            if "MARKER-B" in messages[0]["content"]:
-                raise _boom
-            resp = MagicMock()
-            resp.choices = [MagicMock()]
-            resp.choices[0].message.content = _digest_body(messages)
-            return resp
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        assert task == "compression"
+        if "MARKER-B" in messages[0]["content"]:
+            raise WorkerFatal("worker-fatal")
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = _digest_body(messages)
+        return resp
 
-        compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
-        with (
-            patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", _THREE_CHUNK_CHARS),
-            patch("agent.auxiliary_client.call_llm", fake_call_llm),
-            patch(
-                "agent.auxiliary_client._get_auxiliary_task_config",
-                return_value={"max_concurrency": 2},
-            ),
-        ):
-            out = compressor._build_chunk_digests(_three_marker_turns())
+    compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
+    with (
+        patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", _THREE_CHUNK_CHARS),
+        patch("agent.auxiliary_client.call_llm", fake_call_llm),
+        patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"max_concurrency": 2},
+        ),
+    ):
+        out = compressor._build_chunk_digests(_three_marker_turns())
 
-        assert _segment_headers(out) == [("1", "3"), ("2", "3"), ("3", "3")]
-        assert "DIGEST-A" in out
-        assert "DIGEST-C" in out
-        assert "DIGEST-B" not in out
-        assert "[digest unavailable for segment 2/3" in out
-        assert "recover via session_search" in out
+    assert _segment_headers(out) == [("1", "3"), ("2", "3"), ("3", "3")]
+    assert "DIGEST-A" in out
+    assert "DIGEST-C" in out
+    assert "DIGEST-B" not in out
+    assert "[digest unavailable for segment 2/3" in out
+    assert "recover via session_search" in out

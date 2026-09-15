@@ -429,6 +429,28 @@ def aux_stream_deadline(deadline: Optional[float]):
         _aux_stream_deadline.value = previous
 
 
+def propagate_auxiliary_scope_to_thread(target: Callable) -> Callable:
+    """Carry the current auxiliary request lifecycle into a nested worker."""
+    protected = _aux_interrupt_protected()
+    cancel_check = _capture_aux_cancel_check()
+    progress_hook = getattr(_aux_progress, "hook", None)
+    dispatch_hook = getattr(_aux_dispatch, "hook", None)
+    provider_response_hook = getattr(_aux_provider_response, "hook", None)
+    host_deadline = _current_aux_stream_deadline()
+
+    def _runner(*args, **kwargs):
+        with (
+            aux_progress_hook(progress_hook),
+            _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
+            _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
+            aux_stream_deadline(host_deadline),
+            aux_interrupt_protection(active=protected, cancel_check=cancel_check),
+        ):
+            return target(*args, **kwargs)
+
+    return _runner
+
+
 def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any], kwargs: dict[str, Any]) -> Any:
     """Run one protected provider callback in an attempt-isolated daemon thread.
 
@@ -2417,12 +2439,20 @@ def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode
 
 
 def _record_route_info(
-    route_info: Optional[Dict[str, str]], provider: Optional[str], model: Optional[str]
+    route_info: Optional[Dict[str, Any]], provider: Optional[str], model: Optional[str], *,
+    base_url: Optional[str] = None, api_key: Optional[str] = None,
+    api_mode: Optional[str] = None, timeout: Optional[float] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
-        route_info["provider"] = provider or "auto"
-        route_info["model"] = model or "default"
+        route_info.clear()
+        route_info.update(provider=provider or "auto", model=model or "default")
+        for key, value in (
+            ("base_url", base_url), ("api_key", api_key),
+            ("api_mode", api_mode), ("timeout", timeout),
+        ):
+            if value not in (None, ""):
+                route_info[key] = value
 
 
 def _relay_auxiliary_metadata(
@@ -3731,6 +3761,7 @@ def _call_fallback_candidate_sync(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery: on an auth error refresh its
     credentials and retry once with a rebuilt client; if that also auth-fails, quarantine the
@@ -3748,6 +3779,11 @@ def _call_fallback_candidate_sync(
     )
 
     def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
+        _record_route_info(
+            route_info, dest.provider, dest.model, base_url=dest.base_url,
+            api_key=str(getattr(client, "api_key", "") or ""), api_mode=dest.api_mode,
+            timeout=request_kwargs.get("timeout"),
+        )
         return _validate_llm_response(
             _relay_sync_completion(
                 client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
@@ -3783,6 +3819,7 @@ async def _call_fallback_candidate_async(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire)."""
     destination, fb_kwargs, rebuild = _plan_fallback_candidate(
@@ -3793,6 +3830,11 @@ async def _call_fallback_candidate_async(
     )
 
     async def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
+        _record_route_info(
+            route_info, dest.provider, dest.model, base_url=dest.base_url,
+            api_key=str(getattr(client, "api_key", "") or ""), api_mode=dest.api_mode,
+            timeout=request_kwargs.get("timeout"),
+        )
         return _validate_llm_response(
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
             task,
@@ -6663,7 +6705,7 @@ def _prepare_aux_request(
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     timeout: Optional[float], extra_body: Optional[dict], reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]], api_mode: Optional[str],
-    route_info: Optional[Dict[str, str]], async_mode: bool,
+    route_info: Optional[Dict[str, Any]], async_mode: bool,
 ) -> _PreparedAuxRequest:
     """Shared head of call_llm/async_call_llm: resolve route + client, publish it, build request kwargs.
     Sync-only: compression fast lane, per-request ``extra_headers``, and ``base_info`` falling
@@ -6691,7 +6733,6 @@ def _prepare_aux_request(
             extra_body=effective_extra_body,
         )
     _set_relay_auxiliary_route(request_provider, final_model, resolved_api_mode)
-    _record_route_info(route_info, _fallback_provider_from_label(request_provider), final_model)
     if async_mode:
         base_info = str(getattr(client, "base_url", "") or "")
     else:
@@ -6700,6 +6741,13 @@ def _prepare_aux_request(
             logger.info("Auxiliary %s: using %s (%s)%s",
                          task, request_provider or "auto", final_model or "default",
                          f" at {base_info}" if base_info and "openrouter" not in base_info else "")
+    _record_route_info(
+        route_info, _fallback_provider_from_label(request_provider), final_model,
+        base_url=base_info or resolved_base_url,
+        api_key=str(getattr(client, "api_key", resolved_api_key) or ""),
+        api_mode=resolved_api_mode,
+        timeout=effective_timeout,
+    )
     # Client's actual base_url so endpoint-specific temperature overrides work on
     # auto-detected routes (api.moonshot.ai vs api.kimi.com/coding).
     kwargs = _build_call_kwargs(
@@ -7001,7 +7049,7 @@ def _aux_recovery_ladder(
     async_mode: bool, base_info: str, resolved_provider: str, resolved_model: Optional[str],
     resolved_base_url: Optional[str], resolved_api_key: Optional[str],
     resolved_api_mode: Optional[str], final_model: Optional[str], max_tokens: Optional[int],
-    main_runtime: Optional[Dict[str, Any]], route_info: Optional[Dict[str, str]],
+    main_runtime: Optional[Dict[str, Any]], route_info: Optional[Dict[str, Any]],
 ):
     """Ordered recovery rungs after the primary request failed (generator): parameter
     strips → Nous heal/refresh → credential refresh/pool rotation → provider fallback.
@@ -7088,7 +7136,7 @@ def call_llm(
     temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
     timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
     extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
-    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+    stream_options: dict = None, route_info: Optional[Dict[str, Any]] = None,
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
@@ -7150,7 +7198,7 @@ def _plan_aux_call(
     messages: list, temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     timeout: Optional[float], extra_body: Optional[dict], reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]], api_mode: Optional[str],
-    route_info: Optional[Dict[str, str]],
+    route_info: Optional[Dict[str, Any]],
 ) -> Tuple[_PreparedAuxRequest, Dict[str, Any], Dict[str, Any]]:
     """Shared head of both call impls: prepare the request and bundle the kwargs the recovery
     drivers pass to ``_retry_same_provider_*`` / ``_call_fallback_candidate_*``. One immutable
@@ -7168,12 +7216,14 @@ def _plan_aux_call(
         task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, effective_timeout=req.effective_timeout,
         effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
+        route_info=route_info,
     )
     retry_kwargs = dict(
         candidate_kwargs, resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
     )
+    retry_kwargs.pop("route_info", None)
     return req, retry_kwargs, candidate_kwargs
 
 
@@ -7204,7 +7254,7 @@ def _ladder_step_call(
 
 def _start_recovery_ladder(
     first_err: Exception, req: _PreparedAuxRequest, retry_kwargs: Dict[str, Any], *,
-    task: Optional[str], async_mode: bool, route_info: Optional[Dict[str, str]],
+    task: Optional[str], async_mode: bool, route_info: Optional[Dict[str, Any]],
 ):
     """Build the recovery-ladder generator for a failed primary request."""
     return _aux_recovery_ladder(
@@ -7222,7 +7272,7 @@ def _call_llm_impl(
     temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
     timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
     extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
-    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+    stream_options: dict = None, route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Centralized synchronous LLM call: resolve provider/model, auth, kwargs, fallbacks.
     task: aux task whose provider:model comes from config (ignored if provider set); api_mode
@@ -7387,7 +7437,7 @@ async def async_call_llm(
     api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
     temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
     timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
     semaphore = _acquire_async_aux_semaphore(task)
@@ -7410,7 +7460,7 @@ async def _async_call_llm_impl(
     api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
     temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
     timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Centralized asynchronous LLM call; see call_llm() for full documentation.
     No per-request header / api_mode override on the async entry point."""

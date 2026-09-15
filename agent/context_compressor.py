@@ -3143,7 +3143,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
         # Re-inject AFTER the size cap: markers live at the end, where truncation cuts.
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
-        return self._augment_summary_lean(summary, turns_to_summarize)
+        return self._augment_summary_lean(
+            summary, turns_to_summarize, harvest_digests=False,
+        )
 
     def _demote_stale_tail_tools(self, messages: List[Dict[str, Any]], tail_start: int) -> List[Dict[str, Any]]:
         """Lean mode: demote tail tool results older than the newest ``_LEAN_TAIL_KEEP_TOOL_ROUNDS`` rounds to
@@ -3182,6 +3184,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         text = _serialize_turns_for_digest(
             turns, getattr(self, "_lean_pristine_tools", None),
         )
+        text = _redact_compaction_text(text)
         if not text:
             return ""
         chunk_size = _LEAN_DIGEST_CHUNK_CHARS
@@ -3214,7 +3217,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             route: dict[str, Any] | None = None,
             route_info: dict[str, Any] | None = None,
         ) -> str:
-            from agent.auxiliary_client import call_llm
+            from agent.auxiliary_client import _aux_interrupt_cancel_requested, call_llm
 
             call_kwargs: dict[str, Any] = {
                 "messages": [{
@@ -3226,9 +3229,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             }
             if route:
                 call_kwargs.update(route)
-            elif route_info is not None:
+            if route_info is not None:
                 call_kwargs["route_info"] = route_info
             for attempt in range(2):
+                if _aux_interrupt_cancel_requested():
+                    raise AuxiliaryExplicitCancellation()
                 try:
                     resp = call_llm(**call_kwargs)
                     body = (
@@ -3240,7 +3245,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     body = strip_think_blocks(None, body).strip()
                     return f"### Segment {ci + 1}/{n_chunks}\n{body}"
                 except BaseException as exc:
-                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit, AuxiliaryExplicitCancellation)):
                         raise
                     if attempt == 0 and isinstance(exc, Exception) and not _is_summary_access_or_quota_error(exc):
                         logger.warning(
@@ -3252,25 +3257,28 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             return _unavailable(ci)
 
         from concurrent.futures import ThreadPoolExecutor
-        from agent.auxiliary_client import _get_task_max_concurrency
+        from agent.auxiliary_client import (
+            _get_task_max_concurrency,
+            propagate_auxiliary_scope_to_thread,
+        )
         from tools.thread_context import propagate_context_to_thread
 
         configured = _get_task_max_concurrency("compression")
         first_ci, first_segment = jobs[0]
-        selected_route: dict[str, Any] | None = None
+        selected_route = dict(getattr(self, "_last_summary_route", {}) or {}) or None
         route_info: dict[str, Any] = {}
         first_digest = _digest_one(
-            first_ci, first_segment, route_info=route_info,
+            first_ci, first_segment, route=selected_route, route_info=route_info,
         )
+        route_info = route_info or {}
         provider = str(route_info.get("provider") or "").strip()
         model = str(route_info.get("model") or "").strip()
         if provider and model and model not in {"default", "unknown"}:
-            selected_route = {"provider": provider, "model": model}
-            fallback_label = route_info.get("fallback_label")
-            if fallback_label:
-                selected_route["route_info"] = {
-                    "fallback_label": str(fallback_label),
-                }
+            selected_route = {
+                key: route_info[key]
+                for key in _PINNED_ROUTE_FIELDS
+                if route_info.get(key) not in (None, "")
+            }
 
         remaining = jobs[1:]
         if not remaining:
@@ -3286,10 +3294,13 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     for ci, segment in remaining
                 ]
             else:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
+                pool = ThreadPoolExecutor(max_workers=workers)
+                try:
                     futures = [
                         pool.submit(
-                            propagate_context_to_thread(_digest_one),
+                            propagate_context_to_thread(
+                                propagate_auxiliary_scope_to_thread(_digest_one)
+                            ),
                             ci,
                             segment,
                             route=selected_route,
@@ -3301,26 +3312,35 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                         try:
                             sibling_digests.append(fut.result())
                         except BaseException as exc:
-                            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                            if isinstance(exc, (KeyboardInterrupt, SystemExit, AuxiliaryExplicitCancellation)):
+                                for pending in futures:
+                                    pending.cancel()
                                 raise
                             sibling_digests.append(_unavailable(ci, exc))
+                except BaseException:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
+                else:
+                    pool.shutdown(wait=True)
             digests = [first_digest, *sibling_digests]
         return (
             "\n\n" + _LEAN_DIGESTS_HEADING + "\n"
             + "\n\n".join(digests)
         )
 
-    def _augment_summary_lean(self, summary: str, turns_to_summarize: List[Dict[str, Any]]) -> str:
+    def _augment_summary_lean(
+        self, summary: str, turns_to_summarize: List[Dict[str, Any]], *, harvest_digests: bool = True,
+    ) -> str:
         """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
         if _LEAN_ANCHOR_HEADING not in summary:
             summary += _redact_compaction_text(_build_anchor_index(turns_to_summarize))
-        if _LEAN_DIGESTS_HEADING not in summary:
+        if harvest_digests and _LEAN_DIGESTS_HEADING not in summary:
             try:
                 digest_text = self._build_chunk_digests(turns_to_summarize)
             except BaseException as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                if isinstance(exc, (KeyboardInterrupt, SystemExit, AuxiliaryExplicitCancellation)):
                     raise
                 logger.warning("lean chunk digest map failed: %s", exc)
                 digest_text = ""
@@ -3474,6 +3494,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 f"Context compression summary was truncated ({_TRUNCATED_SUMMARY_MARKER}): generation hit the output "
                 f"token cap and the summary is incomplete {where}"
             )
+        if route_known:
+            self._last_summary_route = {
+                field: _aux_route[field]
+                for field in _PINNED_ROUTE_FIELDS
+                if _aux_route.get(field) not in (None, "")
+            }
         return content
 
     def _generate_summary(
@@ -3521,7 +3547,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # See #32106.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
-            summary = self._augment_summary_lean(summary, turns_to_summarize)
+            try:
+                summary = self._augment_summary_lean(summary, turns_to_summarize)
+            finally:
+                self._last_summary_route = None
             self._validate_summary_user_provenance(summary, has_user_turn)
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()

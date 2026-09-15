@@ -115,16 +115,49 @@ class TestSubdirectoryHintTracker:
         assert len(result) < len(body)
         assert any("TRUNCATED" in r.message and "AGENTS.md" in r.message for r in caplog.records)
 
-    def test_area_file_under_ceiling_is_delivered_whole(self, tmp_path):
-        """An area AGENTS.md sized like ours (well under the ceiling) arrives intact — no marker."""
+    def test_area_file_over_live_8k_cap_is_truncated(self, tmp_path):
+        """Live Unit B per-file cap is 8_000 chars, not official 32_000."""
         sub = tmp_path / "gateway"
         sub.mkdir()
-        body = "# Gateway rules\n" + ("- rule\n" * 1500)   # ~12k chars: over the OLD 8k cap, under the new one
+        body = "# Gateway rules\n" + ("- rule\n" * 1500)  # ~12k: over live 8k, under official 32k
+        (sub / "AGENTS.md").write_text(body)
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call("read_file", {"path": str(sub / "run.py")})
+        assert result is not None
+        assert "truncated" in result.lower()
+        assert len(result) < len(body)
+
+    def test_area_file_under_live_8k_cap_is_delivered_whole(self, tmp_path):
+        sub = tmp_path / "gateway"
+        sub.mkdir()
+        body = "# Gateway rules\n" + ("- rule\n" * 200)  # ~1.4k, under live 8k
         (sub / "AGENTS.md").write_text(body)
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
         result = tracker.check_tool_call("read_file", {"path": str(sub / "run.py")})
         assert result is not None and "truncated" not in result.lower()
         assert result.endswith(body.strip())
+
+    def test_total_hint_cap_keeps_nearest_unicode_context(self, tmp_path):
+        directory = tmp_path
+        for name in ("parent", "middle", "deepest"):
+            directory = directory / name
+            directory.mkdir()
+            (directory / "AGENTS.md").write_text(
+                f"{name}-rules\n" + "λ" * 9_000,
+                encoding="utf-8",
+            )
+        target = directory / "file.py"
+        target.write_text("pass\n")
+
+        result = SubdirectoryHintTracker(str(tmp_path)).check_tool_call(
+            "read_file", {"path": str(target)}
+        )
+
+        assert result is not None
+        assert len(result) <= 16_000
+        assert result.index("deepest-rules") < result.index("middle-rules")
+        assert "truncated" in result[-100:].lower()
+        assert result.encode("utf-8").decode("utf-8") == result
 
     def test_empty_args(self, project):
         """Empty args should not crash."""

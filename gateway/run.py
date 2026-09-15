@@ -1211,6 +1211,7 @@ def _build_gateway_agent_history(
         render_user_content_with_timestamp as _render_msg_ts,
         strip_leading_message_timestamps as _strip_msg_ts,
     )
+    from agent.message_metadata import is_hidden_loop_timing as _is_hidden_loop_timing
 
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
@@ -1220,7 +1221,19 @@ def _build_gateway_agent_history(
     for msg in history or []:
         role = msg.get("role")
         # session_meta rows are transcript logging, not LLM input; the agent rebuilds its own system prompt.
-        if not role or role in {"session_meta", "system"}:
+        if not role or role == "session_meta":
+            continue
+
+        # The timing row was already admitted to the prior provider request as a
+        # user item. Keep its durable carrier so cached and DB resumes rebuild the
+        # same prefix; ordinary stored system rows remain excluded.
+        if role == "system":
+            if _is_hidden_loop_timing(msg):
+                timing_entry = {"role": role, "content": msg["content"]}
+                for key in ("display_kind", "display_metadata"):
+                    if key in msg:
+                        timing_entry[key] = msg[key]
+                agent_history.append(timing_entry)
             continue
 
         content = msg.get("content")

@@ -3236,6 +3236,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             }
             if route:
                 call_kwargs.update(route)
+                inherited_receipt = call_kwargs.get("route_info")
+                if route_info is None and isinstance(inherited_receipt, dict):
+                    call_kwargs["route_info"] = dict(inherited_receipt)
             if route_info is not None:
                 call_kwargs["route_info"] = route_info
             for attempt in range(2):

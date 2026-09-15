@@ -302,6 +302,129 @@ def test_public_finalization_poller_retry_keeps_c1_barrier_c2_order(
         process_registry._poll_observed.difference_update(event_ids)
 
 
+def test_foreign_barrier_cannot_fence_local_completion_suffix(tmp_path, monkeypatch):
+    """A foreign W is routed to its owner without fencing A's C1/C2 handoff."""
+    sid_a, sid_b = "ui-foreign-barrier-a", "ui-foreign-barrier-b"
+    session_id_a, session_id_b = "session-foreign-barrier-a", "session-foreign-barrier-b"
+    c1_id, w_id, c2_id = "foreign-barrier-c1", "foreign-barrier-w", "foreign-barrier-c2"
+    completion_ids = (c1_id, c2_id)
+    process_registry._completion_consumed.difference_update(completion_ids)
+    process_registry._poll_observed.difference_update(completion_ids)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id_a, source="tui", model="test/model")
+    db.create_session(session_id_b, source="tui", model="test/model")
+    agent_a = _agent(db, session_id_a)
+    agent_b = _agent(db, session_id_b)
+    session_a = _session(agent_a, session_id_a)
+    session_b = _session(agent_b, session_id_b)
+    first_call_started = threading.Event()
+    release_first_call = threading.Event()
+    second_call_started = threading.Event()
+    release_second_call = threading.Event()
+    foreign_seen_by_a = threading.Event()
+    calls_a = 0
+
+    def model_call_a(_kwargs):
+        nonlocal calls_a
+        calls_a += 1
+        if calls_a == 1:
+            first_call_started.set()
+            assert release_first_call.wait(4), "initial turn was not released"
+            return _tool_response()
+        if calls_a == 2:
+            second_call_started.set()
+            assert release_second_call.wait(4), "C1 insertion turn was not released"
+        return _response()
+
+    agent_a._interruptible_api_call = model_call_a
+    agent_b._interruptible_api_call = lambda _kwargs: _response()
+    stop_a = threading.Event()
+    stop_b = threading.Event()
+    poller_a = None
+    poller_b = None
+    try:
+        with _gateway_runtime(monkeypatch, tmp_path, session_a, sid_a) as events:
+            server._sessions[sid_b] = session_b
+            real_handle_event = server._notif_handle_event
+
+            def observe_foreign_route(sid, session, event, *args, **kwargs):
+                result = real_handle_event(sid, session, event, *args, **kwargs)
+                if sid == sid_a and event.get("session_id") == w_id:
+                    foreign_seen_by_a.set()
+                return result
+
+            monkeypatch.setattr(server, "_notif_handle_event", observe_foreign_route)
+            poller_a = threading.Thread(
+                target=server._notification_poller_loop,
+                args=(stop_a, sid_a, session_a),
+                name="foreign-barrier-poller-a",
+            )
+            poller_a.start()
+            response = server.handle_request({
+                "id": "initial-user-a",
+                "method": "prompt.submit",
+                "params": {"session_id": sid_a, "text": "initial user turn a"},
+            })
+            assert response["result"]["status"] == "streaming"
+            assert first_call_started.wait(4), "A did not reach the provider boundary"
+            events.put(_completion(c1_id, session_id_a))
+            events.put(_barrier("watch_match", w_id, session_id_b, sid_b))
+            events.put(_completion(c2_id, session_id_a))
+            assert foreign_seen_by_a.wait(4), "A did not route B's foreign barrier"
+
+            poller_b = threading.Thread(
+                target=server._notification_poller_loop,
+                args=(stop_b, sid_b, session_b),
+                name="foreign-barrier-poller-b",
+            )
+            poller_b.start()
+            release_first_call.set()
+            assert second_call_started.wait(4), "C1 did not reach its core insertion boundary"
+            deadline = time.monotonic() + 4
+            while not process_registry.is_completion_consumed(c1_id) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert process_registry.is_completion_consumed(c1_id)
+            release_second_call.set()
+
+            deadline = time.monotonic() + 6
+            rows_a: list[str] = []
+            rows_b: list[str] = []
+            while time.monotonic() < deadline:
+                rows_a = _user_rows(db, session_id_a)
+                rows_b = _user_rows(db, session_id_b)
+                if (
+                    any(c1_id in row for row in rows_a)
+                    and any(c2_id in row for row in rows_a)
+                    and any(w_id in row for row in rows_b)
+                ):
+                    break
+                time.sleep(0.02)
+
+            assert sum(c1_id in row for row in rows_a) == 1
+            assert sum(c2_id in row for row in rows_a) == 1
+            assert all(w_id not in row for row in rows_a)
+            assert sum(w_id in row for row in rows_b) == 1
+            assert all(c1_id not in row and c2_id not in row for row in rows_b)
+            assert all(process_registry.is_completion_consumed(item) for item in completion_ids)
+            assert session_a.get("_completion_transfer_barrier") is None
+            assert session_a.get("_completion_active_receipt") is None
+            assert session_a.get("_completion_pending") in (None, [])
+            assert session_a.get("_completion_transfer") in (None, [])
+            assert poller_a.is_alive() and poller_b.is_alive()
+    finally:
+        stop_a.set()
+        stop_b.set()
+        release_first_call.set()
+        release_second_call.set()
+        for poller in (poller_a, poller_b):
+            if poller is not None:
+                poller.join(5)
+                assert not poller.is_alive()
+        db.close()
+        process_registry._completion_consumed.difference_update(completion_ids)
+        process_registry._poll_observed.difference_update(completion_ids)
+
+
 def test_public_host_failure_falls_back_to_local_receipt_ingestion(tmp_path, monkeypatch):
     """A prior isolated host cannot capture a receipt created by later inline fallback."""
     sid, session_id, event_id = "ui-host-fallback", "session-host-fallback", "c-host-fallback"

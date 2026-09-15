@@ -210,7 +210,8 @@ def _filter_routine_delegated_child_completions(events: list) -> list:
             silent.append(evt)
         else:
             visible.append(evt)
-    _mark_completion_events_consumed(silent)
+    if silent:
+        _mark_completion_events_consumed(silent)
     return visible
 
 

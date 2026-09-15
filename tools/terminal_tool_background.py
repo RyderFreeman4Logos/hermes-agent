@@ -88,8 +88,9 @@ def _stamp_gateway_routing(proc_session, get_session_env) -> None:
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
            session_key, effective_pty, notify_on_complete=False):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
-                  owner_task_id=task_id or effective_task_id, session_key=session_key,
-                  notify_on_complete=notify_on_complete)
+                  owner_task_id=task_id or effective_task_id, session_key=session_key)
+    if notify_on_complete:
+        common["notify_on_complete"] = True
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)

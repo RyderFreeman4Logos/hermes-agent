@@ -2,11 +2,24 @@
 import json
 import shlex
 import sys
+import threading
+import time
+
+import pytest
 
 from agent.turn_context import _bind_turn_identity
 from run_agent import AIAgent
 from tools.process_registry import ProcessRegistry
 from tools.terminal_tool import terminal_tool
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 def _agent():
@@ -57,7 +70,67 @@ def test_close_reclaims_processes_from_previous_turns(tmp_path, monkeypatch):
         first = _spawn(agent, "turn-one-owner", tmp_path)
         second = _spawn(agent, "turn-two-owner", tmp_path)
         agent.close()
-        assert all(registry.poll(s)["status"] != "running" for s in (first, second))
+        assert _wait_until(
+            lambda: all(registry.poll(s)["status"] != "running" for s in (first, second))
+        )
     finally:
+        registry.kill_all()
+        agent.close()
+
+
+@pytest.mark.linux_only
+def test_close_preserves_tail_when_reader_settles_after_return(tmp_path, monkeypatch):
+    import tools.process_registry as processes
+    registry = ProcessRegistry()
+    monkeypatch.setattr(processes, "process_registry", registry)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(processes, "save_completed_result", lambda _session: None)
+    agent = _agent()
+    _bind_turn_identity(agent, "delayed-reader-owner", None, None, None, None)
+    entered_finish = threading.Event()
+    release_finish = threading.Event()
+    original_finish = registry._finish_reader
+
+    def held_finish(*args, **kwargs):
+        entered_finish.set()
+        assert release_finish.wait(5), "test did not release terminal reader"
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_finish_reader", held_finish)
+    code = (
+        "import signal, time\n"
+        "def stop(_signum, _frame):\n"
+        "    print('FINAL-DELAYED-READER', flush=True)\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "print('READY-DELAYED-READER', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    result = json.loads(terminal_tool(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+        background=True, task_id="delayed-reader-owner",
+        workdir=str(tmp_path), notify_on_complete=True,
+    ))
+    session = registry.get(result["session_id"])
+    assert session is not None
+    assert _wait_until(lambda: "READY-DELAYED-READER" in session.output_buffer)
+    assert session.process.poll() is None
+    monkeypatch.setattr(
+        session._reader_settlement_ready,
+        "wait",
+        lambda timeout=None: False,
+    )
+    try:
+        agent.close()
+
+        assert entered_finish.wait(2), "reader did not reach terminal settlement"
+        assert session.process.wait(timeout=2) is not None
+        assert registry.poll(session.id)["status"] == "running"
+
+        release_finish.set()
+        assert _wait_until(lambda: registry.poll(session.id)["status"] != "running")
+        assert "FINAL-DELAYED-READER" in session.output_buffer
+    finally:
+        release_finish.set()
         registry.kill_all()
         agent.close()

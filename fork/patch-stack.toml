@@ -1,0 +1,326 @@
+# Generated final carried-patch manifest for delivery PR #188.
+# Source heads are immutable ownership anchors. This file intentionally omits its own commit SHA.
+schema_version = 1
+name = "docker-freeman-hermes"
+kind = "final-integration-manifest"
+fork = "RyderFreeman4Logos/hermes-agent"
+upstream = "NousResearch/hermes-agent"
+official_base = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+generated_pr = 188
+absorbs_metadata_pr = 265
+source_prs = 26
+protected_unread_pr = 213
+excluded_prs = [278, 279, 288, 305, 306, 307, 311, 321, 322, 323]
+exclusion_policy = "official-baseline and fixture-only changes are outside the installed customization stack"
+
+[[patch]]
+order = 1
+pr = 182
+feature = "long-task launch, resume and completion lifecycle"
+branch = "topic/upgrade-pr13-01-terminal-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "702d4795e295a37a5e44adc531dc3e8bc68268f9"
+source_commits = 4
+source_diff_sha256 = "d906355a42ee5991c29968f27cbacbd1ed96a1d484b1550853cc5ab0a078fe20"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 2
+pr = 183
+feature = "cross-process SessionDB write coordination"
+branch = "topic/upgrade-pr13-02-sessiondb-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "f2d2318bd41a50200f0e4af3bbb5ec7505ee5090"
+source_commits = 2
+source_diff_sha256 = "e4882db5b77475d7a3c6dd8a8f50de7c097c0f8313c70bc67dc178f973f0f37b"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 3
+pr = 184
+feature = "compression watermark publication guard"
+branch = "topic/upgrade-pr13-03-watermark-security-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "db01ad24524cce37a2106bce9d276873650de4d1"
+source_commits = 1
+source_diff_sha256 = "f2e608a259ed07a9ecc4d4899f38695cb0fd8c2fc529503908255a2473b5ef58"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 4
+pr = 41
+feature = "request override rebuild and fallback provenance"
+branch = "fix/request-overrides-runtime-provenance"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "087df1460d9cab16de49e40505cde8b508cd10b3"
+source_commits = 1
+source_diff_sha256 = "137305218f64257e7880562335861c812dd14dfdfe413db1d6dad9a96cbcb0d4"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 5
+pr = 187
+feature = "fallback budgets, TTFB and truncation handling"
+branch = "topic/upgrade-pr13-06-fallback-digest-status-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "dfa67d5c5e501172b2174e859672abaa3348bb63"
+source_commits = 2
+source_diff_sha256 = "7507202ba06a4421f69d43be525136594c9c5bedcd1338b8c5ed66d21e8ef81d"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 6
+pr = 42
+feature = "managed heartbeat and cache-warm lifecycle"
+branch = "fix/runtime-heartbeat-managed-targets"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "c3ed8f8e4d5e8fc668bf62051b1ee354f58f5bce"
+source_commits = 2
+source_diff_sha256 = "16ff6abcb14cb55bb1c84177d02d96a8a297ac5ca8ca6f070d7a625cee306c28"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 7
+pr = 180
+feature = "cache lifecycle, telemetry and TUI status surfaces"
+branch = "topic/upgrade-pr13-07-tui-cache-completion-20260821"
+parent = "c3ed8f8e4d5e8fc668bf62051b1ee354f58f5bce"
+head = "cb883e02e1390bd417a1879524d4145359e6a7f1"
+source_commits = 5
+source_diff_sha256 = "43e1062022baeece64472baa75cfd4258129f628a9f2bed7e6759c926977cd75"
+depends_on = [42]
+integration = "included-once"
+
+[[patch]]
+order = 8
+pr = 186
+feature = "large-turn budgeting and stream payload bounds"
+branch = "topic/upgrade-pr13-05-compression-active-turn-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "410ece9ab7d5f50c7cb9ef4e56d75afa78949f64"
+source_commits = 7
+source_diff_sha256 = "92bc2719b43ae310d676184662748547f3e5a386c69ce97a5f58029c7ee2f6c9"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 9
+pr = 62
+feature = "completion batching, ACK, restart and handoff ownership"
+branch = "fix/issue61-completion-backlog-batching"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "fca2529cd4b3032dce6f8a8ee03de85127c3cba4"
+source_commits = 27
+source_diff_sha256 = "055b8c9a206faed5c65e720b536dc78dea839cb7551e54d50e4626b74028f74e"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 10
+pr = 149
+feature = "delegated completion notification and child-final isolation"
+branch = "topic/141-child-tail-silence-20260819"
+parent = "fca2529cd4b3032dce6f8a8ee03de85127c3cba4"
+head = "fee347830d1766e82ae1ed3135624099a569564c"
+source_commits = 4
+source_diff_sha256 = "229c77520c914af7accd3ce36ff973b000e2f051f8cd90ea3f3f782090c4e519"
+depends_on = [62]
+integration = "included-once"
+
+[[patch]]
+order = 11
+pr = 181
+feature = "opt-in custom-provider session identity"
+branch = "topic/upgrade-pr13-08-session-identity-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "112199c78a116840aa19d2fc54c1a9a79effffd2"
+source_commits = 2
+source_diff_sha256 = "78bef8e84f777255be2fdd42a77659e039b797cc0fbea633106c3fed9892107d"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 12
+pr = 148
+feature = "TUI commentary/final exact dedupe"
+branch = "topic/142-tui-commentary-final-dedupe-20260820"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "2575502c30e9174701dfc58c68512868247d41ed"
+source_commits = 1
+source_diff_sha256 = "fed0022c0fa5dc5a992780f65a968c9e343631ede1813e3f9808203e14236674"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 13
+pr = 165
+feature = "bounded lean-digest concurrency and attempt-local routes"
+branch = "topic/163-aux-concurrency-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "30463ae65e512cfa3b31539016e365a981a6d883"
+source_commits = 4
+source_diff_sha256 = "c4fe1c4aaf5f93e0412a59e089d6204c91f5864793a916cc9a22b7ac300b1d38"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 14
+pr = 160
+feature = "auxiliary fallback destination and physical route receipts"
+branch = "topic/159-aux-codex-dest-live-20260820"
+parent = "30463ae65e512cfa3b31539016e365a981a6d883"
+head = "13f48a0594b4c6d1bb265588c05f0897c5352466"
+source_commits = 8
+source_diff_sha256 = "2f242f807dd562141cc27b377f155682f8b00d17f630114096069a7be4181f5b"
+depends_on = [165]
+integration = "included-once"
+
+[[patch]]
+order = 15
+pr = 173
+feature = "notified process wait semantics"
+branch = "topic/172-wait-tool-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "9c4e13e431804fd06e2c305e43ed4c130739478b"
+source_commits = 1
+source_diff_sha256 = "7909a3a3eb2316a0b2a49329b7666bb165e62ea71437f7271996d4c44a6efa54"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 16
+pr = 178
+feature = "stable-prefix routing across compression and profiles"
+branch = "topic/176-short-gap-cache-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "b9fc1084ac8131c2034ae66a0f131d279628ee85"
+source_commits = 5
+source_diff_sha256 = "7784af34401b54c458d9640ab50cac5acd2800a03ff0d367174d22a47a8e08af"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 17
+pr = 227
+feature = "HMAC-only physical-attempt and cache evidence"
+branch = "topic/cache-pair-dump-224-20260826"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "67ecbbc941c3cd402d6398a3e3d40edd413c82b7"
+source_commits = 7
+source_diff_sha256 = "d4751340b63784b43992c452820d7cb97983ad60903181d8b4a175000d595409"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 18
+pr = 185
+feature = "model-pool profile and task route provenance"
+branch = "topic/upgrade-pr13-04-lineage-cache-delegate-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "583e38e39b750a89b9f8373cd2ad1dbf335b31a5"
+source_commits = 5
+source_diff_sha256 = "835d995465b32c9de6bc85dc45329342d5fc8e570cf6f064f1cab0d6a0e043a0"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 19
+pr = 161
+feature = "standard pool policy and accepted fallback identity"
+branch = "topic/154-std-fallback-live-20260820"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "21974dcf1cf583ed6509b76fffe9d7e48118655a"
+source_commits = 16
+source_diff_sha256 = "a53a4904601491a528b9ec9cac85efa066ef3950a565150dccc0a358c5d16567"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 20
+pr = 162
+feature = "authoritative external memory routing and persistence"
+branch = "topic/143-auth-mem-live-20260820"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "7409394149bf049fd0e495a2e454cc200607b829"
+source_commits = 7
+source_diff_sha256 = "80ddeee8937b3e8385f9b57287578ddaaae45d0436324648e341e2b29cd7d2bd"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 21
+pr = 179
+feature = "deferred model/provider/reasoning switches"
+branch = "topic/upgrade-after-compression-model-and-reasoning-20260821"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "ded983a6bbe31ee46cea147be0278eb41734f586"
+source_commits = 6
+source_diff_sha256 = "21b1a8e516c1d97a457767ad98f155a1c384000a9d328a76f82bcecc06ce7d1a"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 22
+pr = 210
+feature = "durable loop timing without cache-prefix breakage"
+branch = "topic/iss206-persist-timing-af8870f7-20260826"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "11774daf01ec62344cce479154d27055815afba5"
+source_commits = 15
+source_diff_sha256 = "79fe452672f2db00c2e791fc3387b59e5c3caa0535c004c71e23d6a7f7bf9d3c"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 23
+pr = 199
+feature = "xAI bad-credentials-only OAuth refresh"
+branch = "topic/ledger-xai403-refresh-20260823"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "8f9f98fc2386daf14b91e1a7bb977bd064e90899"
+source_commits = 1
+source_diff_sha256 = "f627abf04c9a8dba77db371287f60dd4880b71bdae202f594c752378ef965d21"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 24
+pr = 212
+feature = "xAI billing failure attribution and fallback continuation"
+branch = "topic/iss209-xai-billing-unverified-085c062d-20260826"
+parent = "21974dcf1cf583ed6509b76fffe9d7e48118655a"
+head = "7f27b085486f93a3fc76a3fef0d52eaa4fb2a096"
+source_commits = 4
+source_diff_sha256 = "dd5e81350d1276dc6f38c6e102290769b9e1ce936e27e23df21769387aa0e38e"
+depends_on = [161]
+integration = "included-once"
+
+[[patch]]
+order = 25
+pr = 251
+feature = "parallel test worker cap"
+branch = "topic/test-runner-pid-cap-20260831"
+parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
+head = "1ddb454f88f280daeabb4edd6f0d17b9dd845fc3"
+source_commits = 1
+source_diff_sha256 = "3ec71c885b4367c10d93cbcfff495dabfa8c3fdad516b6b71dd4228942f580fe"
+depends_on = []
+integration = "included-once"
+
+[[patch]]
+order = 26
+pr = 253
+feature = "Linux test-runner process-tree containment"
+branch = "topic/test-runner-tree-containment-20260901"
+parent = "1ddb454f88f280daeabb4edd6f0d17b9dd845fc3"
+head = "aa7415729717d4297f2d007a397b63e7d2428ed6"
+source_commits = 11
+source_diff_sha256 = "75ac9ed9931fdc47ad18811e1d066bf0d20148605ba009185c932e32443090e1"
+depends_on = [251]
+integration = "included-once"

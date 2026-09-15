@@ -375,7 +375,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         usage = params.get("tokenUsage")
         if not isinstance(usage, dict):
             return
-        _observe_codex_app_server_usage(agent, usage.get("last"))
+        last = usage.get("last")
+        if isinstance(last, dict) and last:
+            _observe_codex_app_server_usage(agent, last)
 
     handlers: dict[str, Callable[[dict], None]] = {
         "item/agentMessage/delta": lambda p: _fire_delta(p, "_fire_stream_delta"),

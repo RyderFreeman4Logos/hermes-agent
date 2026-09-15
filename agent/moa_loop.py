@@ -1388,3 +1388,19 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
         resolved_preset = "default"
     # ``agent`` lets the fan-out wait be aborted on a user interrupt.
     return MoAClient(resolved_preset, reference_callback=_moa_reference_relay, agent=agent)
+
+
+def install_shared_moa_facade(agent, preset_name: Any = None) -> MoAClient:
+    """Publish one shared MoA client together with its transport identity.
+
+    The identity is written before the client, so a concurrent cache-warm
+    observer can see the old HTTP client as non-warmable but can never see the
+    new MoA facade stamped as an HTTP transport.
+    """
+    client = build_moa_facade(agent, preset_name)
+    agent._openai_transport_kind = "moa"
+    agent._openai_transport_generation = int(
+        getattr(agent, "_openai_transport_generation", 0)
+    ) + 1
+    agent.client = client
+    return client

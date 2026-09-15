@@ -395,6 +395,49 @@ def test_app_server_usage_is_observed_at_notification_ingress():
     assert agent._first_turn_usage["cache_read_tokens"] == 90
 
 
+def test_partial_app_server_usage_does_not_latch_unavailable_before_real_usage():
+    events = []
+    agent = _make_agent()
+    agent._tui_cache_callback = lambda *args: events.append(args)
+    bridge = make_codex_app_server_event_bridge(agent)
+
+    bridge({
+        "method": "thread/tokenUsage/updated",
+        "params": {
+            "tokenUsage": {
+                "total": {
+                    "inputTokens": 100,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 0,
+                    "totalTokens": 100,
+                },
+                "modelContextWindow": 200_000,
+            }
+        },
+    })
+
+    assert events == []
+    assert not hasattr(agent, "_first_turn_usage")
+
+    bridge({
+        "method": "thread/tokenUsage/updated",
+        "params": {
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 100,
+                    "cachedInputTokens": 90,
+                    "outputTokens": 10,
+                    "totalTokens": 110,
+                }
+            }
+        },
+    })
+
+    assert len(events) == 1
+    assert events[0][0] == "hit"
+    assert agent._first_turn_usage["cache_read_tokens"] == 90
+
+
 def test_response_checker_observes_usage_before_length_recovery(monkeypatch):
     import agent.turn_recovery as recovery
     import agent.turn_response_check as checker

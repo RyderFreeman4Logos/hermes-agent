@@ -753,7 +753,7 @@ def _init_anthropic_client(agent, api_key, base_url, _provider_timeout):
 
 def _init_moa_client(agent, api_key):
     """provider == "moa": virtual Mixture-of-Agents facade, no real HTTP client."""
-    from agent.moa_loop import build_moa_facade
+    from agent.moa_loop import install_shared_moa_facade
     agent.api_mode = "chat_completions"
 
     # build_moa_facade relays "moa.*" events through tool_progress_callback so every surface
@@ -765,7 +765,7 @@ def _init_moa_client(agent, api_key):
     # facade emits "moa.reference", "moa.progress", "moa.phase", and "moa.aggregating" events, forwarded
     # through the same callback the tool lifecycle uses. Best-effort and cache-safe — display-only events,
     # they never touch the message history. See #53802.
-    agent.client = build_moa_facade(agent, agent.model)
+    install_shared_moa_facade(agent, agent.model)
     agent._client_kwargs = {}
     agent.api_key = api_key or "moa-virtual-provider"
     agent.base_url = "moa://local"

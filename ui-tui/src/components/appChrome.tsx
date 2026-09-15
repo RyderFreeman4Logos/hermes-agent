@@ -1,6 +1,6 @@
 import { Box, type ScrollBoxHandle, stringWidth, Text } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
-import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 import unicodeSpinners from 'unicode-animations'
 
 import { $delegationState } from '../app/delegationStore.js'
@@ -332,7 +332,17 @@ export function statusBarSegments(cols: number): StatusBarSegments {
   }
 }
 
-function SpawnHud({ cols, standalone = false, t }: { cols?: number; standalone?: boolean; t: Theme }) {
+function SpawnHud({
+  cols,
+  leadingRule = false,
+  standalone = false,
+  t
+}: {
+  cols?: number
+  leadingRule?: boolean
+  standalone?: boolean
+  t: Theme
+}) {
   // Tight HUD that only appears when the session is actually fanning out.
   // Colour escalates to warn/error as depth or concurrency approaches the cap.
   const delegation = useStore($delegationState)
@@ -387,7 +397,7 @@ function SpawnHud({ cols, standalone = false, t }: { cols?: number; standalone?:
 
   const content = (
     <Text color={color}>
-      {standalone ? (atCap ? '⚠ ' : '') : atCap ? ' │ ⚠ ' : ' │ '}
+      {standalone ? `${leadingRule ? '─ ' : ''}${atCap ? '⚠ ' : ''}` : atCap ? ' │ ⚠ ' : ' │ '}
       {pieces.join(' ')}
     </Text>
   )
@@ -469,7 +479,7 @@ const modelLabel = (model: string, effort?: string, fast?: boolean) =>
 interface StatusRenderItem {
   id: string
   node: ReactNode
-  ownRow?: boolean
+  ownRow?: (leadingRule: boolean) => ReactNode
   width: number
 }
 
@@ -520,29 +530,33 @@ function StatusRows({ cols, items, t }: { cols: number; items: readonly StatusRe
 
   return (
     <Box flexDirection="column" flexShrink={0} width={width}>
-      {rows.map((row, rowIndex) => (
-        <Box flexDirection="row" flexShrink={0} height={1} key={row.map(item => item.id).join(':')} overflow="hidden">
-          {rowIndex === 0 ? <Text color={t.color.border}>─ </Text> : null}
-          {row.map((item, itemIndex) => (
-            <Box
-              flexDirection="row"
-              flexShrink={item.width > width ? 1 : 0}
-              key={item.id}
-              maxWidth={width}
-              overflow="hidden"
-            >
-              {itemIndex ? <Text color={t.color.muted}> │ </Text> : null}
-              {item.width > width ? (
-                <Box overflow="hidden" width={width}>
-                  {item.node}
-                </Box>
-              ) : (
-                item.node
-              )}
-            </Box>
-          ))}
-        </Box>
-      ))}
+      {rows.map((row, rowIndex) =>
+        row.length === 1 && row[0]?.ownRow ? (
+          <Fragment key={row[0].id}>{row[0].ownRow(rowIndex === 0)}</Fragment>
+        ) : (
+          <Box flexDirection="row" flexShrink={0} height={1} key={row.map(item => item.id).join(':')} overflow="hidden">
+            {rowIndex === 0 ? <Text color={t.color.border}>─ </Text> : null}
+            {row.map((item, itemIndex) => (
+              <Box
+                flexDirection="row"
+                flexShrink={item.width > width ? 1 : 0}
+                key={item.id}
+                maxWidth={width}
+                overflow="hidden"
+              >
+                {itemIndex ? <Text color={t.color.muted}> │ </Text> : null}
+                {item.width > width ? (
+                  <Box overflow="hidden" width={width}>
+                    {item.node}
+                  </Box>
+                ) : (
+                  item.node
+                )}
+              </Box>
+            ))}
+          </Box>
+        )
+      )}
     </Box>
   )
 }
@@ -911,15 +925,14 @@ export function StatusRule({
               narrowRightLabel
             )
           : null,
-      spawn_hud:
-        legacy('spawn_hud')
-          ? {
-              id: 'spawn_hud',
-              node: <SpawnHud cols={Math.max(1, cols - 2)} standalone t={t} />,
-              ownRow: true,
-              width: cols
-            }
-          : null
+      spawn_hud: legacy('spawn_hud')
+        ? {
+            id: 'spawn_hud',
+            node: null,
+            ownRow: leadingRule => <SpawnHud cols={Math.max(1, cols - 2)} leadingRule={leadingRule} standalone t={t} />,
+            width: cols
+          }
+        : null
     }
 
     const defaultOrder = [

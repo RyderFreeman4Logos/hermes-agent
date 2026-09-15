@@ -6,6 +6,8 @@ provider/base_url/api_key empty in AIAgent, causing HTTP 404.
 """
 
 import os
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -140,3 +142,101 @@ def test_apply_model_switch_does_not_leak_process_env():
     # Sibling session is completely untouched.
     assert sess_a["model_override"] is None
     assert sess_a["agent"].model == "minimax/m3"
+
+
+def test_public_model_switch_to_moa_disables_bodyless_warm_dispatch(monkeypatch, tmp_path):
+    from hermes_cli import heartbeat
+    from run_agent import AIAgent
+    from tui_gateway import server
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        """
+moa:
+  default_preset: review
+  presets:
+    review:
+      reference_models:
+        - provider: openai-codex
+          model: gpt-5.5
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    agent = AIAgent(
+        api_key="synthetic-key",
+        base_url="http://127.0.0.1:9/v1",
+        model="local-before-switch",
+        provider="custom:synthetic",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        enabled_toolsets=["file"],
+        max_iterations=1,
+    )
+    generation = agent._openai_transport_generation
+    physical_calls = []
+    agent._interruptible_api_call = lambda *args, **kwargs: physical_calls.append((args, kwargs))
+    result = SimpleNamespace(
+        success=True,
+        error_message="",
+        warning_message="",
+        new_model="review",
+        target_provider="moa",
+        base_url="moa://local",
+        api_key="moa-virtual-provider",
+        api_mode="chat_completions",
+        model_info=None,
+        runtime_capabilities=None,
+    )
+    session = {
+        "agent": agent,
+        "session_key": "synthetic-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "image_counter": 0,
+        "cols": 80,
+        "slash_worker": None,
+        "show_reasoning": False,
+        "tool_progress_mode": "all",
+    }
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kwargs: result)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *_args: None)
+    monkeypatch.setattr(server, "_persist_live_session_system_prompt", lambda *_args: None)
+    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_emit_session_info", lambda *_args: None)
+
+    response = server._apply_model_switch(
+        "sid", session, "review --provider moa", confirm_expensive_model=True
+    )
+
+    assert response["value"] == "review"
+    assert agent._openai_transport_kind == "moa"
+    assert agent._openai_transport_generation == generation + 1
+
+    class _Due:
+        def due_prompt(self):
+            raise AssertionError("MoA must not consume or dispatch a bodyless warm request")
+
+        def clear(self):
+            pass
+
+    route = "moa:review"
+    identity = server._tui_cache_warm_identity(agent)
+    session.update(_cache_warm_route=route, _cache_warm_identity=identity)
+    monkeypatch.setattr(heartbeat, "HeartbeatManager", lambda *_args, **_kwargs: _Due())
+
+    server._tui_cache_warm_due("sid", session, agent, route, identity)
+
+    assert physical_calls == []
+    assert session["running"] is False

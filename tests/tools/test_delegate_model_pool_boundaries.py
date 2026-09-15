@@ -6,14 +6,19 @@ import io
 import json
 import logging
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.redact import RedactingFormatter
+from tools import async_delegation as ad
 from tools.delegate_tool import delegate_task
 from tools.delegate_tool_child_run import _lease_child_credential
 from tools.delegate_tool_config import _resolve_child_credential_pool
-from tools.process_registry_notifications import _format_batch_delegation
+from tools.process_registry import process_registry
+from tools.process_registry_notifications import _format_batch_delegation, format_process_notification
 
 
 def _parent():
@@ -305,3 +310,109 @@ def test_public_independent_units_keep_routes_in_manifest_dispatch_and_completio
     assert "Model: standard-model" in rendered
     assert rendered.index("Model: fast-model") < rendered.index("fast done")
     assert rendered.index("Model: standard-model") < rendered.index("standard done")
+
+
+class _SelectedRouteFailureChild:
+    def __init__(self, *, model: str, provider: str, outcome: str):
+        self.model = model
+        self.provider = provider
+        self.outcome = outcome
+        self.session_id = f"fixture-{outcome}-child"
+        self._delegate_role = "leaf"
+        self._delegate_depth = 1
+        self._subagent_id = None
+        self._interrupt_requested = False
+        self.tool_progress_callback = None
+        self._release = threading.Event()
+
+    def run_conversation(self, **_kwargs):
+        if self.outcome == "exception":
+            raise RuntimeError("synthetic selected-route failure")
+        self._release.wait(timeout=5.0)
+        return {"completed": False, "final_response": "", "api_calls": 1}
+
+    def get_activity_summary(self):
+        return {"api_call_count": 1, "current_tool": None, "max_iterations": 4}
+
+    def interrupt(self):
+        self._release.set()
+
+    def close(self):
+        self._release.set()
+
+
+@pytest.mark.parametrize(("outcome", "expected_status"), [("exception", "error"), ("timeout", "timeout")])
+def test_public_background_route_errors_keep_selected_provenance(
+    tmp_path, monkeypatch, outcome, expected_status,
+):
+    """Public result, durable completion, and formatter keep the route selected before the run."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg = {
+        "max_iterations": 4,
+        "model_pool": {
+            "standard": _route("standard-model", port=9),
+            "fast": _route("fast-model", port=8),
+        },
+    }
+    parent = _parent()
+
+    def _build(**kwargs):
+        child = _SelectedRouteFailureChild(
+            model=kwargs["model"], provider=kwargs["override_provider"], outcome=outcome,
+        )
+        parent._active_children.append(child)
+        return child
+
+    ad._reset_for_tests()
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    try:
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools", side_effect=_build,
+        ), patch(
+            "tools.delegate_tool_dispatch._resolve_async_wake_sid", return_value="",
+        ), patch(
+            "tools.delegate_tool._get_child_timeout", return_value=0.05 if outcome == "timeout" else None,
+        ):
+            handle = json.loads(delegate_task(
+                goal="exercise selected route failure",
+                model_profile="fast",
+                background=True,
+                parent_agent=parent,
+            ))
+
+            assert handle["status"] == "dispatched"
+            deadline = time.monotonic() + 5.0
+            event = None
+            while time.monotonic() < deadline:
+                if process_registry.completion_queue.empty():
+                    time.sleep(0.02)
+                    continue
+                candidate = process_registry.completion_queue.get_nowait()
+                if candidate.get("delegation_id") == handle["delegation_id"]:
+                    event = candidate
+                    break
+            assert event is not None
+            (result,) = event["results"]
+            assert (result["status"], result["model"], result["provider"]) == (
+                expected_status, "fast-model", "custom",
+            )
+
+            durable = ad.get_durable_delegation(event["delegation_id"])
+            assert durable is not None
+            (persisted,) = durable["result"]["results"]
+            assert (persisted["status"], persisted["model"], persisted["provider"]) == (
+                expected_status, "fast-model", "custom",
+            )
+
+            rendered = format_process_notification(event)
+            assert "Model: fast-model" in rendered
+            assert "Provider: custom" in rendered
+            assert rendered.index("Model: fast-model") < rendered.index("(no summary")
+    finally:
+        deadline = time.monotonic() + 2.0
+        while ad.active_count() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        ad._reset_for_tests()
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()

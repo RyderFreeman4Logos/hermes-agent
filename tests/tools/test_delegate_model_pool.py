@@ -120,7 +120,7 @@ class TestModelProfileResolution:
         payload, kwargs = _child_kwargs(model_profile="standard")
         assert "error" not in payload
         assert kwargs["model"] == "deepseek-v4-flash"
-        assert kwargs["provider"] == "opencode-go"
+        assert kwargs["provider"] == "custom"
         assert kwargs["model"] != "gpt-5.6-terra"
 
     def test_profile_fallback_chain_not_parent_or_global_pin(self):
@@ -285,13 +285,13 @@ class TestOmittedProfileUsesPoolDefault:
         payload, kwargs = _child_kwargs()
         assert "error" not in payload
         assert kwargs["model"] == "deepseek-v4-flash"
-        assert kwargs["provider"] == "opencode-go"
+        assert kwargs["provider"] == "custom"
 
     def test_omitted_profile_uses_standard_not_global_pin(self):
         payload, kwargs = _child_kwargs()
         assert "error" not in payload
         assert kwargs["model"] == "deepseek-v4-flash"
-        assert kwargs["provider"] == "opencode-go"
+        assert kwargs["provider"] == "custom"
         assert [e["model"] for e in kwargs["fallback_model"]] == [
             "fb-one",
             "fb-two",

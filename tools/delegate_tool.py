@@ -439,19 +439,43 @@ def _credentials_for_model_profile(
     creds = _resolve_delegation_credentials(merged, parent_agent)
     if overlay["model"]:
         creds["model"] = overlay["model"]
-    if overlay["provider"]:
-        creds["provider"] = overlay["provider"]
     creds["fallback_chain"] = _normalize_profile_fallback_chain(
         profile.get("fallback_chain")
     )
     return creds
 
 
+def _resolve_task_routes(
+    task_list: List[Dict[str, Any]], cfg: Dict[str, Any], parent_agent,
+    top_profile: Optional[str],
+) -> List[tuple[Optional[str], Dict[str, Any]]]:
+    """Resolve every effective task route before child-owned resources exist."""
+    routes: List[tuple[Optional[str], Dict[str, Any]]] = []
+    by_profile: Dict[Optional[str], tuple[Optional[str], Dict[str, Any]]] = {}
+    has_pool = bool(_model_pool(cfg))
+    for task in task_list:
+        requested = str(task.get("model_profile") or "").strip() or top_profile
+        if requested not in by_profile:
+            creds = _credentials_for_model_profile(cfg, parent_agent, requested)
+            resolved = requested or ("standard" if has_pool else None)
+            by_profile[requested] = (resolved, creds)
+        routes.append(by_profile[requested])
+    return routes
+
+
+def _fallback_route_labels(chain: Any) -> List[Dict[str, str]]:
+    """Credential-free fallback metadata safe for logs."""
+    return [
+        {"provider": str(entry.get("provider") or ""), "model": str(entry.get("model") or "")}
+        for entry in chain or [] if isinstance(entry, dict)
+    ]
+
+
 def _build_children(
-    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
+    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]],
+    task_routes: List[tuple[Optional[str], Dict[str, Any]]], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list,
-    top_profile: Optional[str] = None, cfg: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -461,21 +485,12 @@ def _build_children(
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
-        route_profile = str(t.get("model_profile") or "").strip() or top_profile
-        try:
-            task_creds = (
-                _credentials_for_model_profile(cfg, parent_agent, route_profile)
-                if cfg is not None else creds
-            )
-        except ValueError as exc:
-            return [], str(exc)
-        resolved_profile = route_profile or ("standard" if _model_pool(cfg or {}) else None)
+        resolved_profile, creds = task_routes[i]
         logger.info(
             "delegate_task: resolved profile=%s model=%s provider=%s reasoning=%s fallback=%s",
-            resolved_profile, task_creds.get("model"), task_creds.get("provider"),
-            (cfg or {}).get("reasoning_effort") or "", task_creds.get("fallback_chain"),
+            resolved_profile, creds.get("model"), creds.get("provider"),
+            routing_cfg.get("reasoning_effort") or "", _fallback_route_labels(creds.get("fallback_chain")),
         )
-        creds = task_creds
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         overrides = {
@@ -570,33 +585,42 @@ def delegate_task(
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     top_profile = str(model_profile or "").strip() or None
-    try:
-        creds = _credentials_for_model_profile(routing_cfg, parent_agent, top_profile)
-    except ValueError as exc:
-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450). Unknown/missing-standard model_pool profiles fail closed here too.
-        return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if err:
         return tool_error(err)
+    try:
+        task_routes = _resolve_task_routes(task_list, routing_cfg, parent_agent, top_profile)
+    except ValueError as exc:
+        # Validate every selected route before transcripts, child DBs, hooks, or
+        # parent ownership are created. A non-empty pool still requires standard.
+        return tool_error(str(exc))
+    creds = task_routes[0][1]
+    route_metadata = [
+        {"model": route.get("model"), "provider": route.get("provider")}
+        for _, route in task_routes
+    ]
+    common_models = {route["model"] for route in route_metadata}
+    common_providers = {route["provider"] for route in route_metadata}
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
     from tools.delegation_live_log import create_live_transcripts
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context,
+        model=next(iter(common_models)) if len(common_models) == 1 else None,
+        provider=next(iter(common_providers)) if len(common_providers) == 1 else None,
+        task_routes=route_metadata,
     )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
     children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+        task_list, task_schemas, task_routes, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers,
-        top_profile=top_profile, cfg=routing_cfg,
     )
     if err:
         return tool_error(err)

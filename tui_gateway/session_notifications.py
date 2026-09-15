@@ -321,7 +321,11 @@ def _deliver_completion_notifications(sid: str, session: dict, events: list, emi
     receipt = None
     with _completion_ownership_lock(session):
         with session["history_lock"]:
-            if session.get("_closing") or session.get("_finalized"):
+            # Status output is deliberately outside the claim so a slow client
+            # cannot hold history.  A user may have claimed the idle turn while
+            # it was emitted; make the final check and receipt creation one
+            # transaction so that user row can never acknowledge these events.
+            if session.get("running") or session.get("_closing") or session.get("_finalized"):
                 pending = session.setdefault("_completion_pending", [])
                 session["_completion_pending"] = list(events) + list(pending)
                 return
@@ -355,7 +359,12 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
         with session["history_lock"]:
             session["_completion_pending"] = []
     if pending and running:
-        if not _deliver_completions_via_steer(sid, session, pending, emitted):
+        try:
+            staged = _deliver_completions_via_steer(sid, session, pending, emitted)
+        except Exception as exc:
+            _notif_log_failure("completion staging failed", exc)
+            staged = False
+        if not staged:
             with session["history_lock"]:
                 session["_completion_pending"] = list(pending) + list(
                     session.get("_completion_pending") or []
@@ -375,6 +384,19 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
     if not pending:
         if _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session):
             return
+        if _ingest_completion_transfer(session, insert):
+            _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
+        return
+
+    # A noncompletion observed after a prior transfer is an ordering boundary,
+    # not merely a busy-turn detail.  First let the older transfer reserve its
+    # own turn; leave the later pending suffix with P until the boundary route
+    # has actually started.  This prevents C1/W/C2 from becoming C1+C2/W when
+    # the session becomes idle between poller snapshots.
+    with _completion_ownership_lock(session):
+        barrier = session.get("_completion_transfer_barrier")
+        transfer_waiting_for_barrier = isinstance(barrier, dict) and not barrier.get("started")
+    if transfer_waiting_for_barrier:
         if _ingest_completion_transfer(session, insert):
             _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
         return
@@ -740,6 +762,10 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
         return True
+    if evt_type != "completion" and deferred is None:
+        with _completion_ownership_lock(session):
+            if session.get("_completion_transfer"):
+                session["_completion_transfer_barrier"] = dict(evt)
     if not _notif_claim_turn(session):
         queue.put(evt)
         if deferred is not None:
@@ -798,9 +824,6 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
             completions = []
             if deferred is None:
                 _flush_pending_completions_if_idle(sid, session, emitted)
-                with _completion_ownership_lock(session):
-                    if session.get("_completion_transfer"):
-                        session["_completion_transfer_barrier"] = dict(event)
         if not _notif_handle_event(sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned):
             for remaining in events[index + 1:]:
                 (deferred.append if deferred is not None else registry.completion_queue.put)(remaining)

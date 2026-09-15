@@ -300,11 +300,251 @@ def test_refused_idle_admission_requeues_once_and_normal_admission_settles_once(
                 "admitted-ui", admitted, [_completion(admitted_id)], set()
             )
 
-            assert process_registry.is_completion_consumed(admitted_id) is True
-            assert settlements == [[admitted_id]]
+            # Admission and the synthetic thread return are still before the
+            # real turn-context row. The receipt therefore stays recoverable
+            # until that insertion callback commits it.
+            assert process_registry.is_completion_consumed(admitted_id) is False
+            assert settlements == []
+            assert [event["session_id"] for event in admitted["_completion_pending"]] == [admitted_id]
             assert admitted["running"] is False
+            admitted.update(_closing=True, _finalized=True)
+            server._notification_poller_loop(stop, "admitted-ui", admitted)
+            assert _queued_ids(isolated) == [admitted_id]
     finally:
         _clear_ids(refused_id, admitted_id)
+
+
+def test_idle_completion_claim_keeps_receipt_pending_when_prompt_submit_claims_after_status(
+    monkeypatch,
+):
+    """The real submit claim between status output and idle receipt wins exactly once."""
+    event = _completion("proc_idle_claim_race")
+    session = _session(running=False)
+    submitted: list[tuple] = []
+
+    def emit(kind, sid, payload=None):
+        if kind == "status.update":
+            # This is the same history-lock transaction used by prompt.submit,
+            # after its normal busy observation has seen the session idle.
+            err, _fields = server._lock_in_submit_turn(
+                "user-rid", sid, session, "actual user prompt", {}, False, None, None
+            )
+            assert err is None
+
+    monkeypatch.setattr(server, "_emit", emit)
+    monkeypatch.setattr(server, "_idle_completion_turn", lambda *args: submitted.append(args) or True)
+
+    server._deliver_completion_notifications("owner-ui", session, [event], set())
+
+    assert submitted == []
+    assert session["running"] is True
+    assert session.get("_completion_active_receipt") is None
+    assert [item["session_id"] for item in session["_completion_pending"]] == ["proc_idle_claim_race"]
+
+
+def test_live_poller_prompt_submit_claim_keeps_completion_receipt_unconsumed(
+    monkeypatch,
+):
+    """A real prompt.submit admission wins the paused live-poller idle claim.
+
+    The transport pause is deliberately at the status emission boundary.  The
+    JSON-RPC handler therefore performs its normal history-lock admission
+    before the poller reaches the final ownership transaction.
+    """
+    event = _completion("proc_live_poller_prompt_claim")
+    _clear_ids(event["session_id"])
+    session = _session(running=False, agent=_bare_agent(), agent_ready=threading.Event())
+    submitted: list[dict] = []
+    completion_submits: list[dict] = []
+    sid = "owner-live-poller"
+
+    class _OnePoll:
+        checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            return self.checks > 1
+
+    def emit(kind, emitted_sid, _payload=None):
+        if kind != "status.update":
+            return
+        response = server.handle_request({
+            "id": "real-user-admission",
+            "method": "prompt.submit",
+            "params": {"session_id": emitted_sid, "text": "actual user prompt"},
+        })
+        assert response["result"]["status"] == "streaming"
+
+    try:
+        with _isolated_queue(monkeypatch) as isolated:
+            isolated.put(event)
+            server._sessions[sid] = session
+            monkeypatch.setattr(server, "_emit", emit)
+            monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a: None)
+            monkeypatch.setattr(server, "_persist_session_row_for_submit", lambda *_a: None)
+            monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *_a: True)
+            monkeypatch.setattr(server, "_run_after_agent_ready", lambda *_a: submitted.append(dict(session)))
+            monkeypatch.setattr(
+                server,
+                "_run_prompt_submit",
+                lambda *_a, **kwargs: completion_submits.append(dict(kwargs)) or True,
+            )
+            monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+
+            server._notification_poller_loop(_OnePoll(), sid, session)
+
+            assert len(submitted) == 1
+            assert completion_submits == []
+            assert session["running"] is True
+            assert session.get("_completion_active_receipt") is None
+            held = list(session.get("_completion_pending") or []) + list(
+                session.get("_completion_transfer") or [])
+            assert [item["session_id"] for item in held] == [event["session_id"]]
+            assert process_registry.is_completion_consumed(event["session_id"]) is False
+            assert _queued_ids(isolated) == []
+    finally:
+        server._sessions.pop(sid, None)
+        _clear_ids(event["session_id"])
+
+
+def test_public_user_core_row_does_not_ack_waiting_receipt_on_stop(monkeypatch, tmp_path):
+    """A completed public user turn cannot consume its waiting completion receipt."""
+    event = _completion("proc_user_core_stop_reclaim")
+    _clear_ids(event["session_id"])
+
+    class Agent:
+        model = "test-model"
+        provider = "test-provider"
+        session_id = "owner-session"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, prompt, **_kwargs):
+            return {"final_response": "user response", "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "user response"},
+            ]}
+
+    sid = "owner-user-core-stop"
+    session = _session(agent=Agent(), running=False, agent_ready=threading.Event())
+    session["agent_ready"].set()
+    try:
+        with _isolated_queue(monkeypatch) as isolated:
+            server._sessions[sid] = session
+            _patch_inline_turn(monkeypatch, tmp_path)
+            monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a: None)
+            monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a: None)
+            monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a: None)
+            monkeypatch.setattr(server, "_wire_callbacks", lambda *_a: None)
+            monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_k: [])
+            monkeypatch.setattr(server, "_clear_session_context", lambda *_a: None)
+            monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+            monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a: False)
+            response = server.handle_request({"id": "user-core", "method": "prompt.submit", "params": {"session_id": sid, "text": "real user"}})
+            assert response["result"]["status"] == "streaming"
+            assert [row["role"] for row in session["history"]] == ["user", "assistant"]
+            session["_completion_active_receipt"] = {"events": [event]}
+            session.update(_closing=True, _finalized=True)
+            stop = threading.Event(); stop.set()
+            server._notification_poller_loop(stop, sid, session)
+            assert process_registry.is_completion_consumed(event["session_id"]) is False
+            assert _queued_ids(isolated) == [event["session_id"]]
+    finally:
+        server._sessions.pop(sid, None)
+        _clear_ids(event["session_id"])
+
+
+def test_idle_flush_keeps_suffix_pending_until_real_noncompletion_barrier_starts(monkeypatch):
+    """C1/W/C2 must not merge C2 into C1 while W has not claimed its route."""
+    c1, c2 = _completion("proc_barrier_first"), _completion("proc_barrier_later")
+    session = _session(
+        running=False,
+        _completion_transfer=[c1],
+        _completion_pending=[c2],
+        _completion_transfer_barrier={"type": "watch_match", "session_id": "watch-boundary"},
+    )
+    reservations: list[list[str]] = []
+
+    def enqueue(_session, _text, _transport, **kwargs):
+        reservations.append([event["session_id"] for event in kwargs["completion_events"]])
+
+    monkeypatch.setattr(server, "_enqueue_prompt", enqueue)
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    server._flush_pending_completions_if_idle("owner-ui", session, set())
+
+    assert reservations == [["proc_barrier_first"]]
+    assert [event["session_id"] for event in session["_completion_pending"]] == ["proc_barrier_later"]
+
+
+def test_structured_queued_receipt_uses_local_ingestion_when_compute_host_is_active(monkeypatch):
+    """A compute-host flag cannot strand a local receipt on an incompatible bridge."""
+    event = _completion("proc_local_receipt")
+    session = _session(
+        running=False,
+        queued_prompt={
+            "text": "completion text", "transport": None,
+            "structured_completion": True, "completion_events": [event],
+        },
+        _compute_host_active=True,
+    )
+    local: list[dict] = []
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", lambda *_a, **_k: pytest.fail("receipt reached host"))
+
+    def submit(*_args, **kwargs):
+        local.append(kwargs["completion_receipt"])
+        return True
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    assert server._drain_queued_prompt("rid", "owner-ui", session)
+    assert local and local[0] is session["_completion_active_receipt"]
+
+
+def test_receipt_callback_binds_to_agent_selected_by_preparation(monkeypatch):
+    """Capability preparation may replace the agent; only that final agent may consume."""
+    original, replacement = types.SimpleNamespace(), types.SimpleNamespace()
+    event = _completion("proc_rebuilt_agent")
+    receipt = {"events": [event]}
+    session = _session(agent=original, running=True)
+    session["_completion_active_receipt"] = receipt
+    consumed: list[bool] = []
+
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_admit_prompt_turn", lambda *_a: ([], original))
+    monkeypatch.setattr(server, "_record_turn_marker", lambda *_a, **_k: "marker")
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_finish_turn", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_clear_inflight_turn", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_run_post_turn_followups", lambda *_a, **_k: None)
+
+    def prepare(_sid, current, st, *_args, **_kwargs):
+        current["agent"] = replacement
+        st.agent = replacement
+        return "completion", "completion", 80, None
+
+    def invoke(_sid, _session, st, *_args):
+        consumed.append(st.agent._completion_queue_ingest())
+        st.result = {"final_response": "done", "messages": []}
+
+    monkeypatch.setattr(server, "_prepare_turn_input", prepare)
+    monkeypatch.setattr(server, "_invoke_agent", invoke)
+    monkeypatch.setattr(server, "_absorb_turn_result", lambda *_a: None)
+    monkeypatch.setattr(server, "_complete_turn_payload", lambda *_a: ({"text": "done"}, "done", "complete"))
+    monkeypatch.setattr(server, "_goal_followup_after_turn", lambda *_a: None)
+    monkeypatch.setattr(server, "_after_complete_turn", lambda *_a: None)
+    monkeypatch.setattr(server, "_publish_session_control_snapshot", lambda *_a, **_k: None)
+
+    assert server._run_prompt_submit("rid", "owner-ui", session, "completion", completion_receipt=receipt)
+    assert consumed == [True]
+    assert session.get("_completion_active_receipt") is None
+    assert getattr(original, "_completion_queue_ingest", None) is None
+    assert getattr(replacement, "_completion_queue_ingest", None) is None
 
 
 class _BlockingMessages(list):
@@ -371,11 +611,13 @@ def test_ingest_uses_structured_identity_not_formatted_text(monkeypatch):
             assert staged_id not in payload
             assert restaged_id in payload
             assert process_registry.is_completion_consumed(staged_id) is True
-            assert process_registry.is_completion_consumed(restaged_id) is True
+            # Queue staging preserves the structured receipt; only the core
+            # insertion tests commit it. A lifecycle reclaim returns it once.
+            assert process_registry.is_completion_consumed(restaged_id) is False
             session.update(_closing=True, _finalized=True)
             stop = threading.Event()
             stop.set()
             server._notification_poller_loop(stop, "owner-ui", session)
-            assert _queued_ids(isolated) == []
+            assert _queued_ids(isolated) == [restaged_id]
     finally:
         _clear_ids(first_id, staged_id, restaged_id)

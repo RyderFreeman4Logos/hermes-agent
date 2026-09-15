@@ -779,3 +779,26 @@ def test_successful_snapshot_flushes_idle_completion_despite_foreign_busy_watch(
         server._sessions.pop("idle-a", None)
         server._sessions.pop("busy-b", None)
         _clear_ids(completion_id)
+
+
+def test_busy_staging_transport_error_restores_pending_receipt(monkeypatch):
+    """A real status-write failure cannot strand a detached completion batch."""
+    event_id = "proc_transport_restore"
+    _clear_ids(event_id)
+    try:
+        with _isolated(monkeypatch):
+            agent = _agent()
+            session = _session(agent)
+            session["_completion_pending"] = [_completion(event_id)]
+
+            def fail_write(*_args, **_kwargs):
+                raise OSError("test transport write failed")
+
+            monkeypatch.setattr(server, "_emit", fail_write)
+            server._flush_pending_completions_if_idle("owner-ui", session, set())
+
+            assert [event["session_id"] for event in session["_completion_pending"]] == [event_id]
+            assert session.get("_completion_transfer") in (None, [])
+            assert process_registry.is_completion_consumed(event_id) is False
+    finally:
+        _clear_ids(event_id)

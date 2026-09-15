@@ -15,6 +15,7 @@ from tools.delegate_tool import delegate_task
 
 ACCEPTED = ("configured-model", "configured-provider")
 SELECTED = ("selected-model", "selected-provider")
+FALLBACK = ("fallback-model", "fallback-provider")
 _REAL_RUN_CONVERSATION = AIAgent.run_conversation
 
 
@@ -91,7 +92,7 @@ def _delegate_patches(run_conversation, *, timeout):
     [("accepted", ACCEPTED), ("selected", SELECTED), ("none", (None, None))],
     ids=("accepted-over-selected", "selected", "not-accepted"),
 )
-def test_public_sync_outer_exception_reports_only_accepted_identity(monkeypatch, tmp_path, identity, expected):
+def test_public_sync_outer_exception_reports_route_identity(monkeypatch, tmp_path, identity, expected):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     events = []
 
@@ -102,7 +103,8 @@ def test_public_sync_outer_exception_reports_only_accepted_identity(monkeypatch,
             assert child._delegate_successful_llm_route == ACCEPTED
         if identity in {"accepted", "selected"}:
             child._delegate_model_profile = "fast"
-            child.model, child.provider = SELECTED
+            child._delegate_selected_llm_route = SELECTED
+            child.model, child.provider = FALLBACK
         raise RuntimeError("synthetic outer child failure")
 
     with _delegate_patches(accepted_then_raise, timeout=None):
@@ -127,7 +129,7 @@ def test_public_sync_outer_exception_reports_only_accepted_identity(monkeypatch,
     [("accepted", ACCEPTED), ("selected", SELECTED), ("none", (None, None))],
     ids=("accepted-over-selected", "selected", "not-accepted"),
 )
-def test_public_background_timeout_persists_only_accepted_identity(monkeypatch, tmp_path, identity, expected):
+def test_public_background_timeout_persists_route_identity(monkeypatch, tmp_path, identity, expected):
     from tools import async_delegation
     from tools.process_registry import process_registry
 
@@ -141,7 +143,8 @@ def test_public_background_timeout_persists_only_accepted_identity(monkeypatch, 
             assert child._delegate_successful_llm_route == ACCEPTED
         if identity in {"accepted", "selected"}:
             child._delegate_model_profile = "fast"
-            child.model, child.provider = SELECTED
+            child._delegate_selected_llm_route = SELECTED
+            child.model, child.provider = FALLBACK
         release.wait(5)
         return {"completed": True, "final_response": "released too late", "api_calls": 1}
 

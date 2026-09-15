@@ -382,6 +382,7 @@ def _build_children(
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
+        selected_profile = str(t.get("model_profile") or "").strip() or None
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
@@ -390,10 +391,15 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
-                model_profile=str(t.get("model_profile") or "").strip() or None, **overrides,
+                model_profile=selected_profile, **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
+        child._delegate_selected_llm_route = (
+            (creds.get("model"), creds.get("provider"))
+            if selected_profile is not None
+            else None
+        )
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema

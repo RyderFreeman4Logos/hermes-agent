@@ -759,13 +759,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
         on_direct_signal: Optional[Callable[[bool], None]] = None,
         on_direct_noop: Optional[Callable[[bool], None]] = None,
         direct_signal_lock: Optional[Any] = None,
+        owned_process_group: Optional[int] = None,
     ) -> None:
         """Terminate a host-visible PID and its descendants.
         ``expected_start`` (kernel start time at spawn) is re-validated first: a mismatch
         or dead PID means the number was recycled onto a stranger and we refuse to touch
         it — a leaked orphan beats tree-killing someone's browser. POSIX: psutil SIGTERMs
         children before the parent (so trees aren't reparented to init and survive), then
-        SIGKILLs survivors after ``terminal.daemon_term_grace_seconds``. Windows:
+        SIGKILLs survivors after ``terminal.daemon_term_grace_seconds``. An
+        ``owned_process_group`` is a verified local ``start_new_session`` boundary.
+        Windows:
         ``taskkill /T /F`` (psutil's stale PPID links miss orphans there); ``os.kill``
         is the fallback."""
         identity_lock = direct_signal_lock or nullcontext()
@@ -848,6 +851,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 if cls._proc_alive(proc):
                     proc.kill()  # SIGKILL on POSIX
                     logger.info("Escalated to SIGKILL for pid %d (ignored SIGTERM within %.1fs grace)", proc.pid, grace)
+        # Local pipe children are started as their own session/process-group.
+        # A SIGTERM handler can fork after the psutil tree snapshot and escape
+        # that fixed PID list; the still-owned group is the stable boundary.
+        if owned_process_group is not None:
+            with suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(owned_process_group, signal.SIGKILL)
 
     # ----- Spawn -----
 
@@ -1955,10 +1964,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
             def record_direct_noop(lock_held: bool = False) -> None:
                 self._record_kill_noop(session, lock_held=lock_held)
 
+            owned_process_group = None
+            if not _IS_WINDOWS:
+                with suppress(ProcessLookupError, PermissionError, OSError):
+                    pgid = os.getpgid(session.process.pid)
+                    if pgid == session.process.pid:
+                        owned_process_group = pgid
             self._terminate_host_pid(
                 session.process.pid, session.host_start_time, record_direct_signal,
                 on_direct_noop=record_direct_noop,
                 direct_signal_lock=session._lock,
+                owned_process_group=owned_process_group,
             )
         elif session.env_ref and session.pid:
             session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)

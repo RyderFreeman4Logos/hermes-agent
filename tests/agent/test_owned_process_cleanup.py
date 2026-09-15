@@ -79,6 +79,62 @@ def test_close_reclaims_processes_from_previous_turns(tmp_path, monkeypatch):
 
 
 @pytest.mark.linux_only
+def test_close_reclaims_descendant_created_during_termination(tmp_path, monkeypatch):
+    import psutil
+    import tools.process_registry as processes
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(processes, "process_registry", registry)
+    agent = _agent()
+    owner = "signal-fork-owner"
+    late_pid_path = tmp_path / "late-child.pid"
+
+    def late_child_alive(pid):
+        try:
+            return ProcessRegistry._proc_alive(psutil.Process(pid))
+        except psutil.NoSuchProcess:
+            return False
+
+    _bind_turn_identity(agent, owner, None, None, None, None)
+    code = (
+        "import pathlib, signal, subprocess, sys, time\n"
+        f"late_pid_path = pathlib.Path({str(late_pid_path)!r})\n"
+        "def stop(_signum, _frame):\n"
+        "    child = subprocess.Popen(\n"
+        "        [sys.executable, '-c', 'import time; time.sleep(8)'],\n"
+        "        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+        "    )\n"
+        "    late_pid_path.write_text(str(child.pid), encoding='ascii')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "print('READY-SIGNAL-FORK', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    result = json.loads(terminal_tool(
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
+        background=True, task_id=owner, workdir=str(tmp_path), notify_on_complete=True,
+    ))
+    session_id = result["session_id"]
+    late_pid = None
+    try:
+        assert _wait_until(
+            lambda: "READY-SIGNAL-FORK" in registry.poll(session_id)["output_preview"]
+        )
+
+        agent.close()
+
+        assert _wait_until(late_pid_path.exists), "SIGTERM handler did not create its descendant"
+        late_pid = int(late_pid_path.read_text(encoding="ascii"))
+        assert registry.poll(session_id)["status"] != "running"
+        assert _wait_until(lambda: not late_child_alive(late_pid))
+    finally:
+        if late_pid is not None:
+            assert _wait_until(lambda: not late_child_alive(late_pid), timeout=10)
+        registry.kill_all()
+        agent.close()
+
+
+@pytest.mark.linux_only
 def test_close_preserves_tail_when_reader_settles_after_return(tmp_path, monkeypatch):
     import tools.process_registry as processes
     registry = ProcessRegistry()

@@ -53,6 +53,34 @@ def test_skip_memory_with_memory_toolset_creates_store(monkeypatch, tmp_path):
     )
 
 
+def test_explicit_memory_background_role_stays_builtin_under_authoritative_profile(
+    monkeypatch, tmp_path
+):
+    """skip_memory is an execution role: it must never acquire an external route."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "memory": {
+                "provider_mode": "authoritative",
+                "memory_enabled": True,
+                "user_profile_enabled": True,
+            }
+        },
+    )
+    agent = _make_agent(monkeypatch, enabled_toolsets=["memory"], skip_memory=True)
+
+    assert agent._memory_provider_mode == "hybrid"
+    assert agent._memory_manager is None
+    from agent.inline_tool_executors import InlineToolContext, _memory
+    result = __import__("json").loads(_memory(
+        agent,
+        {"action": "add", "target": "memory", "content": "synthetic local fact"},
+        InlineToolContext(effective_task_id="review", tool_call_id="memory-call"),
+    ))
+    assert result["success"] is True
+
+
 
 
 

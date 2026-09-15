@@ -590,7 +590,11 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, task_env_
                 kernel.active_stop = None
     if poller_alive or cleanup_failed:
         _discard_remote_kernel(key, kernel)
-    if cell_status == "canceled" or _is_canceled(invocation):
+    with _REGISTRY.lock:
+        invocation_canceled = invocation.canceled
+        kernel_retired = kernel.retired
+    result_decoded = cell_status in ("ok", "error", "exit")
+    if not result_decoded and (cell_status == "canceled" or invocation_canceled):
         return _cancel_result(state_reset=state_reset, state_lost=state_lost)
     kernel_info: Dict[str, Any] = {"reused": reused, "remote": True}
     result: Dict[str, Any] = {
@@ -624,6 +628,10 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, task_env_
     if poller_alive or cleanup_failed:
         kernel_info.update(ended=True, state_lost=True, note=(
             "Remote kernel retired after its RPC or result namespace could not be safely handed off."))
+    elif kernel_retired:
+        kernel_info.update(ended=True, state_lost=True, note=(
+            "Remote kernel was retired after the cell completed; its result was preserved but its "
+            "state cannot be reused."))
     if cell_status == "error" and result["traceback"]:
         result["error"] = result["traceback"].strip().splitlines()[-1]
     return result

@@ -78,7 +78,10 @@ class FileAwareEnv:
         self.result_payload = None
         self.cell_submissions = []
         self.emit_rpc = False
+        self.rpc_tool = "read_file"
+        self.rpc_args = None
         self.rpc_done = threading.Event()
+        self.result_removed = threading.Event()
         self.hold_stage = None
         self.stage_entered = threading.Event()
         self.stage_release = threading.Event()
@@ -157,6 +160,7 @@ class FileAwareEnv:
         if "rm -f" in command and "/rpc/req_*" in command:
             return {"output": "", "returncode": self.cleanup_returncode}
         if command.startswith("rm -f ") and "/rpc/req_" in command:
+            self.hold_once("rpc_request_remove")
             path = shlex.split(command)[2]
             with self._lock:
                 self.files.pop(path, None)
@@ -174,7 +178,9 @@ class FileAwareEnv:
                     rpc_path = f"{rpc_dir}/req_{request['id']}"
                     self.files[rpc_path] = json.dumps({
                         "token": "fixed-rpc-token", "seq": int(request["id"]),
-                        "tool": "read_file", "args": {"path": request["code"]},
+                        "tool": self.rpc_tool,
+                        "args": self.rpc_args if self.rpc_args is not None
+                        else {"path": request["code"]},
                     })
                 result_path = target.replace("cell_req_", "cell_res_")
                 payload = self.result_payload
@@ -198,9 +204,11 @@ class FileAwareEnv:
         if command.startswith("rm -f ") and "/cells/cell_res_" in command:
             if self.result_cleanup_error is not None:
                 raise self.result_cleanup_error
+            self.hold_once("cell_result_remove")
             path = shlex.split(command)[2]
             with self._lock:
                 self.files.pop(path, None)
+            self.result_removed.set()
             return {"output": "", "returncode": 0}
         return {"output": "", "returncode": 0}
 
@@ -1309,6 +1317,164 @@ class TestRemoteInvocationOwnership(RemoteKernelBase):
         self.assertTrue(result["kernel"]["ended"])
         self.assertTrue(result["kernel"]["state_lost"])
         self.assertEqual(len(_REMOTE_KERNELS), 0)
+
+    def test_owner_cleanup_during_result_removal_preserves_decoded_terminal_result(self):
+        """R1: owner cleanup retires state without erasing a decoded cell outcome."""
+        cases = (
+            (_cell(status="ok", stdout="completed-ok", stderr="warning-ok",
+                   execution_count=11), "success", None),
+            (_cell(status="error", stdout="completed-error", stderr="warning-error",
+                   traceback="ValueError: decoded", execution_count=12),
+             "error", "ValueError: decoded"),
+            (_cell(status="exit", stdout="completed-exit", stderr="warning-exit",
+                   execution_count=13), "success", None),
+        )
+        for payload, expected_status, expected_error in cases:
+            with self.subTest(cell_status=payload["status"]):
+                shutdown_all_remote_kernels()
+                env = FileAwareEnv()
+                env.result_payload = payload
+                env.hold_stage = "cell_result_remove"
+                self._ship_mock.side_effect = env.ship
+                task = f"decoded-owner-{payload['status']}"
+                result, errors = {}, []
+
+                def invoke():
+                    try:
+                        result["value"] = _run(env, code=task, task=task)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                worker = threading.Thread(target=invoke)
+                worker.start()
+                self.assertTrue(env.stage_entered.wait(5), "result removal was not reached")
+                with _REGISTRY.lock:
+                    kernel = next(iter(_REMOTE_KERNELS.values()))
+                    self.assertEqual(kernel.attached, 1)
+                try:
+                    shutdown_remote_kernels_for_owner(task)
+                    with _REGISTRY.lock:
+                        self.assertEqual(_REMOTE_KERNELS, {})
+                finally:
+                    env.stage_release.set()
+                    worker.join(5)
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                settled = result["value"]
+                self.assertEqual(settled["status"], expected_status)
+                self.assertEqual(settled["stdout"], payload["stdout"])
+                self.assertEqual(settled["stderr"], payload["stderr"])
+                self.assertEqual(settled["traceback"], payload["traceback"])
+                self.assertEqual(settled["kernel"]["execution_count"], payload["execution_count"])
+                self.assertTrue(settled["kernel"]["ended"])
+                self.assertTrue(settled["kernel"]["state_lost"])
+                self.assertEqual(settled.get("error"), expected_error)
+                self.assertEqual(settled["tool_calls_made"], 0)
+                self.assertEqual(len(env.cell_submissions), 1)
+                self.assertFalse(any("python3 script.py" in command for command in env.commands))
+                self.assertEqual(kernel.attached, 0)
+
+    def test_public_execute_code_global_cleanup_during_poller_join_preserves_result(self):
+        """R1: public formatting retains decoded output and real RPC accounting."""
+        from tools.code_execution_rpc import _rpc_poll_loop
+        from tools.code_execution_tool import execute_code
+        import tools.terminal_tool as terminal_tool
+
+        class SettlementEnv(FileAwareEnv):
+            def __init__(self):
+                super().__init__()
+                self.terminal_commands = []
+
+            def execute(self, command, cwd=None, timeout=None, **kwargs):
+                if command == "printf settled-rpc":
+                    with self._lock:
+                        self.commands.append(command)
+                        self.terminal_commands.append(command)
+                    return {"output": "settled-rpc", "returncode": 0}
+                return super().execute(command, cwd=cwd, timeout=timeout, **kwargs)
+
+        env = SettlementEnv()
+        env.emit_rpc = True
+        env.rpc_tool = "terminal"
+        env.rpc_args = {"command": "printf settled-rpc"}
+        env.result_payload = _cell(
+            status="ok", stdout="completed-public", stderr="decoded-warning",
+            execution_count=21,
+        )
+        env.hold_stage = "rpc_request_remove"
+        self._ship_mock.side_effect = env.ship
+        terminal_config = {
+            "env_type": "ssh", "cwd": "/", "host_cwd": None, "timeout": 30,
+            "lifetime_seconds": 300, "docker_mount_cwd_to_workspace": False,
+            "docker_volumes": [], "docker_shared_container_key": "",
+        }
+        with terminal_tool._env_lock:
+            previous_envs = dict(terminal_tool._active_environments)
+            previous_activity = dict(terminal_tool._last_activity)
+            terminal_tool._active_environments.clear()
+            terminal_tool._last_activity.clear()
+            terminal_tool._active_environments["default"] = env
+        result, errors = {}, []
+
+        def invoke():
+            try:
+                result["value"] = json.loads(execute_code(
+                    "print('completed-public')", task_id="decoded-global",
+                    enabled_tools=["terminal"],
+                ))
+            except BaseException as exc:
+                errors.append(exc)
+
+        try:
+            with patch("tools.code_execution_tool._load_config",
+                       return_value={"timeout": 30, "max_tool_calls": 5}), \
+                 patch("tools.code_execution_tool._get_or_create_env",
+                       return_value=(env, "ssh")), \
+                 patch("tools.terminal_tool._get_env_config", return_value=terminal_config), \
+                 patch("tools.approval.check_execute_code_guard",
+                       return_value={"approved": True}), \
+                 patch("tools.process_registry._is_supervised_gateway_process",
+                       return_value=False), \
+                 patch("tools.code_execution_tool._rpc_poll_loop", _rpc_poll_loop), \
+                 patch("tools.code_kernel_remote.secrets.token_urlsafe",
+                       return_value="fixed-rpc-token"):
+                worker = threading.Thread(target=invoke)
+                worker.start()
+                self.assertTrue(env.stage_entered.wait(5), "RPC poller did not reach join hold")
+                self.assertTrue(env.result_removed.wait(5), "cell result was not decoded and removed")
+                with _REGISTRY.lock:
+                    kernel = next(iter(_REMOTE_KERNELS.values()))
+                    self.assertEqual(kernel.attached, 1)
+                try:
+                    shutdown_all_remote_kernels()
+                    with _REGISTRY.lock:
+                        self.assertEqual(_REMOTE_KERNELS, {})
+                finally:
+                    env.stage_release.set()
+                    worker.join(5)
+        finally:
+            env.stage_release.set()
+            with terminal_tool._env_lock:
+                terminal_tool._active_environments.clear()
+                terminal_tool._active_environments.update(previous_envs)
+                terminal_tool._last_activity.clear()
+                terminal_tool._last_activity.update(previous_activity)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        settled = result["value"]
+        self.assertEqual(settled["status"], "success")
+        self.assertIn("completed-public", settled["output"])
+        self.assertIn("decoded-warning", settled["output"])
+        self.assertEqual(settled["tool_calls_made"], 1)
+        self.assertEqual(settled["kernel"]["execution_count"], 21)
+        self.assertTrue(settled["kernel"]["ended"])
+        self.assertTrue(settled["kernel"]["state_lost"])
+        self.assertEqual(env.terminal_commands, ["printf settled-rpc"])
+        self.assertEqual(len(env.cell_submissions), 1)
+        self.assertFalse(any("python3 script.py" in command for command in env.commands))
+        self.assertEqual(kernel.attached, 0)
 
     def test_malformed_result_is_protocol_failure_and_not_reused(self):
         """W08/W11: result shape failure retires K without a second execution."""

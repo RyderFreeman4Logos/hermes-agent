@@ -3,8 +3,20 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent import auxiliary_client as aux
 from agent.context_compressor import ContextCompressor
+
+_NON_CODEX_CHAIN_PROVIDERS = (
+    "custom",
+    "custom:",
+    "custom:localrouter",
+    "local/custom",
+    "pm",
+    "nous",
+    "openrouter",
+)
 
 
 def _client(text, base_url):
@@ -83,6 +95,81 @@ def test_configured_chain_fails_closed_without_codex():
     assert label == ""
     assert resolved == []
     assert route_info.get("codex_skip_reason") == "unavailable"
+
+
+@pytest.mark.parametrize("provider", _NON_CODEX_CHAIN_PROVIDERS)
+def test_configured_chain_rejects_non_codex_entry(provider):
+    """Every non-Codex fallback_chain label fails closed (#160)."""
+    chain = [{"provider": provider, "model": "forbidden-model"}]
+    resolved = []
+
+    def resolve_entry(entry):
+        resolved.append(entry["provider"])
+        return _client("leak", "https://forbidden.invalid/v1"), entry["model"]
+
+    with (
+        patch.object(aux, "_get_auxiliary_task_config", return_value={"fallback_chain": chain}),
+        patch.object(aux, "_resolve_fallback_entry", side_effect=resolve_entry),
+    ):
+        client, model, label = aux._try_configured_fallback_chain(
+            "title_generation",
+            "openai-codex",
+            reason="payment error",
+        )
+
+    assert client is None
+    assert model is None
+    assert label == ""
+    assert resolved == []
+
+
+def test_configured_chain_keeps_valid_codex_after_rejected_prefix():
+    """Rejected custom/aggregator prefixes must not block a later Codex entry."""
+    chain = [
+        {"provider": "custom", "model": "custom-model"},
+        {"provider": "custom:localrouter", "model": "grok-model"},
+        {"provider": "openai-codex", "model": "codex-model"},
+        {"provider": "openrouter", "model": "or-model"},
+    ]
+    resolved = []
+    clients = {
+        "openai-codex": _client("codex", "https://chatgpt.com/backend-api"),
+    }
+
+    def resolve_entry(entry):
+        resolved.append(entry["provider"])
+        return clients[entry["provider"]], entry["model"]
+
+    with (
+        patch.object(aux, "_get_auxiliary_task_config", return_value={"fallback_chain": chain}),
+        patch.object(aux, "_resolve_fallback_entry", side_effect=resolve_entry),
+    ):
+        client, model, label = aux._try_configured_fallback_chain(
+            "title_generation",
+            "qwen",
+            reason="rate limit",
+        )
+
+    assert model == "codex-model"
+    assert "openai-codex" in label
+    assert client is clients["openai-codex"]
+    assert resolved == ["openai-codex"]
+
+
+def test_distinct_custom_endpoint_cache_isolation_at_shared_seam():
+    """Hosted custom billing state must not share the local custom cache key."""
+    hosted_url = "https://hosted.example/v1"
+    local_url = "http://127.0.0.1:8080/v1"
+    aux._reset_aux_unhealthy_cache()
+    try:
+        aux._mark_provider_unhealthy("custom", base_url=hosted_url)
+        assert aux._is_provider_unhealthy("custom", hosted_url) is True
+        assert aux._is_provider_unhealthy("custom", local_url) is False
+        assert aux._is_provider_unhealthy("custom:") is False
+        assert aux._is_provider_unhealthy("custom:localrouter", local_url) is False
+        assert aux._is_provider_unhealthy("local/custom", local_url) is False
+    finally:
+        aux._reset_aux_unhealthy_cache()
 
 
 def test_payment_fallback_skips_non_codex_discovery():

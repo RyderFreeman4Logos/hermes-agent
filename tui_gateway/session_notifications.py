@@ -199,6 +199,21 @@ def _ingest_completion_transfer(session: dict, insert) -> bool:
         return True
 
 
+def _filter_routine_delegated_child_completions(events: list) -> list:
+    """Consume silent child successes before completion fan-in projects them."""
+    from tools.process_registry import ProcessRegistry
+
+    visible = []
+    silent = []
+    for evt in events:
+        if ProcessRegistry._is_routine_delegated_child_completion(evt):
+            silent.append(evt)
+        else:
+            visible.append(evt)
+    _mark_completion_events_consumed(silent)
+    return visible
+
+
 def _bind_completion_ingest(session: dict, agent) -> None:
     """Expose the session's short ingestion transaction to core turn consumers."""
     if agent is not None:
@@ -338,6 +353,8 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
         pending = list(session.get("_completion_pending") or [])
         if session.get("_closing") or session.get("_finalized"):
             return
+        pending = _filter_routine_delegated_child_completions(pending)
+        session["_completion_pending"] = list(pending)
         running = bool(session.get("running"))
     if not running:
         with _completion_ownership_lock(session):

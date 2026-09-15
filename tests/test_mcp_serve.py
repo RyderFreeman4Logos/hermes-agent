@@ -2262,6 +2262,112 @@ def test_event_bridge_startup_partial_gateway_rewind_keeps_handoff_historical(
         close()
 
 
+@pytest.mark.parametrize(
+    "replacement_mode", ["same-generation", "same-path", "different-inode"]
+)
+def test_event_bridge_restart_scopes_cutoff_to_current_database(
+    monkeypatch, tmp_path, replacement_mode
+):
+    """A stopped bridge cannot apply an old database's row IDs to its replacement."""
+    import hermes_state
+    import mcp_serve
+    from hermes_state import SessionDB
+    from hermes_state_registry import acquire
+
+    db_path = tmp_path / "state.db"
+    session_id = "restart-generation"
+    session_key = "agent:main:test:restart-generation"
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", db_path)
+    monkeypatch.setattr(mcp_serve, "_hermes_home", lambda: tmp_path)
+
+    owner = acquire(db_path)
+    owner.create_session(session_id, "test", session_key=session_key)
+    owner.append_message(session_id, "user", "old database", timestamp=100)
+
+    bridge = mcp_serve.EventBridge()
+    original_poll_once = bridge._poll_once
+    first_quiet_poll = threading.Event()
+
+    def observe_first_poll(db):
+        original_poll_once(db)
+        first_quiet_poll.set()
+
+    monkeypatch.setattr(bridge, "_poll_once", observe_first_poll)
+    try:
+        assert bridge.start() is True
+        assert first_quiet_poll.wait(timeout=3)
+        assert bridge.poll_events(session_key=session_key)["events"] == []
+        bridge.stop()
+        assert bridge._thread is not None
+        assert not bridge._thread.is_alive()
+
+        old_identity = db_path.stat().st_ino
+        if replacement_mode == "same-generation":
+            expected_message_id = "2"
+        elif replacement_mode == "same-path":
+            owner.close()
+            db_path.unlink()
+            replacement = SessionDB(db_path)
+            replacement.close()
+            expected_message_id = "1"
+        else:
+            owner.close()
+            replacement_path = tmp_path / "replacement.db"
+            replacement = SessionDB(replacement_path)
+            replacement.close()
+            os.replace(replacement_path, db_path)
+            assert db_path.stat().st_ino != old_identity
+            expected_message_id = "1"
+
+        second_poll_entered = threading.Event()
+        release_second_poll = threading.Event()
+        second_poll_finished = threading.Event()
+
+        def hold_second_poll(db):
+            second_poll_entered.set()
+            assert release_second_poll.wait(timeout=3)
+            original_poll_once(db)
+            second_poll_finished.set()
+
+        monkeypatch.setattr(bridge, "_poll_once", hold_second_poll)
+        assert bridge.start() is True
+        assert second_poll_entered.wait(timeout=3)
+
+        writer = SessionDB(db_path)
+        try:
+            writer.create_session(session_id, "test", session_key=session_key)
+            writer.append_message(
+                session_id, "user", "new after restart", timestamp=200
+            )
+        finally:
+            writer.close()
+        baseline_ns = int(bridge._state_db_mtime * 1_000_000_000)
+        newer_ns = max(db_path.stat().st_mtime_ns + 1_000_000_000, baseline_ns + 1)
+        os.utime(db_path, ns=(newer_ns, newer_ns))
+
+        release_second_poll.set()
+        assert second_poll_finished.wait(timeout=3)
+        event = bridge.wait_for_event(session_key=session_key, timeout_ms=3000)
+        assert event is not None
+        assert event["content"] == "new after restart"
+        assert event["message_id"] == expected_message_id
+
+        result = bridge.poll_events(session_key=session_key)
+        assert [item["content"] for item in result["events"]] == ["new after restart"]
+        assert (
+            bridge.poll_events(
+                after_cursor=result["next_cursor"], session_key=session_key
+            )["events"]
+            == []
+        )
+    finally:
+        if "release_second_poll" in locals():
+            release_second_poll.set()
+        bridge.stop()
+        if getattr(owner, "_conn", None) is not None:
+            owner.close()
+
+
 def test_event_bridge_watcher_uses_escaped_uri_for_literal_path_characters(tmp_path):
     """The tracked watcher must open the same #/% path it records."""
     import mcp_serve

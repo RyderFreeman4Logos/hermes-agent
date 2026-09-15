@@ -480,6 +480,9 @@ class EventBridge:
 
     def _establish_baseline(self) -> bool:
         """Record startup history without replaying an incomplete baseline later."""
+        # start() admits this baseline only after excluding an older worker.
+        # Row IDs belong to that worker's database generation, not this one.
+        self._baseline_cutoffs = {}
         db = _get_session_db()
         if not db:
             return False

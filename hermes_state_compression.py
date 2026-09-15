@@ -184,7 +184,8 @@ class SessionCompressionMixin:
         system_prompt: str = None, cwd: str = None, profile_name: str = None,
         compression_lock_holder: str = None, require_compression_lease: bool = True,
         require_lease_refresh: bool = False, lease_ttl_seconds: float = 300.0,
-        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None) -> None:
+        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None,
+        source_ids: Optional[List[int]] = None, source_signature: Optional[str] = None) -> None:
         """Atomically close a parent and publish its durable compression child: closure, child row, and
         handoff commit in one transaction, so readers see the live parent or a complete child, never an
         ended parent with a missing/empty child. *watermark* (parent's ``get_active_message_watermark`` at compression start): parent rows with ``id
@@ -197,6 +198,11 @@ class SessionCompressionMixin:
 
         See #75316.
         ``None`` = unbounded (no internal flush happened). See #47202.
+
+        When *source_signature* is supplied, it must match the complete active
+        pre-watermark durable source; a rewritten source aborts instead of
+        letting a stale summary publish over it. ``source_ids`` remains a
+        narrower compatibility check for direct callers.
         """
         from hermes_state_errors import CompressionSessionBusyError
         def _do(conn):
@@ -212,6 +218,8 @@ class SessionCompressionMixin:
             ):
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}")
+            self._assert_pre_watermark_source_unchanged(
+                conn, parent_session_id, watermark, source_ids, source_signature)
             parent = conn.execute(
                 """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,

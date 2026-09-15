@@ -666,7 +666,10 @@ def _build_result_entry(
         # Classified reason from the child loop (e.g. "rate_limit", "billing")
         # lets the parent tell a quota wall from a task error without parsing prose.
         _failure_reason = result.get("failure_reason")
-        if isinstance(_failure_reason, str) and _failure_reason:
+        # The same leak guard that replaces xAI billing prose must also own
+        # its structured classification.  Otherwise a last accepted non-xAI
+        # route (or an unknown route) is paired with xAI's billing reason.
+        if not _xai_billing_leak and isinstance(_failure_reason, str) and _failure_reason:
             entry["failure_reason"] = _failure_reason
     elif interrupt_note:
         entry["error"] = interrupt_note

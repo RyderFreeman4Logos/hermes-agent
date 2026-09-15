@@ -423,6 +423,136 @@ def test_cli_midchat_resume_uses_shared_state_restore():
     assert "_restore_session_state" in src
 
 
+def test_cli_memory_restore_updates_manager_and_initial_snapshot(monkeypatch):
+    from agent.memory_manager import MemoryManager
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    agent = FakeAgent("hybrid")
+    agent._memory_manager = MemoryManager(provider_mode="hybrid")
+    agent.enabled_toolsets = ["memory"]
+    agent.disabled_toolsets = []
+    agent.quiet_mode = True
+    agent._memory_enabled = True
+    agent._user_profile_enabled = True
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **_kwargs: [])
+    cli = CLIAgentSetupMixin.__new__(CLIAgentSetupMixin)
+    cli.agent = agent
+    cli._memory_provider_mode_override = None
+
+    cli._restore_session_memory_mode(
+        {"model_config": json.dumps({"memory_provider_mode": "authoritative"})}
+    )
+
+    assert agent._memory_provider_mode == "authoritative"
+    assert agent._memory_manager.provider_mode == "authoritative"
+    assert agent._session_init_model_config["memory_provider_mode"] == "authoritative"
+
+
+def test_tui_new_row_reads_selected_profile_memory_mode(monkeypatch, tmp_path):
+    from hermes_constants import get_hermes_home
+
+    launch_home = tmp_path / "launch"
+    selected_home = tmp_path / "selected"
+    launch_home.mkdir()
+    selected_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    monkeypatch.setattr(server, "_resolve_model", lambda: "synthetic-model")
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "memory": {
+                "provider_mode": (
+                    "hybrid" if get_hermes_home() == selected_home else "authoritative"
+                )
+            }
+        },
+    )
+
+    _, config = server._workdir_row_model_config(
+        {"profile_home": str(selected_home)}
+    )
+
+    assert config["memory_provider_mode"] == "hybrid"
+
+
+def test_deferred_resume_keeps_memory_mode_without_llm_provider():
+    current = {
+        "resume_session_id": "synthetic-session",
+        "resume_runtime_overrides": {"memory_provider_mode_override": "hybrid"},
+    }
+    kwargs = server._deferred_build_agent_kwargs(current, object())
+    assert kwargs["memory_provider_mode_override"] == "hybrid"
+
+
+def test_seeded_branch_live_record_keeps_parent_memory_mode(monkeypatch):
+    db = DurableDB()
+    db.create_session(
+        "parent",
+        source="tui",
+        model_config={"memory_provider_mode": "authoritative"},
+    )
+    record = {"cwd": "/synthetic", "profile_home": None}
+
+    @contextmanager
+    def session_db(_record):
+        yield db
+
+    monkeypatch.setattr(server, "_session_db", session_db)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "synthetic-model")
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    server._seed_branch_row(
+        record,
+        "child",
+        "parent",
+        [{"role": "user", "content": "synthetic"}],
+        "tui",
+        None,
+    )
+
+    assert record["resume_runtime_overrides"] == {
+        "memory_provider_mode_override": "authoritative"
+    }
+
+
+def test_gateway_fresh_agent_uses_durable_memory_mode(monkeypatch):
+    from gateway.run_turn_runner import TurnRunner
+
+    db = DurableDB()
+    db.create_session(
+        "stored-session",
+        source="gateway",
+        model_config={"memory_provider_mode": "hybrid"},
+    )
+    captured = {}
+
+    def make_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    source = SimpleNamespace(
+        user_id="u", user_id_alt=None, user_name="user", chat_id="c",
+        chat_name="chat", chat_type="direct", thread_id=None,
+    )
+    ctx = SimpleNamespace(
+        AIAgent=make_agent, user_config={}, enabled_toolsets=["memory"],
+        disabled_toolsets=[], session_id="stored-session", source=source,
+        session_key="gateway-key",
+    )
+    runner = SimpleNamespace(
+        _prefill_messages=None, _service_tier=None,
+        _session_db=SimpleNamespace(_db=db),
+        _refresh_fallback_model=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._checkpoint_agent_kwargs", lambda _cfg: {})
+
+    TurnRunner(runner, ctx)._build_fresh_agent(
+        {"model": "synthetic", "runtime": {}}, "gateway", None, 4, {}, {}, False
+    )
+
+    assert captured["memory_provider_mode_override"] == "hybrid"
+
+
 def test_background_agent_kwargs_carry_frozen_memory_mode(monkeypatch):
     from tui_gateway import server
 

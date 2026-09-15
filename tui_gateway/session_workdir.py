@@ -232,8 +232,19 @@ def _workdir_row_model_config(session: dict) -> tuple[str, dict]:
         model_config["_branched_from"] = parent_session_id
     try:
         from tools.memory_tool import get_memory_provider_mode
-        memory_config = _load_cfg().get("memory", {})
-        mode = get_memory_provider_mode(memory_config if isinstance(memory_config, dict) else {})
+        resume_overrides = session.get("resume_runtime_overrides")
+        mode = (resume_overrides.get("memory_provider_mode_override")
+                if isinstance(resume_overrides, dict) else None)
+        if mode not in {"authoritative", "hybrid"}:
+            home_token = None
+            try:
+                if profile_home := session.get("profile_home"):
+                    home_token = set_hermes_home_override(profile_home)
+                memory_config = _load_cfg().get("memory", {})
+                mode = get_memory_provider_mode(memory_config if isinstance(memory_config, dict) else {})
+            finally:
+                if home_token is not None:
+                    reset_hermes_home_override(home_token)
         if mode in {"authoritative", "hybrid"}:
             model_config["memory_provider_mode"] = mode
     except Exception:

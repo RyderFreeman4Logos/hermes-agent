@@ -595,7 +595,7 @@ class MemoryManager:
         "error_class",
     }
 
-    def authoritative_memory_write(self, args: Dict[str, Any], **kwargs) -> str:
+    def authoritative_memory_write(self, args: Dict[str, Any], *, authorization_callback=None, **kwargs) -> str:
         """Route the core ``memory`` write shape to the external provider.
 
         This path never touches ``MemoryStore``. Providers must implement a
@@ -676,6 +676,10 @@ class MemoryManager:
                     success=False,
                     error_class="missing_content",
                 )
+        if authorization_callback is not None:
+            gate_result = authorization_callback(request)
+            if gate_result is not None:
+                return gate_result
         provider = next((c for c in self._providers if c.name != "builtin"), None)
         if provider is None:
             return tool_error(

@@ -413,7 +413,8 @@ class CLIAgentSetupMixin:
         )
         agent = getattr(self, "agent", None)
         if agent is not None and self._memory_provider_mode_override is not None:
-            agent._memory_provider_mode = self._memory_provider_mode_override
+            from agent.agent_init import apply_memory_provider_mode
+            apply_memory_provider_mode(agent, self._memory_provider_mode_override)
 
     def _restore_session_state(self, session_meta, *, quiet: bool = False) -> None:
         """Restore cwd / yolo / frozen memory mode / model from the resumed session."""

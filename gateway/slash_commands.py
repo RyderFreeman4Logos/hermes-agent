@@ -191,7 +191,7 @@ class GatewaySlashCommandsMixin(
         """The live running agent for *session_key*, else the cached one, else None. The pending
         sentinel (a run that is starting) never counts as a usable agent."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        agent = self._running_agents.get(session_key)
+        agent = getattr(self, "_running_agents", {}).get(session_key)
         if agent is not None and agent is not _AGENT_PENDING_SENTINEL:
             return agent
         return self._cached_agent_for(session_key)
@@ -834,10 +834,13 @@ class GatewaySlashCommandsMixin(
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
         from tools.memory_tool import load_on_disk_store
+        session_key = self._session_key_for_source(event.source)
+        agent = self._resident_agent_for(session_key) if session_key else None
         # Apply approved writes against a fresh on-disk store (the gateway has no long-lived agent;
         # the store persists to the same MEMORY/USER.md and honors the configured char limits).
         out = handle_pending_subcommand(
             wa.MEMORY, event.get_command_args().strip().split(), memory_store=load_on_disk_store(),
+            memory_manager=getattr(agent, "_memory_manager", None),
             set_mode_fn=self._write_approval_setter("memory", event))
         return out if out is not None else (
             "Unknown /memory subcommand. Use: pending, approve <id>, reject <id>, approval <on|off>."

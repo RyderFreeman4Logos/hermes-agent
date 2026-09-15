@@ -31,7 +31,8 @@ def _fmt_pending_list(subsystem: str) -> str:
 
 
 def handle_pending_subcommand(
-    subsystem: str, args: List[str], *, memory_store=None, set_mode_fn=None) -> Optional[str]:
+    subsystem: str, args: List[str], *, memory_store=None, memory_manager=None,
+    set_mode_fn=None) -> Optional[str]:
     """Dispatch a /memory or /skills write-approval subcommand.
 
     ``memory_store`` applies approved memory writes (CLI passes its live store; gateway a freshly
@@ -45,7 +46,7 @@ def handle_pending_subcommand(
     if sub == "pending":
         return _fmt_pending_list(subsystem)
     if sub in {"approve", "apply"}:
-        return _approve(subsystem, rest, memory_store)
+        return _approve(subsystem, rest, memory_store, memory_manager)
     if sub in {"reject", "deny", "drop"}:
         return _reject(subsystem, rest)
     if sub == "diff" and subsystem == wa.SKILLS:
@@ -59,7 +60,7 @@ def _usage(subsystem: str) -> str:
     return f"Usage: /{subsystem} approve|reject <id>  (or 'all')"
 
 
-def _approve(subsystem: str, rest: List[str], memory_store) -> str:
+def _approve(subsystem: str, rest: List[str], memory_store, memory_manager=None) -> str:
     if not rest:
         return _usage(subsystem)
     target = rest[0]
@@ -76,7 +77,7 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
     applied, failed = 0, []
     for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store)
+        ok, msg = _apply_one(subsystem, rec, memory_store, memory_manager)
         if ok:
             wa.discard_pending(subsystem, rec["id"])
             applied += 1
@@ -90,10 +91,17 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     return "\n".join(out)
 
 
-def _apply_one(subsystem: str, rec, memory_store):
+def _apply_one(subsystem: str, rec, memory_store, memory_manager=None):
     payload = rec.get("payload", {})
     try:
         if subsystem == wa.MEMORY:
+            if payload.get("memory_provider_mode") == "authoritative":
+                if memory_manager is None:
+                    return False, "authoritative memory provider unavailable"
+                provider_payload = dict(payload)
+                provider_payload.pop("memory_provider_mode", None)
+                result = json.loads(memory_manager.authoritative_memory_write(provider_payload))
+                return bool(result.get("success")), result.get("error", "")
             if memory_store is None:
                 return False, "memory store unavailable"
             from tools.memory_tool import apply_memory_pending

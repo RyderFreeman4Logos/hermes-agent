@@ -908,6 +908,10 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     if isinstance(resume_overrides, dict) and resume_overrides and _overrides_have_routable_provider(resume_overrides):
         kw.update(resume_overrides)
     else:
+        if isinstance(resume_overrides, dict):
+            memory_mode = resume_overrides.get("memory_provider_mode_override")
+            if memory_mode in {"authoritative", "hybrid"}:
+                kw["memory_provider_mode_override"] = memory_mode
         if override := current.get("model_override"):
             kw["model_override"] = override
         kw.update({k: v for k, v in (("reasoning_config_override", current.get("create_reasoning_override")),

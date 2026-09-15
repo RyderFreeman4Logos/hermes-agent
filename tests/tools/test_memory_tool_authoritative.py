@@ -4,6 +4,9 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from agent.inline_tool_executors import InlineToolContext, _memory
 from agent.memory_manager import MemoryManager
 from hermes_cli.memory_setup import cmd_status
 from tools.memory_tool import check_memory_requirements, get_memory_provider_mode
@@ -57,6 +60,120 @@ class LegacyMemoryProvider:
 
     def on_memory_write(self, *args, **kwargs):
         self.mirror_calls.append((args, kwargs))
+
+
+@pytest.fixture
+def approval_callback_cleanup():
+    yield
+    from tools.terminal_tool import set_approval_callback
+    set_approval_callback(None)
+
+
+def _authoritative_agent(provider):
+    manager = MemoryManager(provider_mode="authoritative")
+    manager.add_provider(provider)
+    return SimpleNamespace(
+        _memory_provider_mode="authoritative",
+        _memory_manager=manager,
+        _memory_store=None,
+        _build_memory_write_metadata=lambda **kwargs: kwargs,
+    )
+
+
+def test_authoritative_core_write_honors_interactive_denial(
+    monkeypatch, approval_callback_cleanup
+):
+    """The real inline core route must authorize before provider I/O."""
+    from tools import write_approval as wa
+    from tools.terminal_tool import set_approval_callback
+
+    provider = RecordingAuthoritativeProvider()
+    agent = _authoritative_agent(provider)
+    decisions = []
+    monkeypatch.setattr(wa, "write_approval_enabled", lambda subsystem: subsystem == wa.MEMORY)
+    set_approval_callback(lambda *args, **kwargs: decisions.append((args, kwargs)) or "deny")
+
+    result = json.loads(_memory(
+        agent,
+        {"action": "add", "target": "memory", "content": "synthetic denied fact"},
+        InlineToolContext(effective_task_id="task", tool_call_id="call"),
+    ))
+
+    assert result["success"] is False
+    assert "denied" in result["error"].lower()
+    assert len(decisions) == 1
+    assert provider.calls == []
+
+
+def test_authoritative_no_channel_stages_and_approval_keeps_backend(
+    monkeypatch, tmp_path, approval_callback_cleanup
+):
+    """A staged authoritative proposal must never replay into the Markdown store."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+    from tools.terminal_tool import set_approval_callback
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(wa, "write_approval_enabled", lambda subsystem: subsystem == wa.MEMORY)
+    set_approval_callback(None)
+    provider = RecordingAuthoritativeProvider()
+    agent = _authoritative_agent(provider)
+    result = json.loads(_memory(
+        agent,
+        {"action": "add", "target": "user", "content": "synthetic staged fact"},
+        InlineToolContext(effective_task_id="task", tool_call_id="call"),
+    ))
+    assert result["staged"] is True
+    assert provider.calls == []
+
+    store = MemoryStore()
+    store.load_from_disk()
+    output = handle_pending_subcommand(
+        wa.MEMORY,
+        ["approve", result["pending_id"]],
+        memory_store=store,
+        memory_manager=agent._memory_manager,
+    )
+    assert "Approved 1" in output
+    assert len(provider.calls) == 1
+    assert provider.calls[0][1]["target"] == "user"
+    assert store.memory_entries == []
+    assert store.user_entries == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "flags", "expected_targets", "exposed"),
+    [
+        ("authoritative", (False, False), ["memory", "user"], True),
+        ("authoritative", (True, False), ["memory", "user"], True),
+        ("authoritative", (False, True), ["memory", "user"], True),
+        ("hybrid", (False, False), None, False),
+    ],
+)
+def test_public_memory_schema_uses_same_mode_and_target_snapshot(
+    monkeypatch, mode, flags, expected_targets, exposed
+):
+    import model_tools
+    from tools import memory_tool as memory_module
+
+    monkeypatch.setattr(
+        memory_module,
+        "get_builtin_memory_config",
+        lambda _config=None: {"provider_mode": mode},
+    )
+    monkeypatch.setattr(
+        memory_module,
+        "get_builtin_memory_store_flags",
+        lambda _config=None: flags,
+    )
+    definitions = model_tools.get_tool_definitions(
+        enabled_toolsets=["memory"], quiet_mode=False, skip_tool_search_assembly=True
+    )
+    memory_defs = [d for d in definitions if d["function"]["name"] == "memory"]
+    assert bool(memory_defs) is exposed
+    if exposed:
+        assert memory_defs[0]["function"]["parameters"]["properties"]["target"]["enum"] == expected_targets
 
 
 def test_authoritative_write_requires_explicit_provider_capability():

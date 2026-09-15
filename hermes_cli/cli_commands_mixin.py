@@ -1858,6 +1858,7 @@ class CLICommandsMixin:
             store = load_on_disk_store()
         out = handle_pending_subcommand(
             wa.MEMORY, args, memory_store=store,
+            memory_manager=getattr(self.agent, "_memory_manager", None) if getattr(self, "agent", None) else None,
             set_mode_fn=lambda enabled: self._save_write_approval("memory", enabled))
         print(out if out is not None else
               "Unknown /memory subcommand. Use: pending, approve <id>, reject <id>, approval <on|off>.")

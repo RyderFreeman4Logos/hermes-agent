@@ -175,6 +175,25 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
+def test_new_command_persists_resolved_memory_mode(tmp_path):
+    cli = _make_cli(config_overrides={"memory": {"provider_mode": "hybrid"}})
+    cli._session_db = SessionDB(db_path=tmp_path / "state.db")
+    cli._session_db.create_session(session_id=cli.session_id, source="cli", model=cli.model)
+    cli.agent = _FakeAgent(cli.session_id, cli.session_start)
+    cli.agent._memory_provider_mode = "authoritative"
+    cli.agent._session_init_model_config = {"memory_provider_mode": "authoritative"}
+    cli.conversation_history = [{"role": "user", "content": "hello"}]
+    cli._confirm_destructive_slash = lambda *_a, **_kw: "once"
+
+    cli.process_command("/new")
+
+    row = cli._session_db.get_session(cli.session_id)
+    config = __import__("json").loads(row["model_config"])
+    assert config["memory_provider_mode"] == "hybrid"
+    assert cli.agent._memory_provider_mode == "hybrid"
+    assert cli.agent._session_init_model_config["memory_provider_mode"] == "hybrid"
+
+
 
 
 
@@ -295,5 +314,4 @@ def test_new_session_with_title(capsys):
 
     captured = capsys.readouterr()
     assert "My Test Session" in captured.out
-
 

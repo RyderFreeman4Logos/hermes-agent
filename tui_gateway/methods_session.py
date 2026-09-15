@@ -228,7 +228,7 @@ def _billing_pending_change(result: dict) -> dict:
 
 # ── session.create / list / most_recent / facts ──────────────────────
 def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list, *, source, cwd, profile_name,
-                    copy_fields=(), compensate: bool = False, memory_provider_mode: str | None = None) -> None:
+                    copy_fields=(), compensate: bool = False, memory_provider_mode: str | None = None) -> str | None:
     """Branch child row + parent transcript (bounded-chunk transactions) + title. ``_branched_from`` keeps the
     row visible in list_sessions_rich() (the live parent never matches the legacy end_reason='branched'
     heuristic); NULL ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate``
@@ -264,6 +264,7 @@ def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list
             except Exception:
                 logger.debug("branch seed compensation delete failed for %s", new_key, exc_info=True)
         raise
+    return mode if mode in {"authoritative", "hybrid"} else None
 
 
 def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: list, source: str, profile_home):
@@ -274,9 +275,13 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
         with _session_db(record) as db:
             if db is None:
                 return
-            _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
-                            source=source, cwd=record["cwd"],
-                            profile_name=profile_name_for_home(profile_home) or _current_profile_name(), compensate=True)
+            mode = _persist_branch(
+                db, key, parent_session_id, _branch_title(db, parent_session_id), history,
+                source=source, cwd=record["cwd"],
+                profile_name=profile_name_for_home(profile_home) or _current_profile_name(), compensate=True,
+            )
+            if mode is not None:
+                record["resume_runtime_overrides"] = {"memory_provider_mode_override": mode}
             record["pending_title"] = None
     except Exception:
         logger.warning("seeded-branch persistence failed for %s; falling back to lazy row creation", key,

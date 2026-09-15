@@ -113,8 +113,12 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
 def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
     if getattr(agent, "_memory_provider_mode", "hybrid") == "authoritative":
         if agent._memory_manager:
+            from tools.memory_tool import authorize_memory_write
             result = agent._memory_manager.authoritative_memory_write(
                 args,
+                authorization_callback=lambda request: authorize_memory_write(
+                    request, provider_mode="authoritative"
+                ),
                 metadata=agent._build_memory_write_metadata(
                     task_id=ctx.effective_task_id,
                     tool_call_id=ctx.tool_call_id,

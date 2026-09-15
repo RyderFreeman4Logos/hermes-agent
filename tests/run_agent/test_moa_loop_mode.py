@@ -120,6 +120,7 @@ moa:
         max_iterations=1,
     )
     primary_client = agent.client
+    initial_generation = int(getattr(agent, "_openai_transport_generation", 0))
 
     def fail_openai_rebuild(*_args, **_kwargs):
         raise AssertionError("MoA restore must not build a real OpenAI client")
@@ -139,6 +140,12 @@ moa:
     assert agent.client is not primary_client
     assert hasattr(agent.client.chat, "completions")
     assert getattr(agent, "_fallback_activated") is False
+    assert agent._openai_transport_kind == "moa"
+    assert agent._openai_transport_generation == initial_generation + 1
+
+    from tui_gateway.cache_telemetry import _tui_cache_warm_request
+
+    assert _tui_cache_warm_request(agent) is None
 
 
 def test_moa_restored_facade_still_emits_reference_events(monkeypatch, tmp_path):

@@ -50,7 +50,6 @@ const LEGACY_STATUS_BAR_SEGMENTS = new Set([
   'context_bar',
   'context_percent',
   'focus',
-  'heartbeat',
   'session_duration',
   'idle',
   'compressions',

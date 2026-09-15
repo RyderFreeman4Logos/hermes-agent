@@ -22422,7 +22422,18 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     "provider",
     ["custom:mp-cpi", "custom:localrouter", "custom:zenmux", "custom:z2", "custom:z1", "custom:deepinfra.man"],
 )
-def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(monkeypatch, provider):
+@pytest.mark.parametrize(
+    ("reserved", "reserved_value"),
+    [
+        ("stream", True),
+        ("messages", [{"role": "user", "content": "must-not-leak"}]),
+        ("tools", [{"type": "function", "function": {"name": "must-not-leak"}}]),
+        ("max_completion_tokens", 321),
+    ],
+)
+def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(
+    monkeypatch, provider, reserved, reserved_value
+):
     import httpx
     from openai import OpenAI
 
@@ -22443,7 +22454,9 @@ def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(monkeypat
         _cache_disabled = False
         _cache_ttl = "5m"
         max_tokens = 4096
-        request_overrides = {"extra_body": {"route": "stable"}}
+        request_overrides = {
+            "extra_body": {"route": "stable", reserved: reserved_value}
+        }
         tools = [{"type": "function", "function": {"name": "must-not-leak"}}]
         _ephemeral_max_output_tokens = 123
         _ollama_num_ctx = None
@@ -22461,6 +22474,7 @@ def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(monkeypat
             self.provider = provider
             self.requests = []
             self.wire = []
+            self.max_token_values = []
             self._transport = ChatCompletionsTransport()
 
             def record(request):
@@ -22479,13 +22493,28 @@ def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(monkeypat
                 http_client=httpx.Client(transport=httpx.MockTransport(record)),
             )
 
-        def _interruptible_api_call(self, request):
+        def _interruptible_api_call(
+            self,
+            request,
+            *,
+            _before_dispatch=None,
+            _on_worker_start=None,
+            _on_worker_retire=None,
+        ):
             from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
 
             assert session["running"] is True
-            self.requests.append(request)
-            return _dispatch_nonstreaming_api_request(
-                self, request, make_client=lambda *_args, **_kwargs: self.client)
+            if _on_worker_start:
+                _on_worker_start()
+            try:
+                if _before_dispatch and not _before_dispatch():
+                    return None
+                self.requests.append(request)
+                return _dispatch_nonstreaming_api_request(
+                    self, request, make_client=lambda *_args, **_kwargs: self.client)
+            finally:
+                if _on_worker_retire:
+                    _on_worker_retire()
 
         def _get_transport(self):
             return self._transport
@@ -22502,8 +22531,9 @@ def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(monkeypat
         def _resolved_api_call_timeout(self):
             return 17
 
-        def _max_tokens_param(self, _value):
-            raise AssertionError("warm projection must not add a completion budget")
+        def _max_tokens_param(self, value):
+            self.max_token_values.append(value)
+            return {"max_tokens": value}
 
         def _supports_reasoning_extra_body(self):
             return False
@@ -22512,6 +22542,23 @@ def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(monkeypat
             return None
 
     agent = _Agent()
+    from agent.chat_completion_helpers import _build_chat_completions_kwargs
+
+    ordinary = _build_chat_completions_kwargs(
+        agent,
+        [{"role": "user", "content": "ordinary"}],
+        agent.tools,
+        None,
+        agent.request_overrides,
+        None,
+    )
+    assert ordinary["extra_body"] == {
+        "route": "stable",
+        reserved: reserved_value,
+    }
+    assert agent.max_token_values == [123]
+    agent.max_token_values.clear()
+    agent._ephemeral_max_output_tokens = 123
     route = f"{provider}:test-model"
     session = _session(
         agent=agent,
@@ -22532,6 +22579,7 @@ def test_tui_cache_warm_due_uses_resolved_http_chat_and_owns_idle_slot(monkeypat
         "extra_body": {"route": "stable"},
     }]
     assert agent._ephemeral_max_output_tokens == 123
+    assert agent.max_token_values == []
     assert agent.wire == [{
         "messages": [], "model": "test-model", "route": "stable",
     }]
@@ -22958,3 +23006,249 @@ def test_tui_cache_status_uses_first_provider_response_per_wake(
     assert [payload["text"] for payload in cache_updates] == [text]
     assert cache_updates[0]["cache_record"]["turn_origin"] == origin
     assert session["first_provider_response"] == cache_updates[0]["cache_record"]
+
+
+@pytest.mark.parametrize("action", ["session.interrupt", "session.close"])
+def test_public_stop_or_close_fences_fired_cache_warm_before_physical_dispatch(
+    monkeypatch, action
+):
+    from hermes_cli import heartbeat
+
+    guard_entered = threading.Event()
+    release_guard = threading.Event()
+    dispatched = []
+    drained = []
+
+    class _Manager:
+        state = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def due_prompt(self):
+            return "cache warm"
+
+        def clear(self):
+            pass
+
+    class _Agent:
+        provider = "custom"
+        model = "z1"
+        api_mode = "chat_completions"
+        base_url = "https://example.invalid/v1"
+        session_id = "warm-stop"
+        _openai_transport_generation = 1
+        _openai_transport_kind = "http_chat"
+
+        def _interruptible_api_call(
+            self, request, *, _before_dispatch, _on_worker_start, _on_worker_retire
+        ):
+            _on_worker_start()
+            guard_entered.set()
+            assert release_guard.wait(timeout=2)
+            if _before_dispatch():
+                dispatched.append(request)
+            _on_worker_retire()
+
+        def interrupt(self):
+            pass
+
+    agent = _Agent()
+    identity = server._tui_cache_warm_identity(agent)
+    session = _session(
+        agent=agent,
+        _cache_warm_route="custom:z1",
+        _cache_warm_identity=identity,
+    )
+    server._sessions["warm-stop"] = session
+    monkeypatch.setattr(heartbeat, "HeartbeatManager", _Manager)
+    monkeypatch.setattr(server, "_tui_cache_warm_request", lambda _agent: {"messages": []})
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *args: drained.append(args))
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *_args, **_kwargs: None)
+    worker = threading.Thread(
+        target=server._tui_cache_warm_due,
+        args=("warm-stop", session, agent, "custom:z1", identity),
+    )
+    try:
+        worker.start()
+        assert guard_entered.wait(timeout=2)
+        response = server.handle_request({
+            "id": "stop",
+            "method": action,
+            "params": {"session_id": "warm-stop"},
+        })
+        if action == "session.interrupt":
+            assert response["result"]["status"] == "interrupted"
+        else:
+            assert response["result"]["closed"] is True
+        assert session["running"] is True
+        release_guard.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert dispatched == []
+        assert session["running"] is False
+        assert len(drained) == (1 if action == "session.interrupt" else 0)
+    finally:
+        release_guard.set()
+        worker.join(timeout=2)
+        server._sessions.pop("warm-stop", None)
+
+
+def test_public_stop_keeps_dispatched_abort_resistant_warm_as_admission_fence(monkeypatch):
+    from hermes_cli import heartbeat
+
+    dispatched = threading.Event()
+    release_transport = threading.Event()
+    drained = []
+
+    class _Manager:
+        state = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def due_prompt(self):
+            return "cache warm"
+
+        def clear(self):
+            pass
+
+    class _Agent:
+        provider = "custom"
+        model = "z1"
+        api_mode = "chat_completions"
+        base_url = "https://example.invalid/v1"
+        session_id = "warm-dispatched"
+        _openai_transport_generation = 1
+        _openai_transport_kind = "http_chat"
+
+        def _interruptible_api_call(
+            self, _request, *, _before_dispatch, _on_worker_start, _on_worker_retire
+        ):
+            _on_worker_start()
+            assert _before_dispatch()
+            dispatched.set()
+            assert release_transport.wait(timeout=2)
+            _on_worker_retire()
+
+        def interrupt(self):
+            pass
+
+    agent = _Agent()
+    identity = server._tui_cache_warm_identity(agent)
+    session = _session(
+        agent=agent,
+        _cache_warm_route="custom:z1",
+        _cache_warm_identity=identity,
+    )
+    server._sessions["warm-dispatched"] = session
+    monkeypatch.setattr(heartbeat, "HeartbeatManager", _Manager)
+    monkeypatch.setattr(server, "_tui_cache_warm_request", lambda _agent: {"messages": []})
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *args: drained.append(args))
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    worker = threading.Thread(
+        target=server._tui_cache_warm_due,
+        args=("warm-dispatched", session, agent, "custom:z1", identity),
+    )
+    try:
+        worker.start()
+        assert dispatched.wait(timeout=2)
+        server.handle_request({
+            "id": "stop",
+            "method": "session.interrupt",
+            "params": {"session_id": "warm-dispatched"},
+        })
+        assert session["running"] is True
+        assert session.get("_turn_owner_kind") == "cache_warm"
+        successor = server.handle_request({
+            "id": "successor",
+            "method": "prompt.submit",
+            "params": {
+                "session_id": "warm-dispatched",
+                "text": "B",
+                "queued": True,
+            },
+        })
+        assert successor["result"]["status"] == "queued"
+        assert session["queued_prompt"]["text"] == "B"
+        release_transport.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert session["running"] is False
+        assert len(drained) == 1
+    finally:
+        release_transport.set()
+        worker.join(timeout=2)
+        server._sessions.pop("warm-dispatched", None)
+
+
+def test_failed_agent_initialization_keeps_turn_owner_through_terminal_publication(monkeypatch):
+    captured_threads = []
+    terminal_entered = threading.Event()
+    release_terminal = threading.Event()
+    real_thread = threading.Thread
+
+    class _CapturedThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            captured_threads.append(self)
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return True
+
+    ready = threading.Event()
+    ready.set()
+    session = _session(agent_ready=ready)
+    session["agent"] = None
+    session["agent_error"] = "provider unavailable"
+    server._sessions["init-owner"] = session
+
+    def _failing_build(_sid, target):
+        target["agent_error"] = "provider unavailable"
+        target["agent_ready"].set()
+
+    def _held_terminal(*_args, **_kwargs):
+        terminal_entered.set()
+        assert release_terminal.wait(timeout=2)
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _CapturedThread)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+        monkeypatch.setattr(server, "_start_agent_build", _failing_build)
+        monkeypatch.setattr(server, "_emit_terminal_turn_error", _held_terminal)
+        monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+
+        first = server.handle_request({
+            "id": "a",
+            "method": "prompt.submit",
+            "params": {"session_id": "init-owner", "text": "A"},
+        })
+        assert first["result"]["status"] == "streaming"
+
+        runner = real_thread(target=captured_threads[0].target)
+        runner.start()
+        assert terminal_entered.wait(timeout=2)
+
+        second = server.handle_request({
+            "id": "b",
+            "method": "prompt.submit",
+            "params": {"session_id": "init-owner", "text": "B"},
+        })
+        assert len(captured_threads) == 1
+        assert second["result"]["status"] in {"queued", "steered"}
+        assert session.get("_turn_owner_kind") == "user"
+
+        release_terminal.set()
+        runner.join(timeout=2)
+        assert not runner.is_alive()
+        assert session["running"] is False
+    finally:
+        release_terminal.set()
+        server._sessions.pop("init-owner", None)

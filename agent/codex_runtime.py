@@ -82,6 +82,29 @@ def _queue_token_counts(agent, fail_msg: str, *fail_extra: Any, counts: Callable
         logger.debug(fail_msg, agent.session_id, *fail_extra, exc)
 
 
+def _canonical_codex_app_server_usage(raw: dict):
+    from agent.usage_pricing import CanonicalUsage, _cache_evidence
+
+    cache_read_tokens, cache_valid = _cache_evidence(raw, ("cachedInputTokens",))
+    return CanonicalUsage(
+        input_tokens=_coerce_usage_int(raw.get("inputTokens")),
+        output_tokens=_coerce_usage_int(raw.get("outputTokens")),
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=0,
+        reasoning_tokens=_coerce_usage_int(raw.get("reasoningOutputTokens")),
+        raw_usage=raw,
+        cache_telemetry="reported" if cache_valid else "unavailable",
+    )
+
+
+def _observe_codex_app_server_usage(agent, raw: Any) -> None:
+    from agent.turn_usage import _capture_first_turn_usage, _notify_tui_cache
+
+    canonical = _canonical_codex_app_server_usage(raw) if isinstance(raw, dict) else None
+    if _capture_first_turn_usage(agent, canonical):
+        _notify_tui_cache(agent, canonical, no_usage=canonical is None)
+
+
 def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting. Prompt bucket = uncached + cached
     input (the protocol exposes no cache-write tokens); a turn with no usage still counts as one API call.
@@ -96,9 +119,7 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     def billing(**extra):
         return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
     if not isinstance(usage, dict) or not usage:
-        from agent.turn_usage import _capture_first_turn_usage, _notify_tui_cache
-        _capture_first_turn_usage(agent)
-        _notify_tui_cache(agent, no_usage=True)
+        _observe_codex_app_server_usage(agent, None)
         if compressor is not None and getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage cannot adjudicate the pending compaction; unlatch preflight deferral.
             compressor.update_from_response({})
@@ -107,23 +128,9 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
         _queue_token_counts(agent, "Codex app-server api-call persistence failed (session=%s): %s",
                             counts=lambda: billing(billing_mode="subscription_included"))
         return {}
-    from agent.usage_pricing import CanonicalUsage, _cache_evidence, estimate_usage_cost
+    from agent.usage_pricing import estimate_usage_cost
 
-    def canonical(raw):
-        cache_read_tokens, cache_valid = _cache_evidence(raw, ("cachedInputTokens",))
-        cache_telemetry = "reported" if cache_valid else "unavailable"
-        return CanonicalUsage(
-            input_tokens=_coerce_usage_int(raw.get("inputTokens")),
-            output_tokens=_coerce_usage_int(raw.get("outputTokens")),
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=0,
-            reasoning_tokens=_coerce_usage_int(raw.get("reasoningOutputTokens")),
-            raw_usage=raw,
-            cache_telemetry=cache_telemetry,
-        )
-
-    canonical_usage = canonical(usage)
-    first_canonical = canonical(first_usage) if isinstance(first_usage, dict) else canonical_usage
+    canonical_usage = _canonical_codex_app_server_usage(usage)
     cache_telemetry = canonical_usage.cache_telemetry
     prompt_tokens = canonical_usage.prompt_tokens
     total_tokens = _coerce_usage_int(usage.get("totalTokens")) or canonical_usage.total_tokens
@@ -131,9 +138,7 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
                     ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")}
     usage_dict = {"prompt_tokens": prompt_tokens, "completion_tokens": canonical_usage.output_tokens,
                   "total_tokens": total_tokens, **token_counts}
-    from agent.turn_usage import _capture_first_turn_usage, _notify_tui_cache
-    _capture_first_turn_usage(agent, first_canonical)
-    _notify_tui_cache(agent, first_canonical)
+    _observe_codex_app_server_usage(agent, first_usage if isinstance(first_usage, dict) else usage)
     turn_usage = {**usage_dict, "cache_telemetry": cache_telemetry}
     agent._last_turn_usage = dict(turn_usage)
     if compressor is not None:
@@ -365,11 +370,19 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             (_fire_tool_completed if completed else _fire_tool_started)(item)
         elif completed and item_type == "agentMessage":
             _fire_agent_message_completed(item)
+
+    def _on_usage(params: dict) -> None:
+        usage = params.get("tokenUsage")
+        if not isinstance(usage, dict):
+            return
+        _observe_codex_app_server_usage(agent, usage.get("last"))
+
     handlers: dict[str, Callable[[dict], None]] = {
         "item/agentMessage/delta": lambda p: _fire_delta(p, "_fire_stream_delta"),
         "item/reasoning/delta": lambda p: _fire_delta(p, "_fire_reasoning_delta"),
         "item/reasoning/summaryDelta": lambda p: _fire_delta(p, "_fire_reasoning_delta"),
         "item/started": lambda p: _on_item(p, completed=False), "item/completed": lambda p: _on_item(p, completed=True),
+        "thread/tokenUsage/updated": _on_usage,
     }
 
     def on_event(note: dict) -> None:

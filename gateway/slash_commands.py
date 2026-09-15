@@ -838,15 +838,27 @@ class GatewaySlashCommandsMixin(
         from tools.memory_tool import load_on_disk_store
         session_key = self._session_key_for_source(event.source)
         agent = self._resident_agent_for(session_key) if session_key else None
-        session_entry = await self.async_session_store.get_or_create_session(event.source)
         source = event.source
+        # The slash-command mixin is also a public surface for lightweight runners that only
+        # provide config commands. Full GatewayRunner instances expose this facade and retain the
+        # persisted-session binding required by cold authoritative approvals.
+        session_store = getattr(self, "async_session_store", None)
+        session_entry = (
+            await session_store.get_or_create_session(source)
+            if session_store is not None else None
+        )
+        approval_session_id = (
+            getattr(agent, "session_id", None)
+            or getattr(session_entry, "session_id", None)
+        )
+
         # Apply approved writes against a fresh on-disk store (the gateway has no long-lived agent;
         # the store persists to the same MEMORY/USER.md and honors the configured char limits).
         out = handle_pending_subcommand(
             wa.MEMORY, event.get_command_args().strip().split(), memory_store=load_on_disk_store(),
             memory_manager=getattr(agent, "_memory_manager", None),
-            memory_manager_factory=lambda: load_authoritative_memory_manager(
-                session_id=(getattr(agent, "session_id", None) or session_entry.session_id),
+            memory_manager_factory=lambda: approval_session_id and load_authoritative_memory_manager(
+                session_id=approval_session_id,
                 platform=source.platform.value if source.platform else "gateway",
                 identity={
                     "user_id": source.user_id,

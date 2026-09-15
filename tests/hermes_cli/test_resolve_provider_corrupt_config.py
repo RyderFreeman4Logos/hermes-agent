@@ -15,12 +15,15 @@ active config is corrupt. Explicit provider requests and valid-config
 env-sniff flows are untouched, and fixing the file in place clears the block.
 """
 
+import hashlib
+import io
 import logging
 import os
 import threading
 import uuid
 
 import pytest
+import yaml
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +44,11 @@ CORRUPT_YAML = "model:\n  provider: openai-codex\n  default: gpt-5.5\n broken: [
 VALID_YAML = "gateway:\n  enabled: false\n"
 
 
+def _incomplete_utf8_config_bytes():
+    prefix = b"image_gen:\n  provider: nous\n#"
+    return prefix + (b"x" * ((64 * 1024) - len(prefix))) + b"\xc3"
+
+
 def _setup_home(tmp_path, monkeypatch, config_text):
     home = tmp_path / "hermes"
     home.mkdir(parents=True, exist_ok=True)
@@ -55,6 +63,112 @@ def _load_config_fresh():
     from hermes_cli.config import load_config
 
     return load_config()
+
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+@pytest.mark.parametrize(
+    "loader_name",
+    [
+        "safe",
+        pytest.param(
+            "default",
+            marks=pytest.mark.skipif(
+                not hasattr(yaml, "CSafeLoader"), reason="libyaml CSafeLoader unavailable"
+            ),
+        ),
+    ],
+)
+def test_incomplete_utf8_tail_is_rejected_without_raw_memoization(
+    tmp_path, monkeypatch, reader_name, loader_name
+):
+    """A buffered partial character is not YAML EOF for either public raw API."""
+    from hermes_cli import config as config_mod
+    from tools.tool_backend_helpers import read_selection
+    import utils
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    cfg = home / "config.yaml"
+    cfg.write_bytes(_incomplete_utf8_config_bytes())
+    if loader_name == "safe":
+        monkeypatch.setattr(utils, "_fast_yaml_loader", yaml.SafeLoader)
+    else:
+        assert utils._fast_yaml_loader is yaml.CSafeLoader
+
+    reader = getattr(config_mod, reader_name)
+    assert reader() == {}
+    assert str(cfg) not in config_mod._RAW_CONFIG_CACHE
+    assert reader() == {}
+    assert str(cfg) not in config_mod._RAW_CONFIG_CACHE
+    assert read_selection("image_gen") is None
+
+
+@pytest.mark.parametrize("reader_name", ["read_raw_config", "read_raw_config_readonly"])
+def test_incomplete_utf8_tail_cannot_retire_active_config_failure(
+    tmp_path, monkeypatch, reader_name
+):
+    """Raw validation cannot release refusal while invalid UTF-8 remains."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.auth import AuthError, resolve_provider
+    import utils
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-FAKE1234567890")
+    monkeypatch.setattr(utils, "_fast_yaml_loader", yaml.SafeLoader)
+    cfg = home / "config.yaml"
+    cfg.write_bytes(_incomplete_utf8_config_bytes())
+
+    config_mod.load_config()
+    assert config_mod.get_active_config_parse_failure()
+    assert getattr(config_mod, reader_name)() == {}
+    assert str(cfg) not in config_mod._RAW_CONFIG_CACHE
+    assert config_mod.get_active_config_parse_failure()
+    with pytest.raises(AuthError) as denied:
+        resolve_provider("auto")
+    assert denied.value.code == "corrupt_config"
+
+
+class _OneByteReader(io.BytesIO):
+    def read(self, size=-1):
+        return super().read(1 if size is None or size < 0 else min(size, 1))
+
+
+def test_digesting_reader_continues_past_buffered_utf8_to_text_and_true_eof():
+    from hermes_cli.config import _DigestingConfigReader
+
+    encoded = "é".encode("utf-8")
+    reader = _DigestingConfigReader(_OneByteReader(encoded))
+
+    assert reader.read() == "é"
+    assert reader.read() == ""
+    assert reader.digest() == hashlib.sha256(encoded).digest()
+
+
+def test_digesting_reader_zero_length_read_does_not_consume_or_finalize():
+    from hermes_cli.config import _DigestingConfigReader
+
+    source = io.BytesIO("é".encode("utf-8"))
+    reader = _DigestingConfigReader(source)
+
+    assert reader.read(0) == ""
+    assert source.tell() == 0
+    assert reader.read() == "é"
+    assert reader.read() == ""
+
+
+def test_digesting_reader_finalizes_invalid_tail_only_at_true_eof():
+    from hermes_cli.config import _DigestingConfigReader
+
+    encoded = b"comment\xc3"
+    reader = _DigestingConfigReader(io.BytesIO(encoded))
+
+    assert reader.read() == "comment"
+    with pytest.raises(UnicodeDecodeError):
+        reader.read()
+    assert reader.digest() == hashlib.sha256(encoded).digest()
 
 
 class TestParseFailureProbe:

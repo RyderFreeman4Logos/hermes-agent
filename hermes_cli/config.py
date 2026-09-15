@@ -221,9 +221,14 @@ class _DigestingConfigReader:
         # compatible loader asks for its usual "all" sentinel.
         size = _RAW_CONFIG_READ_CHUNK_BYTES if size is None or size < 0 else min(
             size, _RAW_CONFIG_READ_CHUNK_BYTES)
-        chunk = self._source.read(size)
-        self._digest.update(chunk)
-        return self._decoder.decode(chunk, final=not chunk)
+        if size == 0:
+            return ""
+        while True:
+            chunk = self._source.read(size)
+            self._digest.update(chunk)
+            text = self._decoder.decode(chunk, final=not chunk)
+            if text or not chunk:
+                return text
 
     def digest(self) -> bytes:
         return self._digest.digest()

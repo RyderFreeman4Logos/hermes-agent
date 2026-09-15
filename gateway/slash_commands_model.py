@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 from typing import Any, Optional
 
@@ -237,6 +238,10 @@ class GatewayModelCommandsMixin:
         """Persist a committed switch: session DB, next-turn note, override map, config write-through."""
         from hermes_cli.model_switch import format_model_for_display
 
+        state = self._peek_session_state(ctx.session_key)
+        if state is not None:
+            state.conversation.after_compression_model_switch = None
+
         # Persist the new model to the session DB so the dashboard shows the updated model (#34850).
         _sess_db = getattr(self, "_session_db", None)
         if _sess_db is not None:  # so the dashboard shows the updated model
@@ -250,6 +255,19 @@ class GatewayModelCommandsMixin:
                 await _sess_db.update_session_model(
                     _sess_entry.session_id, result.new_model, provider=result.target_provider,
                 )
+                # The command can commit while no agent is cached. Remove the cold-restorable
+                # descriptor at the same durable seam so eviction/rebuild cannot revive the
+                # route that this immediate switch superseded.
+                _row = await _sess_db.get_session(_sess_entry.session_id)
+                _raw_config = _row.get("model_config") if _row else None
+                _model_config = (
+                    json.loads(_raw_config) if isinstance(_raw_config, str) and _raw_config
+                    else dict(_raw_config or {})
+                )
+                if _model_config.pop("pending_model_switch_after_compression", None) is not None:
+                    await _sess_db.update_session_meta(
+                        _sess_entry.session_id, json.dumps(_model_config, sort_keys=True)
+                    )
             except Exception as exc:
                 logger.debug("Failed to persist model switch to DB: %s", exc)
         # Prepended to the next user message (no system messages mid-history). Display form strips

@@ -290,6 +290,10 @@ def _apply_model_switch(
             "pending": True, "replaced": replaced is not None}
     if agent:
         _commit_agent_switch(sid, session, agent, result, current_model, restore_snapshot)
+    # A successful immediate commit supersedes the host copy of any deferred intent. The
+    # live agent cleared its durable descriptor inside switch_model(); clear the mirror
+    # before any rebuild can adopt it again.
+    session.pop("after_compression_model_switch", None)
     # PER-SESSION override so a rebuild of THIS session (/new, resume) re-derives the model.
     # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
     # every same-profile session in one process, so os.environ would leak the switch to all.

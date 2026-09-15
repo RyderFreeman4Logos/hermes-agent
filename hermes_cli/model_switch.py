@@ -446,6 +446,7 @@ class ModelSwitchResult:
     context_length: Optional[int] = None
     reasoning_config: Optional[dict] = None
     is_after_compression: bool = False
+    _resolve_runtime_on_apply: bool = False
 
 
 @dataclass(frozen=True)
@@ -859,11 +860,11 @@ def schedule_model_switch_after_compression(
 def restore_model_switch_after_compression(
     agent: Any, config: Optional[dict] = None,
 ) -> Optional[ModelSwitchResult]:
-    """Restore a persisted deferred route through the current provider config.
+    """Restore a persisted deferred route without touching a provider.
 
     The durable descriptor intentionally contains only route identity and
-    reasoning.  Credentials and endpoint details are resolved afresh, without a
-    live provider probe, when the session's agent is reconstructed.
+    reasoning. Credentials and endpoint details are resolved afresh at the
+    successful-compression apply boundary, where provider I/O is expected.
     """
     descriptor = _session_model_config(agent).get(_AFTER_COMPRESSION_CONFIG_KEY)
     if not isinstance(descriptor, dict):
@@ -872,36 +873,56 @@ def restore_model_switch_after_compression(
     provider = _clean(descriptor.get("provider"))
     if not model or not provider:
         return None
-    try:
-        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
-
-        current_config = config if isinstance(config, dict) else load_config_readonly()
-        result = switch_model(
-            raw_input=model,
-            current_provider=_clean(getattr(agent, "requested_provider", None) or getattr(agent, "provider", "")),
-            current_model=_clean(getattr(agent, "model", "")),
-            current_base_url=_clean(getattr(agent, "base_url", "")),
-            current_api_key=getattr(agent, "api_key", "") or "",
-            explicit_provider=provider,
-            user_providers=current_config.get("providers") if isinstance(current_config, dict) else None,
-            custom_providers=(
-                get_compatible_custom_providers(current_config)
-                if isinstance(current_config, dict) else None
-            ),
-            validate_live=False,
-        )
-    except Exception:
-        logger.debug("failed to restore deferred model switch", exc_info=True)
-        return None
-    if not result.success:
-        logger.debug("persisted deferred model switch is not currently resolvable: %s", result.error_message)
-        return None
+    result = ModelSwitchResult(
+        success=True,
+        new_model=model,
+        target_provider=provider,
+        provider_changed=(provider != _clean(getattr(agent, "provider", ""))),
+        api_mode=_clean(descriptor.get("api_mode")),
+        provider_label=provider,
+        is_after_compression=True,
+        _resolve_runtime_on_apply=True,
+    )
     reasoning = descriptor.get("reasoning_config")
     if isinstance(reasoning, dict):
         result.reasoning_config = copy.deepcopy(reasoning)
     result.is_after_compression = True
     schedule_model_switch_after_compression(agent, result)
     return result
+
+
+def _resolve_restored_model_switch_for_apply(
+    agent: Any, result: ModelSwitchResult,
+) -> ModelSwitchResult:
+    """Resolve a cold-restored descriptor only once its compression commits."""
+    if not result._resolve_runtime_on_apply:
+        return result
+    from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+
+    current_config = load_config_readonly()
+    resolved = switch_model(
+        raw_input=result.new_model,
+        current_provider=_clean(
+            getattr(agent, "requested_provider", None) or getattr(agent, "provider", "")
+        ),
+        current_model=_clean(getattr(agent, "model", "")),
+        current_base_url=_clean(getattr(agent, "base_url", "")),
+        current_api_key=getattr(agent, "api_key", "") or "",
+        explicit_provider=result.target_provider,
+        user_providers=(
+            current_config.get("providers") if isinstance(current_config, dict) else None
+        ),
+        custom_providers=(
+            get_compatible_custom_providers(current_config)
+            if isinstance(current_config, dict) else None
+        ),
+        validate_live=True,
+    )
+    if not resolved.success:
+        raise ValueError(resolved.error_message or "deferred model route is not resolvable")
+    resolved.reasoning_config = _copy_state(result.reasoning_config)
+    resolved.is_after_compression = True
+    return resolved
 
 
 def clear_model_switch_after_compression(agent: Any) -> Optional[ModelSwitchResult]:
@@ -933,19 +954,20 @@ def apply_model_switch_after_compression(agent: Any) -> str:
         durable = _snapshot_durable_route(agent)
         callback = getattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, None)
         try:
+            applied = _resolve_restored_model_switch_for_apply(agent, result)
             agent._applying_model_switch_after_compression = True
-            agent._deferred_model_switch_context_length = result.context_length
-            agent._deferred_model_switch_reasoning_config = result.reasoning_config
+            agent._deferred_model_switch_context_length = applied.context_length
+            agent._deferred_model_switch_reasoning_config = applied.reasoning_config
             agent.switch_model(
-                result.new_model, result.target_provider, result.api_key, result.base_url, result.api_mode)
+                applied.new_model, applied.target_provider, applied.api_key, applied.base_url, applied.api_mode)
             prompt = None
             build_prompt = getattr(agent, "_build_system_prompt", None)
             if callable(build_prompt):
                 prompt = build_prompt(None)
                 agent._cached_system_prompt = prompt
             _persist_session_model_config(
-                agent, _applied_model_config(agent, result), model=result.new_model,
-                result=result, system_prompt=prompt)
+                agent, _applied_model_config(agent, applied), model=applied.new_model,
+                result=applied, system_prompt=prompt)
         except Exception as exc:
             _restore_runtime(agent, runtime)
             try:
@@ -967,6 +989,8 @@ def apply_model_switch_after_compression(agent: Any) -> str:
                     delattr(agent, name)
                 except AttributeError:
                     pass
+        if applied is not result:
+            result.__dict__.update(applied.__dict__)
         setattr(agent, _AFTER_COMPRESSION_ATTR, None)
         setattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, None)
         agent._model_switch_after_compression_state = {

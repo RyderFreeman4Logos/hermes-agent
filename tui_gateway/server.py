@@ -2366,6 +2366,8 @@ def _init_session(
             "transport": current_transport() or _stdio_transport,
         }
         _session_todo_state(_sessions[sid])
+        # Adopt cold-restored intent before releasing the new session record to readers.
+        _attach_model_switch_after_compression(sid, _sessions[sid], agent)
     _hydrate_session_cwd(sid, key, session_db, profile_home)
     _register_session_cwd(_sessions[sid])
     _wire_session_agent(sid, key, agent)  # no eager slash-worker pre-warm (see _start_agent_build)

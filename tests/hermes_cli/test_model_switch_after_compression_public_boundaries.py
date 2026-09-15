@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -147,8 +149,7 @@ def _cold_rebuilt_agent(tmp_path, monkeypatch, session_id: str, *, platform: str
     return reopened, rebuilt, calls
 
 
-@pytest.mark.asyncio
-async def test_gateway_public_command_crosses_real_compression_commit(tmp_path, monkeypatch):
+def test_gateway_public_command_crosses_real_compression_commit(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
@@ -178,13 +179,13 @@ async def test_gateway_public_command_crosses_real_compression_commit(tmp_path, 
     })
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: _resolved(**kwargs))
 
-    reply = await runner._gateway_idle_command_handlers()["model"](
+    reply = asyncio.run(runner._gateway_idle_command_handlers()["model"](
         MessageEvent(
             text=(f"/model {NEW_MODEL} --provider {NEW_PROVIDER} "
                   "--after-compression --reasoning low"),
             source=source,
         )
-    )
+    ))
 
     assert "scheduled after the next successful compression" in reply
     assert (agent.model, agent.provider, calls) == (OLD_MODEL, OLD_PROVIDER, [])
@@ -433,11 +434,12 @@ def test_cold_sessiondb_recreation_restores_secret_free_pending_intent(
     assert (pending.new_model, pending.target_provider, pending.reasoning_config) == (
         NEW_MODEL, NEW_PROVIDER, LOW
     )
-    assert len(resolution_calls) == 1
-    assert resolution_calls[0]["validate_live"] is False
-    assert resolution_calls[0]["user_providers"] is current_config["providers"]
+    assert resolution_calls == []
     assert (rebuilt.model, rebuilt.provider, calls) == (OLD_MODEL, OLD_PROVIDER, [])
     _compress(rebuilt)
+    assert len(resolution_calls) == 1
+    assert resolution_calls[0]["validate_live"] is True
+    assert resolution_calls[0]["user_providers"] is current_config["providers"]
     assert calls == [(NEW_MODEL, NEW_PROVIDER, SECRET, BASE_URL, "chat_completions")]
 
 
@@ -547,3 +549,357 @@ def test_tui_cold_rebuild_adopts_pending_and_updates_rebuild_surface(
     rebuilt_kwargs = server._deferred_build_agent_kwargs(session, db)
     assert rebuilt_kwargs["model_override"]["model"] == NEW_MODEL
     assert rebuilt_kwargs["model_override"]["provider"] == NEW_PROVIDER
+
+
+@pytest.mark.parametrize("provider", ["openai-codex", "llamacpp"])
+def test_cold_agent_restore_defers_every_network_capable_route_lookup(
+    tmp_path, monkeypatch, provider
+):
+    """A public cold agent build restores intent without refreshing or probing."""
+    session_id = f"offline-{provider}"
+    db, agent, _calls = _compression_agent(tmp_path, session_id)
+    pending = _resolved(raw_input=f"{provider}/model", explicit_provider=provider)
+    pending.reasoning_config = dict(LOW)
+    schedule_model_switch_after_compression(agent, pending)
+    db.close()
+
+    network_calls = []
+
+    def reject_network(*args, **kwargs):
+        network_calls.append((args, kwargs))
+        raise AssertionError(f"cold restore attempted {provider} network I/O")
+
+    if provider == "openai-codex":
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_codex_runtime_credentials",
+            reject_network,
+        )
+    else:
+        monkeypatch.setattr(
+            "hermes_cli.local_runtime.endpoint.resolve_llamacpp_endpoint",
+            reject_network,
+        )
+
+    reopened = SessionDB(db_path=tmp_path / "state.db")
+    _db2, rebuilt, calls = _compression_agent(
+        tmp_path, session_id, platform="cli", db=reopened
+    )
+
+    restored = get_model_switch_after_compression(rebuilt)
+    assert restored is not None
+    assert (restored.new_model, restored.target_provider) == (
+        f"{provider}/model", provider
+    )
+    assert network_calls == []
+    assert calls == []
+    reopened.close()
+
+
+class _RestoredAgent:
+    model = OLD_MODEL
+    provider = OLD_PROVIDER
+    requested_provider = OLD_PROVIDER
+    api_key = "old-key"
+    base_url = "https://openrouter.ai/api/v1"
+    api_mode = "chat_completions"
+
+    def __init__(self, pending):
+        self._session_init_model_config = {}
+        self.calls = []
+        schedule_model_switch_after_compression(self, pending)
+
+    def switch_model(self, new_model, new_provider, api_key, base_url, api_mode):
+        self.calls.append((new_model, new_provider, api_key, base_url, api_mode))
+        self.model, self.provider = new_model, new_provider
+        self.api_key, self.base_url, self.api_mode = api_key, base_url, api_mode
+
+
+def _pending_result(model=NEW_MODEL, provider=NEW_PROVIDER):
+    result = _resolved(raw_input=model, explicit_provider=provider)
+    result.reasoning_config = dict(LOW)
+    return result
+
+
+def test_tui_public_eager_resume_attaches_restored_switch_before_publish(monkeypatch):
+    from hermes_cli.model_switch import apply_model_switch_after_compression
+    from tui_gateway import server
+
+    class ResumeDB:
+        def get_session(self, _session_id):
+            return {"id": "resume-key", "message_count": 0, "cwd": None}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def reopen_session(self, _session_id):
+            return None
+
+        def get_resume_conversations(self, _session_id):
+            return [], []
+
+        def get_ancestor_display_prefix(self, _session_id):
+            return []
+
+    agent = _RestoredAgent(_pending_result())
+    db = ResumeDB()
+    monkeypatch.setattr(server, "_profile_session_db", lambda _home: (db, False))
+    monkeypatch.setattr(server, "_make_agent_in_context", lambda *_a, **_kw: agent)
+    monkeypatch.setattr(server, "_profile_build_scope", lambda _home: nullcontext())
+    monkeypatch.setattr(server, "_hydrate_session_cwd", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_wire_session_agent", lambda *_a, **_kw: False)
+    monkeypatch.setattr(server, "_start_session_services", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_session_info", lambda a, _s=None: {"model": a.model})
+
+    with patch.dict(server._sessions, {}, clear=True):
+        response = server.handle_request({
+            "id": "resume",
+            "method": "session.resume",
+            "params": {"session_id": "resume-key", "eager_build": True},
+        })
+        assert "error" not in response
+        session = server._sessions[response["result"]["session_id"]]
+
+        assert apply_model_switch_after_compression(agent) == "applied"
+        assert "after_compression_model_switch" not in session
+        assert session["model_override"]["model"] == NEW_MODEL
+
+
+def test_tui_bot_capability_rebuild_attaches_restored_switch(monkeypatch):
+    from hermes_cli.model_switch import apply_model_switch_after_compression
+    from tui_gateway import server
+
+    old_agent = SimpleNamespace(_session_title_hint="Bot Chat", _session_db=None)
+    new_agent = _RestoredAgent(_pending_result())
+    session = {
+        "agent": old_agent,
+        "session_key": "bot-key",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "profile_home": None,
+        "source": "tui",
+        "cwd": "/tmp",
+        "bot_caps_seen": "before",
+    }
+    monkeypatch.setattr("tools.bot_mode_probe.capability_fingerprint", lambda _home: "after")
+    monkeypatch.setattr(server, "_make_agent", lambda *_a, **_kw: new_agent)
+    monkeypatch.setattr(server, "_config_model_target", lambda: (OLD_MODEL, OLD_PROVIDER))
+    monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_kw: ())
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *_a, **_kw: None)
+
+    server._sync_bot_capabilities("bot-public", session)
+
+    assert session["agent"] is new_agent
+    assert apply_model_switch_after_compression(new_agent) == "applied"
+    assert "after_compression_model_switch" not in session
+    assert session["model_override"]["model"] == NEW_MODEL
+
+
+def _clearing_switch(agent, calls):
+    def commit(new_model, new_provider, api_key, base_url, api_mode, **_kwargs):
+        from hermes_cli.model_switch import clear_model_switch_after_compression
+
+        calls.append((new_model, new_provider, api_key, base_url, api_mode))
+        agent.model, agent.provider = new_model, new_provider
+        agent.api_key, agent.base_url, agent.api_mode = api_key, base_url, api_mode
+        if not getattr(agent, "_applying_model_switch_after_compression", False):
+            clear_model_switch_after_compression(agent)
+
+    return commit
+
+
+def test_tui_public_immediate_switch_cancels_host_and_durable_deferred_route(
+    tmp_path, monkeypatch
+):
+    from tui_gateway import server
+
+    db, agent, calls = _compression_agent(tmp_path, "tui-cancel", platform="tui")
+    agent.switch_model = _clearing_switch(agent, calls)
+    session = {
+        "agent": agent,
+        "session_key": "tui-cancel",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+    }
+
+    def resolve(**kwargs):
+        return _pending_result(kwargs["raw_input"], kwargs["explicit_provider"])
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", resolve)
+    for name in (
+        "_restart_slash_worker", "_persist_live_session_runtime",
+        "_persist_live_session_system_prompt", "_append_model_switch_marker",
+        "_emit_session_info", "_emit",
+    ):
+        monkeypatch.setattr(server, name, lambda *_a, **_kw: None)
+
+    with patch.dict(server._sessions, {"public-tui": session}, clear=True):
+        deferred = server.dispatch({
+            "jsonrpc": "2.0", "id": "deferred", "method": "config.set",
+            "params": {"session_id": "public-tui", "key": "model",
+                       "value": f"{NEW_MODEL} --provider {NEW_PROVIDER} --after-compression",
+                       "confirm_expensive_model": True},
+        })
+        assert deferred["result"]["scope"] == "after_compression"
+        immediate = server.dispatch({
+            "jsonrpc": "2.0", "id": "immediate", "method": "config.set",
+            "params": {"session_id": "public-tui", "key": "model",
+                       "value": "current/model --provider custom:current",
+                       "confirm_expensive_model": True},
+        })
+        assert immediate["result"]["value"] == "current/model"
+        assert "after_compression_model_switch" not in session
+        stored = json.loads(db.get_session("tui-cancel")["model_config"])
+        assert "pending_model_switch_after_compression" not in stored
+
+        _db2, rebuilt, _rebuilt_calls = _compression_agent(
+            tmp_path, "tui-cancel", platform="tui", db=db
+        )
+        assert get_model_switch_after_compression(rebuilt) is None
+    db.close()
+
+
+@pytest.mark.parametrize("cached_at_immediate", [True, False])
+def test_gateway_public_immediate_switch_cancels_host_and_durable_deferred_route(
+    tmp_path, monkeypatch, cached_at_immediate
+):
+    from gateway.config import GatewayConfig, Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource, SessionStore
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._sessions = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._pending_model_notes = {}
+    runner._running_agents = {}
+    runner._session_model_overrides = {}
+    sessions_dir = tmp_path / "gateway-cancel-routing"
+    runner.session_store = SessionStore(sessions_dir=sessions_dir, config=GatewayConfig())
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._model_selection_guard_reply = AsyncMock(return_value=(False, None))
+    runner._release_evicted_agent_soft = lambda _agent: None
+    source = SessionSource(
+        platform=Platform.TELEGRAM, user_id="user", chat_id="cancel-chat", chat_type="dm"
+    )
+    session_key = runner._session_key_for_source(source)
+    entry = runner.session_store.get_or_create_session(source)
+    db, agent, calls = _compression_agent(
+        tmp_path, entry.session_id, platform="telegram"
+    )
+    class AsyncDB:
+        async def update_session_model(self, *args, **kwargs):
+            return db.update_session_model(*args, **kwargs)
+
+        async def get_session(self, *args, **kwargs):
+            return db.get_session(*args, **kwargs)
+
+        async def update_session_meta(self, *args, **kwargs):
+            return db.update_session_meta(*args, **kwargs)
+
+    runner._session_db = AsyncDB()
+    agent.switch_model = _clearing_switch(agent, calls)
+    runner._agent_cache[session_key] = (agent, "signature", 0, entry.session_id)
+
+    def resolve(**kwargs):
+        return _pending_result(kwargs["raw_input"], kwargs["explicit_provider"])
+
+    async def no_context(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda **_kw: {
+        "model": {"default": OLD_MODEL, "provider": OLD_PROVIDER}
+    })
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", resolve)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length_async", no_context
+    )
+
+    handler = runner._gateway_idle_command_handlers()["model"]
+    deferred = asyncio.run(handler(MessageEvent(
+        text=f"/model {NEW_MODEL} --provider {NEW_PROVIDER} --after-compression",
+        source=source,
+    )))
+    assert "scheduled after the next successful compression" in deferred
+    if not cached_at_immediate:
+        runner._agent_cache.pop(session_key)
+    immediate = asyncio.run(handler(MessageEvent(
+        text="/model current/model --provider custom:current",
+        source=source,
+    )))
+    assert "current/model" in immediate
+
+    state = runner._session_state(session_key).conversation
+    assert state.after_compression_model_switch is None
+    stored = json.loads(db.get_session(entry.session_id)["model_config"])
+    assert "pending_model_switch_after_compression" not in stored
+    _db2, rebuilt, _rebuilt_calls = _compression_agent(
+        tmp_path, entry.session_id, platform="telegram", db=db
+    )
+    assert get_model_switch_after_compression(rebuilt) is None
+    db.close()
+
+
+def test_tui_public_tool_rebuild_clears_deferred_route_at_conversation_boundary(
+    tmp_path, monkeypatch
+):
+    from tui_gateway import server
+
+    db, agent, _calls = _compression_agent(tmp_path, "tui-reset", platform="tui")
+    schedule_model_switch_after_compression(agent, _pending_result())
+    replacement = SimpleNamespace(_session_db=db, _owns_session_db=False)
+    session = {
+        "agent": agent,
+        "session_key": "tui-reset",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "profile_home": None,
+        "source": "tui",
+        "cwd": "/tmp",
+        "_queued_prompt_generation": 0,
+    }
+    config = SimpleNamespace(
+        load_config=lambda: {}, save_config=lambda _cfg: None,
+    )
+    tools_config = SimpleNamespace(
+        CONFIGURABLE_TOOLSETS=(("terminal", "Terminal", ""),),
+        _get_plugin_toolset_keys=lambda: set(),
+        _apply_toolset_change=lambda *_a, **_kw: None,
+        _apply_mcp_change=lambda *_a, **_kw: set(),
+        _get_platform_tools=lambda *_a, **_kw: set(),
+    )
+    monkeypatch.setattr(
+        server, "_tools_mod",
+        lambda name: config if name == "hermes_cli.config" else tools_config,
+    )
+    monkeypatch.setattr(server, "_make_agent", lambda *_a, **_kw: replacement)
+    monkeypatch.setattr(server, "_config_model_target", lambda: (OLD_MODEL, OLD_PROVIDER))
+    monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_kw: ())
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "off")
+    monkeypatch.setattr(server, "_session_info", lambda *_a, **_kw: {})
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_kw: None)
+
+    with patch.dict(server._sessions, {"public-reset": session}, clear=True):
+        response = server.handle_request({
+            "id": "tools", "method": "tools.configure",
+            "params": {"session_id": "public-reset", "action": "disable",
+                       "names": ["terminal"]},
+        })
+
+    assert "error" not in response
+    assert "after_compression_model_switch" not in session
+    stored = json.loads(db.get_session("tui-reset")["model_config"])
+    assert "pending_model_switch_after_compression" not in stored
+    db.close()

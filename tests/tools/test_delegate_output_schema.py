@@ -335,7 +335,133 @@ def _make_mock_parent():
     return parent
 
 
+def _run_public_schema_retry(child):
+    """Run one schema-bearing task through the public delegate entry point."""
+    with (
+        patch("tools.delegate_tool._load_config", return_value={}),
+        patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value={
+                "provider": None,
+                "model": None,
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+            },
+        ),
+        patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ),
+    ):
+        payload = json.loads(
+            delegate_task(
+                tasks=[{"goal": "produce the address", "output_schema": ADDRESS_SCHEMA}],
+                parent_agent=_make_mock_parent(),
+            )
+        )
+    return payload["results"][0]
+
+
+class _ProvenanceRetryChild(_StubChild):
+    """Synthetic child whose schema retry crosses a provider-result boundary."""
+
+    provider = "xai-oauth"
+    model = "grok-4.6"
+    api_mode = "chat_completions"
+    _delegate_model_profile = "standard"
+    _delegate_successful_llm_route = None
+
+    def __init__(self, *, retry_route):
+        super().__init__([])
+        self.retry_route = retry_route
+        self._delegate_successful_llm_route = ("prior-model", "prior-provider")
+
+    def run_conversation(self, user_message, task_id=None, **_kwargs):
+        self.calls.append(user_message)
+        if len(self.calls) == 1:
+            return {
+                "final_response": "synthetic xAI spending limit",
+                "completed": False,
+                "failed": True,
+                "error": "synthetic xAI spending limit",
+                "failure_reason": "billing",
+                "failure_retryable": False,
+                "billing_unverified": True,
+                "billing_block": {"provider": "xai-oauth"},
+                "api_calls": 3,
+                "messages": [{
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "synthetic-call",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }],
+                }],
+            }
+
+        self.provider, self.model, self.api_mode = self.retry_route
+        if self.api_mode == "codex_app_server":
+            retry_provenance = {"codex_turn_id": "synthetic-turn"}
+        else:
+            self._delegate_successful_llm_route = (self.model, self.provider)
+            retry_provenance = {}
+        return {
+            "final_response": '{"city": "Oslo"}',
+            "completed": True,
+            "failed": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [{
+                "role": "tool",
+                "tool_call_id": "synthetic-call",
+                "content": "synthetic result",
+            }],
+            **retry_provenance,
+        }
+
+
 class TestDelegateTaskDispatch:
+    def test_valid_retry_atomically_replaces_xai_terminal_provenance(self):
+        child = _ProvenanceRetryChild(
+            retry_route=("openrouter", "anthropic/claude-sonnet-4", "chat_completions")
+        )
+
+        entry = _run_public_schema_retry(child)
+
+        assert entry["summary"] == '{"city": "Oslo"}'
+        assert entry["status"] == "completed"
+        assert entry["exit_reason"] == "completed"
+        assert entry["schema_valid"] is True
+        assert entry["schema_retries"] == 1
+        assert entry["api_calls"] == 4
+        assert entry["tool_trace"] == [{
+            "tool": "lookup",
+            "args_bytes": 2,
+            "input_summary": {"argument_keys": [], "targets": {}},
+            "result_bytes": 16,
+            "status": "ok",
+        }]
+        assert entry["model"] == "anthropic/claude-sonnet-4"
+        assert entry["provider"] == "openrouter"
+        assert "error" not in entry
+        assert "failure_reason" not in entry
+
+    def test_valid_app_server_retry_projects_unknown_route(self):
+        child = _ProvenanceRetryChild(
+            retry_route=("openai-codex", "gpt-5.2-codex", "codex_app_server")
+        )
+
+        entry = _run_public_schema_retry(child)
+
+        assert entry["summary"] == '{"city": "Oslo"}'
+        assert entry["status"] == "completed"
+        assert entry["schema_valid"] is True
+        assert entry["schema_retries"] == 1
+        assert entry["model"] is None
+        assert entry["provider"] is None
+        assert "error" not in entry
+        assert "failure_reason" not in entry
+
     def test_non_dict_output_schema_rejected(self):
         with (
             patch("tools.delegate_tool._load_config", return_value={}),

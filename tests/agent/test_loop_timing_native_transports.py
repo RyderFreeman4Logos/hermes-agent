@@ -301,6 +301,34 @@ def test_chat_profile_and_legacy_first_send_coalesce_timing_without_mutation(mon
     assert sent[1]["content"].count("[Agent loop timing]") == 1
 
 
+def test_chat_public_turn_preserves_ordinary_late_system_and_projects_timing(monkeypatch):
+    """Only the hidden timing carrier loses system authority on Chat wire."""
+    agent = _make_local_agent(
+        monkeypatch, api_mode="chat_completions", provider="unknown-profile", model="chat-test",
+    )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = _completed_chat_response()
+    ordinary_system = "Keep this ordinary resumed-session policy authoritative."
+    history = [
+        {"role": "user", "content": "previous user"},
+        {"role": "assistant", "content": "previous answer"},
+        {"role": "system", "content": ordinary_system},
+    ]
+    original = copy.deepcopy(history)
+
+    result = agent.run_conversation("current user", conversation_history=history)
+
+    assert result["completed"] is True
+    assert history == original
+    wire = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    ordinary = [row for row in wire if ordinary_system in _wire_text(row)]
+    timing = [row for row in wire if "[Agent loop timing]" in _wire_text(row)]
+    assert len(ordinary) == 1
+    assert ordinary[0]["role"] == "system"
+    assert len(timing) == 1
+    assert timing[0]["role"] == "user"
+
+
 def test_chat_send_keeps_two_hidden_timing_rows_through_mixed_content(monkeypatch):
     """W6: the real Chat call demotes only timing rows through mixed blocks.
 
@@ -313,8 +341,8 @@ def test_chat_send_keeps_two_hidden_timing_rows_through_mixed_content(monkeypatc
     )
     agent.client = MagicMock()
     agent.client.chat.completions.create.return_value = _completed_chat_response()
-    timing_one = "[Agent loop timing] first durable timing"
-    timing_two = "[Agent loop timing] second durable timing"
+    timing_one = "[Agent loop timing] Current loop start: first durable timing"
+    timing_two = "[Agent loop timing] Current loop start: second durable timing"
     history = [
         {
             "role": "system",
@@ -333,7 +361,7 @@ def test_chat_send_keeps_two_hidden_timing_rows_through_mixed_content(monkeypatc
         {"role": "user", "content": []},
         {
             "role": "system",
-            "content": [{"type": "text", "text": timing_two}],
+            "content": timing_two,
             "display_kind": "hidden",
             "display_metadata": {"loop_timing_turn_id": "timing-two"},
         },

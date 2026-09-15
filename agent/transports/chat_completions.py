@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
+from agent.message_metadata import is_hidden_loop_timing
 from agent.reasoning_effort import (
     KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS, TOKENHUB_EFFORTS, clamp_effort,
     kimi_supported_efforts, requested_effort,
@@ -353,7 +354,7 @@ class ChatCompletionsTransport(ProviderTransport):
         sanitized_pairs = []
         for index, message in enumerate(messages):
             sanitized = _sanitize_message(message, strip_extra_content)
-            if index and isinstance(message, dict) and message.get("role") == "system":
+            if index and is_hidden_loop_timing(message):
                 sanitized = dict(message) if sanitized is None else sanitized
                 sanitized["role"] = "user"
             sanitized_pairs.append((message, sanitized))

@@ -123,7 +123,14 @@ class TestChatCompletionsBasic:
             {"role": "system", "content": "stable instructions"},
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
-            {"role": "system", "content": "[Agent loop timing] stop at 12:34:56"},
+            {
+                "role": "system",
+                "content": (
+                    "[Agent loop timing]\n"
+                    "Previous loop stop: 2026-09-14T12:34:56-07:00\n"
+                    "Current loop start: 2026-09-14T12:35:00-07:00"
+                ),
+            },
         ]
 
         payload = transport.build_kwargs(model="test/model", messages=history)
@@ -139,11 +146,16 @@ class TestChatCompletionsBasic:
         history = [
             {"role": "system", "content": "stable instructions"},
             {"role": "user", "content": "hello"},
-            {"role": "system", "content": "[Agent loop timing] current"},
+            {
+                "role": "system",
+                "content": "[Agent loop timing] Current loop start: current",
+            },
         ]
         payload = transport.build_kwargs(model="test/model", messages=history)
         assert [message["role"] for message in payload["messages"]] == ["system", "user"]
-        assert payload["messages"][-1]["content"] == "hello\n\n[Agent loop timing] current"
+        assert payload["messages"][-1]["content"] == (
+            "hello\n\n[Agent loop timing] Current loop start: current"
+        )
         assert history[-1]["role"] == "system"
 
     def test_build_kwargs_keeps_marked_blocks_when_coalescing_timing(self, transport):
@@ -157,7 +169,7 @@ class TestChatCompletionsBasic:
             },
             {
                 "role": "system",
-                "content": "[Agent loop timing] current",
+                "content": "[Agent loop timing] Current loop start: current",
                 "display_kind": "hidden",
             },
         ]
@@ -168,7 +180,7 @@ class TestChatCompletionsBasic:
         assert [message["role"] for message in payload["messages"]] == ["system", "user"]
         assert payload["messages"][-1]["content"] == [
             {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": "[Agent loop timing] current"},
+            {"type": "text", "text": "[Agent loop timing] Current loop start: current"},
         ]
         assert history == original
 

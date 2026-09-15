@@ -2857,6 +2857,32 @@ class TestHandleMaxIterations:
         assert messages[2]["name"] == "execute_code"
         assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
 
+    def test_summary_projects_hidden_timing_at_real_chat_wire(self, agent):
+        """The direct terminal-summary call uses the normal Chat projection."""
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        timing = {
+            "role": "system",
+            "content": (
+                "[Agent loop timing]\n"
+                "Current loop start: 2026-09-14T10:00:00-07:00"
+            ),
+            "display_kind": "hidden",
+            "display_metadata": {"loop_timing_turn_id": "turn-final"},
+        }
+        messages = [{"role": "user", "content": "do stuff"}, timing]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Summary"
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert all("display_kind" not in row for row in sent)
+        assert all("display_metadata" not in row for row in sent)
+        timing_rows = [row for row in sent if "[Agent loop timing]" in str(row.get("content", ""))]
+        assert len(timing_rows) == 1
+        assert timing_rows[0]["role"] == "user"
+        assert messages[1] == timing
+
 
 
 

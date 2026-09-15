@@ -607,7 +607,10 @@ class ChatCompletionsTransport(ProviderTransport):
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
         return _finish_kwargs(
-            api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
+            api_kwargs, sanitized, params,
+            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False))
+            or str(params.get("provider_name") or "").strip().lower().startswith("custom:"),
+        )
         )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

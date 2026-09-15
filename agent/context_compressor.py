@@ -66,6 +66,13 @@ _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_pin", default=None)
 )
 
+# The destination that successfully served a summary belongs to that compression attempt.
+# A stalled primary and its fallback can overlap on one ContextCompressor instance, so a
+# compressor attribute lets the two attempts overwrite or clear each other's digest route.
+_SUMMARY_ROUTE_RECEIPT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("hermes_summary_route_receipt", default=None)
+)
+
 # ``timeout`` is included so a fallback entry keeps its own deadline.
 _PINNED_ROUTE_FIELDS: tuple[str, ...] = ("provider", "model", "base_url", "api_key", "api_mode", "timeout")
 
@@ -3265,7 +3272,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
         configured = _get_task_max_concurrency("compression")
         first_ci, first_segment = jobs[0]
-        selected_route = dict(getattr(self, "_last_summary_route", {}) or {}) or None
+        selected_route = dict(_SUMMARY_ROUTE_RECEIPT.get() or {}) or None
         route_info: dict[str, Any] = {}
         first_digest = _digest_one(
             first_ci, first_segment, route=selected_route, route_info=route_info,
@@ -3495,11 +3502,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 f"token cap and the summary is incomplete {where}"
             )
         if route_known:
-            self._last_summary_route = {
+            _SUMMARY_ROUTE_RECEIPT.set({
                 field: _aux_route[field]
                 for field in _PINNED_ROUTE_FIELDS
                 if _aux_route.get(field) not in (None, "")
-            }
+            })
         return content
 
     def _generate_summary(
@@ -3536,31 +3543,32 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if has_user_turn is None:
             has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
         prompt = self._build_summary_prompt(content_to_summarize, summary_budget, focus_topic, memory_context, has_user_turn)
+        route_token = _SUMMARY_ROUTE_RECEIPT.set(None)
         try:
-            content = self._call_summary_llm(prompt, prompt_started_at)
-            # Strip <think> blocks: they would be stored, injected, and compounded on every iterative update.
-            from agent.agent_runtime_helpers import strip_think_blocks
-            content = strip_think_blocks(None, content).strip() or content
-            # The summarizer may echo secrets verbatim; redact the output too.
-            summary = _redact_compaction_text(content.strip())
-            # Restore any [SKILL_PRUNED] marker the summarizer paraphrased away.
-            # See #32106.
-            summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
-            summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             try:
+                content = self._call_summary_llm(prompt, prompt_started_at)
+                # Strip <think> blocks: they would be stored, injected, and compounded on every iterative update.
+                from agent.agent_runtime_helpers import strip_think_blocks
+                content = strip_think_blocks(None, content).strip() or content
+                # The summarizer may echo secrets verbatim; redact the output too.
+                summary = _redact_compaction_text(content.strip())
+                # Restore any [SKILL_PRUNED] marker the summarizer paraphrased away.
+                # See #32106.
+                summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
+                summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
                 summary = self._augment_summary_lean(summary, turns_to_summarize)
-            finally:
-                self._last_summary_route = None
-            self._validate_summary_user_provenance(summary, has_user_turn)
-            self._previous_summary = summary
-            self._clear_compression_failure_cooldown()
-            self._summary_model_fallen_back = False
-            self._last_summary_error = None
-            for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
-                setattr(self, flag, False)
-            return self._with_summary_prefix(summary)
-        except Exception as e:
-            return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
+                self._validate_summary_user_provenance(summary, has_user_turn)
+                self._previous_summary = summary
+                self._clear_compression_failure_cooldown()
+                self._summary_model_fallen_back = False
+                self._last_summary_error = None
+                for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
+                    setattr(self, flag, False)
+                return self._with_summary_prefix(summary)
+            except Exception as e:
+                return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
+        finally:
+            _SUMMARY_ROUTE_RECEIPT.reset(route_token)
 
     def _build_summary_prompt(
         self, content_to_summarize: str, summary_budget: int, focus_topic: Optional[str],

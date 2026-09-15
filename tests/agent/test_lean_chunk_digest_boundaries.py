@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import ContextCompressor, _SUMMARY_ROUTE_RECEIPT
 
 
 def _response(text: str = "digest"):
@@ -95,17 +95,20 @@ def test_first_digest_reuses_complete_successful_summary_destination():
     }
     digest_calls: list[dict] = []
     compressor = ContextCompressor("main-model", quiet_mode=True, tail_mode="lean")
-    compressor._last_summary_route = dict(selected)
 
     def fake_call_llm(**kwargs):
         digest_calls.append(kwargs)
         return _response()
 
-    with (
-        patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", 10_000),
-        patch("agent.auxiliary_client.call_llm", fake_call_llm),
-    ):
-        compressor._build_chunk_digests(_turns(1))
+    token = _SUMMARY_ROUTE_RECEIPT.set(dict(selected))
+    try:
+        with (
+            patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", 10_000),
+            patch("agent.auxiliary_client.call_llm", fake_call_llm),
+        ):
+            compressor._build_chunk_digests(_turns(1))
+    finally:
+        _SUMMARY_ROUTE_RECEIPT.reset(token)
 
     assert len(digest_calls) == 1
     assert {key: digest_calls[0].get(key) for key in selected} == selected

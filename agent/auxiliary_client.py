@@ -2455,6 +2455,25 @@ def _record_route_info(
                 route_info[key] = value
 
 
+def _record_physical_route(
+    route_info: Optional[Dict[str, Any]], provider: Optional[str], client: Any,
+    request_kwargs: Dict[str, Any], api_mode: Optional[str],
+) -> None:
+    """Publish the concrete destination immediately before a physical retry."""
+    concrete_provider = _fallback_provider_from_label(
+        _effective_provider_for_client(client, provider or "auto")
+    )
+    model = request_kwargs.get("model")
+    _set_relay_auxiliary_route(concrete_provider, model, api_mode)
+    _record_route_info(
+        route_info, concrete_provider, model,
+        base_url=str(getattr(client, "base_url", "") or ""),
+        api_key=str(getattr(client, "api_key", "") or ""),
+        api_mode=api_mode,
+        timeout=request_kwargs.get("timeout"),
+    )
+
+
 def _relay_auxiliary_metadata(
     *, provider: str | None = None, api_mode: str | None = None
 ) -> tuple[str, str, dict[str, Any]] | None:
@@ -3451,19 +3470,27 @@ def _prepare_same_provider_retry(
     return retry_client, retry_kwargs
 
 
-def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+def _retry_same_provider_sync(
+    *, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str],
+    route_info: Optional[Dict[str, Any]] = None, **prep,
+) -> Any:
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
     )
+    _record_physical_route(route_info, resolved_provider, retry_client, retry_kwargs, resolved_api_mode)
     return _validate_llm_response(
         _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
     )
 
 
-async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+async def _retry_same_provider_async(
+    *, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str],
+    route_info: Optional[Dict[str, Any]] = None, **prep,
+) -> Any:
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=True, **prep,
     )
+    _record_physical_route(route_info, resolved_provider, retry_client, retry_kwargs, resolved_api_mode)
     return _validate_llm_response(
         await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
         task,
@@ -7223,7 +7250,6 @@ def _plan_aux_call(
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
     )
-    retry_kwargs.pop("route_info", None)
     return req, retry_kwargs, candidate_kwargs
 
 
@@ -7350,6 +7376,7 @@ def _call_llm_impl(
         def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
+                _record_physical_route(route_info, kw["provider"], args[0], args[1], kw["api_mode"])
                 return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
             if kind == "retry":
                 return _retry_same_provider_sync(**kw)
@@ -7499,6 +7526,7 @@ async def _async_call_llm_impl(
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
+                _record_physical_route(route_info, kw["provider"], args[0], args[1], kw["api_mode"])
                 return _validate_llm_response(await _relay_async_completion(*args, **kw), task)
             if kind == "retry":
                 return await _retry_same_provider_async(**kw)

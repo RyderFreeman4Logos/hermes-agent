@@ -8,7 +8,9 @@ from unittest.mock import MagicMock, patch
 
 from agent.transports.anthropic import AnthropicTransport
 from agent.transports.bedrock import BedrockTransport
+from agent.transports.chat_completions import ChatCompletionsTransport
 from agent.transports.codex import ResponsesApiTransport
+from providers.base import ProviderProfile
 from run_agent import AIAgent
 
 
@@ -256,3 +258,44 @@ def test_two_agent_turns_reach_each_native_sdk_send_with_ordered_timing(
             assert matching_rows[0]["role"] == "user"
             positions.append("\n".join(_wire_text(row) for row in _wire_rows(payload)).index(timing_text))
         assert positions == sorted(positions)
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [None, ProviderProfile(name="identity-profile")],
+    ids=["legacy-no-profile", "identity-profile"],
+)
+def test_chat_profile_and_legacy_first_send_coalesce_timing_without_mutation(monkeypatch, profile):
+    """W2: both Chat builder modes keep S,U,T as one ordered user request."""
+    history = _history()
+    original = copy.deepcopy(history)
+    transport = ChatCompletionsTransport()
+    kwargs = transport.build_kwargs(
+        model="chat-test", messages=history, provider_profile=profile,
+        provider_name="identity-profile" if profile else "unknown-profile",
+    )
+    assert history == original
+    assert [row["role"] for row in kwargs["messages"]] == ["system", "user"]
+    assert kwargs["messages"][0]["content"] == "Stable instructions"
+    assert kwargs["messages"][1]["content"].startswith("Ask")
+    assert "[Agent loop timing] Current loop start: now" in kwargs["messages"][1]["content"]
+
+    monkeypatch.setattr(
+        "providers.get_provider_profile",
+        lambda _name: profile,
+    )
+    agent = _make_local_agent(
+        monkeypatch, api_mode="chat_completions",
+        provider="identity-profile" if profile else "unknown-profile", model="chat-test",
+    )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = _completed_chat_response()
+
+    result = agent.run_conversation("chat first send")
+
+    assert result["completed"] is True
+    sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    assert [row["role"] for row in sent] == ["system", "user"]
+    assert sent[0]["content"] == "Stable instructions"
+    assert sent[1]["content"].startswith("chat first send")
+    assert sent[1]["content"].count("[Agent loop timing]") == 1

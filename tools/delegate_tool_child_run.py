@@ -785,8 +785,6 @@ class _ChildRun:
             "timeout_seconds": child_timeout if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,
-            "model": _str_or_none(getattr(child, "model", None)),
-            "provider": _str_or_none(getattr(child, "provider", None)),
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }

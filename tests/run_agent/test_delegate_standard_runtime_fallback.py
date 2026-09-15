@@ -807,8 +807,8 @@ def test_standard_child_unusable_fallback_suffix_reenters_nous_recovery(unusable
     refreshed.assert_called_once_with(agent)
 
 
-def test_standard_child_post_mutation_fallback_failure_does_not_recover_original_route():
-    """A failed switch may not send the original error through changed runtime state."""
+def test_standard_child_post_mutation_fallback_failure_restores_original_route_atomically():
+    """A rejected fallback cannot leave the child on a partially switched runtime."""
     agent = _make_standard_child(max_retries=1, route=NOUS)
     agent._fallback_chain = [dict(FALLBACK_CHAIN[0])]
     fallback_client = MagicMock()
@@ -865,8 +865,11 @@ def test_standard_child_post_mutation_fallback_failure_does_not_recover_original
         result = agent.run_conversation("hello")
 
     assert result["completed"] is False
-    assert agent.provider == FALLBACK_CHAIN[0]["provider"]
-    refreshed.assert_not_called()
+    assert (agent.provider, agent.model, agent.base_url) == (
+        NOUS["provider"], NOUS["model"], NOUS["base_url"]
+    )
+    assert agent._fallback_index == len(agent._fallback_chain)
+    refreshed.assert_called_once_with(agent)
 
 def test_standard_child_direct_output_cap_retries_same_route_before_fallback():
     """A direct 400 max-output error is a request-shape repair, not failover."""
@@ -951,7 +954,18 @@ def test_delegate_task_content_policy_respects_profile_fallback_boundary(
     fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
     fallback_client._custom_headers = None
     fallback_client.default_headers = None
-    monkeypatch.setattr(delegate_mod, "_load_config", lambda: {"max_iterations": 2})
+    routing_cfg = {"max_iterations": 2}
+    if model_profile == "standard":
+        routing_cfg["model_pool"] = {
+            "standard": {
+                **PRIMARY,
+                "provider": "custom",
+                "api_key": "primary-key",
+                "api_mode": "chat_completions",
+                "fallback_chain": FALLBACK_CHAIN,
+            }
+        }
+    monkeypatch.setattr(delegate_mod, "_load_config", lambda: routing_cfg)
 
     def policy_result():
         if policy_response == "http-200":
@@ -1027,12 +1041,17 @@ def test_delegate_task_content_policy_respects_profile_fallback_boundary(
             delegate_task(
                 tasks=[task],
                 parent_agent=parent,
-                credentials_cfg={},
+                credentials_cfg=routing_cfg if model_profile == "standard" else {},
                 background=False,
             )
         )
 
     fallback_route = (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"])
+    primary_route = (
+        ("custom", PRIMARY["model"])
+        if model_profile == "standard"
+        else (PRIMARY["provider"], PRIMARY["model"])
+    )
     assert (fallback_route in attempts) is fallback_expected
     if fallback_expected:
         assert result["results"][0]["status"] == "completed"
@@ -1042,7 +1061,7 @@ def test_delegate_task_content_policy_respects_profile_fallback_boundary(
         ]
     else:
         assert attempts
-        assert all(route == (PRIMARY["provider"], PRIMARY["model"]) for route in attempts)
+        assert all(route == primary_route for route in attempts)
 
 
 def test_nonstandard_child_records_its_successful_primary_route():

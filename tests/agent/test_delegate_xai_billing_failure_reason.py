@@ -27,11 +27,11 @@ class _BillingChild:
     session_estimated_cost_usd = 0.0
     session_cost_status = None
 
-    def __init__(self, *, accepted_route, model, profile, result):
+    def __init__(self, *, accepted_route, model, selected_route, result):
         self._delegate_successful_llm_route = accepted_route
         self.model = model
         self.provider = "xai-oauth" if "grok" in model else "configured-provider"
-        self._delegate_model_profile = profile
+        self._delegate_selected_llm_route = selected_route
         self._result = result
 
     def get_activity_summary(self):
@@ -113,7 +113,7 @@ def test_public_sync_drops_unaccepted_xai_billing_reason_from_non_xai_identity()
     child = _BillingChild(
         accepted_route=("accepted-model", "accepted-provider"),
         model="grok-4.6",
-        profile=None,
+        selected_route=None,
         result=_failed_result(
             reason="billing",
             billing_block={"provider": "xai-oauth"},
@@ -141,7 +141,7 @@ def test_public_background_durably_drops_unaccepted_xai_billing_reason(monkeypat
     child = _BillingChild(
         accepted_route=None,
         model="grok-4.6",
-        profile=None,
+        selected_route=None,
         result=_failed_result(
             reason="billing",
             billing_block={"provider": "xai-oauth"},
@@ -180,12 +180,12 @@ def test_public_background_durably_drops_unaccepted_xai_billing_reason(monkeypat
 
 
 @pytest.mark.parametrize(
-    ("accepted_route", "model", "profile", "result", "expected_reason"),
+    ("accepted_route", "model", "selected_route", "result", "expected_reason"),
     [
         pytest.param(
             ("grok-4.6", "xai-oauth"),
             "grok-4.6",
-            "premium",
+            ("grok-4.6", "xai-oauth"),
             _failed_result(
                 reason="billing",
                 billing_block={"provider": "xai-oauth"},
@@ -196,7 +196,7 @@ def test_public_background_durably_drops_unaccepted_xai_billing_reason(monkeypat
         pytest.param(
             ("accepted-model", "accepted-provider"),
             "accepted-model",
-            "standard",
+            ("accepted-model", "accepted-provider"),
             _failed_result(reason="rate_limit"),
             "rate_limit",
             id="non-billing-failure",
@@ -204,12 +204,12 @@ def test_public_background_durably_drops_unaccepted_xai_billing_reason(monkeypat
     ],
 )
 def test_public_sync_keeps_owned_failure_reason(
-    accepted_route, model, profile, result, expected_reason
+    accepted_route, model, selected_route, result, expected_reason
 ):
     child = _BillingChild(
         accepted_route=accepted_route,
         model=model,
-        profile=profile,
+        selected_route=selected_route,
         result=result,
     )
 
@@ -221,17 +221,21 @@ def test_public_sync_keeps_owned_failure_reason(
 
 
 @pytest.mark.parametrize(
-    ("model", "profile", "owns_xai"),
+    ("model", "selected_route"),
     [
-        pytest.param("grok-4.6", "premium", True, id="selected-xai"),
-        pytest.param("selected-model", "fast", False, id="selected-non-xai"),
+        pytest.param("grok-4.6", ("grok-4.6", "xai-oauth"), id="selected-xai"),
+        pytest.param(
+            "selected-model",
+            ("selected-model", "configured-provider"),
+            id="selected-non-xai",
+        ),
     ],
 )
-def test_public_sync_billing_uses_explicit_selected_route(model, profile, owns_xai):
+def test_public_sync_unverified_billing_requires_accepted_route(model, selected_route):
     child = _BillingChild(
         accepted_route=None,
         model=model,
-        profile=profile,
+        selected_route=selected_route,
         result=_failed_result(
             reason="billing",
             billing_block={"provider": "xai-oauth"},
@@ -241,9 +245,8 @@ def test_public_sync_billing_uses_explicit_selected_route(model, profile, owns_x
 
     entry = _public_delegate(child, background=False)["results"][0]
 
-    # A structured child result still publishes accepted identity only.  The
-    # selected route is authoritative for billing ownership, not a substitute
-    # for an accepted response on this surface.
+    # Selection identifies an outer failure, but it does not prove which
+    # fallback produced an explicitly unverified structured terminal.
     assert (entry["model"], entry["provider"]) == (None, None)
-    assert ("spending-limit" in entry["summary"]) is owns_xai
-    assert (entry.get("failure_reason") == "billing") is owns_xai
+    assert "spending-limit" not in entry["summary"]
+    assert "failure_reason" not in entry

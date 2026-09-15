@@ -40,11 +40,11 @@ def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
 
 
 def _selected_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
-    """Return a route selected by the model-pool resolver before the child ran."""
-    profile = getattr(child, "_delegate_model_profile", None)
-    if not (isinstance(profile, str) and profile.strip()):
+    """Return the immutable route selected before the child started running."""
+    route = getattr(child, "_delegate_selected_llm_route", None)
+    if not (isinstance(route, tuple) and len(route) == 2):
         return None, None
-    return _str_or_none(getattr(child, "model", None)), _str_or_none(getattr(child, "provider", None))
+    return _str_or_none(route[0]), _str_or_none(route[1])
 
 
 def _result_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:

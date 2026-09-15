@@ -1142,7 +1142,14 @@ def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
 
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    _before_dispatch=None,
+    _on_worker_start=None,
+    _on_worker_retire=None,
+):
     """Run the API call on a worker thread so the caller can detect interrupts
     without waiting for the full HTTP round-trip. Each worker gets its own
     per-request client (interrupts close only that one); a stale-call detector
@@ -1151,11 +1158,25 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
-        return direct_api_call(agent, api_kwargs)
+        if callable(_on_worker_start):
+            _on_worker_start()
+        try:
+            if callable(_before_dispatch) and not _before_dispatch():
+                return None
+            return direct_api_call(agent, api_kwargs)
+        finally:
+            if callable(_on_worker_retire):
+                _on_worker_retire()
     _check_stale_giveup(agent)  # cross-turn stale breaker (#58962), non-streaming sibling
     from agent.chat_completion_nonstream import _NonStreamRequest
 
-    return _NonStreamRequest(agent, api_kwargs).run()
+    return _NonStreamRequest(
+        agent,
+        api_kwargs,
+        before_dispatch=_before_dispatch,
+        on_worker_start=_on_worker_start,
+        on_worker_retire=_on_worker_retire,
+    ).run()
 
 
 def _consume_ephemeral_reasoning_off(agent) -> bool:
@@ -1293,7 +1314,10 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
 
 
 
-def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
+def _build_chat_completions_kwargs(
+    agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id,
+    *, bodyless_warm: bool = False,
+):
     transport = agent._get_transport()
     tools_for_api = _alias_tool_search_bridge_for_xai(agent, transport, tools_for_api)
 
@@ -1314,24 +1338,28 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
 
     _prefs = _provider_preferences_for_agent(agent)
 
-    _qwen_meta = {"sessionId": agent.session_id or "hermes", "promptId": str(uuid.uuid4())} if _is_qwen else None
+    _qwen_meta = (
+        {"sessionId": agent.session_id or "hermes", "promptId": str(uuid.uuid4())}
+        if _is_qwen and not bodyless_warm else None
+    )
     _profile = None
     with contextlib.suppress(Exception):
         from providers import get_provider_profile
         _profile = get_provider_profile(agent.provider)
 
-    _ephemeral_out = _consume_ephemeral_max_output(agent)
+    _ephemeral_out = None if bodyless_warm else _consume_ephemeral_max_output(agent)
     # Strip image parts for non-vision models on BOTH paths (registered
     # providers with profiles used to bypass it).
     _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
         tools=tools_for_api, base_url=agent.base_url, timeout=agent._resolved_api_call_timeout(),
-        max_tokens=agent.max_tokens, ephemeral_max_output_tokens=_ephemeral_out,
+        max_tokens=None if bodyless_warm else agent.max_tokens,
+        ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
         request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
         cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
         supports_reasoning=agent._supports_reasoning_extra_body(),
-        qwen_session_metadata=_qwen_meta)
+        qwen_session_metadata=_qwen_meta, bodyless_warm=bodyless_warm)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
         return transport.build_kwargs(provider_profile=_profile, **_common)
@@ -1356,6 +1384,53 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         provider_name=agent.provider,
+    )
+
+
+def build_chat_cache_warm_kwargs(agent) -> dict | None:
+    """Project the resolved ordinary HTTP Chat route into one bodyless request.
+
+    This keeps the route's stable profile, client timeout, static overrides and
+    logical cache identity while leaving turn-scoped reasoning, tools and output
+    budgets untouched.
+    """
+    if (
+        getattr(agent, "api_mode", None) != "chat_completions"
+        or getattr(agent, "_openai_transport_kind", None) != "http_chat"
+    ):
+        return None
+    reserved = {
+        "model", "messages", "tools", "stream", "max_tokens", "max_completion_tokens",
+        "reasoning", "reasoning_effort",
+    }
+    request_overrides = {
+        key: value for key, value in dict(getattr(agent, "request_overrides", {}) or {}).items()
+        if key not in reserved
+    }
+    nested = request_overrides.get("extra_body")
+    if isinstance(nested, dict):
+        request_overrides["extra_body"] = {
+            key: value for key, value in nested.items() if key not in reserved
+        }
+    kwargs = _build_chat_completions_kwargs(
+        agent, [], [], None, request_overrides, _prompt_cache_scope_for_agent(agent),
+        bodyless_warm=True,
+    )
+    final_extra_body = kwargs.get("extra_body")
+    if isinstance(final_extra_body, dict):
+        final_extra_body = {
+            key: value for key, value in final_extra_body.items() if key not in reserved
+        }
+        if final_extra_body:
+            kwargs["extra_body"] = final_extra_body
+        else:
+            kwargs.pop("extra_body", None)
+    from agent.opencode_affinity import merge_opencode_session_headers
+    return merge_opencode_session_headers(
+        kwargs,
+        getattr(agent, "provider", None),
+        getattr(agent, "base_url", None),
+        getattr(agent, "session_id", None),
     )
 
 

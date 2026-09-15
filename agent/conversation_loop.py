@@ -1430,6 +1430,7 @@ def _run_conversation_turn(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_origin: str = "user",
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1491,6 +1492,8 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    agent._tui_provider_response_index = 0
+    agent._cache_turn_origin = turn_origin
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,
@@ -1578,6 +1581,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_origin: str = "user",
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1601,6 +1605,7 @@ def run_conversation(
         persist_user_display_metadata=persist_user_display_metadata,
         persist_user_platform_id=persist_user_platform_id,
         moa_config=moa_config,
+        turn_origin=turn_origin,
     )
     return export_current_turn_boundary(agent, result, user_message)
 

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.usage_pricing import (
     _OFFICIAL_DOCS_PRICING,
     CanonicalUsage,
@@ -93,6 +95,58 @@ def test_normalize_usage_openai_reads_top_level_anthropic_cache_fields():
     # input_tokens = prompt_total - cache_read - cache_write = 1000 - 500 - 300 = 200
     assert normalized.input_tokens == 200
     assert normalized.output_tokens == 200
+
+
+@pytest.mark.parametrize(
+    ("mode", "details_key", "fallback_key"),
+    [
+        ("chat_completions", "cached_tokens", "prompt_cache_hit_tokens"),
+        ("chat_completions", "cache_write_tokens", "cache_creation_input_tokens"),
+        ("codex_responses", "cache_write_tokens", "cache_creation_tokens"),
+    ],
+)
+@pytest.mark.parametrize("masked", [0, None])
+def test_normalize_usage_positive_cache_alias_survives_earlier_zero_or_null(
+    mode, details_key, fallback_key, masked
+):
+    detail_container = (
+        "prompt_tokens_details" if mode == "chat_completions" else "input_tokens_details"
+    )
+    usage = {
+        "prompt_tokens" if mode == "chat_completions" else "input_tokens": 2_000,
+        "completion_tokens" if mode == "chat_completions" else "output_tokens": 100,
+        detail_container: {details_key: masked},
+    }
+    if mode == "codex_responses":
+        usage[detail_container][fallback_key] = 1_900
+    else:
+        usage[fallback_key] = 1_900
+
+    normalized = normalize_usage(usage, provider="custom", api_mode=mode)
+
+    bucket = (
+        normalized.cache_write_tokens
+        if "write" in details_key
+        else normalized.cache_read_tokens
+    )
+    assert bucket == 1_900
+    assert normalized.cache_telemetry == "reported"
+
+
+@pytest.mark.parametrize("value", [None, "bad", -1])
+def test_normalize_usage_invalid_cache_alias_without_fallback_is_unavailable(value):
+    normalized = normalize_usage(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 1,
+            "prompt_tokens_details": {"cached_tokens": value},
+        },
+        provider="custom",
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_read_tokens == 0
+    assert normalized.cache_telemetry == "unavailable"
 
 
 
@@ -861,6 +915,35 @@ def test_normalize_usage_nested_details_win_over_qwen_flat_top_level():
 
     assert normalized.cache_read_tokens == 900
     assert normalized.input_tokens == 1100
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.5, float("nan"), "bad", [], {}])
+def test_normalize_usage_rejects_invalid_cache_evidence(value):
+    normalized = normalize_usage(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": value},
+        },
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_read_tokens == 0
+    assert normalized.cache_telemetry == "unavailable"
+
+
+def test_normalize_usage_accepts_integral_string_cache_evidence():
+    normalized = normalize_usage(
+        {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": "25"},
+        },
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_read_tokens == 25
+    assert normalized.cache_telemetry == "reported"
 
 
 # ── Context-tiered pricing (Gemini Pro >200k prompts, #93469) ─────────────

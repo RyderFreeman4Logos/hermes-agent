@@ -81,7 +81,7 @@ def _plan_goal_compression_recovery(
 
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
-    queued_prompt_generation: int | None) -> tuple[list[str], Any] | None:
+    queued_prompt_generation: int | None, turn_token=None) -> tuple[list[str], Any] | None:
     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
     bypass that once let a second backend run a duplicate turn."""
@@ -92,14 +92,20 @@ def _admit_prompt_turn(
             session.get("session_key") or sid,
             getattr(ownership_refusal, "reason", None) or "refused")
         with session["history_lock"]:
-            session["running"] = False
+            if turn_token is None or session.get("_turn_owner_token") is turn_token:
+                session["running"] = False
+                session.pop("_turn_owner_token", None)
+                session.pop("_turn_owner_kind", None)
         _emit("error", sid, {"message": str(ownership_refusal)})
         return None
     with session["history_lock"]:
         if session.get("_closing") or (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation):
-            session["running"] = False
+            if turn_token is None or session.get("_turn_owner_token") is turn_token:
+                session["running"] = False
+                session.pop("_turn_owner_token", None)
+                session.pop("_turn_owner_kind", None)
             return None
         images = list(session.get("attached_images", []) if image_paths is None else image_paths)
         if image_paths is None:
@@ -539,6 +545,8 @@ def _invoke_agent(
     if display_kind and "persist_user_display_kind" in run_params:
         run_kwargs["persist_user_display_kind"] = display_kind
         run_kwargs["persist_user_display_metadata"] = display_metadata
+    if "turn_origin" in run_params:
+        run_kwargs["turn_origin"] = getattr(agent, "_cache_turn_origin", "user")
     # Live-rename hook: auto-titling fires inside the turn prologue.
     _title_key = session.get("session_key") or sid
     agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
@@ -670,6 +678,13 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         st.receipt_committed = True
     if st.receipt_committed:
         _retire_turn_marker(session, st.marker_key)
+    first_usage = getattr(agent, "_first_turn_usage", None)
+    if first_usage:
+        payload["cache_info"] = _cache_info_from_usage(first_usage)
+    elif not getattr(agent, "_tui_first_provider_response_recorded", False):
+        emit_cache = getattr(agent, "_tui_cache_callback", None)
+        if callable(emit_cache):
+            emit_cache("no_field", 0, 0, 0)
     return payload, raw, status
 
 
@@ -751,11 +766,31 @@ def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
-    terminal_callback: Callable[[dict[str, Any]], None] | None = None) -> bool:
-    admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
+    terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+    turn_origin: str = "user", turn_token=None) -> bool:
+    with session["history_lock"]:
+        if turn_token is None:
+            turn_token = session.get("_turn_owner_token")
+        if turn_token is None:
+            turn_token = object()
+            session["running"] = True
+            session["_turn_owner_token"] = turn_token
+            session["_turn_owner_kind"] = turn_origin
+    admitted = _admit_prompt_turn(
+        sid, session, text, image_paths, queued_prompt_generation, turn_token)
     if admitted is None:
         return False
     images, agent = admitted
+    # Cache-warm retain/first-usage after admit so the ownership gate stays pin-identical.
+    from tui_gateway.cache_telemetry import _cancel_tui_cache_warm
+    with session["history_lock"]:
+        if turn_origin == "user":
+            _cancel_tui_cache_warm(session, retain_arm=True)
+        agent._tui_first_provider_response_record_enabled = True
+        agent._tui_first_provider_response_recorded = False
+        agent._first_turn_usage = None
+        session.pop("first_provider_response", None)
+        agent._cache_turn_origin = turn_origin
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
     # session_key and the agent's live session_id together.  No prompt content is logged.
     _turn_started_monotonic = time.monotonic()
@@ -782,6 +817,7 @@ def _run_prompt_submit(
             receipt_committed=terminal_callback is None)
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None)
         goal_followup = None
+        owns_turn = False
         try:
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
@@ -814,10 +850,19 @@ def _run_prompt_submit(
             # A stale interim closure must not fire during a later turn.
             st.agent.interim_assistant_callback = None
             with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-                if not st.error_retained:
-                    _clear_inflight_turn(session)
+                owns_turn = session.get("_turn_owner_token") is turn_token
+                if owns_turn:
+                    session["running"] = False
+                    session.pop("_turn_owner_token", None)
+                    session.pop("_turn_owner_kind", None)
+                    session["last_active"] = time.time()
+                    if (
+                        getattr(st.agent, "_cache_turn_origin", "user") == "user"
+                        and not getattr(st.agent, "_tui_first_provider_response_recorded", False)
+                    ):
+                        session.pop("_cache_warm_previous_arm", None)
+                    if not st.error_retained:
+                        _clear_inflight_turn(session)
             # Closing bookend of "tui prompt accepted" — exactly one per accepted prompt.
             # agent.session_id is re-read because compression may have rotated it (an
             # accepted/finished pair whose id changed IS a rotation trace).
@@ -840,7 +885,8 @@ def _run_prompt_submit(
                     session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
-        _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
+        if owns_turn:
+            _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
     run_thread = threading.Thread(target=run, daemon=True)
     with _sessions_lock:
         registered = _sessions.get(sid)
@@ -850,7 +896,10 @@ def _run_prompt_submit(
             run_thread.start()
     if not can_start:
         with session["history_lock"]:
-            session["running"] = False
+            if session.get("_turn_owner_token") is turn_token:
+                session["running"] = False
+                session.pop("_turn_owner_token", None)
+                session.pop("_turn_owner_kind", None)
     return can_start
 
 

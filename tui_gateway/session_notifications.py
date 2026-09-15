@@ -119,17 +119,26 @@ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out
 _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0  # /loop and /heartbeat share one idle-poll cadence
 
 
-def _notif_release_turn(session: dict) -> None:
+def _notif_release_turn(session: dict, token=None) -> bool:
     with session["history_lock"]:
+        if token is not None and session.get("_turn_owner_token") is not token:
+            return False
         session["running"] = False
+        session.pop("_turn_owner_token", None)
+        session.pop("_turn_owner_kind", None)
+        return True
 
 
-def _notif_claim_turn(session: dict) -> bool:
-    """Claim the idle session (running=True) under history_lock; False if a turn is live."""
+def _notif_claim_turn(session: dict, *, owner: str = "notification"):
+    """Claim the idle session and return its generation token, or None if busy."""
     with session["history_lock"]:
-        claimed = not session.get("running")
+        if session.get("running"):
+            return None
+        token = object()
         session["running"] = True
-        return claimed
+        session["_turn_owner_token"] = token
+        session["_turn_owner_kind"] = owner
+        return token
 
 
 def _notif_log_failure(what: str, exc: BaseException) -> None:
@@ -376,7 +385,10 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
     with session["history_lock"]:
         batch, session["_kanban_pending"] = list(session.get("_kanban_pending") or []), []
     with contextlib.suppress(Exception):
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch), "kanban notification dispatch failed")
+        _notif_submit(
+            f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
+            "kanban notification dispatch failed", turn_origin="background_completion",
+        )
 
 
 def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
@@ -384,8 +396,15 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
     if (claim := claim_event_delivery(evt, "tui-poller")) is None:
         return
-    kwargs = ({"display_kind": "async_delegation_complete", "display_metadata": _async_delegation_display_metadata(evt)}
-              if evt.get("type") == "async_delegation" else {})
+    kwargs = (
+        {
+            "display_kind": "async_delegation_complete",
+            "display_metadata": _async_delegation_display_metadata(evt),
+            "turn_origin": "subagent_result",
+        }
+        if evt.get("type") == "async_delegation"
+        else {"turn_origin": "background_completion"}
+    )
     try:
         _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
@@ -466,7 +485,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     try:
         if text is not None:
             _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                          "completion batch dispatch failed")
+                          "completion batch dispatch failed", turn_origin="background_completion")
     except Exception:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)

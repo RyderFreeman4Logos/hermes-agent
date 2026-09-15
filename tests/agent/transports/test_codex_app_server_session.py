@@ -8,6 +8,8 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 from __future__ import annotations
 
 import time
+import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 from typing import Any, Optional
 
@@ -20,6 +22,7 @@ from agent.transports.codex_app_server_session import (
     _approval_choice_to_codex_decision,
     _coerce_turn_input_text,
 )
+from agent.codex_runtime import make_codex_app_server_event_bridge
 
 
 class FakeClient:
@@ -124,6 +127,78 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
         client_factory=lambda **kw: client,
         **kwargs,
     )
+
+
+def test_first_usage_is_published_before_held_tool_phase_and_turn_completion():
+    client = FakeClient()
+    events = []
+    tool_phase = threading.Event()
+    release_tool = threading.Event()
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        api_mode="codex_app_server",
+        _first_turn_usage=None,
+        _tui_cache_callback=lambda *args: events.append(args),
+        show_commentary=True,
+    )
+    bridge = make_codex_app_server_event_bridge(agent)
+
+    def on_event(note):
+        bridge(note)
+        if note.get("method") == "item/started":
+            tool_phase.set()
+            assert release_tool.wait(timeout=2)
+
+    client.queue_notification(
+        "thread/tokenUsage/updated",
+        tokenUsage={"last": {
+            "inputTokens": 100,
+            "cachedInputTokens": 90,
+            "outputTokens": 10,
+            "totalTokens": 110,
+        }},
+    )
+    client.queue_notification(
+        "item/started",
+        item={"id": "tool-1", "type": "commandExecution", "command": "synthetic"},
+    )
+    client.queue_notification(
+        "thread/tokenUsage/updated",
+        tokenUsage={"last": {
+            "inputTokens": 200,
+            "cachedInputTokens": 0,
+            "outputTokens": 20,
+            "totalTokens": 220,
+        }},
+    )
+    client.queue_notification(
+        "item/completed",
+        item={"id": "message-1", "type": "agentMessage", "text": "done"},
+    )
+    client.queue_notification(
+        "turn/completed",
+        turn={"id": "turn-fake-001", "status": "completed", "error": None},
+    )
+    result = []
+    runner = threading.Thread(target=lambda: result.append(
+        make_session(client, on_event=on_event).run_turn("hello", turn_timeout=2)
+    ))
+    runner.start()
+    try:
+        assert tool_phase.wait(timeout=2)
+        assert len(events) == 1
+        assert events[0][0] == "hit"
+        assert events[0][2] == 90
+        assert result == []
+    finally:
+        release_tool.set()
+        runner.join(timeout=2)
+
+    assert not runner.is_alive()
+    assert result[0].final_text == "done"
+    assert result[0].token_usage_first["cachedInputTokens"] == 90
+    assert result[0].token_usage_last["cachedInputTokens"] == 0
+    assert len(events) == 1
 
 
 # ---- choice mapping ----
@@ -910,4 +985,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

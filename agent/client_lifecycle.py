@@ -274,8 +274,8 @@ class ClientLifecycleMixin:
             try:
                 # MoA's ``client`` is an in-process facade, not an SDK client; generic rebuilds must preserve that.
                 if (getattr(self, "provider", "") or "").strip().lower() == "moa":
-                    from agent.moa_loop import build_moa_facade
-                    new_client = build_moa_facade(self, self.model)
+                    from agent.moa_loop import install_shared_moa_facade
+                    new_client = install_shared_moa_facade(self, self.model)
                 else:
                     new_client = self._create_openai_client(self._client_kwargs, reason=reason, shared=True)
             except Exception as exc:

@@ -916,8 +916,8 @@ def _rebuild_primary_client(agent, rt: Dict[str, Any], *, reason: str) -> None:
     if (agent.provider or "").strip().lower() == "moa":
         # MoA has empty client_kwargs; rebuild via the shared facade factory so the
         # reference_callback relay survives recovery.
-        from agent.moa_loop import build_moa_facade
-        agent.client = build_moa_facade(agent, agent.model)
+        from agent.moa_loop import install_shared_moa_facade
+        install_shared_moa_facade(agent, agent.model)
         # MoA is a virtual chat-completions provider. It never has real OpenAI client kwargs; restoring it
         # after a fallback must recreate the facade, not call OpenAI() with an empty api_key. Use the shared
         # factory so the restored facade keeps the reference_callback relay wired at init — a bare
@@ -963,8 +963,8 @@ def try_recover_primary_transport(
             # MoA is a virtual provider with empty client_kwargs — rebuilding via _create_openai_client
             # would raise "api_key client option must be set". Recreate the facade through the shared
             # factory so the reference_callback relay survives recovery (#53802).
-            from agent.moa_loop import build_moa_facade
-            agent.client = build_moa_facade(agent, agent.model)
+            from agent.moa_loop import install_shared_moa_facade
+            install_shared_moa_facade(agent, agent.model)
         else:
             agent.client = agent._create_openai_client(dict(rt["client_kwargs"]), reason="primary_recovery", shared=True)
         wait_time = min(3 + retry_count, 8)
@@ -1699,8 +1699,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # base_url, leaks the request to a foreign gateway. Rebuild the facade instead (build_moa_facade also
     # re-wires the reference relay, see #53802).
     if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
-        from agent.moa_loop import build_moa_facade
-        return build_moa_facade(agent, getattr(agent, "model", None) or "default")
+        from agent.moa_loop import build_moa_facade, install_shared_moa_facade
+        preset = getattr(agent, "model", None) or "default"
+        return install_shared_moa_facade(agent, preset) if shared else build_moa_facade(agent, preset)
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
@@ -1713,6 +1714,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # provider possible). None (the default) falls through, so existing providers are unaffected.
     provider_client = _provider_supplied_client(agent, client_kwargs)
     if provider_client is not None:
+        agent._openai_transport_kind = "provider"
+        if shared:
+            agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
         _ra().logger.info(
             "%s client created from provider profile (%s, shared=%s) %s",
             agent.provider, reason, shared, agent._client_log_context(),
@@ -1722,6 +1726,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     if agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
         client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
+            agent._openai_transport_kind = "gemini"
+            if shared:
+                agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
             return client
     # TCP keepalives so dead provider connections are detected (~60s) instead of hanging in
     # CLOSE-WAIT. Injected into the local copy only, so each client gets its own httpx.Client;
@@ -1768,6 +1775,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # ``process_bootstrap.OpenAI`` is a lazy SDK proxy; resolved at call time so tests can patch it.
     from agent import process_bootstrap
     client = process_bootstrap.OpenAI(**client_kwargs)
+    agent._openai_transport_kind = "http_chat"
+    if shared:
+        agent._openai_transport_generation = int(getattr(agent, "_openai_transport_generation", 0)) + 1
     _ra().logger.info("OpenAI client created (%s, shared=%s) %s", reason, shared, agent._client_log_context())
     return client
 
@@ -1802,7 +1812,8 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
-    "_credential_pool", "_credential_pool_entry_id",
+    "_credential_pool", "_credential_pool_entry_id", "_openai_transport_kind",
+    "_openai_transport_generation",
 )
 _MISSING = object()
 
@@ -1864,7 +1875,7 @@ def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mo
 def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new_norm) -> None:
     """Build the client for the switched-to destination (MoA facade / native Anthropic / OpenAI wire)."""
     if new_norm == "moa":
-        from agent.moa_loop import build_moa_facade
+        from agent.moa_loop import install_shared_moa_facade
         # MoA speaks only chat.completions via the MoAClient facade; the aggregator's real transport
         # is applied inside the fan-out. Pin api_mode so the loop never dispatches
         # client.responses.create against the facade (matches agent_init.py).
@@ -1872,7 +1883,7 @@ def _build_switched_client(agent, new_provider, api_key, base_url, api_mode, new
         agent.api_key = api_key or "moa-virtual-provider"
         agent.base_url = "moa://local"
         agent._client_kwargs = {}
-        agent.client = build_moa_facade(agent, agent.model)
+        install_shared_moa_facade(agent, agent.model)
         return
     if api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client

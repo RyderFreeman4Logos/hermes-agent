@@ -3,7 +3,10 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import tools.terminal_tool as terminal_tool
+import tools.terminal_tool_background as terminal_background
 
 
 def _minimal_terminal_config(cwd="/default"):
@@ -174,6 +177,51 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
         "env_vars": {},
         "use_pty": False,
     }]
+
+
+@pytest.mark.parametrize(
+    ("notification_kwargs", "expected_notification"),
+    [({}, None), ({"notify_on_complete": False}, None), ({"notify_on_complete": True}, True)],
+)
+def test_background_spawn_forwards_only_true_completion_notification(
+    notification_kwargs, expected_notification,
+):
+    """False uses the registry default; true preserves completion delivery."""
+
+    class FakeRegistry:
+        def __init__(self):
+            self.calls = []
+
+        def spawn_local(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(id="proc_test", pid=1234)
+
+    registry = FakeRegistry()
+    terminal_background._spawn(
+        registry,
+        env=SimpleNamespace(env={}),
+        env_type="local",
+        command="sleep 1",
+        cwd="/workspace/live",
+        effective_task_id="effective-task",
+        task_id="owner-task",
+        session_key="session-key",
+        effective_pty=False,
+        **notification_kwargs,
+    )
+
+    expected = {
+        "command": "sleep 1",
+        "cwd": "/workspace/live",
+        "task_id": "effective-task",
+        "owner_task_id": "owner-task",
+        "session_key": "session-key",
+        "env_vars": {},
+        "use_pty": False,
+    }
+    if expected_notification is not None:
+        expected["notify_on_complete"] = expected_notification
+    assert registry.calls == [expected]
 
 
 def test_host_local_background_command_bypasses_configured_backend(tmp_path, monkeypatch):

@@ -25,6 +25,7 @@ from tools.delegate_tool import (
     _load_config,
     delegate_task,
     _build_child_agent,
+    _build_children,
     _build_child_progress_callback,
     _build_child_system_prompt,
     _strip_blocked_tools,
@@ -2415,6 +2416,37 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials({"provider": "copilot", "model": "gpt-5"}, parent)
         self.assertIn("without a base_url", str(ctx.exception))
+
+    def test_selected_route_is_frozen_at_child_batch_boundary(self):
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        creds = {
+            "provider": "selected-provider",
+            "model": "selected-model",
+            "base_url": "https://selected.invalid/v1",
+            "api_key": "synthetic-key",
+            "api_mode": "chat_completions",
+        }
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ):
+            children, error = _build_children(
+                [{"goal": "freeze selected route", "model_profile": "fast"}],
+                [None],
+                creds,
+                top_role="leaf",
+                max_iterations=10,
+                parent_agent=parent,
+                routing_cfg={},
+                live_deleg_id=None,
+                live_writers=[],
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(children[0][2]._delegate_selected_llm_route, ("selected-model", "selected-provider"))
+        child.model, child.provider = "fallback-model", "fallback-provider"
+        self.assertEqual(child._delegate_selected_llm_route, ("selected-model", "selected-provider"))
 
 
 if __name__ == "__main__":

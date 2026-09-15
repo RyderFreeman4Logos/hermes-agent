@@ -40,11 +40,11 @@ def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
 
 
 def _selected_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
-    """Return a route selected by the model-pool resolver before the child ran."""
-    profile = getattr(child, "_delegate_model_profile", None)
-    if not (isinstance(profile, str) and profile.strip()):
+    """Return the immutable route selected before the child started running."""
+    route = getattr(child, "_delegate_selected_llm_route", None)
+    if not (isinstance(route, tuple) and len(route) == 2):
         return None, None
-    return _str_or_none(getattr(child, "model", None)), _str_or_none(getattr(child, "provider", None))
+    return _str_or_none(route[0]), _str_or_none(route[1])
 
 
 def _result_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
@@ -597,20 +597,14 @@ def _build_result_entry(
     _result_billing = result.get("billing_block")
     _child_model = getattr(child, "model", "")
     accepted_model, accepted_provider = _accepted_route_identity(child)
-    selected_model, selected_provider = _selected_route_identity(child)
-    route_model, route_provider = (
-        (accepted_model, accepted_provider)
-        if accepted_model is not None or accepted_provider is not None
-        else (selected_model, selected_provider)
-    )
-    if route_provider is not None:
-        _route_owns_xai = route_provider in {"xai", "xai-oauth"}
-    elif route_model is not None:
-        _route_owns_xai = "grok" in route_model.lower()
+    if accepted_provider is not None:
+        _route_owns_xai = accepted_provider in {"xai", "xai-oauth"}
+    elif accepted_model is not None:
+        _route_owns_xai = "grok" in accepted_model.lower()
     else:
-        # Legacy/no-profile children have no selected-route authority. Preserve
-        # verified configured-xAI failures, but never trust that hint for a
-        # result explicitly marked unverified.
+        # A selected/configured route proves where the child was intended to
+        # run, not which fallback produced an unverified provider terminal.
+        # Preserve verified legacy configured-xAI failures only.
         _route_owns_xai = (
             "grok" in str(_child_model).lower()
             and not result.get("billing_unverified", False)

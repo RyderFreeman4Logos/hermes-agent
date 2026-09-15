@@ -248,7 +248,14 @@ def test_public_independent_units_keep_task_routes_in_manifest_dispatch_and_comp
         "tools.async_delegation._persist_dispatch", side_effect=lambda record: persisted.append(dict(record))
     ), patch("tools.async_delegation._get_executor", return_value=_NoRunExecutor()), patch(
         "tools.async_delegation._ensure_stale_monitor"
-    ):
+    ), patch("tools.delegate_tool._get_max_async_children", return_value=4):
+        sole_handle = json.loads(
+            delegate_task(
+                tasks=[{"goal": "run only fast", "model_profile": "fast"}],
+                background=True,
+                parent_agent=parent,
+            )
+        )
         handle = json.loads(
             delegate_task(
                 tasks=[
@@ -260,6 +267,15 @@ def test_public_independent_units_keep_task_routes_in_manifest_dispatch_and_comp
             )
         )
 
+    sole_manifest_path = (
+        tmp_path / "cache" / "delegation" / "live" / sole_handle["delegation_id"] / "manifest.json"
+    )
+    sole_manifest = json.loads(sole_manifest_path.read_text(encoding="utf-8"))
+    assert sole_manifest["model"] == "fast-model"
+    assert (sole_manifest["tasks"][0]["model"], sole_manifest["tasks"][0]["provider"]) == (
+        "fast-model", "custom"
+    )
+
     manifest_path = tmp_path / "cache" / "delegation" / "live" / handle["delegation_id"] / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert [(t["model"], t["provider"]) for t in manifest["tasks"]] == [
@@ -267,7 +283,9 @@ def test_public_independent_units_keep_task_routes_in_manifest_dispatch_and_comp
         ("standard-model", "custom"),
     ]
     assert manifest["model"] is None
-    assert [record["model"] for record in persisted] == ["fast-model", "standard-model"]
+    assert [record["model"] for record in persisted] == [
+        "fast-model", "fast-model", "standard-model"
+    ]
 
     rendered = _format_batch_delegation(
         {

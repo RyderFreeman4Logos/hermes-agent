@@ -155,7 +155,7 @@ async def test_gateway_public_command_crosses_real_compression_commit(tmp_path, 
     })
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: _resolved(**kwargs))
 
-    reply = await runner._handle_model_command(
+    reply = await runner._gateway_idle_command_handlers()["model"](
         MessageEvent(
             text=(f"/model {NEW_MODEL} --provider {NEW_PROVIDER} "
                   "--after-compression --reasoning low"),

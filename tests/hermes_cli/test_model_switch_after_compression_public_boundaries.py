@@ -1,0 +1,412 @@
+"""Public-surface lifecycle coverage for deferred model switches.
+
+All provider resolution is synthetic.  The tests still cross the real Gateway,
+JSON-RPC, and CLI command dispatchers and the real compression commit boundary.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from hermes_cli.model_switch import ModelSwitchResult, get_model_switch_after_compression
+from hermes_state import SessionDB
+
+
+OLD_MODEL = "old/model"
+OLD_PROVIDER = "openrouter"
+NEW_MODEL = "new/model"
+NEW_PROVIDER = "custom:synthetic"
+SECRET = "synthetic-secret"
+BASE_URL = "http://127.0.0.1:9/v1"
+LOW = {"enabled": True, "effort": "low"}
+
+
+def _resolved(**kwargs) -> ModelSwitchResult:
+    model = kwargs.get("raw_input") or OLD_MODEL
+    provider = kwargs.get("explicit_provider") or OLD_PROVIDER
+    return ModelSwitchResult(
+        success=True,
+        new_model=model,
+        target_provider=provider,
+        api_key=SECRET,
+        base_url=BASE_URL,
+        api_mode="chat_completions",
+        provider_label="Synthetic",
+        reasoning_config={"enabled": True, "effort": "medium"},
+    )
+
+
+def _compression_agent(tmp_path, session_id: str, *, platform: str = "cli", db=None):
+    db = db or SessionDB(db_path=tmp_path / "state.db")
+    if db.get_session(session_id) is None:
+        db.create_session(session_id, source=platform, model=OLD_MODEL)
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model=OLD_MODEL,
+            provider=OLD_PROVIDER,
+            quiet_mode=True,
+            session_db=db,
+            session_id=session_id,
+            platform=platform,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+        {"role": "assistant", "content": "summary acknowledged"},
+        {"role": "user", "content": "live tail"},
+    ]
+    compressor.compression_count = 1
+    compressor.last_prompt_tokens = 0
+    compressor.last_completion_tokens = 0
+    compressor._last_summary_error = None
+    compressor._last_compress_aborted = False
+    compressor._last_summary_auth_failure = False
+    compressor._last_aux_model_failure_model = None
+    compressor._last_aux_model_failure_error = None
+    agent.context_compressor = compressor
+    agent.compression_in_place = True
+    agent._compression_feasibility_checked = True
+    calls = []
+
+    def switch_model(new_model, new_provider, api_key, base_url, api_mode, **_kwargs):
+        calls.append((new_model, new_provider, api_key, base_url, api_mode))
+        agent.model = new_model
+        agent.provider = new_provider
+        agent.api_key = api_key
+        agent.base_url = base_url
+        agent.api_mode = api_mode
+        pending_reasoning = getattr(agent, "_deferred_model_switch_reasoning_config", None)
+        if pending_reasoning is not None:
+            agent.reasoning_config = dict(pending_reasoning)
+
+    agent.switch_model = switch_model
+    return db, agent, calls
+
+
+def _compress(agent, *, abort: bool = False):
+    agent.context_compressor._last_compress_aborted = abort
+    if abort:
+        agent.context_compressor._last_summary_error = "synthetic abort"
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": f"message-{i}"} for i in range(8)
+        ]
+    else:
+        agent.context_compressor._last_summary_error = None
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "assistant", "content": "summary acknowledged"},
+            {"role": "user", "content": "live tail"},
+        ]
+    messages = [{"role": "user", "content": f"message-{i}"} for i in range(8)]
+    return agent._compress_context(messages, "system", approx_tokens=120_000)
+
+
+def _assert_secret_free_pending(db, session_id: str) -> None:
+    stored = json.loads(db.get_session(session_id)["model_config"])
+    pending = stored["pending_model_switch_after_compression"]
+    assert pending == {
+        "api_mode": "chat_completions",
+        "model": NEW_MODEL,
+        "provider": NEW_PROVIDER,
+        "reasoning_config": LOW,
+    }
+    assert SECRET not in json.dumps(stored)
+    assert BASE_URL not in json.dumps(stored)
+
+
+@pytest.mark.asyncio
+async def test_gateway_public_command_crosses_real_compression_commit(tmp_path, monkeypatch):
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    db, agent, calls = _compression_agent(tmp_path, "gateway-session", platform="telegram")
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._sessions = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._pending_model_notes = {}
+    runner._running_agents = {}
+    runner._session_db = db
+    runner.session_store = None
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._model_selection_guard_reply = AsyncMock(return_value=(False, None))
+    source = SessionSource(
+        platform=Platform.TELEGRAM, user_id="user", chat_id="chat", chat_type="dm"
+    )
+    session_key = runner._session_key_for_source(source)
+    runner._agent_cache[session_key] = (agent, "signature", 0, "gateway-session")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda **_kwargs: {
+        "model": {"default": OLD_MODEL, "provider": OLD_PROVIDER}
+    })
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: _resolved(**kwargs))
+
+    reply = await runner._handle_model_command(
+        MessageEvent(
+            text=(f"/model {NEW_MODEL} --provider {NEW_PROVIDER} "
+                  "--after-compression --reasoning low"),
+            source=source,
+        )
+    )
+
+    assert "scheduled after the next successful compression" in reply
+    assert (agent.model, agent.provider, calls) == (OLD_MODEL, OLD_PROVIDER, [])
+    _assert_secret_free_pending(db, "gateway-session")
+
+    _compress(agent)
+
+    state = runner._session_state(session_key).conversation
+    assert calls == [(NEW_MODEL, NEW_PROVIDER, SECRET, BASE_URL, "chat_completions")]
+    assert state.after_compression_model_switch is None
+    assert state.model_override["reasoning_config"] == LOW
+    rebuilt_model, rebuilt_runtime = runner._apply_session_model_override(
+        session_key, OLD_MODEL, {"provider": OLD_PROVIDER}
+    )
+    assert rebuilt_model == NEW_MODEL
+    assert {key: rebuilt_runtime[key] for key in ("provider", "api_key", "base_url", "api_mode")} == {
+        "provider": NEW_PROVIDER,
+        "api_key": SECRET,
+        "base_url": BASE_URL,
+        "api_mode": "chat_completions",
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_model", "expected_provider"),
+    [
+        (f"{NEW_MODEL} --provider {NEW_PROVIDER} --after-compression --reasoning low",
+         NEW_MODEL, NEW_PROVIDER),
+        ("--after-compression --reasoning low", OLD_MODEL, OLD_PROVIDER),
+    ],
+)
+def test_tui_jsonrpc_command_crosses_real_compression_commit(
+    tmp_path, monkeypatch, value, expected_model, expected_provider
+):
+    from tui_gateway import server
+
+    db, agent, calls = _compression_agent(tmp_path, "tui-session", platform="tui")
+    session = {
+        "agent": agent,
+        "session_key": "tui-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+    }
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: _resolved(**kwargs))
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_append_model_switch_marker", lambda *_args, **_kwargs: None)
+    with patch.dict(server._sessions, {"public-tui": session}, clear=True):
+        response = server.dispatch({
+            "jsonrpc": "2.0",
+            "id": "switch",
+            "method": "config.set",
+            "params": {"session_id": "public-tui", "key": "model", "value": value,
+                       "confirm_expensive_model": True},
+        })
+        assert response["result"]["scope"] == "after_compression"
+        assert (agent.model, agent.provider, calls) == (OLD_MODEL, OLD_PROVIDER, [])
+
+        _compress(agent)
+
+        assert calls == [(expected_model, expected_provider, SECRET, BASE_URL, "chat_completions")]
+        assert "after_compression_model_switch" not in session
+        assert session["model_override"]["model"] == expected_model
+        assert session["model_override"]["provider"] == expected_provider
+        assert session["model_override"]["reasoning_config"] == LOW
+        rebuild = server._deferred_build_agent_kwargs(
+            {**session, "resume_session_id": "tui-session"}, db
+        )
+        assert rebuild["model_override"]["reasoning_config"] == LOW
+
+
+def _public_cli(agent):
+    from cli import HermesCLI
+
+    cli = object.__new__(HermesCLI)
+    for name, value in {
+        "model": OLD_MODEL,
+        "provider": OLD_PROVIDER,
+        "requested_provider": OLD_PROVIDER,
+        "api_key": "test-key",
+        "_explicit_api_key": "test-key",
+        "base_url": "https://openrouter.ai/api/v1",
+        "_explicit_base_url": "https://openrouter.ai/api/v1",
+        "api_mode": "chat_completions",
+        "_app": None,
+        "_pending_resume_sessions": None,
+        "_pending_one_turn_model_restore": None,
+        "_pending_model_switch_note": None,
+        "session_id": getattr(agent, "session_id", None),
+        "agent": agent,
+    }.items():
+        setattr(cli, name, value)
+    cli._confirm_expensive_model_switch = lambda _result: True
+    return cli
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_model", "expected_provider"),
+    [
+        (f"/model {NEW_MODEL} --provider {NEW_PROVIDER} --after-compression --reasoning low",
+         NEW_MODEL, NEW_PROVIDER),
+        ("/model --after-compression --reasoning low", OLD_MODEL, OLD_PROVIDER),
+    ],
+)
+def test_cli_public_dispatch_crosses_real_compression_commit(
+    tmp_path, monkeypatch, command, expected_model, expected_provider
+):
+    from cli import HermesCLI
+
+    _db, agent, calls = _compression_agent(tmp_path, "cli-session")
+    cli = _public_cli(agent)
+    monkeypatch.setattr("cli._cprint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers=None, custom_providers=None
+            ),
+        ),
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: _resolved(**kwargs))
+
+    assert HermesCLI.process_command(cli, command) is True
+    assert (cli.model, cli.provider, agent.model, agent.provider, calls) == (
+        OLD_MODEL, OLD_PROVIDER, OLD_MODEL, OLD_PROVIDER, []
+    )
+
+    _compress(agent)
+
+    assert calls == [(expected_model, expected_provider, SECRET, BASE_URL, "chat_completions")]
+    assert (cli.model, cli.provider, cli.reasoning_config) == (
+        expected_model, expected_provider, LOW
+    )
+
+
+def test_public_schedule_survives_abort_and_apply_failure_then_applies_once(
+    tmp_path, monkeypatch
+):
+    from cli import HermesCLI
+
+    db, agent, calls = _compression_agent(tmp_path, "retry-session")
+    cli = _public_cli(agent)
+    monkeypatch.setattr("cli._cprint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None, custom_providers=None,
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers=None, custom_providers=None),
+        ),
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: _resolved(**kwargs))
+    command = (f"/model {NEW_MODEL} --provider {NEW_PROVIDER} "
+               "--after-compression --reasoning low")
+
+    HermesCLI.process_command(cli, command)
+    _compress(agent, abort=True)
+    assert calls == []
+    assert get_model_switch_after_compression(agent) is not None
+    _assert_secret_free_pending(db, "retry-session")
+
+    original_switch = agent.switch_model
+    fail_once = True
+
+    def failing_switch(*args, **kwargs):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise RuntimeError("synthetic apply failure")
+        return original_switch(*args, **kwargs)
+
+    agent.switch_model = failing_switch
+    _compress(agent)
+    assert calls == []
+    assert (agent.model, agent.provider) == (OLD_MODEL, OLD_PROVIDER)
+    assert get_model_switch_after_compression(agent) is not None
+    _assert_secret_free_pending(db, "retry-session")
+
+    _compress(agent)
+    assert calls == [(NEW_MODEL, NEW_PROVIDER, SECRET, BASE_URL, "chat_completions")]
+    assert get_model_switch_after_compression(agent) is None
+    assert json.loads(db.get_session("retry-session")["model_config"]).get(
+        "pending_model_switch_after_compression"
+    ) is None
+
+
+def test_cold_sessiondb_recreation_restores_secret_free_pending_intent(
+    tmp_path, monkeypatch
+):
+    from cli import HermesCLI
+    from hermes_cli import config as config_module
+
+    db, agent, _calls = _compression_agent(tmp_path, "cold-session")
+    cli = _public_cli(agent)
+    monkeypatch.setattr("cli._cprint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None, custom_providers=None,
+            with_overrides=lambda **_kwargs: SimpleNamespace(
+                user_providers=None, custom_providers=None),
+        ),
+    )
+    resolution_calls = []
+
+    def resolve_from_current_config(**kwargs):
+        resolution_calls.append(kwargs)
+        return _resolved(**kwargs)
+
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model", resolve_from_current_config
+    )
+    HermesCLI.process_command(
+        cli,
+        f"/model {NEW_MODEL} --provider {NEW_PROVIDER} --after-compression --reasoning low",
+    )
+    _assert_secret_free_pending(db, "cold-session")
+    db.close()
+
+    resolution_calls.clear()
+    current_config = {
+        "providers": {
+            "synthetic-current": {
+                "base_url": BASE_URL,
+                "api_key": SECRET,
+                "models": {NEW_MODEL: {}},
+            }
+        }
+    }
+    monkeypatch.setattr(config_module, "load_config_readonly", lambda: current_config)
+    reopened = SessionDB(db_path=tmp_path / "state.db")
+    _db2, rebuilt, calls = _compression_agent(
+        tmp_path, "cold-session", platform="cli", db=reopened
+    )
+    pending = get_model_switch_after_compression(rebuilt)
+    assert pending is not None
+    assert (pending.new_model, pending.target_provider, pending.reasoning_config) == (
+        NEW_MODEL, NEW_PROVIDER, LOW
+    )
+    assert len(resolution_calls) == 1
+    assert resolution_calls[0]["validate_live"] is False
+    assert resolution_calls[0]["user_providers"] is current_config["providers"]
+    assert (rebuilt.model, rebuilt.provider, calls) == (OLD_MODEL, OLD_PROVIDER, [])
+    _compress(rebuilt)
+    assert calls == [(NEW_MODEL, NEW_PROVIDER, SECRET, BASE_URL, "chat_completions")]

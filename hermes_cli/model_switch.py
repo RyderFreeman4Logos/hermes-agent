@@ -856,6 +856,54 @@ def schedule_model_switch_after_compression(
         return previous
 
 
+def restore_model_switch_after_compression(
+    agent: Any, config: Optional[dict] = None,
+) -> Optional[ModelSwitchResult]:
+    """Restore a persisted deferred route through the current provider config.
+
+    The durable descriptor intentionally contains only route identity and
+    reasoning.  Credentials and endpoint details are resolved afresh, without a
+    live provider probe, when the session's agent is reconstructed.
+    """
+    descriptor = _session_model_config(agent).get(_AFTER_COMPRESSION_CONFIG_KEY)
+    if not isinstance(descriptor, dict):
+        return None
+    model = _clean(descriptor.get("model"))
+    provider = _clean(descriptor.get("provider"))
+    if not model or not provider:
+        return None
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+
+        current_config = config if isinstance(config, dict) else load_config_readonly()
+        result = switch_model(
+            raw_input=model,
+            current_provider=_clean(getattr(agent, "requested_provider", None) or getattr(agent, "provider", "")),
+            current_model=_clean(getattr(agent, "model", "")),
+            current_base_url=_clean(getattr(agent, "base_url", "")),
+            current_api_key=getattr(agent, "api_key", "") or "",
+            explicit_provider=provider,
+            user_providers=current_config.get("providers") if isinstance(current_config, dict) else None,
+            custom_providers=(
+                get_compatible_custom_providers(current_config)
+                if isinstance(current_config, dict) else None
+            ),
+            validate_live=False,
+        )
+    except Exception:
+        logger.debug("failed to restore deferred model switch", exc_info=True)
+        return None
+    if not result.success:
+        logger.debug("persisted deferred model switch is not currently resolvable: %s", result.error_message)
+        return None
+    reasoning = descriptor.get("reasoning_config")
+    if isinstance(reasoning, dict):
+        result.reasoning_config = copy.deepcopy(reasoning)
+    result.is_after_compression = True
+    schedule_model_switch_after_compression(agent, result)
+    return result
+
+
 def clear_model_switch_after_compression(agent: Any) -> Optional[ModelSwitchResult]:
     """Clear pending session intent without touching the current route."""
     with model_switch_transaction_lock(agent):

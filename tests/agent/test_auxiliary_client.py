@@ -460,6 +460,166 @@ class TestConfiguredAuxiliarySessionId:
         request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
         assert request_headers == {"session_id": "root-session", "x-initiator": "user"}
 
+    def test_partial_main_runtime_keeps_ambient_session_identity(self, monkeypatch):
+        """_current_main_runtime omits session_id/cache_scope; scoped calls must keep them."""
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _call_llm_impl
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _call_llm_impl(
+                task="compression",
+                provider="pm",
+                model="gpt-5.6-luna",
+                base_url=client.base_url,
+                api_key="pm-key",
+                api_mode="chat_completions",
+                main_runtime={
+                    "provider": "custom:pm",
+                    "model": "gpt-5.6-luna",
+                    "base_url": client.base_url,
+                    "api_key": "pm-key",
+                    "api_mode": "chat_completions",
+                },
+                messages=[{"role": "user", "content": "summarize"}],
+                timeout=30.0,
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers["session_id"] == "root-session"
+
+    def test_partial_main_runtime_explicit_identity_overrides_ambient(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _call_llm_impl
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _call_llm_impl(
+                task="compression",
+                provider="pm",
+                model="gpt-5.6-luna",
+                base_url=client.base_url,
+                api_key="pm-key",
+                api_mode="chat_completions",
+                main_runtime={
+                    "provider": "custom:pm",
+                    "model": "gpt-5.6-luna",
+                    "base_url": client.base_url,
+                    "api_key": "pm-key",
+                    "api_mode": "chat_completions",
+                    "session_id": "other-physical",
+                    "cache_scope": "other-root",
+                },
+                messages=[{"role": "user", "content": "summarize"}],
+                timeout=30.0,
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers["session_id"] == "other-root"
+
+    def test_partial_main_runtime_explicit_clear_does_not_inherit(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _call_llm_impl
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _call_llm_impl(
+                task="compression",
+                provider="pm",
+                model="gpt-5.6-luna",
+                base_url=client.base_url,
+                api_key="pm-key",
+                api_mode="chat_completions",
+                main_runtime={
+                    "provider": "custom:pm",
+                    "model": "gpt-5.6-luna",
+                    "base_url": client.base_url,
+                    "api_key": "pm-key",
+                    "api_mode": "chat_completions",
+                    "session_id": "",
+                    "cache_scope": "",
+                },
+                messages=[{"role": "user", "content": "summarize"}],
+                timeout=30.0,
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs.get("extra_headers") or {}
+        assert "session_id" not in request_headers
+
+    def test_empty_runtime_scope_isolates_from_ambient_session_identity(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            with aux.scoped_runtime_main({}):
+                kwargs = _build_call_kwargs(
+                    "pm",
+                    "gpt-5.6-luna",
+                    [{"role": "user", "content": "summarize"}],
+                    task="compression",
+                )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert "session_id" not in (kwargs.get("extra_headers") or {})
+
 
 class TestResolveTaskProviderModel:
     @pytest.mark.parametrize(

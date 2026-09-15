@@ -2588,6 +2588,18 @@ def reset_runtime_main(token: contextvars.Token) -> None:
 @contextlib.contextmanager
 def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
     """Temporarily bind an explicit runtime without touching legacy mirrors."""
+    # Partial snapshots (e.g. _current_main_runtime) omit session identity.
+    # Inherit only omitted fields; {} isolates, and explicit ""/override win.
+    if isinstance(main_runtime, dict) and main_runtime:
+        current = _RUNTIME_MAIN_CONTEXT.get()
+        if isinstance(current, dict):
+            merged = dict(main_runtime)
+            for field in ("session_id", "cache_scope"):
+                if field not in main_runtime:
+                    inherited = current.get(field)
+                    if isinstance(inherited, str) and inherited.strip():
+                        merged[field] = inherited
+            main_runtime = merged
     runtime = _normalize_main_runtime(main_runtime)
     token = _RUNTIME_MAIN_CONTEXT.set(runtime or None)
     try:
@@ -7257,10 +7269,10 @@ def _call_llm_impl(
     overrides task config; timeout=None reads auxiliary.{task}.timeout; extra_headers override
     client defaults. stream=True returns the raw SDK stream (caller consumes/falls back)
     instead of a validated response. RuntimeError if no provider is configured."""
-    with scoped_runtime_main(main_runtime):
+    with scoped_runtime_main(main_runtime) as runtime:
         return _call_llm_impl_unscoped(
             task=task, provider=provider, model=model, base_url=base_url,
-            api_key=api_key, main_runtime=main_runtime, messages=messages,
+            api_key=api_key, main_runtime=runtime, messages=messages,
             temperature=temperature, max_tokens=max_tokens, tools=tools,
             timeout=timeout, extra_body=extra_body, reasoning_config=reasoning_config,
             extra_headers=extra_headers, api_mode=api_mode, stream=stream,
@@ -7461,10 +7473,10 @@ async def _async_call_llm_impl(
 ) -> Any:
     """Centralized asynchronous LLM call; see call_llm() for full documentation.
     No per-request header / api_mode override on the async entry point."""
-    with scoped_runtime_main(main_runtime):
+    with scoped_runtime_main(main_runtime) as runtime:
         return await _async_call_llm_impl_unscoped(
             task=task, provider=provider, model=model, base_url=base_url,
-            api_key=api_key, main_runtime=main_runtime, messages=messages,
+            api_key=api_key, main_runtime=runtime, messages=messages,
             temperature=temperature, max_tokens=max_tokens, tools=tools,
             timeout=timeout, extra_body=extra_body, reasoning_config=reasoning_config,
             route_info=route_info,

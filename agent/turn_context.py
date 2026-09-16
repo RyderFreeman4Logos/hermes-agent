@@ -1217,6 +1217,11 @@ def build_api_messages(
 
     api_messages = []
     for idx, msg in enumerate(canonical_messages):
+        # Hidden system rows are durable internal bookkeeping, not conversation
+        # history. The effective system prompt is supplied separately below; keep
+        # ordinary system rows and hidden user/assistant replay semantics intact.
+        if msg.get("role") == "system" and msg.get("display_kind") == "hidden":
+            continue
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
         # persisted history via nested containers; see _clone_message_for_send.
         api_msg = _clone_message_for_send(msg)

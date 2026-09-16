@@ -1772,7 +1772,7 @@ def _should_skip_unresolved_fallback_candidate(agent, fb: dict, fb_key: tuple, f
 
 
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
-    """True when a resolved entry repeats the failed backend identity."""
+    """True when raw or resolved fields prove an entry repeats a failed backend."""
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
@@ -1982,6 +1982,11 @@ def _try_activate_fallback_unlocked(
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
         if _should_skip_unresolved_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+            continue
+        # A raw self-identity can reject before key lookup/provider resolution; aliases whose raw
+        # identity does not prove sameness (for example an omitted-endpoint route alias) are checked
+        # again after effective resolution.
+        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
         runtime_snapshot = None

@@ -181,7 +181,8 @@ def test_failed_backend_is_not_retried_through_a_later_alias():
         assert agent.provider == "route-b"
         assert agent._try_activate_fallback(FailoverReason.server_error) is False
 
-    assert [call.args[0] for call in resolve.call_args_list] == ["route-b", "route-a-alias"]
+    # The explicit same endpoint is sufficient to reject the alias before it selects credentials.
+    assert [call.args[0] for call in resolve.call_args_list] == ["route-b"]
 
     with patch("agent.agent_runtime_helpers.time.monotonic", return_value=0):
         agent._restore_primary_runtime()

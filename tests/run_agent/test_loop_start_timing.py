@@ -245,6 +245,39 @@ def test_next_turn_replays_the_prior_decorated_prefix_byte_for_byte(tmp_path, mo
         db.close()
 
 
+def test_public_turn_drops_legacy_hidden_system_history_only(tmp_path, monkeypatch):
+    """A predecessor timing row stays durable but never reaches a provider."""
+    agent, db = _make_agent(tmp_path, "legacy-hidden")
+    agent.client.chat.completions.create.return_value = _response()
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *_a, **_k: None)
+    legacy = {
+        "role": "system",
+        "content": f"{MARKER}\nCurrent loop start: 2026-09-14T09:00:00-07:00",
+        "display_kind": "hidden",
+        "display_metadata": {"loop_timing_turn_id": "old-turn"},
+    }
+    ordinary_system = {"role": "system", "content": "ordinary historical system context"}
+    hidden_assistant = {
+        "role": "assistant",
+        "content": "unrelated hidden assistant payload",
+        "display_kind": "hidden",
+    }
+
+    try:
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=[legacy, ordinary_system, hidden_assistant],
+        )
+        assert result["completed"] is True
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        contents = [_text(row.get("content")) for row in sent]
+        assert legacy["content"] not in contents
+        assert ordinary_system["content"] in contents
+        assert hidden_assistant["content"] in contents
+    finally:
+        db.close()
+
+
 def test_disabled_loop_timing_keeps_public_and_durable_input_unchanged(tmp_path, monkeypatch):
     from agent import loop_timing
 
@@ -266,72 +299,156 @@ def test_disabled_loop_timing_keeps_public_and_durable_input_unchanged(tmp_path,
         db.close()
 
 
-def test_only_successful_completion_advances_session_scoped_stop(tmp_path, monkeypatch):
-    """A failed N cannot relabel the latest successful N-1 stop as N's end."""
+def test_public_failed_turn_keeps_last_successful_stop_for_next_turn(tmp_path, monkeypatch):
+    """A real failed N cannot relabel the successful N-1 stop as N's end."""
     from agent import loop_timing
 
-    db_path = tmp_path / "state.db"
-    db = SessionDB(db_path=db_path)
-    db.create_session("main", source="cli", model="test/model")
-    db.create_session(
-        "branch",
-        source="cli",
-        model="test/model",
-        model_config={"_branched_from": "main"},
-        parent_session_id="main",
-    )
-    db.create_session("new", source="cli", model="test/model")
-    agent = SimpleNamespace(
-        _session_db=db,
-        session_id="main",
-        _loop_timing_start_decorated=True,
-    )
-    stop_n_minus_1 = datetime(2026, 9, 15, 12, 0, 3, tzinfo=TZ)
-    failed_n = datetime(2026, 9, 15, 12, 5, 9, tzinfo=TZ)
-
-    assert loop_timing.record_completed_loop_stop(
-        agent,
-        {"completed": True, "failed": False, "interrupted": False},
-        now=stop_n_minus_1,
-    )
-    assert not loop_timing.record_completed_loop_stop(
-        agent,
-        {"completed": False, "failed": True, "interrupted": False},
-        now=failed_n,
-    )
-    assert not loop_timing.record_completed_loop_stop(
-        agent,
-        {"completed": False, "failed": False, "interrupted": True},
-        now=failed_n,
-    )
-
-    # A cold process for the same session sees N-1.  A branch/new session sees none.
-    cold = SimpleNamespace(_session_db=SessionDB(db_path=db_path), session_id="main")
-    branch = SimpleNamespace(_session_db=cold._session_db, session_id="branch")
-    new_session = SimpleNamespace(_session_db=cold._session_db, session_id="new")
-    start_n_plus_1 = datetime(2026, 9, 15, 12, 10, 0, tzinfo=TZ)
+    agent, db = _make_agent(tmp_path, "failed-middle")
+    terminal = Exception("synthetic non-retryable request")
+    terminal.status_code = 403
+    agent.client.chat.completions.create.side_effect = [
+        _response("n-1 success"), terminal, _response("n+1 success"),
+    ]
+    times = iter([
+        datetime(2026, 9, 15, 12, 0, 0, tzinfo=TZ),
+        datetime(2026, 9, 15, 12, 0, 3, tzinfo=TZ),
+        datetime(2026, 9, 15, 12, 5, 0, tzinfo=TZ),
+        datetime(2026, 9, 15, 12, 10, 0, tzinfo=TZ),
+        datetime(2026, 9, 15, 12, 10, 2, tzinfo=TZ),
+    ])
+    monkeypatch.setattr(loop_timing, "_now", lambda: next(times))
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *_a, **_k: None)
     try:
-        current, persisted = loop_timing.decorate_loop_start_input(
-            cold, "next", None, now=start_n_plus_1,
+        assert agent.run_conversation("n-1")["completed"] is True
+        failed = agent.run_conversation(
+            "failed n", conversation_history=db.get_messages_as_conversation(agent.session_id),
         )
-        assert persisted == "next"
-        assert "Latest successful completed loop stop: 2026-09-15T12:00:03-07:00" in current
-        assert "12:05:09" not in current
-        fresh, _ = loop_timing.decorate_loop_start_input(
-            branch, "branch input", None, now=start_n_plus_1,
-        )
-        assert "Latest successful completed loop stop:" not in fresh
-        new_input, _ = loop_timing.decorate_loop_start_input(
-            new_session, "new session input", None, now=start_n_plus_1,
-        )
-        assert "Latest successful completed loop stop:" not in new_input
-
-        # Rotation copies the scalar into the child model config; the parent is untouched.
-        rotated = loop_timing.model_config_for_compression_child(
-            cold, {"reasoning_effort": "high"},
-        )
-        assert rotated[loop_timing.LOOP_STOP_KEY] == "2026-09-15T12:00:03-07:00"
-        assert db.get_session_model_config_value("main", loop_timing.LOOP_STOP_KEY) == rotated[loop_timing.LOOP_STOP_KEY]
+        assert failed["failed"] is True
+        assert agent.run_conversation(
+            "n+1", conversation_history=db.get_messages_as_conversation(agent.session_id),
+        )["completed"] is True
+        third_request = agent.client.chat.completions.create.call_args_list[-1].kwargs["messages"]
+        current = next(row for row in reversed(third_request) if row.get("role") == "user")
+        text = _text(current["content"])
+        assert "Latest successful completed loop stop: 2026-09-15T12:00:03-07:00" in text
+        assert "12:05:00" not in text
     finally:
-        cold._session_db.close()
+        db.close()
+
+
+def test_public_interrupted_turn_keeps_last_successful_stop_for_next_turn(
+    tmp_path, monkeypatch,
+):
+    """A real interrupted N also leaves the successful N-1 stop unchanged."""
+    from agent import loop_timing
+
+    agent, db = _make_agent(tmp_path, "interrupted-middle")
+    agent.client.chat.completions.create.side_effect = [
+        _response("n-1 success"), _response("n+1 success"),
+    ]
+    real_api_call = agent._interruptible_api_call
+    call_count = 0
+
+    def interrupt_second(api_kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise InterruptedError("synthetic user stop")
+        return real_api_call(api_kwargs)
+
+    times = iter([
+        datetime(2026, 9, 15, 12, 20, 0, tzinfo=TZ),
+        datetime(2026, 9, 15, 12, 20, 3, tzinfo=TZ),
+        datetime(2026, 9, 15, 12, 25, 0, tzinfo=TZ),
+        datetime(2026, 9, 15, 12, 30, 0, tzinfo=TZ),
+        datetime(2026, 9, 15, 12, 30, 2, tzinfo=TZ),
+    ])
+    monkeypatch.setattr(loop_timing, "_now", lambda: next(times))
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *_a, **_k: None)
+    try:
+        with patch.object(agent, "_interruptible_api_call", side_effect=interrupt_second):
+            assert agent.run_conversation("n-1")["completed"] is True
+            interrupted = agent.run_conversation(
+                "interrupted n",
+                conversation_history=db.get_messages_as_conversation(agent.session_id),
+            )
+            assert interrupted["interrupted"] is True
+            assert agent.run_conversation(
+                "n+1", conversation_history=db.get_messages_as_conversation(agent.session_id),
+            )["completed"] is True
+        third_request = agent.client.chat.completions.create.call_args_list[-1].kwargs["messages"]
+        current = next(row for row in reversed(third_request) if row.get("role") == "user")
+        text = _text(current["content"])
+        assert "Latest successful completed loop stop: 2026-09-15T12:20:03-07:00" in text
+        assert "12:25:00" not in text
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("session_id", "model_config", "parent_session_id"),
+    [
+        ("branch", {"_branched_from": "main"}, "main"),
+        ("new", {"max_iterations": 90}, None),
+    ],
+)
+def test_public_branch_and_new_session_do_not_inherit_parent_stop(
+    tmp_path, monkeypatch, session_id, model_config, parent_session_id,
+):
+    """A public turn on a fresh branch/new session starts without parent timing."""
+    from agent import loop_timing
+
+    parent, db = _make_agent(tmp_path, "main")
+    parent.client.chat.completions.create.return_value = _response()
+    times = iter([
+        datetime(2026, 9, 15, 13, 0, 0, tzinfo=TZ),
+        datetime(2026, 9, 15, 13, 0, 2, tzinfo=TZ),
+        datetime(2026, 9, 15, 13, 5, 0, tzinfo=TZ),
+        datetime(2026, 9, 15, 13, 5, 2, tzinfo=TZ),
+    ])
+    monkeypatch.setattr(loop_timing, "_now", lambda: next(times))
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *_a, **_k: None)
+    try:
+        assert parent.run_conversation("parent input")["completed"] is True
+        assert db.get_session_model_config_value("main", loop_timing.LOOP_STOP_KEY)
+        db.create_session(
+            session_id,
+            source="cli",
+            model="test/model",
+            model_config=model_config,
+            parent_session_id=parent_session_id,
+        )
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[]),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("agent.process_bootstrap.OpenAI"),
+        ):
+            fresh = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                platform="cli",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                save_trajectories=False,
+                session_db=db,
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+            )
+        fresh._session_db_created = True
+        fresh._cached_system_prompt = "SYSTEM"
+        fresh._skip_mcp_refresh = True
+        fresh._use_prompt_caching = False
+        fresh.compression_enabled = False
+        fresh._fallback_chain = []
+        fresh.client = MagicMock()
+        fresh.client.chat.completions.create.return_value = _response()
+
+        assert fresh.run_conversation(f"{session_id} input")["completed"] is True
+        sent = fresh.client.chat.completions.create.call_args.kwargs["messages"]
+        current = next(row for row in reversed(sent) if row.get("role") == "user")
+        assert "Latest successful completed loop stop:" not in _text(current["content"])
+        assert db.get_session_model_config_value("main", loop_timing.LOOP_STOP_KEY)
+    finally:
         db.close()

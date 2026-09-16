@@ -586,9 +586,12 @@ def _usage_from_metadata(usage_meta: Dict[str, Any]) -> SimpleNamespace:
     them. Absent on non-thinking/older responses, which keeps their numbers as-is."""
     count = lambda key: int(usage_meta.get(key) or 0)  # noqa: E731
     reasoning_tokens = count("thoughtsTokenCount")
+    prompt_details = SimpleNamespace()
+    if "cachedContentTokenCount" in usage_meta:
+        prompt_details.cached_tokens = usage_meta.get("cachedContentTokenCount")
     return SimpleNamespace(
         prompt_tokens=count("promptTokenCount"), completion_tokens=count("candidatesTokenCount") + reasoning_tokens,
-        total_tokens=count("totalTokenCount"), prompt_tokens_details=SimpleNamespace(cached_tokens=count("cachedContentTokenCount")),
+        total_tokens=count("totalTokenCount"), prompt_tokens_details=prompt_details,
         completion_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
     )
 

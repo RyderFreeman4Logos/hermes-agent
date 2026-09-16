@@ -89,6 +89,7 @@ export interface ConfigDisplayConfig {
    *  CLI bar — see display.status_bar.fields in configuration docs).
    *  Raw YAML: callers must runtime-validate entries. */
   status_bar?: { fields?: unknown }
+  tui_statusbar_segments?: unknown
   streaming?: boolean
   thinking_mode?: string
   /** Show [HH:MM] timestamps on transcript rows — same key the classic CLI

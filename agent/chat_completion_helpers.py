@@ -2206,7 +2206,12 @@ def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
 
 
 def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
-    summary_kwargs = _iteration_summary_chat_kwargs(agent, api_messages)
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    wire_messages = ChatCompletionsTransport().convert_messages(
+        api_messages, model=agent.model,
+    )
+    summary_kwargs = _iteration_summary_chat_kwargs(agent, wire_messages)
 
     def _attempt(retry_count: int) -> str:
         summary_client = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry" if retry_count else "iteration_limit_summary")

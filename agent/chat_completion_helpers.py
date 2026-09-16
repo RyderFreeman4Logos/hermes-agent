@@ -1771,7 +1771,39 @@ def _should_skip_unresolved_fallback_candidate(agent, fb: dict, fb_key: tuple, f
     return False
 
 
-def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
+def _fallback_has_explicit_credential(fb: dict) -> bool:
+    return any(
+        str(fb.get(field) or "").strip() for field in ("api_key", "key_env", "api_key_env")
+    )
+
+
+def _raw_fallback_is_exact_self(fb: dict, candidate, failed) -> bool:
+    exact_self = candidate.provider == failed.provider and candidate.model == failed.model
+    return bool(
+        exact_self and not _fallback_has_explicit_credential(fb)
+        and not (candidate.base_url and failed.base_url and candidate.base_url != failed.base_url)
+    )
+
+
+def _raw_fallback_identity_is_known(
+    fb: dict, candidate, failed, failure_scope,
+) -> bool:
+    """True when raw fields are sufficient for the selected failure axis."""
+    from agent.backend_identity import FailureScope
+
+    if _raw_fallback_is_exact_self(fb, candidate, failed):
+        return True
+    if failure_scope is FailureScope.ENDPOINT:
+        return bool(candidate.base_url and failed.base_url)
+    if failure_scope is FailureScope.CREDENTIAL:
+        return bool(candidate.provider and failed.provider and not _fallback_has_explicit_credential(fb))
+    return bool(candidate.model and failed.model and candidate.base_url and failed.base_url)
+
+
+def _should_skip_fallback_candidate(
+    agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set,
+    *, pre_resolution: bool = False, candidate_api_key=None,
+) -> bool:
     """True when raw or resolved fields prove an entry repeats a failed backend."""
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
@@ -1779,12 +1811,24 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     # See #22548, #62984, #70893.
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
-        model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
-    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
+        model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""),
+        api_key=getattr(agent, "api_key", None))
+    fb_ident = BackendIdentity.build(
+        provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""), api_key=candidate_api_key,
+    )
     runtime_failures = getattr(agent, "_runtime_failed_backend_identities", ())
     if runtime_failures:
         for failed_ident, failure_scope in runtime_failures:
-            if should_skip_candidate(fb_ident, failed_ident, failure_scope):
+            if pre_resolution:
+                if _raw_fallback_is_exact_self(fb, fb_ident, failed_ident):
+                    skip = True
+                elif not _raw_fallback_identity_is_known(fb, fb_ident, failed_ident, failure_scope):
+                    continue
+                else:
+                    skip = should_skip_candidate(fb_ident, failed_ident, failure_scope)
+            else:
+                skip = should_skip_candidate(fb_ident, failed_ident, failure_scope)
+            if skip:
                 logger.warning(
                     "Fallback skip: chain entry %s/%s repeats a failed backend (%s)",
                     fb_provider, fb_model, failed_ident.provider or "unnamed route")
@@ -1967,6 +2011,7 @@ def _try_activate_fallback_unlocked(
     current_ident = BackendIdentity.build(
         provider=getattr(agent, "provider", ""), model=getattr(agent, "model", ""),
         base_url=str(getattr(agent, "base_url", "") or ""),
+        api_key=getattr(agent, "api_key", None),
     )
     if current_ident.provider or current_ident.model or current_ident.base_url:
         runtime_failures.add((current_ident, _fallback_failure_scope(reason)))
@@ -1986,7 +2031,9 @@ def _try_activate_fallback_unlocked(
         # A raw self-identity can reject before key lookup/provider resolution; aliases whose raw
         # identity does not prove sameness (for example an omitted-endpoint route alias) are checked
         # again after effective resolution.
-        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+        if _should_skip_fallback_candidate(
+            agent, fb, fb_key, fb_provider, fb_model, unavailable, pre_resolution=True,
+        ):
             continue
 
         runtime_snapshot = None
@@ -2020,7 +2067,16 @@ def _try_activate_fallback_unlocked(
             if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
                 fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
             resolved_fb = {**fb, "model": fb_model, "base_url": fb_base_url}
-            if _should_skip_fallback_candidate(agent, resolved_fb, fb_key, fb_provider, fb_model, unavailable):
+            fb_identity_key = vars(fb_client).get("_api_key_provider") or getattr(fb_client, "api_key", None)
+            if _should_skip_fallback_candidate(
+                agent, resolved_fb, fb_key, fb_provider, fb_model, unavailable,
+                candidate_api_key=fb_identity_key,
+            ):
+                # Direct resolve_provider_client calls return a fresh candidate. It has not been
+                # published to the agent yet, so this owner thread must close it on rejection.
+                if fb_client is not getattr(agent, "client", None) and fb_client is not getattr(agent, "_anthropic_client", None):
+                    from agent.auxiliary_client import _close_cached_client
+                    _close_cached_client(fb_client)
                 continue
 
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url

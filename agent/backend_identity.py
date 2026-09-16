@@ -10,10 +10,11 @@ three axes — credential surface (401/402), endpoint (DNS/refused), model deplo
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli.route_identity import normalize_route_base_url
 
@@ -36,9 +37,16 @@ def _norm(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 
+def _credential_fingerprint(value: Any) -> bytes:
+    """One-way, process-local comparison token; raw credentials never enter identities."""
+    if not isinstance(value, str) or not value.strip():
+        return b""
+    return hashlib.blake2b(value.strip().encode("utf-8"), digest_size=16).digest()
+
+
 @dataclass(frozen=True)
 class BackendIdentity:
-    """Normalized identity of one (provider, model, endpoint) deployment.
+    """Normalized identity of one (provider, model, endpoint, credential) deployment.
 
     Empty fields mean "unknown" — an unknown axis can neither prove sameness nor difference
     on its own; the remaining axes decide."""
@@ -46,15 +54,17 @@ class BackendIdentity:
     provider: str = ""
     model: str = ""
     base_url: str = ""
+    credential_fingerprint: bytes = b""
 
     @classmethod
     def build(
         cls, provider: Optional[str] = None, model: Optional[str] = None,
-        base_url: Optional[str] = None,
+        base_url: Optional[str] = None, api_key: Any = None,
     ) -> "BackendIdentity":
         return cls(
             provider=_norm(provider), model=_norm(model),
             base_url=normalize_route_base_url(base_url),
+            credential_fingerprint=_credential_fingerprint(api_key),
         )
 
 
@@ -80,6 +90,12 @@ def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
     Conservative: an unprovable axis answers "different" (one wasted RTT) rather than "same"
     (stranded failover). Same label = same configured credential; custom entries can each carry
     their own api_key, so a shared URL alone is only a weak signal when a label is missing."""
+    if a.credential_fingerprint or b.credential_fingerprint:
+        return bool(
+            a.credential_fingerprint
+            and b.credential_fingerprint
+            and a.credential_fingerprint == b.credential_fingerprint
+        )
     if a.provider and b.provider:
         # Different labels = different credential config (first-class registry providers explicitly so —
         # #70893; custom entries can each carry their own api_key, so sameness is unprovable and we must not

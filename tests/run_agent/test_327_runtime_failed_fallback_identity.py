@@ -150,10 +150,10 @@ def _make_agent(fallback_model):
     return agent
 
 
-def _client(base_url):
+def _client(base_url, api_key="fallback-key"):
     client = MagicMock()
     client.base_url = base_url
-    client.api_key = "fallback-key"
+    client.api_key = api_key
     return client
 
 
@@ -190,33 +190,76 @@ def test_failed_backend_is_not_retried_through_a_later_alias():
 
 
 @pytest.mark.parametrize(
-    ("reason", "current_provider", "candidate_provider", "current_url", "candidate_url"),
+    ("reason", "current_provider", "fallback", "current_url", "resolved_url", "expected_key"),
     [
-        ("server_error", "route", "route", _PRIMARY_URL, _SHARED_URL),
-        ("auth", "credential-a", "credential-b", _SHARED_URL, _SHARED_URL),
+        (
+            "server_error", "route", {"provider": "route", "model": "same-model", "base_url": _SHARED_URL},
+            _PRIMARY_URL, _SHARED_URL, None,
+        ),
+        (
+            "auth", "credential-a", {"provider": "credential-b", "model": "same-model", "base_url": _SHARED_URL},
+            _SHARED_URL, _SHARED_URL, None,
+        ),
+        (
+            "ssl_cert_verification", "same-label-route", {"provider": "same-label-route", "model": "model-b"},
+            _PRIMARY_URL, _SHARED_URL, None,
+        ),
+        (
+            "auth", "openrouter", {
+                "provider": "openrouter", "model": "model-b",
+                "base_url": "https://openrouter.ai/api/v1", "api_key": "fixture-key-b",
+            },
+            "https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1", "fixture-key-b",
+        ),
     ],
 )
 def test_failure_scope_keeps_distinct_route_or_credential_eligible(
-    reason, current_provider, candidate_provider, current_url, candidate_url,
+    reason, current_provider, fallback, current_url, resolved_url, expected_key,
 ):
     from agent.error_classifier import FailoverReason
 
     reason = FailoverReason(reason)
-    agent = _make_agent(
-        [{"provider": candidate_provider, "model": "same-model", "base_url": candidate_url}]
-    )
+    agent = _make_agent([fallback])
     agent.provider = current_provider
-    agent.model = "same-model"
+    agent.model = "model-a" if fallback["model"] == "model-b" else "same-model"
     agent.base_url = current_url
 
     with (
         patch("agent.chat_completion_helpers._fallback_entry_unavailable_without_network", return_value=None),
         patch(
             "agent.auxiliary_client.resolve_provider_client",
-            return_value=(_client(candidate_url), "same-model"),
+            return_value=(_client(resolved_url, expected_key or "fallback-key"), fallback["model"]),
         ) as resolve,
     ):
         assert agent._try_activate_fallback(reason) is True
 
     assert resolve.call_count == 1
-    assert agent.provider == candidate_provider
+    assert resolve.call_args.kwargs["explicit_api_key"] == expected_key
+    assert agent.provider == fallback["provider"]
+
+
+def test_post_resolution_duplicate_closes_only_discarded_client_once():
+    from agent.error_classifier import FailoverReason
+
+    agent = _make_agent([{"provider": "zai", "model": "zai/glm-4.7"}])
+    active_client = agent.client
+    shared_client = MagicMock()
+    discarded_client = _client(_PRIMARY_URL)
+    agent.provider = "zai"
+    agent.model = "glm-4.7"
+    agent.base_url = _PRIMARY_URL
+    agent._anthropic_client = shared_client
+
+    with (
+        patch("agent.chat_completion_helpers._fallback_entry_unavailable_without_network", return_value=None),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(discarded_client, "glm-4.7"),
+        ) as resolve,
+    ):
+        assert agent._try_activate_fallback(FailoverReason.server_error) is False
+
+    resolve.assert_called_once()
+    discarded_client.close.assert_called_once_with()
+    active_client.close.assert_not_called()
+    shared_client.close.assert_not_called()

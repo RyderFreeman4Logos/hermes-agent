@@ -5631,6 +5631,9 @@ class TestGetMessagesPagination:
             {"role": "user", "content": "carried", "timestamp": 3.0},
             {"role": "assistant", "content": "tip-answer", "timestamp": 4.0},
         ])
+        # A pre-display-index database must stay bounded too; resume may not backfill every segment first.
+        db._conn.execute("UPDATE messages SET display_identity = NULL, display_order = NULL")
+        db._conn.commit()
 
         reads = []
         original_read_all = db._read_all
@@ -5648,6 +5651,9 @@ class TestGetMessagesPagination:
 
         assert [message["content"] for message in model] == ["carried", "tip-answer"]
         assert [message["content"] for message in display] == ["carried", "tip-answer"]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE display_identity IS NOT NULL OR display_order IS NOT NULL"
+        ).fetchone()[0] == 0
         assert all(row_count <= 2 for _sql, row_count in reads)
         assert any("LIMIT" in sql.upper() for sql, _row_count in reads)
 

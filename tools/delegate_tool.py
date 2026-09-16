@@ -512,11 +512,16 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
-                model_profile=str(t.get("model_profile") or "").strip() or None, **overrides,
+                model_profile=resolved_profile, **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
         child._delegate_model_profile = resolved_profile
+        child._delegate_selected_llm_route = (
+            (creds.get("model"), creds.get("provider"))
+            if resolved_profile is not None
+            else None
+        )
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema

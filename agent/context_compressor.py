@@ -34,7 +34,7 @@ from agent.model_metadata import (
     strip_opaque_replay_items,
 )
 from agent.redact import redact_sensitive_text
-from agent.turn_context import drop_stale_api_content
+from agent.turn_context import drop_stale_api_content, substitute_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -1286,9 +1286,17 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     the full shape; a mismatched size class protects blob-heavy rows as "small" and compaction re-fires.
     ``charge_stale_thinking=False`` skips newest-turn-only thinking keys. Accounting only; never mutates."""
     # Charge the wire substitute, not both it and the clean display content.
-    sidecar = msg.get("api_content")
-    content = sidecar if isinstance(sidecar, str) and sidecar and msg.get("role") in ("user", "assistant") else msg.get("content") or ""
-    text_tokens = estimate_tokens_rough(content) if isinstance(content, str) else _content_length_for_budget(content) // _CHARS_PER_TOKEN
+    wire_msg = dict(msg)
+    substitute_api_content(wire_msg)
+    content = wire_msg.get("content") or ""
+    if isinstance(content, list) and any(_is_image_part(part) for part in content):
+        text_tokens = _content_length_for_budget(content) // _CHARS_PER_TOKEN
+    elif isinstance(content, dict) and content.get("_multimodal"):
+        text_tokens = _content_length_for_budget(
+            content.get("content") or content.get("text_summary") or ""
+        ) // _CHARS_PER_TOKEN
+    else:
+        text_tokens = estimate_tokens_rough(content)
     tokens = text_tokens + 10  # +10 for role/key overhead
     tokens += sum(estimate_tokens_rough(str(tc)) for tc in msg.get("tool_calls") or [] if isinstance(tc, dict))
     for key in _ALWAYS_REPLAYED_BUDGET_KEYS:

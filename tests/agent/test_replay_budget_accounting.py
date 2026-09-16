@@ -38,6 +38,7 @@ BIG_BLOB = [{"type": "reasoning", "encrypted_content": "x" * 4000}]
         {"role": "tool", "content": "clean", "api_content": "ignored"},
         {"role": "user", "content": "clean", "api_content": ""},
         {"role": "user", "content": "clean", "api_content": ["ignored"]},
+        {"role": "assistant", "content": "clean", "api_content": {"text": "ignored"}},
     ],
     ids=[
         "user-sidecar",
@@ -45,7 +46,8 @@ BIG_BLOB = [{"type": "reasoning", "encrypted_content": "x" * 4000}]
         "system-role",
         "tool-role",
         "empty-sidecar",
-        "non-string-sidecar",
+        "list-sidecar",
+        "dict-sidecar",
     ],
 )
 def test_api_content_matches_wire_substitution_without_mutation(message):

@@ -279,10 +279,10 @@ pr = 210
 feature = "外部 Agent Loop 启动输入的一次性 append-only timing decorator（无隐藏 timing row）"
 branch = "topic/iss206-persist-timing-af8870f7-20260826"
 parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
-head = "a2cd5f0768139972fcbf6163a630fa7e80a5aee7"
-source_commits = 2
-source_patch_id = "cf8af4e039ef4c7569c54816c6eee230475f2ba7"
-source_diff_sha256 = "0448a3a30922f711e0d0b51eabf531d5a975ae115a712252ec1a775f3916c3bc"
+head = "c28d676b2d0bc1011dce2fa4c1e13be3b2ab08e0"
+source_commits = 3
+source_patch_id = "a0509b5c955cf1b6e839b531e3043e4d3c0b93f5"
+source_diff_sha256 = "a97e19f222475b251fb591fb7a63f84f40e11828a2128f3d37fb72d943d5375e"
 depends_on = []
 integration = "included-once"
 

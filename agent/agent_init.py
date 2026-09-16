@@ -2368,6 +2368,10 @@ def init_agent(
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
+    # A deferred /model intent is stored without credentials in the session
+    # row.  Re-resolve it only after the current profile and compressor exist.
+    from hermes_cli.model_switch import restore_model_switch_after_compression
+    restore_model_switch_after_compression(agent, _agent_cfg)
 
 
 __all__ = ["init_agent"]

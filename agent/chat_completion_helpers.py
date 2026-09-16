@@ -1664,6 +1664,18 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return label or str(getattr(reason, "value", None) or reason or "provider failure").replace("_", " ")
 
 
+def _fallback_failure_scope(reason: "FailoverReason | None"):
+    """Return the identity axis invalidated by a failed fallback attempt."""
+    from agent.backend_identity import FailureScope
+
+    reason_value = getattr(reason, "value", reason)
+    if reason_value in {"auth", "auth_permanent", "billing"}:
+        return FailureScope.CREDENTIAL
+    if reason_value == "ssl_cert_verification":
+        return FailureScope.ENDPOINT
+    return FailureScope.MODEL
+
+
 def _is_anthropic_wire_url(url: str) -> bool:
     """Same Messages-only host match as determine_api_mode() / _detect_api_mode_for_url(): api.anthropic.com,
     a /anthropic suffix, or Kimi Code's api.kimi.com/coding (its /chat/completions 404s — #77256)."""
@@ -1765,7 +1777,15 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
     fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
-    if should_skip_candidate(fb_ident, current_ident):
+    runtime_failures = getattr(agent, "_runtime_failed_backend_identities", ())
+    if runtime_failures:
+        for failed_ident, failure_scope in runtime_failures:
+            if should_skip_candidate(fb_ident, failed_ident, failure_scope):
+                logger.warning(
+                    "Fallback skip: chain entry %s/%s repeats a failed backend (%s)",
+                    fb_provider, fb_model, failed_ident.provider or failed_ident.base_url)
+                return True
+    elif should_skip_candidate(fb_ident, current_ident):
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider)
@@ -1935,6 +1955,17 @@ def _try_activate_fallback_unlocked(
 ) -> bool:
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
+    from agent.backend_identity import BackendIdentity
+    runtime_failures = getattr(agent, "_runtime_failed_backend_identities", None)
+    if not isinstance(runtime_failures, set):
+        runtime_failures = set()
+        agent._runtime_failed_backend_identities = runtime_failures
+    current_ident = BackendIdentity.build(
+        provider=getattr(agent, "provider", ""), model=getattr(agent, "model", ""),
+        base_url=str(getattr(agent, "base_url", "") or ""),
+    )
+    if current_ident.provider or current_ident.model or current_ident.base_url:
+        runtime_failures.add((current_ident, _fallback_failure_scope(reason)))
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)

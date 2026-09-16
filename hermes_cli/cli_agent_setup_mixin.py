@@ -782,12 +782,14 @@ class CLIAgentSetupMixin:
             lambda rid: self._console_print(
                 f"[dim]Session {self.session_id} was compressed into "
                 f"{rid}; resuming the descendant with your transcript.[/]"))
-        resume_limit_error = self._resume_history_limit_error()
+        resume_limit_error = self._resume_history_limit_error(tip_only=True)
         if resume_limit_error:
             self._resume_history_error = resume_limit_error
             self._console_print(f"[bold red]Cannot resume session:[/] {resume_limit_error}")
             return False
-        restored, display_history = self._session_db.get_resume_conversations(self.session_id)
+        from hermes_state import resolved_max_resume_messages
+        restored, display_history = self._session_db.get_resume_conversations(
+            self.session_id, max_display_messages=resolved_max_resume_messages() or None)
         accent_color = _accent_hex()
         if not restored:
             self._console_print(

@@ -260,13 +260,13 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
     ("exit_code", "completion_reason", "termination_source", "injected"),
     (
         (0, "exited", "", False),
-        (1, "exited", "", True),
-        (-1, "lost", "backend_lost", True),
-        (-15, "killed", "process.kill", True),
+        (1, "exited", "", False),
+        (-1, "lost", "backend_lost", False),
+        (-15, "killed", "process.kill", False),
     ),
     ids=("success", "nonzero", "lost", "killed"),
 )
-def test_delegated_child_watcher_suppresses_only_routine_success(
+def test_delegated_child_watcher_stays_child_owned_for_all_terminal_outcomes(
     monkeypatch,
     isolated_registry,
     exit_code,

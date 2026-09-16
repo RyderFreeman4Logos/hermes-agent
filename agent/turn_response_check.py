@@ -17,7 +17,7 @@ from agent.error_classifier import FailoverReason
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import invalid_response_failure_reason, provider_label_for, site_copy, stamp_failure
 from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
-from agent.turn_usage import record_response_usage
+from agent.turn_usage import observe_response_usage, record_response_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -117,6 +117,7 @@ def check_api_response(
         )
 
     api_duration = time.time() - api_start_time
+    observe_response_usage(agent, response)
 
     # Silent stop: the response box / tool messages that follow are more informative.
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)

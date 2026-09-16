@@ -1361,18 +1361,29 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     @staticmethod
     def _is_routine_delegated_child_completion(evt: dict) -> bool:
-        """Whether a completed native-child command needs no parent turn."""
-        if not isinstance(evt, dict):
+        """Whether a well-formed completion remains owned by a delegated child.
+
+        Ownership, not the command's result, decides whether raw terminal output
+        may wake the parent. Validate the event shape before suppressing it so an
+        unexpected producer failure still gets one bounded parent-visible notice.
+        An explicit handoff transfers ownership back.
+        """
+        if not isinstance(evt, dict) or evt.get("type") != "completion":
+            return False
+        if evt.get("delegated_child") is not True or evt.get("handoff_note"):
             return False
         started_at = evt.get("started_at")
         return (
-            evt.get("type") == "completion"
-            and evt.get("delegated_child") is True
-            and not evt.get("handoff_note")
-            and type(evt.get("exit_code")) is int
-            and evt["exit_code"] == 0
-            and evt.get("completion_reason") == "exited"
-            and evt.get("termination_source") == ""
+            type(evt.get("exit_code")) is int
+            and (evt.get("completion_reason"), evt.get("termination_source"))
+            in {
+                ("exited", ""),
+                ("killed", "process.kill"),
+                ("killed", "kill_all"),
+                ("lost", "backend_lost"),
+                ("failed_start", "failed_start"),
+                ("already_exited", ""),
+            }
             and isinstance(evt.get("session_id"), str)
             and bool(evt["session_id"])
             and isinstance(evt.get("command"), str)

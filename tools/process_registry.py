@@ -787,9 +787,23 @@ class ProcessRegistry(ProcessCheckpointMixin):
         except gone:
             targets = []
         targets.append(parent)
+        # Isolate non-gone errors to descendants only. Owner SIGTERM/SIGKILL
+        # failures must propagate so kill_process can leave a live Popen
+        # running/unconsumed. A denied descendant is not retried via SIGKILL.
+        denied_descendant_pids = set()
         for proc in targets:
-            with suppress(gone):
+            try:
                 proc.terminate()
+            except gone:
+                continue
+            except Exception as exc:
+                if proc is parent:
+                    raise
+                denied_descendant_pids.add(getattr(proc, "pid", None))
+                logger.debug(
+                    "Skipping terminate for pid %s while killing tree of %s: %s",
+                    getattr(proc, "pid", None), pid, type(exc).__name__,
+                )
         # Escalate to SIGKILL for anything that ignored SIGTERM within the grace window.
         # ``psutil.wait_procs``' gone/alive partition is deliberately NOT trusted: it
         # reaps via ``Process.wait()`` and mis-partitions across zombie transitions in a
@@ -802,10 +816,21 @@ class ProcessRegistry(ProcessCheckpointMixin):
         while time.monotonic() < deadline and any(cls._proc_alive(_p) for _p in targets):
             time.sleep(0.05)
         for proc in targets:
-            with suppress(gone):
+            if getattr(proc, "pid", None) in denied_descendant_pids:
+                continue
+            try:
                 if cls._proc_alive(proc):
                     proc.kill()  # SIGKILL on POSIX
                     logger.info("Escalated to SIGKILL for pid %d (ignored SIGTERM within %.1fs grace)", proc.pid, grace)
+            except gone:
+                continue
+            except Exception as exc:
+                if proc is parent:
+                    raise
+                logger.debug(
+                    "Skipping kill for pid %s while killing tree of %s: %s",
+                    getattr(proc, "pid", None), pid, type(exc).__name__,
+                )
 
     # ----- Spawn -----
 

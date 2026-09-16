@@ -188,13 +188,13 @@ const layoutProps: AppLayoutProps = {
 }
 
 /** Mount the real AppLayout with the given overlay + ui state applied first. */
-const mountLayout = (overlay: Partial<OverlayState> = {}, ui: Partial<UiState> = {}) => {
+const mountLayout = (overlay: Partial<OverlayState> = {}, ui: Partial<UiState> = {}, cols = 120) => {
   patchUiState({ sessionTitle: 'test', sid: 'sid-1', status: 'ready', ...ui })
   patchOverlayState(overlay)
 
   return mountTree(
     <GatewayProvider value={gatewayStub}>
-      <AppLayout {...layoutProps} />
+      <AppLayout {...layoutProps} composer={{ ...layoutProps.composer, cols }} />
     </GatewayProvider>,
     { interactive: true }
   )
@@ -408,6 +408,27 @@ describe('status-chrome timers track the current overlay model', () => {
 // above ComposerPane) and FloatingOverlays (absolute, growing upward), then
 // assert on what is actually on screen rather than on the store alone.
 describe('AppLayout status-rule visibility', () => {
+  it('keeps status rows inside the composer content width', async () => {
+    const model = 'abcdefghijklmnopqrstuvwxy'
+
+    const layout = mountLayout(
+      {},
+      {
+        info: { model } as UiState['info'],
+        sessionTitle: '',
+        statusBarSegments: ['indicator', 'model', 'cwd']
+      },
+      44
+    )
+
+    await flush()
+
+    const lines = layout.output().split('\n')
+    expect(lines.findIndex(line => line.includes(model))).not.toBe(
+      lines.findIndex(line => line.includes('~/repo'))
+    )
+  })
+
   it('keeps the status rule on screen AND its clock advancing under a flow-layout approval prompt', async () => {
     const layout = mountLayout({ approval: { command: 'rm -rf /', requestId: 'a-1' } as OverlayState['approval'] })
 

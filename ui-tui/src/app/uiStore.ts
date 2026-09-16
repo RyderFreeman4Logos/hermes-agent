@@ -12,6 +12,7 @@ const buildUiState = (): UiState => ({
   batteryStatus: null,
   bgTasks: new Set(),
   busy: false,
+  cacheStatus: null,
   busyInputMode: 'queue',
   compact: false,
   compacting: false,
@@ -35,6 +36,7 @@ const buildUiState = (): UiState => ({
   statusBar: 'top',
   storedSid: null,
   statusBarFields: null,
+  statusBarSegments: null,
   streaming: true,
   timestamps: false,
   // Last session's resolved theme paints frame one (flash-free boot, like

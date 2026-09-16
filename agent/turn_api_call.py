@@ -137,6 +137,8 @@ def perform_api_call(
             provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
             api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
         )
+        from agent.turn_usage import observe_response_usage
+        observe_response_usage(agent, response)
     finally:
         with _bracket:
             if _model_request_active is not None:

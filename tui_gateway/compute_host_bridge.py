@@ -47,6 +47,33 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
         return _compute_host_supervisor
 
 
+_VALID_MEMORY_PROVIDER_MODES = frozenset({"authoritative", "hybrid"})
+
+
+def _compute_host_memory_provider_mode(session: dict) -> str | None:
+    """Frozen session mode: resume override, then stored row, then live agent/config."""
+    mode = None
+    resume_overrides = session.get("resume_runtime_overrides")
+    if isinstance(resume_overrides, dict):
+        mode = resume_overrides.get("memory_provider_mode_override")
+    if mode not in _VALID_MEMORY_PROVIDER_MODES:
+        try:
+            session_key = str(session.get("session_key") or "")
+            with _session_db(session) as db:
+                row = db.get_session(session_key) if db is not None and session_key else None
+            mode = (_stored_session_runtime_overrides(row) or {}).get("memory_provider_mode_override")
+        except Exception:
+            mode = None
+    if mode not in _VALID_MEMORY_PROVIDER_MODES:
+        agent = session.get("agent")
+        init_config = getattr(agent, "_session_init_model_config", None)
+        if isinstance(init_config, dict):
+            mode = init_config.get("memory_provider_mode")
+        if mode not in _VALID_MEMORY_PROVIDER_MODES:
+            mode = getattr(agent, "_memory_provider_mode", None)
+    return mode if mode in _VALID_MEMORY_PROVIDER_MODES else None
+
+
 def _compute_host_turn_frame(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None) -> dict:
@@ -65,6 +92,7 @@ def _compute_host_turn_frame(
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
+        "memory_provider_mode_override": _compute_host_memory_provider_mode(session),
         "source": _session_source(session), "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation}
 

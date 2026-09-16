@@ -1033,6 +1033,15 @@ class GatewaySessionCommandsMixin:
             current_title = await self._session_db.get_session_title(current_entry.session_id)
             branch_title = await self._session_db.get_next_title_in_lineage(current_title or "branch")
         parent_session_id = current_entry.session_id
+        parent_model_config = {"_branched_from": parent_session_id}
+        with contextlib.suppress(Exception):
+            parent_row = await self._session_db.get_session(parent_session_id)
+            stored_config = parent_row.get("model_config") if parent_row else None
+            if isinstance(stored_config, str):
+                stored_config = _json.loads(stored_config)
+            stored_mode = stored_config.get("memory_provider_mode") if isinstance(stored_config, dict) else None
+            if stored_mode in {"authoritative", "hybrid"}:
+                parent_model_config["memory_provider_mode"] = stored_mode
         # Full parent origin (same shape as the reset path in gateway/session.py); the live entry's
         # origin may hold richer metadata than the triggering event's source.
         # See #82633.
@@ -1047,7 +1056,7 @@ class GatewaySessionCommandsMixin:
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
-                model_config={"_branched_from": parent_session_id},
+                model_config=parent_model_config,
                 parent_session_id=parent_session_id, user_id=source.user_id,
                 session_key=session_key, chat_id=source.chat_id, chat_type=source.chat_type,
                 thread_id=source.thread_id, origin_json=_branch_origin_json,

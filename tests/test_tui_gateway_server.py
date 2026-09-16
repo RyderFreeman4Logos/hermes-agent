@@ -7816,7 +7816,13 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path), "explicit_cwd": True})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": str(tmp_path),
+        }
     ]
 
 
@@ -7835,7 +7841,13 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     server._ensure_session_db_row({"session_key": "k1", "source": "tool"})
 
     assert created == [
-        {"key": "k1", "source": "tool", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "tool",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": None,
+        }
     ]
 
 
@@ -7862,7 +7874,13 @@ def test_ensure_session_db_row_records_a_terminal_workspace(monkeypatch, tmp_pat
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": str(tmp_path),
+        }
     ]
 
 
@@ -7883,7 +7901,13 @@ def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp
     server._ensure_session_db_row({"session_key": "k1", "source": "desktop", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "desktop", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "desktop",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": None,
+        }
     ]
 
 
@@ -7927,7 +7951,7 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
 
 def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
     """A chat that made no explicit pick falls back to the global model and
-    writes no model_config (so it tracks the profile default)."""
+    still stamps memory_provider_mode=hybrid (default provider mode)."""
     created = []
 
     class _FakeDB:
@@ -7939,7 +7963,9 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
 
     server._ensure_session_db_row({"session_key": "k1", "model_override": None})
 
-    assert created == [{"model": "global/default", "model_config": None}]
+    assert created == [
+        {"model": "global/default", "model_config": {"memory_provider_mode": "hybrid"}}
+    ]
 
 
 def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
@@ -20790,11 +20816,17 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
     """The trim boundary must not retain the just-pruned history snapshots."""
     observed = {}
     cleanup_order = []
+    active_home_tokens = []
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_user_message=None,
         ):
+            observed["persist_user_message"] = persist_user_message
             return {
                 "final_response": "reply",
                 "messages": [{"role": "assistant", "content": "reply"}],
@@ -20812,6 +20844,7 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         import inspect
 
         cleanup_order.append("trim")
+        assert len(active_home_tokens) == 1
         frame = inspect.currentframe()
         assert frame is not None and frame.f_back is not None
         caller_locals = frame.f_back.f_locals
@@ -20838,12 +20871,18 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
-        monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: object())
-        monkeypatch.setattr(
-            server,
-            "reset_hermes_home_override",
-            lambda _token: cleanup_order.append("reset_home"),
-        )
+
+        def _set_home(_home):
+            token = object()
+            active_home_tokens.append(token)
+            return token
+
+        def _reset_home(token):
+            active_home_tokens.remove(token)
+            cleanup_order.append("reset_home")
+
+        monkeypatch.setattr(server, "set_hermes_home_override", _set_home)
+        monkeypatch.setattr(server, "reset_hermes_home_override", _reset_home)
         monkeypatch.setattr("hermes_cli.mem_trim.trim_memory", _inspect_trim_frame)
 
         resp = server.handle_request(
@@ -20855,9 +20894,11 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         )
 
         assert resp is not None and resp.get("result")
+        assert observed["persist_user_message"] == "hi"
         assert not observed["history"]
         assert not observed["run_kwargs"]
-        assert cleanup_order == ["trim", "reset_home"]
+        assert not active_home_tokens
+        assert cleanup_order[-2:] == ["trim", "reset_home"]
     finally:
         server._sessions.pop("sid_trim", None)
 

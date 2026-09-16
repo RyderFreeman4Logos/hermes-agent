@@ -175,6 +175,113 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
+def test_new_command_persists_resolved_memory_mode(tmp_path):
+    cli = _make_cli(config_overrides={"memory": {"provider_mode": "hybrid"}})
+    cli._session_db = SessionDB(db_path=tmp_path / "state.db")
+    cli._session_db.create_session(session_id=cli.session_id, source="cli", model=cli.model)
+    cli.agent = _FakeAgent(cli.session_id, cli.session_start)
+    cli.agent._memory_provider_mode = "authoritative"
+    cli.agent._session_init_model_config = {"memory_provider_mode": "authoritative"}
+    cli.conversation_history = [{"role": "user", "content": "hello"}]
+    cli._confirm_destructive_slash = lambda *_a, **_kw: "once"
+
+    cli.process_command("/new")
+
+    row = cli._session_db.get_session(cli.session_id)
+    config = __import__("json").loads(row["model_config"])
+    assert config["memory_provider_mode"] == "hybrid"
+    assert cli.agent._memory_provider_mode == "hybrid"
+    assert cli.agent._session_init_model_config["memory_provider_mode"] == "hybrid"
+
+
+def test_public_resume_reconciles_both_routes_and_branch_mode(tmp_path, monkeypatch):
+    """The slash-command boundary must switch routing, execution, and lineage together."""
+    import json
+
+    from agent.inline_tool_executors import InlineToolContext, _memory
+    from agent.memory_manager import MemoryManager
+    from tools.memory_tool import MemoryStore
+
+    class Provider:
+        name = "synthetic-provider"
+
+        def __init__(self):
+            self.authoritative = []
+            self.mirrors = []
+            self.switches = []
+
+        def get_tool_schemas(self):
+            return []
+
+        def authoritative_memory_write(self, request, **_kwargs):
+            self.authoritative.append(dict(request))
+            return json.dumps({"success": True, "operation_id": "synthetic"})
+
+        def on_memory_write(self, action, target, content, **_kwargs):
+            self.mirrors.append((action, target, content))
+
+        def on_session_switch(self, session_id, **_kwargs):
+            self.switches.append(session_id)
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("hermes_cli.main._resolve_session_by_name_or_id", lambda _value: None)
+    monkeypatch.setattr("model_tools.get_tool_definitions", lambda **_kwargs: [])
+    monkeypatch.setattr("tools.write_approval.write_approval_enabled", lambda _subsystem: False)
+
+    cli = _make_cli(config_overrides={"memory": {"provider_mode": "hybrid"}})
+    cli._session_db = SessionDB(db_path=tmp_path / "state.db")
+    cli._session_db.create_session(cli.session_id, source="cli", model=cli.model)
+    for session_id, mode in (("stored-authoritative", "authoritative"), ("stored-hybrid", "hybrid")):
+        cli._session_db.create_session(
+            session_id, source="cli", model=cli.model,
+            model_config={"memory_provider_mode": mode},
+        )
+        cli._session_db.append_message(session_id, role="user", content=f"{mode} question")
+        cli._session_db.append_message(session_id, role="assistant", content=f"{mode} answer")
+
+    agent = _FakeAgent(cli.session_id, cli.session_start)
+    agent._memory_provider_mode = "hybrid"
+    agent._session_init_model_config = {"memory_provider_mode": "hybrid"}
+    agent.enabled_toolsets, agent.disabled_toolsets, agent.quiet_mode = ["memory"], [], True
+    agent._memory_enabled = agent._user_profile_enabled = True
+    agent._memory_store = MemoryStore()
+    agent._memory_store.load_from_disk()
+    provider = Provider()
+    agent._memory_manager = MemoryManager(provider_mode="hybrid")
+    agent._memory_manager.add_provider(provider)
+    agent._build_memory_write_metadata = lambda **kwargs: kwargs
+    cli.agent = agent
+    cli.conversation_history = [{"role": "user", "content": "current"}]
+    cli.resume_display = "minimal"
+
+    assert cli.process_command("/resume stored-authoritative") is True
+    assert agent._memory_provider_mode == "authoritative"
+    assert agent._memory_manager.provider_mode == "authoritative"
+    auth_result = json.loads(_memory(
+        agent,
+        {"action": "add", "target": "memory", "content": "authoritative fact"},
+        InlineToolContext(effective_task_id="resume", tool_call_id="auth"),
+    ))
+    assert auth_result["success"] is True
+    assert [call["content"] for call in provider.authoritative] == ["authoritative fact"]
+
+    assert cli.process_command("/resume stored-hybrid") is True
+    assert agent._memory_provider_mode == "hybrid"
+    assert agent._memory_manager.provider_mode == "hybrid"
+    hybrid_result = json.loads(_memory(
+        agent,
+        {"action": "add", "target": "memory", "content": "hybrid fact"},
+        InlineToolContext(effective_task_id="resume", tool_call_id="hybrid"),
+    ))
+    assert hybrid_result["success"] is True
+    assert provider.mirrors == [("add", "memory", "hybrid fact")]
+
+    assert cli.process_command("/branch resumed hybrid") is True
+    branch = cli._session_db.get_session(cli.session_id)
+    assert json.loads(branch["model_config"])["memory_provider_mode"] == "hybrid"
+
+
 
 
 
@@ -295,5 +402,3 @@ def test_new_session_with_title(capsys):
 
     captured = capsys.readouterr()
     assert "My Test Session" in captured.out
-
-

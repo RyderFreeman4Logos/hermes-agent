@@ -18,12 +18,14 @@ logger = logging.getLogger(__name__)
 
 # Same filenames as prompt_builder.py, in priority order (first match wins per dir).
 _HINT_FILENAMES = ["AGENTS.override.md", "AGENTS.md", "agents.md", "CLAUDE.md", "claude.md", ".cursorrules"]
-# Per-file ceiling for on-demand subdirectory hints. 32 KiB matches Codex's `project_doc_max_bytes` default
-# (Claude Code and Cursor apply none); it is a guard against a stray huge CLAUDE.md in a vendored tree, not a
-# target — keep area AGENTS.md files well under it (~8k) because this text lands in a tool result on the first
-# touch of that directory. Over the ceiling: head+tail kept, marker with the path so the agent can read_file it,
-# and a WARNING in the log (the old 8k silent tail-chop cut apps/desktop/AGENTS.md for months unnoticed).
-_MAX_HINT_CHARS = 32_000
+# Per-file / aggregate insertion-time hint caps match live 4b8b7109:
+# 8_000 per file, 16_000 combined. Official 32_000 is the stray-huge-file
+# guard; live still truncates area AGENTS.md at 8k before it lands in a
+# tool result. Over the per-file ceiling: reuse ``_truncate_content``
+# (head+tail + warning). Combined overflow uses the live 16k marker.
+_MAX_HINT_CHARS = 8_000
+_MAX_TOTAL_HINT_CHARS = 16_000
+_TOTAL_HINT_TRUNCATION_MARKER = "\n\n[...subdirectory hints truncated to 16,000 characters]"
 _PATH_ARG_KEYS = {"path", "file_path", "workdir"}
 _COMMAND_TOOLS = {"terminal"}
 _MAX_ANCESTOR_WALK = 5  # ancestor levels walked per path — bounds deep-path scans
@@ -74,7 +76,15 @@ class SubdirectoryHintTracker:
     def check_tool_call(self, tool_name: str, tool_args: Dict[str, Any]) -> Optional[str]:
         """Return formatted hint text for newly visited directories, or None."""
         all_hints = [h for d in self._extract_directories(tool_name, tool_args) if (h := self._load_hints_for_directory(d))]
-        return "\n\n" + "\n\n".join(all_hints) if all_hints else None
+        if not all_hints:
+            return None
+        combined = "\n\n" + "\n\n".join(all_hints)
+        if len(combined) > _MAX_TOTAL_HINT_CHARS:
+            combined = (
+                combined[:_MAX_TOTAL_HINT_CHARS - len(_TOTAL_HINT_TRUNCATION_MARKER)]
+                + _TOTAL_HINT_TRUNCATION_MARKER
+            )
+        return combined
 
     def _extract_directories(self, tool_name: str, args: Dict[str, Any]) -> list:
         """Extract directory paths from tool call arguments."""
@@ -86,7 +96,7 @@ class SubdirectoryHintTracker:
         cmd = args.get("command", "") if tool_name in _COMMAND_TOOLS else None
         if isinstance(cmd, str):
             self._extract_paths_from_command(cmd, candidates)
-        return list(candidates)
+        return sorted(candidates, key=lambda path: (-len(path.parts), str(path)))
 
     def _add_path_candidate(self, raw_path: str, candidates: Set[Path]):
         """Add a raw path's directory and its ancestors (up to ``_MAX_ANCESTOR_WALK``

@@ -9,9 +9,32 @@ from hermes_state import SessionDB
 from tui_gateway import server
 
 
+def test_deferred_resume_hydrates_only_the_bounded_display_tail(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("root", source="tui")
+    db.append_messages_batch("root", [
+        {"role": "user", "content": f"old-{i}", "timestamp": float(i)} for i in range(6)
+    ])
+    db.end_session("root", "compression")
+    db.create_session("tip", source="tui", parent_session_id="root")
+    db.append_messages_batch("tip", [
+        {"role": "user", "content": "current", "timestamp": 6.0},
+        {"role": "assistant", "content": "answer", "timestamp": 7.0},
+    ])
+    monkeypatch.setattr("hermes_state.resolved_max_resume_messages", lambda: 3)
+    try:
+        model, display, prefix = server._load_resume_transcript(db, "tip")
+        assert [m["content"] for m in model] == ["current", "answer"]
+        assert [m["content"] for m in display] == ["old-5", "current", "answer"]
+        assert [m["content"] for m in prefix] == ["old-5"]
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("source,omit_messages", [("desktop", True), ("desktop", False), ("tui", True)])
 @pytest.mark.parametrize("profile", [None, "work"])
 def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monkeypatch, source, omit_messages, profile):
+    from hermes_state import resolved_max_resume_messages
     home = tmp_path / "work"
     home.mkdir()
     db = SessionDB(home / "state.db")
@@ -31,8 +54,8 @@ def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monk
     stored = db.get_session("tip")
     assert stored is not None
     stored_count = stored["message_count"]
-    _, display = db.get_resume_conversations("tip")
-    prefix = db.get_ancestor_display_prefix("tip")
+    _, display = db.get_resume_conversations("tip", max_display_messages=resolved_max_resume_messages() or None)
+    prefix = [m for m in display if m.get("_row_id") not in {row.get("_row_id") for row in expected}]
     display_reads = []
     original_display = db.get_resume_conversations
     original_prefix = db.get_ancestor_display_prefix
@@ -45,9 +68,9 @@ def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monk
         original_close()
         closed.set()
 
-    def read_display(sid):
+    def read_display(sid, **kwargs):
         display_reads.append("display")
-        return original_display(sid)
+        return original_display(sid, **kwargs)
 
     def read_prefix(sid):
         display_reads.append("prefix")
@@ -82,7 +105,7 @@ def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monk
         assert session["resume_history_ready"].wait(5)
         assert built.wait(5)
         model_only = source == "desktop" and omit_messages
-        assert display_reads == ([] if model_only else ["display", "prefix"])
+        assert display_reads == ([] if model_only else ["display"])
         assert session["history"] == expected
         assert session["display_history_prefix"] == ([] if model_only else prefix)
         count = stored_count if model_only else len(display)

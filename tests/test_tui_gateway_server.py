@@ -752,7 +752,16 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
                 sid = frame["sid"]
                 server._emit("message.start", sid)
                 server._emit("message.delta", sid, {"text": "hi"})
-                server._emit("message.complete", sid, {"text": "hi", "usage": usage, "status": "complete"})
+                server._emit(
+                    "message.complete",
+                    sid,
+                    {
+                        "text": "hi",
+                        "usage": usage,
+                        "status": "complete",
+                        "cache_info": {"state": "unavailable", "pct": 0},
+                    },
+                )
                 server._emit("session.info", sid, dict(fixed_info))
                 if on_complete is not None:
                     on_complete(

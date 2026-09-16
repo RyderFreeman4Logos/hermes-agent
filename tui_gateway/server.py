@@ -2840,8 +2840,11 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
         try:
             # include_compacted: a compacted session's archived turns are still the user's
             # conversation; without them a warm switch repainted the chat as summary + tail only.
-            display = db.get_messages_as_conversation(
-                key, include_ancestors=True, include_row_ids=True, include_compacted=True)
+            if limit := session.get("display_history_limit"):
+                _model, display = db.get_resume_conversations(key, max_display_messages=limit)
+            else:
+                display = db.get_messages_as_conversation(
+                    key, include_ancestors=True, include_row_ids=True, include_compacted=True)
             # See #92080.
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:

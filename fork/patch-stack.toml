@@ -19,10 +19,10 @@ pr = 182
 feature = "长任务启动、resume control 与完成生命周期"
 branch = "topic/upgrade-pr13-01-terminal-20260821"
 parent = "8068c09432d3e7a23d30aa5f4f7d5a17783f8668"
-head = "702d4795e295a37a5e44adc531dc3e8bc68268f9"
-source_commits = 4
-source_patch_id = "b5db1a062ef70a6b6bf0c376980f0c9fbcc5034a"
-source_diff_sha256 = "d906355a42ee5991c29968f27cbacbd1ed96a1d484b1550853cc5ab0a078fe20"
+head = "f2c7277af08c7e43a390eeaa03cac42d8aea673c"
+source_commits = 6
+source_patch_id = "90dd704da6c8044c50afe835efb4d83b724025bb"
+source_diff_sha256 = "2638181e933eec5140cd0c33fe5392784b4b93ad58dfa03f5d138d64d96990d5"
 depends_on = []
 integration = "included-once"
 

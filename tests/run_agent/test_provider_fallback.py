@@ -364,9 +364,9 @@ class TestFallbackChainDedup:
                 ok = agent._try_activate_fallback()
 
         assert ok is True
-        # The first entry was skipped — only the second reached resolve.
-        assert called == [("zai", "glm-4.7")], (
-            f"expected fallback to skip same-state entry, got call order: {called}"
+        # Identity comparison follows resolution so omitted-url aliases cannot hide an endpoint.
+        assert called == [("openrouter", "z-ai/glm-4.7"), ("zai", "glm-4.7")], (
+            f"expected resolved self entry to be skipped, got call order: {called}"
         )
 
 
@@ -380,11 +380,14 @@ class TestFallbackChainDedup:
         agent.model = "z-ai/glm-4.7"
         agent.base_url = "https://openrouter.ai/api/v1"
 
-        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "z-ai/glm-4.7"),
+        ) as mock_resolve:
             ok = agent._try_activate_fallback()
 
         assert ok is False
-        mock_resolve.assert_not_called()
+        mock_resolve.assert_called_once()
 
     def test_allows_xai_api_fallback_from_xai_oauth_same_host_model(self):
         """xai-oauth and xai share api.x.ai but use different credentials.

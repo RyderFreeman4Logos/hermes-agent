@@ -1752,9 +1752,8 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
     return False
 
 
-def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
-    """True when the entry is already unavailable, malformed, locally unusable, or resolves
-    to the backend that just failed (falling back to it would loop the failure)."""
+def _should_skip_unresolved_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
+    """Reject entries that cannot be resolved without constructing their client."""
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
@@ -1769,6 +1768,11 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         unavailable.add(fb_key)
         logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
         return True
+    return False
+
+
+def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
+    """True when a resolved entry repeats the failed backend identity."""
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
@@ -1783,7 +1787,7 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
             if should_skip_candidate(fb_ident, failed_ident, failure_scope):
                 logger.warning(
                     "Fallback skip: chain entry %s/%s repeats a failed backend (%s)",
-                    fb_provider, fb_model, failed_ident.provider or failed_ident.base_url)
+                    fb_provider, fb_model, failed_ident.provider or "unnamed route")
                 return True
     elif should_skip_candidate(fb_ident, current_ident):
         logger.warning(
@@ -1977,7 +1981,7 @@ def _try_activate_fallback_unlocked(
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
-        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+        if _should_skip_unresolved_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
         runtime_snapshot = None
@@ -2010,6 +2014,9 @@ def _try_activate_fallback_unlocked(
             fb_base_url = str(fb_client.base_url)
             if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
                 fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
+            resolved_fb = {**fb, "model": fb_model, "base_url": fb_base_url}
+            if _should_skip_fallback_candidate(agent, resolved_fb, fb_key, fb_provider, fb_model, unavailable):
+                continue
 
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
             from agent.agent_runtime_helpers import _copy_request_overrides

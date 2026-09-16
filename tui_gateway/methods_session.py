@@ -537,6 +537,7 @@ class _Resume:
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
             close_on_disconnect=_flag(self.params, "close_on_disconnect"),
             profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd), **extra)
+        record["display_history_limit"] = self.display_limit()
         if follows_profile:
             record.update(
                 follow_profile_config=True,
@@ -544,6 +545,11 @@ class _Resume:
                                            if overrides and overrides.get("model_override") else None),
             )
         return record
+
+    @staticmethod
+    def display_limit() -> int | None:
+        from hermes_state import resolved_max_resume_messages
+        return resolved_max_resume_messages() or None
 
     def claim(self, sid: str, record: dict) -> dict | None:
         """Register ``record`` live under the resume lock, or reuse a concurrent winner's session."""
@@ -572,11 +578,20 @@ class _Resume:
         self.db.reopen_session(self.target)
         if self.omit_messages:
             return self.child_history(repair=True), []
-        return self.db.get_resume_conversations(self.target)
+        try:
+            return self.db.get_resume_conversations(self.target, max_display_messages=self.display_limit())
+        except TypeError as exc:
+            # Lightweight stores from older adapters expose the pre-bound method shape.
+            if "max_display_messages" not in str(exc):
+                raise
+            return self.db.get_resume_conversations(self.target)
 
-    def display_prefix(self) -> list:
-        """Ancestor display rows (model-fed history drops a dangling tool-call tail — display keeps it)."""
-        return [] if self.omit_messages else self.db.get_ancestor_display_prefix(self.target)
+    def display_prefix(self, display: list, raw: list) -> list:
+        """Display-only rows already present in the bounded resume read (no second lineage query)."""
+        if self.omit_messages:
+            return []
+        tip_row_ids = {m.get("_row_id") for m in raw if isinstance(m, dict) and m.get("_row_id") is not None}
+        return [m for m in display if m.get("_row_id") not in tip_row_ids]
 
 
 def _find_live_unpersisted(needle: str, home) -> str:
@@ -684,7 +699,8 @@ def _resume_guard(ctx: _Resume) -> dict | None:
     omit_messages / lazy paths load the TIP segment only and are guarded tip-only (a lineage count rejected
     exactly the well-compressed chats). Metadata fallback for lightweight adaptor DBs; fails OPEN on errors."""
     from hermes_state import SessionResumeTooLargeError, resolved_max_resume_messages
-    tip_only = ctx.lazy or ctx.omit_messages or (ctx.defer_history and not ctx.eager_build)
+    # Every path replays only the active tip. Full/eager display history is bounded independently in SQL.
+    tip_only = True
     try:
         if callable(safety_check := getattr(ctx.db, "assert_resume_safe", None)):
             safety_check(ctx.target, **({"tip_only": True} if tip_only else {}))
@@ -798,7 +814,7 @@ def _resume_cold(ctx: _Resume) -> dict:
         return _err(ctx.rid, 5000, resume_failed_message(e))
     with _profile_build_scope(ctx.profile_home):
         overrides = _stored_session_runtime_overrides(ctx.found)
-    record = ctx.record(source, cwd, history, overrides, display_history_prefix=ctx.display_prefix(),
+    record = ctx.record(source, cwd, history, overrides, display_history_prefix=ctx.display_prefix(display_history, raw_history),
                         todo_state=_todo_state_from_history(history))
     if (reused := ctx.claim(sid, record)) is not None:
         return reused
@@ -815,7 +831,7 @@ def _resume_eager(ctx: _Resume) -> dict:
     with _profile_build_scope(ctx.profile_home):
         try:
             history, display_history, raw_history = ctx.restore()
-            display_history_prefix = ctx.display_prefix()
+            display_history_prefix = ctx.display_prefix(display_history, raw_history)
             # Profile db so turns persist to the right state.db; stored runtime identity so switching chats does
             # not inherit another chat's global model.
             stored_runtime_overrides = _stored_session_runtime_overrides(ctx.found)
@@ -855,7 +871,8 @@ def _resume_eager(ctx: _Resume) -> dict:
                 # Each turn re-binds HERMES_HOME (mid-turn memory/skills reads); lease claimed lazily on turn 1.
                 if ctx.profile_home is not None:
                     session["profile_home"] = str(ctx.profile_home)
-                session.update(display_history_prefix=display_history_prefix, active_session_lease=None)
+                session.update(display_history_prefix=display_history_prefix,
+                               display_history_limit=ctx.display_limit(), active_session_lease=None)
         except Exception as e:
             # _init_session registers _sessions[sid] BEFORE its first db read; left in place the fast path
             # would serve that dead session forever.

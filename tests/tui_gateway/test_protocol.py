@@ -849,14 +849,13 @@ def test_session_resume_deferred_and_omitted_paths_guard_the_tip_only(server, mo
         assert err.get("code") != 4130, params
         assert calls == [True], params
 
-    # The non-deferred, non-omitted resume materializes the full lineage in
-    # memory, so it keeps the lineage-wide bound.
+    # Full/cold resume also replays only the tip; its display copy is bounded separately.
     calls.clear()
     response = server.handle_request(
         {"id": "r-full", "method": "session.resume", "params": {"session_id": "deep-lineage"}}
     )
-    assert response["error"]["code"] == 4130
-    assert calls == [False]
+    assert response["error"]["code"] != 4130
+    assert calls == [True]
 
 
 def test_deferred_hydration_falls_back_to_tip_when_lineage_exceeds_limit(server, monkeypatch):

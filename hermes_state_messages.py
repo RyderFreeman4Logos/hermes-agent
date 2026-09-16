@@ -1235,10 +1235,12 @@ class SessionMessagesMixin:
                     "see repair_message_sequence", repaired, session_id)
         return messages
 
-    def get_resume_conversations(self, session_id: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """``(model_history, display_history)`` for a resume from ONE SELECT; byte-identical to the separate
-        reads. model: the tip's active rows, alternation-repaired, summary marker kept for pre-compress
-        checkpointing. display: the full lineage (``/branch`` stands alone), compaction-archived rows deduped.
+    def get_resume_conversations(
+        self, session_id: str, *, max_display_messages: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """``(model_history, display_history)`` for a resume. Model history is always the complete active tip.
+        Display history is the full deduped lineage unless ``max_display_messages`` asks SQLite for only its
+        newest logical rows (``/branch`` still stands alone).
 
         The display projection also includes rows preserved by IN-PLACE compaction (``active=0,
         compacted=1``), deduped by :meth:`_dedupe_display_generations`. Without them a compacted
@@ -1246,11 +1248,47 @@ class SessionMessagesMixin:
         read as deleted even though every row is still on disk, and the REST transcript read (which has
         always included them) disagreed with this one about the same session (#92080).
         """
-        rows = self._fetch_conversation_rows(
-            self._resume_lineage_ids(session_id), _DISPLAY_ACTIVE_CLAUSE, with_session_id=True)
+        if max_display_messages is not None and max_display_messages < 0:
+            raise ValueError("max_display_messages must be non-negative")
+        session_ids = self._resume_lineage_ids(session_id)
+        if max_display_messages is None:
+            rows = self._fetch_conversation_rows(session_ids, _DISPLAY_ACTIVE_CLAUSE, with_session_id=True)
+            tip_rows = [r for r in rows if r["session_id"] == session_id and r["active"]]
+        else:
+            tip_rows = self._fetch_conversation_rows([session_id], " AND active = 1", with_session_id=True)
+            if max_display_messages == 0:
+                rows = []
+            elif all(self._ensure_display_order(sid) for sid in session_ids):
+                placeholders = _placeholders(session_ids)
+                # The window retains the existing display-generation contract: active wins, then the newest
+                # representative, while MIN(id) keeps the logical message's original order. Only the bounded
+                # page crosses the SQLite/Python boundary.
+                rows = self._read_all(f"""WITH ranked AS (
+                        SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}, display_identity,
+                               MIN(id) OVER (PARTITION BY display_identity) AS logical_order,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY display_identity ORDER BY active DESC, id DESC
+                               ) AS generation_rank
+                        FROM messages
+                        WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
+                    ), page AS (
+                        SELECT * FROM ranked WHERE generation_rank = 1
+                        ORDER BY logical_order DESC LIMIT ?
+                    )
+                    SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}
+                    FROM page ORDER BY logical_order ASC""", (*session_ids, max_display_messages))
+            else:
+                # Read-only legacy stores cannot persist display identities. Keep the read bounded; duplicates
+                # in the bounded raw tail still collapse through the historical Python projection below.
+                placeholders = _placeholders(session_ids)
+                rows = self._read_all(f"""SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM (
+                        SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM messages
+                        WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
+                        ORDER BY id DESC LIMIT ?
+                    ) ORDER BY id ASC""", (*session_ids, max_display_messages))
         # The model projection stays active-only: it is the compressed working context.
         model_history = self._rows_to_conversation(
-            [r for r in rows if r["session_id"] == session_id and r["active"]], session_id=session_id,
+            tip_rows, session_id=session_id,
             include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(
             self._dedupe_display_generations(rows), session_id=session_id,

@@ -1346,8 +1346,15 @@ class SessionMessagesMixin:
             tip_rows = self._fetch_conversation_rows([session_id], " AND active = 1", with_session_id=True)
             if max_display_messages == 0:
                 rows = []
-            elif all(self._ensure_display_order(sid) for sid in session_ids):
+            else:
                 placeholders = _placeholders(session_ids)
+                missing_display_identity = self._read_one(
+                    f"""SELECT 1 FROM messages
+                        WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
+                          AND (display_identity IS NULL OR display_order IS NULL) LIMIT 1""",
+                    tuple(session_ids),
+                )
+            if max_display_messages and missing_display_identity is None:
                 # The window retains the existing display-generation contract: active wins, then the newest
                 # representative, while MIN(id) keeps the logical message's original order. Only the bounded
                 # page crosses the SQLite/Python boundary.
@@ -1365,10 +1372,9 @@ class SessionMessagesMixin:
                     )
                     SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}
                     FROM page ORDER BY logical_order ASC""", (*session_ids, max_display_messages))
-            else:
-                # Read-only legacy stores cannot persist display identities. Keep the read bounded; duplicates
-                # in the bounded raw tail still collapse through the historical Python projection below.
-                placeholders = _placeholders(session_ids)
+            elif max_display_messages:
+                # Legacy stores stay read-only here: resume must not backfill each lineage segment before it
+                # can apply the bound. Duplicates in the bounded raw tail still collapse below.
                 rows = self._read_all(f"""SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM (
                         SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM messages
                         WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)

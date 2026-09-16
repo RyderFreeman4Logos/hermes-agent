@@ -387,7 +387,7 @@ class TestFallbackChainDedup:
             ) as mock_resolve,
             patch("hermes_cli.fallback_config.resolve_entry_api_key", return_value=None) as resolve_key,
         ):
-            ok = agent._try_activate_fallback()
+            ok = agent._try_activate_fallback(FailoverReason.auth)
 
         assert ok is False
         mock_resolve.assert_not_called()

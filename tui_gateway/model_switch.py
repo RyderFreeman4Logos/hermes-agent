@@ -55,6 +55,15 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
 @contextlib.contextmanager
 def _session_profile_runtime_scope(session: dict):
     """Bind model resolution to the session's profile config and secrets."""
+    from pathlib import Path
+
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
     profile_home = session.get("profile_home")
     if not profile_home:
         yield

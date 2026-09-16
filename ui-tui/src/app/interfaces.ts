@@ -320,6 +320,7 @@ export interface UiState {
   batteryStatus: BatteryInfo | null
   bgTasks: Set<string>
   busy: boolean
+  cacheStatus?: null | string
   busyInputMode: BusyInputMode
   compact: boolean
   // Context compaction in progress (idle/preflight/auto). Distinct from
@@ -350,6 +351,7 @@ export interface UiState {
   // shared with the classic CLI bar. null = user has not customized (show
   // the default set).
   statusBarFields: null | ReadonlySet<string>
+  statusBarSegments: null | readonly string[]
   streaming: boolean
   theme: Theme
   // `display.timestamps` — dim [HH:MM] labels on user/assistant transcript

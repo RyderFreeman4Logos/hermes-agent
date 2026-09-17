@@ -238,6 +238,31 @@ def test_failure_scope_keeps_distinct_route_or_credential_eligible(
     assert agent.provider == fallback["provider"]
 
 
+def test_billing_keeps_distinct_provider_eligible_with_shared_resolved_key():
+    """A spending-limit/billing failure must not skip a different provider whose
+    resolved client happens to reuse the same key string and URL."""
+    from agent.error_classifier import FailoverReason
+
+    agent = _make_agent([{"provider": "openai", "model": "gpt-4o"}])
+    agent.provider = "xai-oauth"
+    agent.model = "grok-4.6"
+    agent.base_url = "https://fallback.invalid/v1"
+    agent.api_key = "fallback-key"
+
+    with (
+        patch("agent.chat_completion_helpers._fallback_entry_unavailable_without_network", return_value=None),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_client("https://fallback.invalid/v1", "fallback-key"), "gpt-4o"),
+        ) as resolve,
+    ):
+        assert agent._try_activate_fallback(FailoverReason.billing) is True
+
+    assert resolve.call_count == 1
+    assert agent.provider == "openai"
+    assert agent.model == "gpt-4o"
+
+
 def test_post_resolution_duplicate_closes_only_discarded_client_once():
     from agent.error_classifier import FailoverReason
 

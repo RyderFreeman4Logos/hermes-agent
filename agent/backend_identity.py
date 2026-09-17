@@ -84,23 +84,30 @@ def _both_first_class(a: BackendIdentity, b: BackendIdentity) -> bool:
         return False
 
 
+def _fingerprints_match(a: BackendIdentity, b: BackendIdentity) -> bool:
+    return bool(
+        a.credential_fingerprint
+        and b.credential_fingerprint
+        and a.credential_fingerprint == b.credential_fingerprint
+    )
+
+
 def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
     """Do two identities share the credential a 401/402 just invalidated?
 
     Conservative: an unprovable axis answers "different" (one wasted RTT) rather than "same"
     (stranded failover). Same label = same configured credential; custom entries can each carry
-    their own api_key, so a shared URL alone is only a weak signal when a label is missing."""
-    if a.credential_fingerprint or b.credential_fingerprint:
-        return bool(
-            a.credential_fingerprint
-            and b.credential_fingerprint
-            and a.credential_fingerprint == b.credential_fingerprint
-        )
+    their own api_key, so a shared URL alone is only a weak signal when a label is missing.
+    Fingerprints disambiguate keys on one label; they never collapse distinct labels (a shared
+    resolved key string is not a credential surface)."""
     if a.provider and b.provider:
-        # Different labels = different credential config (first-class registry providers explicitly so —
-        # #70893; custom entries can each carry their own api_key, so sameness is unprovable and we must not
-        # skip).
-        return a.provider == b.provider
+        if a.provider != b.provider:
+            return False
+        if a.credential_fingerprint or b.credential_fingerprint:
+            return _fingerprints_match(a, b)
+        return True
+    if a.credential_fingerprint or b.credential_fingerprint:
+        return _fingerprints_match(a, b)
     return bool(a.base_url and a.base_url == b.base_url)
 
 

@@ -141,13 +141,13 @@ class TestCompletionQueue:
         ("exit_code", "completion_reason", "termination_source", "visible"),
         (
             (0, "exited", "", False),
-            (1, "exited", "", True),
-            (-1, "lost", "backend_lost", True),
-            (-15, "killed", "process.kill", True),
+            (1, "exited", "", False),
+            (-1, "lost", "backend_lost", False),
+            (-15, "killed", "process.kill", False),
         ),
         ids=("success", "nonzero", "lost", "killed"),
     )
-    def test_delegated_child_completion_suppresses_only_routine_success(
+    def test_delegated_child_completion_stays_child_owned_for_all_terminal_outcomes(
         self, registry, exit_code, completion_reason, termination_source, visible
     ):
         session = _make_session(
@@ -198,7 +198,7 @@ class TestCompletionQueue:
             ("missing_reason", {}, ("completion_reason",)),
             ("unknown_reason", {"completion_reason": "unknown"}, ()),
             ("missing_termination_source", {}, ("termination_source",)),
-            ("unknown_termination_source", {"termination_source": "unknown"}, ()),
+            ("mismatched_reason_source", {"completion_reason": "lost"}, ()),
             ("missing_session_id", {}, ("session_id",)),
             ("empty_session_id", {"session_id": ""}, ()),
             ("missing_command", {}, ("command",)),
@@ -464,7 +464,7 @@ def test_delegated_child_background_process_is_not_parent_scoped(monkeypatch, tm
     spawn = tt._test_spawn_kwargs[-1]
     assert spawn["session_key"] == ""
     assert spawn["task_id"] == "child-task"
-    assert spawn.get("notify_on_complete") is not True
+    assert spawn.get("notify_on_complete") is True
     assert result.get("notify_on_complete") is not True
 
 

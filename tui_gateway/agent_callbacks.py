@@ -276,6 +276,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "reasoning_config": g("reasoning_config") or _load_reasoning_config(str(g("model", "") or "")),
         "service_tier": g("service_tier") or _load_service_tier(),
         "request_overrides": dict(g("request_overrides", {}) or {}),
+        "memory_provider_mode_override": g("_memory_provider_mode"),
         "platform": "tui", "session_db": _get_db(), "fallback_model": fallback}
 
 
@@ -376,6 +377,8 @@ def _rebuild_session_agent(sid: str, session: dict, **kwargs):
         if opened:
             session_db = _open_profile_session_db(profile_home)
         agent = _make_agent(sid, session["session_key"], session_db=session_db, **kwargs)
+        # Adopt cold-restored intent before publishing the replacement through session["agent"].
+        _attach_model_switch_after_compression(sid, session, agent)
     except BaseException:
         if opened and session_db is not None:
             with contextlib.suppress(Exception):
@@ -399,6 +402,8 @@ def _rebuild_session_agent(sid: str, session: dict, **kwargs):
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
+    with session["history_lock"]:
+        _reclaim_queued_completion_receipts(session)
     updates = dict(
         attached_images=[], queued_prompt=None,
         _queued_prompt_generation=int(session.get("_queued_prompt_generation", 0)) + 1,
@@ -409,6 +414,16 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         # /new is a full conversation boundary: session-scoped runtime overrides (/model,
         # /reasoning, /fast) do NOT carry forward and the pins are cleared so a rebuild can't
         # resurrect them. Global process state is never touched (see _apply_model_switch).
+        from hermes_cli.model_switch import (
+            clear_model_switch_after_compression,
+            get_model_switch_after_compression,
+        )
+        if (
+            (old_agent := session.get("agent")) is not None
+            and get_model_switch_after_compression(old_agent) is not None
+        ):
+            clear_model_switch_after_compression(old_agent)
+        session.pop("after_compression_model_switch", None)
         for k in ("model_override", "create_reasoning_override", "create_service_tier_override", "one_turn_model_restore"):
             session.pop(k, None)
         new_agent = _rebuild_session_agent(
@@ -417,6 +432,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session))
     finally:
         _clear_session_context(tokens)
+    session["agent"] = new_agent
+    _persist_live_session_runtime(session)
     session.update(updates)
     session.pop("queued_prompts", None)
     with session["history_lock"]:

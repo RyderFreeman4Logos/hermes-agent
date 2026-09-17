@@ -25,6 +25,8 @@ runs — closing the gap the same way the compression fix does.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform
@@ -93,6 +95,10 @@ class TestBranchRoutingColumns:
         """
         source = _make_source()
         parent_entry = store.get_or_create_session(source)
+        store._db.update_session_meta(
+            parent_entry.session_id,
+            json.dumps({"memory_provider_mode": "authoritative"}),
+        )
         store._db.append_message(parent_entry.session_id, role="user", content="hello")
         store._db.append_message(parent_entry.session_id, role="assistant", content="world")
 
@@ -137,6 +143,11 @@ class TestBranchRoutingColumns:
         assert row["session_key"] is not None, (
             "branched session lost session_key — primary lookup path fails"
         )
+        model_config = json.loads(row["model_config"])
+        assert model_config["_branched_from"] == parent_entry.session_id
+        assert model_config["memory_provider_mode"] == "authoritative", (
+            "branched session lost the parent's frozen memory-provider mode before switch"
+        )
         # origin_json completes the identity (#82633 reset-path pattern):
         # consumers reading routing/presentation data from state.db
         # (mcp_serve, mirror, channel directory) need the full origin on
@@ -152,4 +163,3 @@ class TestBranchRoutingColumns:
         assert origin.get("thread_id") == "544520"
 
         _ = real_switch_session  # silence unused
-

@@ -42,6 +42,65 @@ export const normalizeStatusBarFields = (raw: unknown): null | ReadonlySet<strin
   return cleaned.length ? new Set(cleaned) : null
 }
 
+const LEGACY_STATUS_BAR_SEGMENTS = new Set([
+  'battery',
+  'indicator',
+  'model',
+  'context_tokens',
+  'context_bar',
+  'context_percent',
+  'focus',
+  'session_duration',
+  'idle',
+  'compressions',
+  'voice',
+  'sessions',
+  'bg_tasks',
+  'subagents',
+  'resume',
+  'dev_credits',
+  'spawn_hud',
+  'cwd'
+])
+
+const DEFAULT_LEGACY_STATUS_BAR_SEGMENTS = [...LEGACY_STATUS_BAR_SEGMENTS]
+
+export const normalizeLegacyStatusBarSegments = (raw: unknown): null | readonly string[] => {
+  if (!Array.isArray(raw)) {
+    return null
+  }
+
+  if (raw.length === 0) {
+    return []
+  }
+
+  const normalized: string[] = []
+
+  const add = (segment: string) => {
+    if (!normalized.includes(segment)) {
+      normalized.push(segment)
+    }
+  }
+
+  for (const value of raw) {
+    if (typeof value !== 'string') {
+      continue
+    }
+
+    const segment = value.trim().toLowerCase()
+
+    if (segment === 'context') {
+      for (const contextSegment of ['context_tokens', 'context_bar', 'context_percent']) {
+        add(contextSegment)
+      }
+    } else if (LEGACY_STATUS_BAR_SEGMENTS.has(segment)) {
+      add(segment)
+    }
+  }
+
+  return normalized.length ? normalized : DEFAULT_LEGACY_STATUS_BAR_SEGMENTS
+}
+
 const BUSY_MODES = new Set<BusyInputMode>(['interrupt', 'queue', 'steer'])
 
 // TUI defaults to `queue` even though the framework default
@@ -308,6 +367,8 @@ export const applyDisplay = (
     showReasoning: !!d.show_reasoning,
     statusBar: normalizeStatusBar(d.tui_statusbar),
     statusBarFields: normalizeStatusBarFields(d.status_bar?.fields),
+    statusBarSegments:
+      d.status_bar?.fields === undefined ? normalizeLegacyStatusBarSegments(d.tui_statusbar_segments) : null,
     streaming: d.streaming !== false,
     // The SAME key that stamps [HH:MM] on classic-CLI labels (#41531) —
     // no separate TUI knob.

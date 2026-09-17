@@ -1,14 +1,8 @@
-"""Lean compaction makes EXACTLY ONE auxiliary LLM request per attempt.
+"""Lean compaction keeps one primary summary request and bounded chunk harvest.
 
-Contract (#96603 — the per-chunk digest loop made up to 28 extra aux calls
-and pushed compactions to 7-11 minutes on slow aux routes):
-
-(a) exactly one ``call_llm`` per compaction attempt in lean mode;
-(b) the single response's detailed-session-log section lands in the summary;
-(c) an oversized region is EVEN-SAMPLED into the one request's input (with
-    explicit elision markers), never split into extra requests;
-(d) the LLM-free anchor index and the session_search recovery footer are
-    still appended.
+Contract (#165): the primary summary is one ``call_llm`` request; oversized
+lean coverage is supplemented by bounded per-chunk digest requests, with
+ordered, cancellable harvest and the LLM-free anchor/recovery sections.
 """
 
 from unittest.mock import patch, MagicMock
@@ -18,6 +12,7 @@ import pytest
 from agent.context_compressor import (
     ContextCompressor,
     _LEAN_ANCHOR_HEADING,
+    _LEAN_DIGEST_MAX_CHUNKS,
     _LEAN_RECOVERY_HEADING,
     _LEAN_SESSION_LOG_HEADING,
 )
@@ -78,7 +73,7 @@ SUMMARY_BODY = (
 
 
 class TestLeanSingleAuxiliaryCall:
-    def test_exactly_one_call_llm_per_lean_attempt(self):
+    def test_one_primary_call_with_bounded_chunk_harvest(self):
         c = _mk_compressor()
         turns = _big_region()
         with patch(
@@ -90,8 +85,10 @@ class TestLeanSingleAuxiliaryCall:
         ) as aux_call:
             summary = c._generate_summary(turns)
         assert summary is not None
-        # THE contract: one auxiliary request per compaction attempt, total.
-        assert main_call.call_count + aux_call.call_count == 1
+        # The primary summary remains exactly one request; #165 intentionally
+        # adds bounded per-chunk digest requests for oversized lean coverage.
+        assert main_call.call_count == 1
+        assert 1 <= aux_call.call_count <= _LEAN_DIGEST_MAX_CHUNKS
 
     def test_session_log_heading_lands_in_summary(self):
         c = _mk_compressor()

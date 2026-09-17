@@ -30,10 +30,13 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
         "_current_runtime_session_record": contextvars.ContextVar("refused_turn"),
         "_TurnRun": prompt_turn._TurnRun,
         "_record_turn_marker": lambda *args, **kwargs: "marker",
-        "_prepare_turn_input": lambda *args: None,
+        # Return the production refusal sentinel while accepting the current
+        # completion-mode keyword; this exercises the terminal receipt path.
+        "_prepare_turn_input": lambda *args, **kwargs: None,
         "_finish_turn": noop, "_clear_inflight_turn": noop,
         "_retire_turn_marker": lambda *args: retired.append(args),
         "_emit_settled_session_info": noop,
+        "_run_post_turn_followups": noop,
     })
     def terminal(outcome):
         mailbox.complete_delivery(tmp_path, queued["id"], status=outcome["status"],

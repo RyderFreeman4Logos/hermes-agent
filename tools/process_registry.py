@@ -8,6 +8,7 @@ import codecs
 from contextlib import suppress
 import json
 import logging
+import math
 import os
 import platform
 import shlex
@@ -410,6 +411,7 @@ class ProcessSession:
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
+    delegated_child: bool = False               # Spawned from a native delegate_task child
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
     _watch_suppressed: int = field(default=0, repr=False)    # matches dropped by rate limit
@@ -449,7 +451,8 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "watch_patterns")
+    "parent_session_id", "notify_on_complete", "delegated_child", "handoff_note",
+    "watch_patterns")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -469,7 +472,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
-        self._lock = threading.Lock()
+        # Ownership handoff persists its checkpoint before releasing this lock.
+        self._lock = threading.RLock()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -524,8 +528,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
         window, a match inside the window is one strike, WATCH_STRIKE_LIMIT consecutive
         strikes or WATCH_LIFETIME_MAX_HITS total deliveries disable watching and
         promote the session to notify_on_complete."""
-        if not session.watch_patterns or session._watch_disabled:
-            return
+        with self._lock:
+            if (
+                not session.watch_patterns
+                or session._watch_disabled
+                or (session.delegated_child and not session.handoff_note)
+            ):
+                return
         # Late chunks after the reader declared exit are post-exit noise; dropping them
         # avoids stale notifications minutes after the process ended.
         if session.exited:
@@ -613,6 +622,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             "task_id": session.task_id,
             "owner_task_id": session.owner_task_id or session.task_id,
             "command": session.command,
+            "delegated_child": session.delegated_child,
+            **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
             **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
         }
 
@@ -787,9 +798,23 @@ class ProcessRegistry(ProcessCheckpointMixin):
         except gone:
             targets = []
         targets.append(parent)
+        # Isolate non-gone errors to descendants only. Owner SIGTERM/SIGKILL
+        # failures must propagate so kill_process can leave a live Popen
+        # running/unconsumed. A denied descendant is not retried via SIGKILL.
+        denied_descendant_pids = set()
         for proc in targets:
-            with suppress(gone):
+            try:
                 proc.terminate()
+            except gone:
+                continue
+            except Exception as exc:
+                if proc is parent:
+                    raise
+                denied_descendant_pids.add(getattr(proc, "pid", None))
+                logger.debug(
+                    "Skipping terminate for pid %s while killing tree of %s: %s",
+                    getattr(proc, "pid", None), pid, type(exc).__name__,
+                )
         # Escalate to SIGKILL for anything that ignored SIGTERM within the grace window.
         # ``psutil.wait_procs``' gone/alive partition is deliberately NOT trusted: it
         # reaps via ``Process.wait()`` and mis-partitions across zombie transitions in a
@@ -802,17 +827,30 @@ class ProcessRegistry(ProcessCheckpointMixin):
         while time.monotonic() < deadline and any(cls._proc_alive(_p) for _p in targets):
             time.sleep(0.05)
         for proc in targets:
-            with suppress(gone):
+            if getattr(proc, "pid", None) in denied_descendant_pids:
+                continue
+            try:
                 if cls._proc_alive(proc):
                     proc.kill()  # SIGKILL on POSIX
                     logger.info("Escalated to SIGKILL for pid %d (ignored SIGTERM within %.1fs grace)", proc.pid, grace)
+            except gone:
+                continue
+            except Exception as exc:
+                if proc is parent:
+                    raise
+                logger.debug(
+                    "Skipping kill for pid %s while killing tree of %s: %s",
+                    getattr(proc, "pid", None), pid, type(exc).__name__,
+                )
 
     # ----- Spawn -----
 
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
+        from agent.delegation_context import is_delegated_child_process_context
         from gateway.session_context import get_session_env
 
+        extra.setdefault("delegated_child", is_delegated_child_process_context())
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id or task_id, session_key=session_key, cwd=cwd,
@@ -864,15 +902,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
         from contextvars import copy_context
 
         # Reader completion must retain the producer's multiplex profile scope.
+        # Register first so a spawn-advertised notification survives an immediate
+        # reader exit (the reader may finish before start() returns).
         reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
                                   daemon=True, name=reader_name)
         session._reader_thread = reader
         with self._lock:
             self._prune_if_needed()
-            # Completion takes this lock too. Starting here also leaves no
-            # ghost entry if the interpreter cannot start another thread.
-            reader.start()
             self._running[session.id] = session
+        reader.start()
         self._write_checkpoint()
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
@@ -900,7 +938,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def spawn_local(
         self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "") -> ProcessSession:
+        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
+        notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing."""
@@ -911,7 +950,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
-        session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()))
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
+            notify_on_complete=notify_on_complete,
+        )
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -998,12 +1040,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "") -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
         the correct sandbox context."""
-        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox")
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
+        )
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -1118,7 +1163,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
-        one U+FFFD instead of vanishing), reap the child (no zombies), record the exit."""
+        one U+FFFD instead of vanishing), reap the child (no zombies), record the exit.
+        Pipe EOF is not completion: a long child can close stdout and stay alive."""
         with suppress(Exception):
             tail = decoder.decode(b"", final=True)
             if tail:
@@ -1127,7 +1173,20 @@ class ProcessRegistry(ProcessCheckpointMixin):
             wait()
         except Exception as e:
             logger.debug("%s wait timed out or failed: %s", label, e)
-        self._finish_exited(session, exit_code())
+        rc = exit_code()
+        if rc is None:
+            proc = getattr(session, "process", None)
+            poll = getattr(proc, "poll", None) if proc is not None else None
+            if callable(poll):
+                with suppress(Exception):
+                    rc = poll()
+            if rc is None and proc is not None:
+                with suppress(Exception):
+                    proc.wait()
+                rc = poll() if callable(poll) else getattr(proc, "returncode", None)
+            if rc is None:
+                return
+        self._finish_exited(session, rc)
 
     @staticmethod
     def _log_delta_command(quoted_log_path: str, offset: int) -> str:
@@ -1280,6 +1339,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 # Stable producer identity across checkpoint recovery (unlike a
                 # consumer-observed completion timestamp).
                 "started_at": session.started_at,
+                "delegated_child": bool(getattr(session, "delegated_child", False)),
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)
@@ -1298,6 +1358,41 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
+
+    @staticmethod
+    def _is_routine_delegated_child_completion(evt: dict) -> bool:
+        """Whether a well-formed completion remains owned by a delegated child.
+
+        Ownership, not the command's result, decides whether raw terminal output
+        may wake the parent. Validate the event shape before suppressing it so an
+        unexpected producer failure still gets one bounded parent-visible notice.
+        An explicit handoff transfers ownership back.
+        """
+        if not isinstance(evt, dict) or evt.get("type") != "completion":
+            return False
+        if evt.get("delegated_child") is not True or evt.get("handoff_note"):
+            return False
+        started_at = evt.get("started_at")
+        return (
+            type(evt.get("exit_code")) is int
+            and (evt.get("completion_reason"), evt.get("termination_source"))
+            in {
+                ("exited", ""),
+                ("killed", "process.kill"),
+                ("killed", "kill_all"),
+                ("lost", "backend_lost"),
+                ("failed_start", "failed_start"),
+                ("already_exited", ""),
+            }
+            and isinstance(evt.get("session_id"), str)
+            and bool(evt["session_id"])
+            and isinstance(evt.get("command"), str)
+            and bool(evt["command"])
+            and isinstance(started_at, (int, float))
+            and not isinstance(started_at, bool)
+            and math.isfinite(started_at)
+            and started_at > 0
+        )
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on
@@ -1628,7 +1723,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def wait(self, session_id: str, timeout: int = None) -> dict:
         """Block until the process exits, the timeout elapses, or the user interrupts.
         ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
-        with status exited|timeout|interrupted|not_found|error and an output snapshot."""
+        with status exited|running|timeout|interrupted|not_found|error and an output
+        snapshot. A running notified session returns immediately; its completion is
+        delivered through the existing notification queue."""
         from tools.interrupt import is_interrupted as _is_interrupted
 
         try:
@@ -1647,6 +1744,28 @@ class ProcessRegistry(ProcessCheckpointMixin):
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
+        # A notified process already has an autonomous completion path. Do not
+        # hold the parent agent turn on a redundant foreground wait: yielding
+        # here lets unrelated prompts/completions arrive while this process runs.
+        if session.notify_on_complete and not session.exited:
+            from agent.delegation_context import is_delegated_child_context
+
+            # A native child has no parent notification drain. Deferring its
+            # wait leaves the child looping on wait_deferred until interrupt.
+            if not is_delegated_child_context():
+                return {
+                    "status": "running",
+                    "session_id": session.id,
+                    "command": session.command,
+                    "process_running": True,
+                    "wait_deferred": True,
+                    "notify_on_complete": True,
+                    "note": (
+                        "process.wait was auto-backgrounded because notify_on_complete "
+                        "is set; continue other work and you will be notified exactly "
+                        "once when the process exits."
+                    ),
+                }
         deadline = time.monotonic() + effective_timeout
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
@@ -1962,6 +2081,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
+            self._write_checkpoint()
             return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
@@ -2042,8 +2162,9 @@ PROCESS_SCHEMA = {
         "terminal(background=true)). "
         "Completed results remain retrievable by session_id when resuming their owning conversation "
         "(up to 7 days, newest 64 results per profile; rolling output tail). "
-        "poll: status + new output. log: full output, paged. wait: block "
-        "until exit or timeout (partial output on timeout). write vs "
+        "poll: status + new output. log: full output, paged. wait: return "
+        "immediately for notify_on_complete targets; otherwise block until "
+        "exit or timeout (partial output on timeout). write vs "
         "submit: submit appends Enter — use it to answer prompts; write "
         "sends raw bytes, no newline. close: EOF stdin. kill: terminate. "
         "handoff (subagents only): transfer a running process you started to your parent agent, which then "
@@ -2067,7 +2188,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait'.",
+                "description": "Max seconds for 'wait' when the target is not already configured for completion notification.",
                 "minimum": 1
             },
             "offset": {

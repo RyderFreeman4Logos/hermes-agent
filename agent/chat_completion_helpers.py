@@ -27,6 +27,7 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (FailoverReason, PROVIDER_STREAM_NON_JSON_ERROR_CODE)
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -660,13 +661,18 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     api_kwargs.pop("__bedrock_converse__", None)
     client = _get_bedrock_runtime_client(region)
     method = client.converse_stream if stream else client.converse
+    from agent import relay_llm
+
+    def send(final_kwargs):
+        return relay_llm.physical_send(final_kwargs, lambda request: method(**request))
+
     finish = (lambda raw: raw.get("stream", [])) if stream else normalize_converse_response
     try:
-        raw_response = method(**api_kwargs)
+        raw_response = send(api_kwargs)
     except Exception as exc:
         retry_kwargs = recover_from_cache_point_rejection(exc, api_kwargs)
         if retry_kwargs is not None:
-            return finish(method(**retry_kwargs))
+            return finish(send(retry_kwargs))
         if on_stream_denied is not None and is_streaming_access_denied_error(exc):
             return on_stream_denied(client, api_kwargs, exc)
         if is_stale_connection_error(exc):
@@ -702,8 +708,15 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
-        return agent.client.chat.completions.create(**api_kwargs)
-    return make_client("chat_completion_request").chat.completions.create(**api_kwargs)
+        from agent import relay_llm
+        return relay_llm.physical_send(
+            api_kwargs, lambda request: agent.client.chat.completions.create(**request)
+        )
+    from agent import relay_llm
+    client = make_client("chat_completion_request")
+    return relay_llm.physical_send(
+        api_kwargs, lambda request: client.chat.completions.create(**request)
+    )
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -1334,7 +1347,11 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         qwen_session_metadata=_qwen_meta)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
-        return transport.build_kwargs(provider_profile=_profile, **_common)
+        return transport.build_kwargs(
+            provider_profile=_profile,
+            provider_name=getattr(agent, "requested_provider", None),
+            **_common,
+        )
 
     # Legacy flag path: only for a provider absent from the providers/ registry.
     return transport.build_kwargs(
@@ -1647,6 +1664,18 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return label or str(getattr(reason, "value", None) or reason or "provider failure").replace("_", " ")
 
 
+def _fallback_failure_scope(reason: "FailoverReason | None"):
+    """Return the identity axis invalidated by a failed fallback attempt."""
+    from agent.backend_identity import FailureScope
+
+    reason_value = getattr(reason, "value", reason)
+    if reason_value in {"auth", "auth_permanent", "billing"}:
+        return FailureScope.CREDENTIAL
+    if reason_value == "ssl_cert_verification":
+        return FailureScope.ENDPOINT
+    return FailureScope.MODEL
+
+
 def _is_anthropic_wire_url(url: str) -> bool:
     """Same Messages-only host match as determine_api_mode() / _detect_api_mode_for_url(): api.anthropic.com,
     a /anthropic suffix, or Kimi Code's api.kimi.com/coding (its /chat/completions 404s — #77256)."""
@@ -1723,9 +1752,8 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
     return False
 
 
-def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
-    """True when the entry is already unavailable, malformed, locally unusable, or resolves
-    to the backend that just failed (falling back to it would loop the failure)."""
+def _should_skip_unresolved_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
+    """Reject entries that cannot be resolved without constructing their client."""
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
@@ -1740,15 +1768,72 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         unavailable.add(fb_key)
         logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
         return True
+    return False
+
+
+def _fallback_has_explicit_credential(fb: dict) -> bool:
+    return any(
+        str(fb.get(field) or "").strip() for field in ("api_key", "key_env", "api_key_env")
+    )
+
+
+def _raw_fallback_is_exact_self(fb: dict, candidate, failed) -> bool:
+    exact_self = candidate.provider == failed.provider and candidate.model == failed.model
+    return bool(
+        exact_self and not _fallback_has_explicit_credential(fb)
+        and not (candidate.base_url and failed.base_url and candidate.base_url != failed.base_url)
+    )
+
+
+def _raw_fallback_identity_is_known(
+    fb: dict, candidate, failed, failure_scope,
+) -> bool:
+    """True when raw fields are sufficient for the selected failure axis."""
+    from agent.backend_identity import FailureScope
+
+    if _raw_fallback_is_exact_self(fb, candidate, failed):
+        return True
+    if failure_scope is FailureScope.ENDPOINT:
+        return bool(candidate.base_url and failed.base_url)
+    if failure_scope is FailureScope.CREDENTIAL:
+        return bool(candidate.provider and failed.provider and not _fallback_has_explicit_credential(fb))
+    return bool(candidate.model and failed.model and candidate.base_url and failed.base_url)
+
+
+def _should_skip_fallback_candidate(
+    agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set,
+    *, pre_resolution: bool = False, candidate_api_key=None,
+) -> bool:
+    """True when raw or resolved fields prove an entry repeats a failed backend."""
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
     # See #22548, #62984, #70893.
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
-        model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
-    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
-    if should_skip_candidate(fb_ident, current_ident):
+        model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""),
+        api_key=getattr(agent, "api_key", None))
+    fb_ident = BackendIdentity.build(
+        provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""), api_key=candidate_api_key,
+    )
+    runtime_failures = getattr(agent, "_runtime_failed_backend_identities", ())
+    if runtime_failures:
+        for failed_ident, failure_scope in runtime_failures:
+            if pre_resolution:
+                if _raw_fallback_is_exact_self(fb, fb_ident, failed_ident):
+                    skip = True
+                elif not _raw_fallback_identity_is_known(fb, fb_ident, failed_ident, failure_scope):
+                    continue
+                else:
+                    skip = should_skip_candidate(fb_ident, failed_ident, failure_scope)
+            else:
+                skip = should_skip_candidate(fb_ident, failed_ident, failure_scope)
+            if skip:
+                logger.warning(
+                    "Fallback skip: chain entry %s/%s repeats a failed backend (%s)",
+                    fb_provider, fb_model, failed_ident.provider or "unnamed route")
+                return True
+    elif should_skip_candidate(fb_ident, current_ident):
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider)
@@ -1825,12 +1910,111 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
+_FALLBACK_SNAPSHOT_FIELDS = (
+    "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
+    "_client_kwargs", "request_overrides", "_fallback_activated", "_reasoning_echo_flag",
+    "_config_context_length", "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url",
+    "_is_anthropic_oauth", "_credential_pool", "_credential_pool_entry_id",
+    "_use_prompt_caching", "_use_native_cache_layout", "reasoning_config", "runtime_capabilities",
+    "_provider_fallback_active", "_provider_fallback_route", "_cached_system_prompt",
+    "_pending_fallback_notice", "_retry_status_buffer", "_consecutive_stale_streams",
+    "_primary_runtime",
+)
+_FALLBACK_COPY_FIELDS = {
+    "_client_kwargs", "request_overrides", "reasoning_config", "runtime_capabilities",
+    "_primary_runtime",
+}
+_COMPRESSOR_RUNTIME_FIELDS = (
+    "model", "base_url", "api_key", "provider", "api_mode", "context_length",
+    "_base_threshold_percent", "threshold_percent", "max_tokens", "threshold_tokens",
+    "_tail_token_budget", "max_summary_tokens", "last_prompt_tokens", "last_completion_tokens",
+    "last_total_tokens", "_prellm_skip_count", "_fallback_compression_streak",
+    "_summary_failure_cooldown_until", "_last_summary_error", "_consecutive_timeout_failures",
+    "_cooldown_persist_failed", "_verify_compaction_cleared_threshold",
+    "_last_compression_made_progress",
+)
+
+
+def _snapshot_fallback_runtime(agent) -> dict:
+    """Capture the finite runtime owners mutated by one fallback activation."""
+    from agent.agent_runtime_helpers import _MISSING, _copy_request_overrides
+
+    values = {}
+    for name in _FALLBACK_SNAPSHOT_FIELDS:
+        value = getattr(agent, name, _MISSING)
+        if name in _FALLBACK_COPY_FIELDS and value is not _MISSING and value is not None:
+            value = _copy_request_overrides(value)
+        elif name in {"_pending_fallback_notice", "_retry_status_buffer"} and isinstance(value, list):
+            value = list(value)
+        values[name] = value
+    cache = getattr(agent, "_transport_cache", _MISSING)
+    cache_contents = dict(cache) if isinstance(cache, dict) else cache
+    compressor = getattr(agent, "context_compressor", None)
+    compressor_values = {
+        name: getattr(compressor, name, _MISSING) for name in _COMPRESSOR_RUNTIME_FIELDS
+    } if compressor is not None else None
+    return {"values": values, "transport_cache": cache_contents, "compressor": compressor_values}
+
+
+def _restore_fallback_runtime(agent, snapshot: dict) -> None:
+    """Restore a rejected candidate before the loop considers its successor."""
+    from agent.agent_runtime_helpers import _MISSING
+
+    for name, value in snapshot["values"].items():
+        if value is _MISSING:
+            with contextlib.suppress(AttributeError):
+                delattr(agent, name)
+        else:
+            setattr(agent, name, value)
+    cache = snapshot["transport_cache"]
+    if isinstance(cache, dict) and isinstance(getattr(agent, "_transport_cache", None), dict):
+        agent._transport_cache.clear()
+        agent._transport_cache.update(cache)
+    compressor_values = snapshot["compressor"]
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None and compressor_values is not None:
+        for name, value in compressor_values.items():
+            if value is _MISSING:
+                with contextlib.suppress(AttributeError):
+                    delattr(compressor, name)
+            else:
+                setattr(compressor, name, value)
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    if getattr(agent, "_delegate_model_profile", None) == "standard":
+        if reason == FailoverReason.content_policy_blocked:
+            return False
+        saved_until = getattr(agent, "_rate_limited_until", 0)
+        saved_backoff = getattr(agent, "_rate_limit_backoff_count", 0)
+        try:
+            return _try_activate_fallback_unlocked(agent, reason, announce_cooldown=False)
+        finally:
+            agent._rate_limited_until = saved_until
+            agent._rate_limit_backoff_count = saved_backoff
+    return _try_activate_fallback_unlocked(agent, reason)
+
+
+def _try_activate_fallback_unlocked(
+    agent, reason: "FailoverReason | None" = None, *, announce_cooldown: bool = True,
+) -> bool:
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason)
+    from agent.backend_identity import BackendIdentity
+    runtime_failures = getattr(agent, "_runtime_failed_backend_identities", None)
+    if not isinstance(runtime_failures, set):
+        runtime_failures = set()
+        agent._runtime_failed_backend_identities = runtime_failures
+    current_ident = BackendIdentity.build(
+        provider=getattr(agent, "provider", ""), model=getattr(agent, "model", ""),
+        base_url=str(getattr(agent, "base_url", "") or ""),
+        api_key=getattr(agent, "api_key", None),
+    )
+    if current_ident.provider or current_ident.model or current_ident.base_url:
+        runtime_failures.add((current_ident, _fallback_failure_scope(reason)))
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)
@@ -1842,9 +2026,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
-        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+        if _should_skip_unresolved_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+            continue
+        # A raw self-identity can reject before key lookup/provider resolution; aliases whose raw
+        # identity does not prove sameness (for example an omitted-endpoint route alias) are checked
+        # again after effective resolution.
+        if _should_skip_fallback_candidate(
+            agent, fb, fb_key, fb_provider, fb_model, unavailable, pre_resolution=True,
+        ):
             continue
 
+        runtime_snapshot = None
         try:
             from agent.auxiliary_client import resolve_provider_client
             from hermes_cli.fallback_config import resolve_entry_api_key
@@ -1874,8 +2066,29 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_base_url = str(fb_client.base_url)
             if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
                 fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
+            resolved_fb = {**fb, "model": fb_model, "base_url": fb_base_url}
+            fb_identity_key = vars(fb_client).get("_api_key_provider") or getattr(fb_client, "api_key", None)
+            if _should_skip_fallback_candidate(
+                agent, resolved_fb, fb_key, fb_provider, fb_model, unavailable,
+                candidate_api_key=fb_identity_key,
+            ):
+                # Direct resolve_provider_client calls return a fresh candidate. It has not been
+                # published to the agent yet, so this owner thread must close it on rejection.
+                if fb_client is not getattr(agent, "client", None) and fb_client is not getattr(agent, "_anthropic_client", None):
+                    from agent.auxiliary_client import _close_cached_client
+                    _close_cached_client(fb_client)
+                continue
 
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+            from agent.agent_runtime_helpers import _copy_request_overrides
+            live_overrides = getattr(agent, "request_overrides", {}) or {}
+            runtime_snapshot = _snapshot_fallback_runtime(agent)
+            if not getattr(agent, "_fallback_activated", False):
+                primary_runtime = getattr(agent, "_primary_runtime", None)
+                if isinstance(primary_runtime, dict):
+                    # First fallback must freeze the pre-rescope graph so restore_primary_runtime
+                    # cannot pick up extra_body mutated by _rescope_fallback_extra_body.
+                    primary_runtime["request_overrides"] = _copy_request_overrides(live_overrides)
 
             # Clear the per-config context_length override so the fallback model's own context
             # window is resolved instead of the previous model's stale value.
@@ -1907,7 +2120,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             notice = (
                 f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
                 f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}.")
-            if cooldown_seconds is not None:
+            if announce_cooldown and cooldown_seconds is not None:
                 remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
                 notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
             _buffer_fallback_notice(agent, notice)
@@ -1924,6 +2137,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
             return True
         except Exception as e:
+            if runtime_snapshot is not None:
+                with contextlib.suppress(Exception):
+                    _restore_fallback_runtime(agent, runtime_snapshot)
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)
@@ -2089,12 +2305,22 @@ def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
 
 
 def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
-    summary_kwargs = _iteration_summary_chat_kwargs(agent, api_messages)
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    wire_messages = ChatCompletionsTransport().convert_messages(
+        api_messages, model=agent.model,
+    )
+    summary_kwargs = _iteration_summary_chat_kwargs(agent, wire_messages)
 
     def _attempt(retry_count: int) -> str:
         summary_client = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry" if retry_count else "iteration_limit_summary")
+        from agent import relay_llm
         response = _managed_summary_call(
-            agent, api_request_id, summary_kwargs, lambda request: summary_client.chat.completions.create(**request), retry_count=retry_count)
+            agent, api_request_id, summary_kwargs,
+            lambda request: relay_llm.physical_send(
+                request, lambda final: summary_client.chat.completions.create(**final)
+            ),
+            retry_count=retry_count)
         return _summary_text(agent, response)
     return _attempt
 
@@ -2137,6 +2363,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
             if text:
                 summary_call_outcome = "success"
+                if hasattr(agent, "_delegate_successful_llm_route"):
+                    agent._delegate_successful_llm_route = (agent.model, agent.provider)
                 append_message(messages, {"role": "assistant", "content": text})
                 final_response = text
             break
@@ -2334,7 +2562,10 @@ class _BedrockStream:
             "   Grant that action to restore streaming output.\n")
         logger.info("bedrock: converse_stream denied by IAM (%s) — "
             "using non-streaming converse() for this session.", type(exc).__name__)
-        return normalize_converse_response(client.converse(**final_kwargs))
+        from agent import relay_llm
+        return normalize_converse_response(relay_llm.physical_send(
+            final_kwargs, lambda request: client.converse(**request)
+        ))
 
     def _worker(self):
         agent = self.agent
@@ -2543,8 +2774,12 @@ class _StreamingCall(StreamingWaitMonitor):
     @staticmethod
     def _quiet(fn, *args) -> None:
         """Best-effort callback: never let a display hook break the stream."""
-        with contextlib.suppress(Exception):
+        try:
             fn(*args)
+        except StreamPayloadBoundExceeded:
+            raise
+        except Exception:
+            pass
 
     def _set_managed_stream(self, stream: Any) -> Any:
         self.managed_stream_holder["stream"] = stream
@@ -2623,7 +2858,8 @@ class _StreamingCall(StreamingWaitMonitor):
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
         if self.agent.stream_delta_callback:
-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+            self._quiet(self.agent.stream_delta_callback, text)
+            self.agent._record_streamed_assistant_text(text)
 
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
@@ -2698,7 +2934,10 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
-        return request_client.chat.completions.create(**stream_kwargs)
+        from agent import relay_llm
+        return relay_llm.physical_send(
+            stream_kwargs, lambda request: request_client.chat.completions.create(**request)
+        )
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
@@ -3162,10 +3401,16 @@ class _StreamingCall(StreamingWaitMonitor):
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    self.result["error"] = e
+                    return
                 except Exception as e:
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
                         return
+        except StreamPayloadBoundExceeded as e:
+            self.result["error"] = e
+            return
         except InterruptedError as e:
             # Fast pre-retry interrupt surfaces through the normal result channel.
             self.result["error"] = e
@@ -3327,6 +3572,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
             self.worker.start()
             self._monitor_loop()
+        if isinstance(self.result["error"], StreamPayloadBoundExceeded):
+            raise self.result["error"]
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag

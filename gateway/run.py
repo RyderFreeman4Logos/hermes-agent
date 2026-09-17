@@ -2960,27 +2960,12 @@ def _format_concise_process_notification(
 def _format_gateway_process_notification(evt: dict) -> "str | None":
     """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
     evt_type = evt.get("type", "completion")
-    _sid = evt.get("session_id", "unknown")
-    _cmd = evt.get("command", "unknown")
 
     # watch_disabled / overflow events carry their summary in `message` (process_registry formatter).
     if evt_type in ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released"):
         return f"[IMPORTANT: {evt.get('message', '')}]"
 
-    if evt_type == "watch_match":
-        _pat = evt.get("pattern", "?")
-        _out = evt.get("output", "")
-        _sup = evt.get("suppressed", 0)
-        text = (
-            f"[IMPORTANT: Background process {_sid} matched "
-            f"watch pattern \"{_pat}\".\n"
-            f"Command: {_cmd}\nMatched output:\n{_out}")
-        if _sup:
-            text += f"\n({_sup} earlier matches were suppressed by rate limit)"
-        text += "]"
-        return text
-
-    if evt_type == "async_delegation":
+    if evt_type in {"watch_match", "async_delegation"}:
         from tools.process_registry_notifications import format_process_notification
         return format_process_notification(evt)
 
@@ -3346,6 +3331,54 @@ class GatewayRunner(
         """Return the SessionState for ``session_key`` without creating one."""
         sessions = self.__dict__.get("_sessions")
         return sessions.get(session_key) if sessions else None
+
+    def _attach_model_switch_after_compression(self, session_key: Optional[str], agent: Any) -> None:
+        """Bind conversation-scoped deferred route state to a live agent."""
+        if not session_key:
+            return
+        state = self._peek_session_state(session_key)
+        pending = state.conversation.after_compression_model_switch if state is not None else None
+        from hermes_cli.model_switch import (
+            get_model_switch_after_compression,
+            schedule_model_switch_after_compression,
+        )
+        if pending is None:
+            # A cold AIAgent restores the durable, secret-free descriptor before the host attaches
+            # it. Adopt that exact result so the host callback and surface state survive recreation.
+            pending = get_model_switch_after_compression(agent)
+            if pending is not None:
+                state = self._session_state(session_key)
+                state.conversation.after_compression_model_switch = pending
+        if pending is None:
+            return
+
+        def _on_applied(result, old_model, _old_provider):
+            current = self._peek_session_state(session_key)
+            if current is None or current.conversation.after_compression_model_switch is not result:
+                return
+            current.conversation.after_compression_model_switch = None
+            current.conversation.model_override = {
+                "model": result.new_model, "provider": result.target_provider,
+                "api_key": result.api_key, "base_url": result.base_url, "api_mode": result.api_mode,
+            }
+            if result.reasoning_config is not None:
+                current.conversation.model_override["reasoning_config"] = dict(result.reasoning_config)
+            store = getattr(self, "session_store", None)
+            if store is not None:
+                try:
+                    # SessionStore is the thread-safe synchronous authority at callback boundaries;
+                    # it sanitizes credentials and makes the committed route survive a restart.
+                    store.set_model_override(session_key, current.conversation.model_override)
+                except Exception:
+                    logger.debug("Failed to persist deferred session model override", exc_info=True)
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            if pending_notes is not None:
+                pending_notes[session_key] = (
+                    f"[Note: model was just switched from {old_model} to "
+                    f"{result.new_model} via {result.provider_label or result.target_provider}. "
+                    "Adjust your self-identification accordingly.]")
+
+        schedule_model_switch_after_compression(agent, pending, on_applied=_on_applied)
 
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""

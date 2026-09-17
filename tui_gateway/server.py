@@ -591,6 +591,13 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    # Authoritative moment a terminal turn frame leaves the gateway. Keep completed_at
+    # on the frame (not client Date.now()) so delayed delivery is distinguishable.
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
+        stamp = globals().get("_stamp_loop_cache_info")
+        if callable(stamp):
+            stamp(sid, payload)
     write_json(_event_frame(event, sid, payload))
 
 
@@ -908,6 +915,10 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     if isinstance(resume_overrides, dict) and resume_overrides and _overrides_have_routable_provider(resume_overrides):
         kw.update(resume_overrides)
     else:
+        if isinstance(resume_overrides, dict):
+            memory_mode = resume_overrides.get("memory_provider_mode_override")
+            if memory_mode in {"authoritative", "hybrid"}:
+                kw["memory_provider_mode_override"] = memory_mode
         if override := current.get("model_override"):
             kw["model_override"] = override
         kw.update({k: v for k, v in (("reasoning_config_override", current.get("create_reasoning_override")),
@@ -954,12 +965,13 @@ def _await_resume_history(sid: str, current: dict) -> bool:
         return _sessions.get(sid) is current
 
 
-def _attach_built_agent(current: dict, agent) -> None:
+def _attach_built_agent(sid: str, current: dict, agent) -> None:
     """Attach a freshly built agent to its live record (session DB row deferred to first run_conversation())."""
     # Bot Mode gate hint: the DB title lands post-first-turn but the system prompt builds at turn START.
     if _title_hint := str(current.get("pending_title") or "").strip():
         agent._session_title_hint = _title_hint
     current["agent"] = agent
+    _attach_model_switch_after_compression(sid, current, agent)
     _session_todo_state(current)
     # Baseline for the per-turn config sync (profile home override still active).
     current["config_model_seen"] = _config_model_target()
@@ -1044,7 +1056,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 agent = _make_agent(sid, key, **_deferred_build_agent_kwargs(current, session_db))
             finally:
                 _clear_session_context(tokens)
-            _attach_built_agent(current, agent)
+            _attach_built_agent(sid, current, agent)
             # No eager slash-worker pre-warm (slash.exec spawns on demand): each worker forks the full stdio
             # MCP fleet, and live-transport sessions are never reaped, so fleets would accumulate.
             notify_registered = _wire_session_agent(sid, key, agent)
@@ -1526,6 +1538,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
+    memory_provider_mode = model_config.get("memory_provider_mode")
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        overrides["memory_provider_mode_override"] = memory_provider_mode
     return overrides
 
 
@@ -1556,6 +1571,9 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
             config[key] = value
         else:
             config.pop(key, None)
+    memory_provider_mode = getattr(agent, "_memory_provider_mode", None)
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        config["memory_provider_mode"] = memory_provider_mode
     return config
 
 
@@ -2262,12 +2280,13 @@ def _make_agent(
     sid: str, key: str, session_id: str | None = None, session_db=None,
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
-    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None):
+    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
+    memory_provider_mode_override: str | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
     from run_agent import AIAgent
     # MCP discovery runs in a daemon thread (a dead server can't freeze the shell); the agent snapshots its tool
     # list once, so briefly wait for in-flight discovery. Dashboard /api/ws uses mcp_startup; TUI stdio uses entry.
@@ -2290,7 +2309,10 @@ def _make_agent(
         credential_pool=runtime.get("credential_pool"), quiet_mode=True,
         verbose_logging=False,  # DEBUG agent logging; independent of tool_progress_mode
         reasoning_config=(
-            reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
+            reasoning_config_override if reasoning_config_override is not None else (
+                dict(model_override["reasoning_config"])
+                if isinstance(model_override, dict) and isinstance(model_override.get("reasoning_config"), dict)
+                else _load_reasoning_config(str(model or "")))),
         service_tier=service_tier_override if service_tier_override is not None else _load_service_tier(),
         enabled_toolsets=_load_enabled_toolsets(platform),
         # OpenRouter provider_routing prefs (gateway + CLI parity).
@@ -2301,12 +2323,13 @@ def _make_agent(
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
+        memory_provider_mode_override=memory_provider_mode_override,
         **_agent_cbs(sid))
     if context_cwd_is_launch_artifact is None:
         with _sessions_lock:
             context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(_sessions.get(sid))
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
-    return agent
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | None) -> None:
@@ -2362,6 +2385,8 @@ def _init_session(
             "transport": current_transport() or _stdio_transport,
         }
         _session_todo_state(_sessions[sid])
+        # Adopt cold-restored intent before releasing the new session record to readers.
+        _attach_model_switch_after_compression(sid, _sessions[sid], agent)
     _hydrate_session_cwd(sid, key, session_db, profile_home)
     _register_session_cwd(_sessions[sid])
     _wire_session_agent(sid, key, agent)  # no eager slash-worker pre-warm (see _start_agent_build)
@@ -2682,8 +2707,11 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
         try:
             # include_compacted: a compacted session's archived turns are still the user's
             # conversation; without them a warm switch repainted the chat as summary + tail only.
-            display = db.get_messages_as_conversation(
-                key, include_ancestors=True, include_row_ids=True, include_compacted=True)
+            if limit := session.get("display_history_limit"):
+                _model, display = db.get_resume_conversations(key, max_display_messages=limit)
+            else:
+                display = db.get_messages_as_conversation(
+                    key, include_ancestors=True, include_row_ids=True, include_compacted=True)
             # See #92080.
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
@@ -3211,7 +3239,7 @@ from . import (  # noqa: E402
     methods_complete as _methods_complete, methods_config as _methods_config,
     methods_config_set as _methods_config_set, methods_images as _methods_images,
     methods_profiles as _methods_profiles, methods_prompt as _methods_prompt, methods_session as _methods_session,
-    methods_tools as _methods_tools, prompt_turn as _prompt_turn, billing_view as _billing_view,
+    methods_tools as _methods_tools, prompt_turn as _prompt_turn, cache_telemetry as _cache_telemetry, billing_view as _billing_view,
     methods_projects as _methods_projects, methods_session_foreign as _methods_session_foreign,
     methods_session_control as _methods_session_control, methods_subagents as _methods_subagents)
 
@@ -3222,7 +3250,7 @@ for _m in (
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,
     _methods_browser_control, _methods_session, _methods_prompt, _methods_config,
     _methods_config_set, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
-    _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
+    _methods_bot_relay, _prompt_turn, _cache_telemetry, _billing_view, _methods_projects, _methods_session_foreign,
     _methods_session_control, _methods_subagents):
     _m.register(sys.modules[__name__])
 del _m

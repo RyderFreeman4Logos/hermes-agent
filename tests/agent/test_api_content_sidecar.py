@@ -503,7 +503,7 @@ class TestWireInvariant:
         assert len(reqs) == 2
         sent_1 = _user_messages(reqs[0])[0]["content"]
         sent_2 = _user_messages(reqs[1])[0]["content"]
-        assert sent_1.startswith("hello please\n\n[Agent loop timing]\nCurrent loop start: ")
+        assert sent_1.startswith("hello please\n\n[Agent loop timing]\nCurrent loop started: ")
         assert sent_1.endswith("\n\nPLUGIN-CTX")
         assert sent_2 == sent_1  # repeated builds: identical bytes
 
@@ -546,9 +546,9 @@ class TestWireInvariant:
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
         assert current["content"].startswith(
-            "second question\n\n[Agent loop timing]\nCurrent loop start: "
+            "second question\n\n[Agent loop timing]\nCurrent loop started: "
         )
-        assert "\nLatest successful completed loop stop: " in current["content"]
+        assert "\nPrevious loop ended: " in current["content"]
         assert current["content"].endswith("\n\nPLUGIN-CTX")
 
 

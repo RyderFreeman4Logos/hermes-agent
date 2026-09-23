@@ -973,6 +973,10 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     if isinstance(resume_overrides, dict) and resume_overrides and _overrides_have_routable_provider(resume_overrides):
         kw.update(resume_overrides)
     else:
+        if isinstance(resume_overrides, dict):
+            memory_mode = resume_overrides.get("memory_provider_mode_override")
+            if memory_mode in {"authoritative", "hybrid"}:
+                kw["memory_provider_mode_override"] = memory_mode
         if override := current.get("model_override"):
             kw["model_override"] = override
         kw.update({k: v for k, v in (("reasoning_config_override", current.get("create_reasoning_override")),
@@ -1571,6 +1575,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
+    memory_provider_mode = model_config.get("memory_provider_mode")
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        overrides["memory_provider_mode_override"] = memory_provider_mode
     return overrides
 
 
@@ -1601,6 +1608,9 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
             config[key] = value
         else:
             config.pop(key, None)
+    memory_provider_mode = getattr(agent, "_memory_provider_mode", None)
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        config["memory_provider_mode"] = memory_provider_mode
     return config
 
 
@@ -2389,7 +2399,8 @@ def _make_agent(
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
     platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
-    cwd_override: str | None = None, auth_user_id: str | None = None):
+    cwd_override: str | None = None, auth_user_id: str | None = None,
+    memory_provider_mode_override: str | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -2436,6 +2447,7 @@ def _make_agent(
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
+        memory_provider_mode_override=memory_provider_mode_override,
         **_agent_cbs(sid))
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)

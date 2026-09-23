@@ -196,7 +196,7 @@ class GatewaySlashCommandsMixin(
         """The live running agent for *session_key*, else the cached one, else None. The pending
         sentinel (a run that is starting) never counts as a usable agent."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        agent = self._running_agents.get(session_key)
+        agent = getattr(self, "_running_agents", {}).get(session_key)
         if agent is not None and agent is not _AGENT_PENDING_SENTINEL:
             return agent
         return self._cached_agent_for(session_key)
@@ -882,13 +882,46 @@ class GatewaySlashCommandsMixin(
     async def _handle_memory_command(self, event: MessageEvent) -> str:
         """Handle /memory — review pending memory writes + toggle the approval gate. Entries are small
         enough to review inline, so the full flow works on every platform."""
-        from hermes_cli.write_approval_commands import handle_pending_subcommand
+        from hermes_cli.write_approval_commands import (
+            handle_pending_subcommand, load_authoritative_memory_manager,
+        )
         from tools import write_approval as wa
         from tools.memory_tool import load_on_disk_store
+        session_key = self._session_key_for_source(event.source)
+        agent = self._resident_agent_for(session_key) if session_key else None
+        source = event.source
+        # The slash-command mixin is also a public surface for lightweight runners that only
+        # provide config commands. Full GatewayRunner instances expose this facade and retain the
+        # persisted-session binding required by cold authoritative approvals.
+        session_store = getattr(self, "async_session_store", None)
+        session_entry = (
+            await session_store.get_or_create_session(source)
+            if session_store is not None else None
+        )
+        approval_session_id = (
+            getattr(agent, "session_id", None)
+            or getattr(session_entry, "session_id", None)
+        )
+
         # Apply approved writes against a fresh on-disk store (the gateway has no long-lived agent;
         # the store persists to the same MEMORY/USER.md and honors the configured char limits).
         out = handle_pending_subcommand(
             wa.MEMORY, event.get_command_args().strip().split(), memory_store=load_on_disk_store(),
+            memory_manager=getattr(agent, "_memory_manager", None),
+            memory_manager_factory=lambda: approval_session_id and load_authoritative_memory_manager(
+                session_id=approval_session_id,
+                platform=source.platform.value if source.platform else "gateway",
+                identity={
+                    "user_id": source.user_id,
+                    "user_id_alt": source.user_id_alt,
+                    "user_name": source.user_name,
+                    "chat_id": source.chat_id,
+                    "chat_name": source.chat_name,
+                    "chat_type": source.chat_type,
+                    "thread_id": source.thread_id,
+                    "gateway_session_key": session_key,
+                },
+            ),
             set_mode_fn=self._write_approval_setter("memory", event))
         return out if out is not None else (
             "Unknown /memory subcommand. Use: pending, approve <id>, reject <id>, approval <on|off>."

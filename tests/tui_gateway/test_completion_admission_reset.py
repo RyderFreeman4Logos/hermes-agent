@@ -58,7 +58,7 @@ class _Agent(InterruptControlMixin):
 
 
 class _InlineThread:
-    def __init__(self, target=None, daemon=None, args=(), kwargs=None):
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
         self._target = target
         self._args = args
         self._kwargs = kwargs or {}
@@ -170,7 +170,7 @@ def test_finishing_turn_never_drains_successor_correction(
     def admit_and_correct(*_args, **_kwargs):
         session["running"] = True
         assert server._admit_prompt_turn(
-            "owner-ui", session, "successor", None, None
+            "owner-ui", session, "successor", None, None, None, None
         ) == ([], agent)
         agent._executing_tools = mode == "interrupt"
         response = server._handle_busy_submit(
@@ -216,8 +216,8 @@ def test_admission_reset_precedes_waiting_busy_correction(
     original_clear = agent.clear_interrupt
     results: dict[str, object] = {}
 
-    def gated_start(target_session, text):
-        original_start(target_session, text)
+    def gated_start(target_session, text, **kwargs):
+        original_start(target_session, text, **kwargs)
         admitted_inside_lock.set()
         assert release_admission.wait(2), "admission release timed out"
 
@@ -229,7 +229,7 @@ def test_admission_reset_precedes_waiting_busy_correction(
     def admit() -> None:
         try:
             results["admit"] = server._admit_prompt_turn(
-                "sid", session, "start turn", None, None
+                "sid", session, "start turn", None, None, None, None
             )
         except BaseException as exc:  # surfaced after both threads are joined
             results["admit_error"] = exc

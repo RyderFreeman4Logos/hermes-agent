@@ -23,6 +23,7 @@ Scenario:
 
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -242,7 +243,7 @@ class TestFallbackChainResetOnTransportRecovery:
         calls = []
 
         def fake_api_call(api_kwargs):
-            calls.append((agent.provider, agent.model))
+            calls.append((agent.provider, agent.model, deepcopy(api_kwargs["messages"])))
             attempt = len(calls)
             if attempt == 1:
                 agent._fallback_index = len(agent._fallback_chain)
@@ -280,12 +281,18 @@ class TestFallbackChainResetOnTransportRecovery:
 
         assert result["completed"] is True
         assert result["final_response"] == "Recovered via fallback"
-        assert calls == [
+        assert [(provider, model) for provider, model, _messages in calls] == [
             ("zai", "glm-5.1"),
             ("zai", "glm-5.1"),
             ("zai", "glm-5.1"),
             ("zai", "glm-4.7"),
         ]
+        decorated = [
+            next(row for row in messages if row.get("role") == "user")["content"]
+            for _provider, _model, messages in calls
+        ]
+        assert decorated == [decorated[0]] * 4
+        assert decorated[0].count("[Agent loop timing]") == 1
         mock_resolve.assert_called_once()
         assert agent._fallback_activated is True
         assert agent.model == "glm-4.7"

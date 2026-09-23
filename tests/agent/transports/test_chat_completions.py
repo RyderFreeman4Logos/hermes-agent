@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -202,6 +203,43 @@ class TestChatCompletionsBasic:
         returned by identity (preserves the deepcopy-on-demand contract)."""
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
+
+    def test_convert_messages_strips_persistence_only_display_fields(self, transport):
+        message = {
+            "role": "user",
+            "content": "ordinary decorated input",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "background"},
+        }
+
+        converted = transport.convert_messages([message])
+
+        assert converted == [{"role": "user", "content": "ordinary decorated input"}]
+        assert message["display_kind"] == "internal_notification"
+        assert message["display_metadata"] == {"source": "background"}
+
+    def test_iteration_summary_uses_the_same_display_field_sanitizer(self):
+        from agent.chat_completion_helpers import _chat_summary_attempt
+
+        message = {
+            "role": "user",
+            "content": "decorated input",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "background"},
+        }
+        agent = SimpleNamespace(
+            model="test/model",
+            _force_ascii_payload=False,
+            _build_api_kwargs=lambda messages, tools_for_api=None: {},
+        )
+
+        with patch.object(agent, "_build_api_kwargs", return_value={}) as build_kwargs:
+            _chat_summary_attempt(agent, [message], "request-id")
+
+        build_kwargs.assert_called_once_with(
+            [{"role": "user", "content": "decorated input"}],
+        )
+        assert message["display_kind"] == "internal_notification"
 
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.

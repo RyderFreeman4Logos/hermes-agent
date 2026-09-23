@@ -258,7 +258,7 @@ def nous_rate_limit_guard(
                     _nous_msg = f"Your Nous account has hit its rate limit; it resets in {reset}."
                 agent._buffer_vprint(f"⏳ {_nous_msg} Trying fallback...")
                 agent._buffer_diagnostic_status(f"⏳ {_nous_msg}")
-                if agent._try_activate_fallback():
+                if agent._try_activate_fallback(reason=FailoverReason.rate_limit):
                     active_system_prompt = _arm_fallback_restart(
                         agent, api_messages, active_system_prompt, _retry)
                     retry_count = 0

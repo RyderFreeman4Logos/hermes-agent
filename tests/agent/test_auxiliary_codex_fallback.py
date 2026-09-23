@@ -261,8 +261,8 @@ def test_vision_auto_order_is_codex_only():
     assert aux._VISION_AUTO_PROVIDER_ORDER == ("openai-codex",)
 
 
-def test_lean_digest_workers_keep_independent_real_call_receipts():
-    """Each lean sibling owns the fallback receipt refreshed by real call_llm."""
+def test_lean_summary_keeps_the_real_codex_call_receipt():
+    """Official lean compression is one summary call; its receipt is the route call_llm selected."""
     class CapacityUnavailable(Exception):
         status_code = 402
 
@@ -306,7 +306,7 @@ def test_lean_digest_workers_keep_independent_real_call_receipts():
         }],
     }
     real_call_llm = aux.call_llm
-    sibling_receipts = []
+    receipts = []
 
     def cached_client(provider, model=None, **_kwargs):
         if provider == "openai-codex":
@@ -315,9 +315,9 @@ def test_lean_digest_workers_keep_independent_real_call_receipts():
 
     def observed_call_llm(**kwargs):
         response = real_call_llm(**kwargs)
-        if kwargs.get("provider") == "openai-codex":
+        if kwargs.get("task") == "compression":
             receipt = kwargs["route_info"]
-            sibling_receipts.append((receipt, dict(receipt)))
+            receipts.append((receipt, dict(receipt)))
         return response
 
     turns = [
@@ -327,8 +327,7 @@ def test_lean_digest_workers_keep_independent_real_call_receipts():
     ]
     compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
     with (
-        patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", 88),
-        patch("agent.auxiliary_client.call_llm", observed_call_llm),
+        patch("agent.context_compressor.call_llm", observed_call_llm),
         patch("agent.auxiliary_client._get_task_max_concurrency", return_value=1),
         patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
         patch("agent.auxiliary_client._get_cached_client", side_effect=cached_client),
@@ -338,21 +337,22 @@ def test_lean_digest_workers_keep_independent_real_call_receipts():
             side_effect=lambda messages, tools, **_kwargs: (messages, tools or []),
         ),
     ):
-        compressor._build_chunk_digests(turns)
+        summary = compressor._generate_summary(turns)
 
-    assert len(physical_requests) == 3
-    assert len(sibling_receipts) == 2
-    assert sibling_receipts[0][0] is not sibling_receipts[1][0]
-    for _receipt_object, receipt in sibling_receipts:
-        assert receipt == {
-            "provider": "openai-codex",
-            "model": "codex-model",
-            "fallback_label": "fallback_chain[0](openai-codex)",
-            "base_url": "https://physical-codex.invalid/backend-api/codex",
-            "api_key": "synthetic-physical-key",
-            "api_mode": "codex_responses",
-            "timeout": 37.0,
-        }
+    assert summary
+    assert len(physical_requests) == 1
+    assert len(receipts) == 1
+    receipt_object, receipt = receipts[0]
+    assert receipt_object is not None
+    assert receipt == {
+        "provider": "openai-codex",
+        "model": "codex-model",
+        "fallback_label": "fallback_chain[0](openai-codex)",
+        "base_url": "https://physical-codex.invalid/backend-api/codex",
+        "api_key": "synthetic-physical-key",
+        "api_mode": "codex_responses",
+        "timeout": 37.0,
+    }
 
 
 def test_public_sync_generic_error_advances_failed_candidate_to_later_codex_hop(monkeypatch, tmp_path):

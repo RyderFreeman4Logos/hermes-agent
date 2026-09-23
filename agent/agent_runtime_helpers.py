@@ -1102,6 +1102,14 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
             prefetched = True
         next_at = getattr(pool, "next_available_at", lambda: None)()
         if next_at is not None and next_at > time.time():
+            # next_available_at is read-only: it will not run the early Codex
+            # quota probe that select() uses. A weekly reset can reopen early;
+            # staying on fallback until that stamp is a multi-day cache break.
+            entry = pool.current() if pool is not None and hasattr(pool, "current") else None
+            if primary_provider == "openai-codex" and bool(
+                getattr(pool, "_codex_quota_restored_upstream", lambda _entry: False)(entry)
+            ):
+                return False, prefetched_pool, prefetched
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(

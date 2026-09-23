@@ -104,11 +104,11 @@ def compose_user_api_content(
     return None if injection is None else content + "\n\n" + injection
 
 
-def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
+def substitute_api_content(api_msg: Dict[str, Any]) -> Any:
     """Pop the ``api_content`` sidecar and substitute it into ``content`` (keeps the
     prompt-cache prefix byte-stable). Returns the popped sidecar, or ``None``."""
     sidecar = api_msg.pop("api_content", None)
-    if isinstance(sidecar, str) and sidecar and api_msg.get("role") in ("user", "assistant"):
+    if isinstance(sidecar, (str, list, dict)) and sidecar and api_msg.get("role") in ("user", "assistant"):
         api_msg["content"] = sidecar
     return sidecar
 
@@ -119,10 +119,10 @@ def drop_stale_api_content(msg: Dict[str, Any]) -> None:
     msg.pop("api_content", None)
 
 
-def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
-    """Extract the ``api_content`` sidecar; ``None`` when absent/non-string."""
+def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Any:
+    """Extract a supported ``api_content`` sidecar; ``None`` when absent."""
     v = msg.get("api_content")
-    return v if isinstance(v, str) else None
+    return v if isinstance(v, (str, list, dict)) else None
 
 
 def _pop_turn_note(agent: Any, attr: str) -> str:
@@ -1008,6 +1008,15 @@ def build_turn_context(
     if recovered_history is not None:
         conversation_history = recovered_history
 
+    # The public facade marks one external loop start. Tool/LLM continuations stay
+    # inside the loop and direct internal projections do not acquire a new start.
+    if getattr(agent, "_loop_timing_external_start", False):
+        from agent.loop_timing import decorate_loop_start_input
+        user_message, persist_user_message = decorate_loop_start_input(
+            agent, user_message, persist_user_message
+        )
+        agent._loop_timing_external_start = False
+
     # Tag log records on this thread with the session ID for ``hermes logs``; bind the
     # skill write-origin ContextVar; restore the primary runtime after a fallback turn.
     # NOTE: the DB session row is created later, AFTER the system prompt is restored/built (see
@@ -1222,7 +1231,7 @@ def build_api_messages(
         # Inject ephemeral context (memory prefetch + pre_llm_call user hooks)
         # at API time only; `messages` is untouched beyond the api_content stamp.
         if msg is current_turn_message and msg.get("role") == "user":
-            if isinstance(_api_content, str) and _api_content:
+            if isinstance(_api_content, (str, list, dict)) and _api_content:
                 # Reuse the prologue's stamp so sidecar and wire cannot drift
                 # and every pass this turn sends identical bytes.
                 api_msg["content"] = _api_content
@@ -1234,7 +1243,7 @@ def build_api_messages(
                 if _composed is not None:
                     api_msg["content"] = _composed
         elif (
-            isinstance(_api_content, str) and _api_content
+            isinstance(_api_content, (str, list, dict)) and _api_content
             and msg.get("role") in ("user", "assistant")
         ):
             # Historical row: replay the exact bytes sent live so the prompt-cache

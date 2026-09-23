@@ -80,6 +80,49 @@ class TestSameCredentialSurface:
         b = _id("proxy-b", "m", "http://gw:9000/v1")
         assert not same_credential_surface(a, b)
 
+    def test_matching_fingerprint_does_not_collapse_distinct_labels(self):
+        """A shared resolved key string is not a credential surface.
+
+        Distinct provider labels own their own config (including first-class
+        pairs that are not both in PROVIDER_REGISTRY). Matching fingerprints
+        only disambiguate keys on one label; otherwise a billing 403 on
+        xai-oauth strands openai/gpt-4o when both resolve to the same client.
+        """
+        failed = BackendIdentity.build(
+            provider="xai-oauth", model="grok-4.6",
+            base_url="https://fallback.invalid/v1", api_key="fallback-key",
+        )
+        candidate = BackendIdentity.build(
+            provider="openai", model="gpt-4o",
+            base_url="https://fallback.invalid/v1", api_key="fallback-key",
+        )
+        assert not same_credential_surface(candidate, failed)
+        assert not should_skip_candidate(candidate, failed, FailureScope.CREDENTIAL)
+
+    def test_matching_fingerprint_on_same_label_is_same_credential(self):
+        failed = BackendIdentity.build(
+            provider="openrouter", model="model-a",
+            base_url="https://openrouter.ai/api/v1", api_key="same-key",
+        )
+        sibling = BackendIdentity.build(
+            provider="openrouter", model="model-b",
+            base_url="https://openrouter.ai/api/v1", api_key="same-key",
+        )
+        assert same_credential_surface(sibling, failed)
+        assert should_skip_candidate(sibling, failed, FailureScope.CREDENTIAL)
+
+    def test_distinct_fingerprints_on_same_label_remain_eligible(self):
+        failed = BackendIdentity.build(
+            provider="openrouter", model="model-a",
+            base_url="https://openrouter.ai/api/v1", api_key="fixture-key-a",
+        )
+        candidate = BackendIdentity.build(
+            provider="openrouter", model="model-b",
+            base_url="https://openrouter.ai/api/v1", api_key="fixture-key-b",
+        )
+        assert not same_credential_surface(candidate, failed)
+        assert not should_skip_candidate(candidate, failed, FailureScope.CREDENTIAL)
+
 
 
 class TestSameEndpoint:

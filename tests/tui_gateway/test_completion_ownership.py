@@ -18,7 +18,7 @@ from tui_gateway import server
 
 
 class _InlineThread:
-    def __init__(self, target=None, daemon=None, args=(), kwargs=None):
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
         self._target = target
         self._args = args
         self._kwargs = kwargs or {}
@@ -177,7 +177,7 @@ def test_real_refusal_does_not_release_successor_turn(monkeypatch, tmp_path):
         assert session["running"] is False
         blocker.release()
         session["running"] = True
-        assert server._admit_prompt_turn("owner-ui", session, "successor", None, None) == (
+        assert server._admit_prompt_turn("owner-ui", session, "successor", None, None, None, None) == (
             [], agent
         )
         successor_lease = session["active_session_lease"]
@@ -327,7 +327,7 @@ def test_idle_completion_claim_keeps_receipt_pending_when_prompt_submit_claims_a
             # This is the same history-lock transaction used by prompt.submit,
             # after its normal busy observation has seen the session idle.
             err, _fields = server._lock_in_submit_turn(
-                "user-rid", sid, session, "actual user prompt", {}, False, None, None
+                "user-rid", sid, session, "actual user prompt", {}, False, None, None, None
             )
             assert err is None
 

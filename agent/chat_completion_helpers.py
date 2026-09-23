@@ -2081,6 +2081,24 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    if getattr(agent, "_delegate_model_profile", None) == "standard":
+        if reason == FailoverReason.content_policy_blocked:
+            return False
+        saved_until = getattr(agent, "_rate_limited_until", 0)
+        saved_backoff = getattr(agent, "_rate_limit_backoff_count", 0)
+        try:
+            return _try_activate_fallback_unlocked(
+                agent, reason, reset_at=reset_at, announce_cooldown=False,
+            )
+        finally:
+            agent._rate_limited_until = saved_until
+            agent._rate_limit_backoff_count = saved_backoff
+    return _try_activate_fallback_unlocked(agent, reason, reset_at=reset_at)
+
+
+def _try_activate_fallback_unlocked(
+    agent, reason: "FailoverReason | None" = None, reset_at=None, *, announce_cooldown: bool = True,
+) -> bool:
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
@@ -2100,6 +2118,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             continue
 
         runtime_snapshot = None
+        old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
         try:
             from agent.auxiliary_client import resolve_provider_client
             from hermes_cli.fallback_config import resolve_entry_api_key
@@ -2143,7 +2162,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                 elif not fb_api_mode_explicit and fb_api_mode == "chat_completions":
                     fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
-            old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
             from agent.agent_runtime_helpers import _copy_request_overrides
             live_overrides = getattr(agent, "request_overrides", {}) or {}
             runtime_snapshot = _snapshot_fallback_runtime(agent)
@@ -2188,7 +2206,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             notice = (
                 f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
                 f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}.")
-            if cooldown_seconds is not None:
+            if announce_cooldown and cooldown_seconds is not None:
                 remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
                 notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
             _buffer_fallback_notice(agent, notice)
@@ -2205,7 +2223,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
             return True
         except Exception as e:
-            if runtime_snapshot is not None:
+            route_mutated = (
+                agent.model != old_model
+                or agent.provider != old_provider
+                or agent.base_url != old_base_url
+            )
+            if runtime_snapshot is not None and not route_mutated:
                 with contextlib.suppress(Exception):
                     _restore_fallback_runtime(agent, runtime_snapshot)
             if fb_provider == "nous":
@@ -2395,6 +2418,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
             if text:
                 summary_call_outcome = "success"
+                if hasattr(agent, "_delegate_successful_llm_route"):
+                    agent._delegate_successful_llm_route = (agent.model, agent.provider)
                 append_message(messages, {"role": "assistant", "content": text})
                 final_response = text
             break

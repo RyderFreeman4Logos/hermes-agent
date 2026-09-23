@@ -620,17 +620,27 @@ class TestWireInvariant:
             agent1.run_conversation(list(turn), conversation_history=[], task_id="t1")
 
         sent = _user_messages(_chat_requests(handler)[0])[0]["content"]
-        assert sent == [*turn, {"type": "text", "text": "PLUGIN-CTX"}]
+        assert sent[0] == turn[0]
+        assert sent[1] == image
+        assert sent[2]["type"] == "text"
+        assert sent[2]["text"].startswith("[Agent loop timing]\nCurrent loop start: ")
+        assert sent[3] == {"type": "text", "text": "PLUGIN-CTX"}
 
         history = db.get_messages_as_conversation(sid)
-        assert "PLUGIN-CTX" in history[0]["content"]  # persisted with the turn, not dropped
+        assert history[0]["content"] == "what is this\n[screenshot]"
+        sidecar = history[0]["api_content"]
+        assert sidecar[0] == turn[0]
+        assert sidecar[1] == image
+        assert sidecar[2]["type"] == "text"
+        assert sidecar[2]["text"].startswith("[Agent loop timing]\nCurrent loop start: ")
+        assert sidecar[3] == {"type": "text", "text": "PLUGIN-CTX"}
 
         handler.captured_requests = []
         agent2 = make_agent()
         with patch.object(AIAgent, "_model_supports_vision", return_value=True):
             agent2.run_conversation("second question", conversation_history=history, task_id="t2")
         replayed = _user_messages(_chat_requests(handler)[0])[0]["content"]
-        assert replayed == history[0]["content"]
+        assert replayed == history[0]["api_content"]
 
 
 # ---------------------------------------------------------------------------

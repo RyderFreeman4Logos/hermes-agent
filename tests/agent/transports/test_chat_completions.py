@@ -227,16 +227,16 @@ class TestChatCompletionsBasic:
             "display_kind": "internal_notification",
             "display_metadata": {"source": "background"},
         }
-        agent = SimpleNamespace(model="test/model")
+        agent = SimpleNamespace(
+            model="test/model",
+            _force_ascii_payload=False,
+            _build_api_kwargs=lambda messages, tools_for_api=None: {},
+        )
 
-        with patch(
-            "agent.chat_completion_helpers._iteration_summary_chat_kwargs",
-            return_value={},
-        ) as build_kwargs:
+        with patch.object(agent, "_build_api_kwargs", return_value={}) as build_kwargs:
             _chat_summary_attempt(agent, [message], "request-id")
 
         build_kwargs.assert_called_once_with(
-            agent,
             [{"role": "user", "content": "decorated input"}],
         )
         assert message["display_kind"] == "internal_notification"

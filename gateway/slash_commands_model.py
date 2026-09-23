@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import logging
 from typing import Any, Optional
 
@@ -71,6 +72,7 @@ class _ModelSwitchContext:
     persist_global: bool
     one_turn: bool = False
     reasoning_effort: str = ""  # `--reasoning <level>` riding with the pick (typed path only)
+    after_compression: bool = False
     restore_snapshot: Optional[dict] = None
     current_model: str = ""
     current_provider: str = "openrouter"
@@ -152,10 +154,12 @@ class GatewayModelCommandsMixin:
             current_model=ctx.current_model, current_base_url=ctx.current_base_url,
             current_api_key=ctx.current_api_key, is_global=ctx.persist_global,
             explicit_provider=explicit_provider, user_providers=ctx.user_provs,
-            custom_providers=ctx.custom_provs,
+            custom_providers=ctx.custom_provs, validate_live=not ctx.after_compression,
         )
         if not result.success:
             return None, t("gateway.model.error_prefix", error=result.error_message)
+        if ctx.after_compression:
+            return result, None
         try:
             from hermes_cli.context_switch_guard import enrich_model_switch_warnings_for_gateway
             # Off-loop: merge_preflight_compression_warning() runs the sync provider probe ladder.
@@ -203,6 +207,10 @@ class GatewayModelCommandsMixin:
         """
         from hermes_cli.model_switch import format_model_for_display
 
+        state = self._peek_session_state(ctx.session_key)
+        if state is not None:
+            state.conversation.after_compression_model_switch = None
+
         # Persist the new model to the session DB so the dashboard shows the updated model (#34850).
         _sess_db = getattr(self, "_session_db", None)
         if _sess_db is not None:  # so the dashboard shows the updated model
@@ -216,6 +224,19 @@ class GatewayModelCommandsMixin:
                 await _sess_db.update_session_model(
                     _sess_entry.session_id, result.new_model, provider=result.target_provider,
                 )
+                # The command can commit while no agent is cached. Remove the cold-restorable
+                # descriptor at the same durable seam so eviction/rebuild cannot revive the
+                # route that this immediate switch superseded.
+                _row = await _sess_db.get_session(_sess_entry.session_id)
+                _raw_config = _row.get("model_config") if _row else None
+                _model_config = (
+                    json.loads(_raw_config) if isinstance(_raw_config, str) and _raw_config
+                    else dict(_raw_config or {})
+                )
+                if _model_config.pop("pending_model_switch_after_compression", None) is not None:
+                    await _sess_db.update_session_meta(
+                        _sess_entry.session_id, json.dumps(_model_config, sort_keys=True)
+                    )
             except Exception as exc:
                 logger.debug("Failed to persist model switch to DB: %s", exc)
         # Prepended to the next user message (no system messages mid-history). Display form strips
@@ -229,12 +250,15 @@ class GatewayModelCommandsMixin:
             f"{'This override applies to the next turn only. ' if one_turn else ''}"
             f"Adjust your self-identification accordingly.]"
         )
-        self._session_model_overrides[ctx.session_key] = {
+        override = {
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
         }
+        if result.reasoning_config is not None:
+            override["reasoning_config"] = dict(result.reasoning_config)
+        self._session_model_overrides[ctx.session_key] = override
         if one_turn:
             # A repeated --once before the turn runs must keep the EARLIEST snapshot: the later
             # command's snapshot is the first temporary model, not the user's standing override.
@@ -374,6 +398,22 @@ class GatewayModelCommandsMixin:
 
     async def _commit_model_switch_locked(self, result, ctx: _ModelSwitchContext, *, source, picker: bool) -> str:
         one_turn = False if picker else ctx.one_turn
+        if ctx.after_compression and not picker:
+            from hermes_cli.model_switch import format_model_for_display
+            cached_agent = self._cached_agent_for(ctx.session_key)
+            if cached_agent is None:
+                return "❌ /model --after-compression requires a live session"
+            state = self._session_state(ctx.session_key)
+            replaced = state.conversation.after_compression_model_switch
+            state.conversation.after_compression_model_switch = result
+            self._attach_model_switch_after_compression(ctx.session_key, cached_agent)
+            lines = [
+                f"✓ Model switch scheduled after the next successful compression: {format_model_for_display(result.new_model)}",
+                t("gateway.model.provider_label", provider=result.provider_label or result.target_provider),
+            ]
+            if replaced is not None:
+                lines.append("    (replaced the previously scheduled model switch)")
+            return "\n".join(lines)
         error = self._switch_cached_agent_model(result, ctx, picker)
         if error is not None:
             return error
@@ -511,6 +551,8 @@ class GatewayModelCommandsMixin:
         request = parse_model_switch_args(event.get_command_args().strip())  # single-owner parser
         if request.errors:
             return f"❌ {request.error_messages()[0]}"  # gateway decoration over canonical copy
+        after_compression = request.is_after_compression
+        reasoning = request.reasoning
         if request.force_refresh:  # bust the disk cache so the picker shows live data
             with contextlib.suppress(Exception):
                 from hermes_cli.models import clear_provider_models_cache
@@ -536,19 +578,30 @@ class GatewayModelCommandsMixin:
             session_key=session_key,
             source=source,
             config_path=(profile_home or _hermes_home) / "config.yaml",
-            persist_global=resolve_persist_behavior(
+            persist_global=False if after_compression else resolve_persist_behavior(
                 request.is_global, request.is_session, is_once=request.is_once,
                 explicit_provider=request.explicit_provider,
             ),
             one_turn=request.is_once,
-            reasoning_effort=request.reasoning_effort,
+            reasoning_effort=request.reasoning,
+            after_compression=after_compression,
             restore_snapshot=self._snapshot_session_model_override(session_key) if request.is_once else None,
         )
         ctx.read_config()
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
-        if not request.target and not request.explicit_provider:
+        if not request.target and not request.explicit_provider and not reasoning:
             return await self._model_listing_reply(event, ctx, profile_home)
-        result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
+        model_input = request.target
+        explicit_provider = request.explicit_provider
+        if reasoning and not model_input and not explicit_provider:
+            model_input = ctx.current_model
+            explicit_provider = ctx.current_provider
+        result, error = await self._perform_model_switch(ctx, model_input, explicit_provider, source)
+        if error is None and reasoning:
+            from hermes_constants import parse_reasoning_effort
+            result.reasoning_config = parse_reasoning_effort(reasoning)
+        if error is None:
+            result.is_after_compression = after_compression
         if error is not None:
             return error
         guard_fired, guard_reply = await self._model_selection_guard_reply(event, ctx, result)

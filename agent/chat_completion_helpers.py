@@ -2366,7 +2366,12 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
     # prompt_cache_key, xAI alias, Moonshot sanitization). Do not omit tools or force
     # tool_choice="none" here: SGLang renders the prompt with tools=None in that mode and the KV
     # prefix diverges. (cache_control breakpoint decoration is not re-applied on this path.)
-    summary_kwargs = agent._build_api_kwargs(api_messages)
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    wire_messages = ChatCompletionsTransport().convert_messages(
+        api_messages, model=agent.model,
+    )
+    summary_kwargs = agent._build_api_kwargs(wire_messages)
     # The summary now carries ``tools``; on cache-planned routes the main loop scrubbed a deep
     # copy, so ``agent.tools`` may still hold bytes the provider 400s on.
     sanitize_outbound_kwargs(agent, summary_kwargs)

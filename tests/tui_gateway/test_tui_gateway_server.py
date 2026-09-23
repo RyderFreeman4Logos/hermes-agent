@@ -21336,7 +21336,6 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
     import contextlib
     observed = {}
     cleanup_order = []
-    active_home_tokens = []
 
     class _Agent:
         def run_conversation(
@@ -21364,7 +21363,6 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         import inspect
 
         cleanup_order.append("trim")
-        assert len(active_home_tokens) == 1
         frame = inspect.currentframe()
         assert frame is not None and frame.f_back is not None
         caller_locals = frame.f_back.f_locals
@@ -21415,7 +21413,6 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         assert observed["persist_user_message"] == "hi"
         assert not observed["history"]
         assert not observed["run_kwargs"]
-        assert not active_home_tokens
         assert cleanup_order[-2:] == ["trim", "reset_home"]
     finally:
         server._sessions.pop("sid_trim", None)

@@ -604,17 +604,24 @@ class TurnController {
     // only when the gateway elected not to send any (#16391).
     // `text` is `str | JsonValue` on the wire (structured parts stay possible); only a string renders here.
     const wireText = typeof payload.text === 'string' ? payload.text : undefined
-    const rawText = (wireText ?? payload.rendered ?? this.bufRef).trimStart()
+    const finalTextProjection = wireText ?? payload.rendered ?? this.bufRef
+    const rawText = finalTextProjection.trimStart()
     const split = splitReasoning(rawText)
-    // Only dedupe segments AFTER the interim boundary — interim-sealed
-    // segments are preserved even if the final text includes them.
-    // Exception: when response_previewed is true, the final text is the
-    // same model response that was published provisionally as an interim
-    // message. Dedupe against ALL segments (including sealed interims) so
-    // the identical text doesn't render as a duplicate message. (#65919
-    // review: duplicate-message blocker)
-    const dedupeStart = payload.response_previewed ? 0 : (this.interimBoundaryIndex ?? 0)
-    const finalText = finalTail(split.text, this.segmentMessages.slice(dedupeStart))
+    // Sealed commentary is separate from streamed post-interim segments: only
+    // byte-identical commentary/final pairs collapse, while post-interim tails
+    // retain their existing prefix handling.
+    // Exception: when response_previewed is true, the final text is the same
+    // model response published provisionally as an interim message. Prefix-dedupe
+    // against ALL segments so that identical text does not render twice. (#65919)
+    const interimBoundary = this.interimBoundaryIndex ?? 0
+    const sealedCommentary = textSegments(this.segmentMessages.slice(0, interimBoundary))
+    const postInterim = this.segmentMessages.slice(interimBoundary)
+    const finalText = sealedCommentary.includes(finalTextProjection)
+      ? ''
+      : finalTail(
+          split.text,
+          payload.response_previewed ? this.segmentMessages : postInterim
+        )
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
     const savedToolTokens = this.toolTokenAcc

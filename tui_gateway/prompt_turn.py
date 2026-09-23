@@ -150,6 +150,11 @@ def _admit_prompt_turn(
         agent = session["agent"]
         if agent is None:
             session["running"] = False
+        else:
+            # Same critical section as admission. A busy correction waits on
+            # this lock, so clearing after release wipes the correction it just stored.
+            with contextlib.suppress(Exception):
+                agent.clear_interrupt()
     if agent is None:
         # A deferred build can finish without attaching an agent (its record was replaced or closed
         # mid-build: ``agent_ready`` set, ``agent`` None, see ``_start_agent_build``).  Every turn source
@@ -163,8 +168,6 @@ def _admit_prompt_turn(
             error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
         return None
     _bind_completion_ingest(session, agent)
-    with contextlib.suppress(Exception):
-        agent.clear_interrupt()
     return images, agent
 
 

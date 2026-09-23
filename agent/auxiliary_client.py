@@ -7748,7 +7748,11 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     explicit_auth_with_task_chain = (
         reason == "auth error" and not is_auto and has_task_fallback_chain
     )
-    if reason == "provider execution error" and not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
+    # A configured task chain is an explicit destination list, not discovery. Generic
+    # execution errors walk it; typed control denials already returned above.
+    if reason == "provider execution error" and not (
+        is_auto or is_capacity_error or explicit_auth_with_task_chain or has_task_fallback_chain
+    ):
         return None
     if reason == "payment error":
         # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip

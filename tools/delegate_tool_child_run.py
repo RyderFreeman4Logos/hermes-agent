@@ -58,7 +58,8 @@ def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: f
     model, provider = _result_route_identity(child)
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
-        "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
+        "duration_seconds": duration, "model": model, "provider": provider,
+        "_child_role": getattr(child, "_delegate_role", None),
     }
 
 def _append_missed_steer(entry: Dict[str, Any], late_steer: Optional[str]) -> None:
@@ -656,13 +657,36 @@ def _build_result_entry(
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
     # Result entry contract: see the _run_single_child docstring.
+    app_server_success = (
+        getattr(child, "api_mode", None) == "codex_app_server"
+        and result.get("completed", False)
+        and not (result.get("failed") or result.get("error") or result.get("interrupted"))
+        and "codex_turn_id" in result
+    )
+    # The app-server result has no selected model/provider field. Retain the
+    # child's last positively known route for later failures, but never assign
+    # it to this newly successful yet unidentified turn.
+    if (
+        _xai_billing_leak
+        and result.get("billing_unverified", False)
+        and accepted_model is None
+        and accepted_provider is None
+    ):
+        model, provider = None, None
+    elif app_server_success:
+        model, provider = None, None
+    elif accepted_model is not None or accepted_provider is not None:
+        model, provider = accepted_model, accepted_provider
+    else:
+        model, provider = getattr(child, "model", None), getattr(child, "provider", None)
     entry: Dict[str, Any] = {
         "task_index": task_index,
         "status": status,
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
-        "model": _str_or_none(getattr(child, "model", None)),
+        "model": _str_or_none(model),
+        "provider": _str_or_none(provider),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -859,6 +883,7 @@ class _ChildRun:
         _safe_progress(
             self.child_progress_cb, "subagent.complete", preview=preview, status=status or entry["status"],
             duration_seconds=entry["duration_seconds"], summary=summary,
+            model=entry.get("model"), provider=entry.get("provider"),
         )
         _append_missed_steer(entry, late_steer)
         return self.attach_worktree(entry)
@@ -1007,6 +1032,7 @@ class _ChildRun:
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
+            "model": model, "provider": provider,
             "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,

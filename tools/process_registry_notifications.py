@@ -3,6 +3,7 @@ watch_match, watch_disabled, watch_overflow_*, async_delegation) into the
 ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION ...]`` text the CLI drain loop, gateway and
 TUI inject into the agent conversation."""
 
+import math
 import time
 from dataclasses import dataclass
 from contextlib import suppress
@@ -398,8 +399,29 @@ def _completion_status(evt: dict) -> str:
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
 
 
+def _routine_delegated_child_completion(evt: dict) -> bool:
+    """Ordinary native-child success: no parent turn. Failures and handoffs stay visible."""
+    if not isinstance(evt, dict) or evt.get("handoff_note"):
+        return False
+    started_at = evt.get("started_at")
+    return (
+        evt.get("type") == "completion"
+        and evt.get("delegated_child") is True
+        and type(evt.get("exit_code")) is int
+        and evt["exit_code"] == 0
+        and evt.get("completion_reason") == "exited"
+        and evt.get("termination_source") == ""
+        and isinstance(evt.get("session_id"), str) and evt["session_id"]
+        and isinstance(evt.get("command"), str) and evt["command"]
+        and isinstance(started_at, (int, float)) and not isinstance(started_at, bool)
+        and math.isfinite(started_at) and started_at > 0
+    )
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a completion_queue event into an ``[IMPORTANT: ...]`` message."""
+    if _routine_delegated_child_completion(evt):
+        return None
     evt_type = evt.get("type", "completion")
     # watch_disabled and overflow events carry their own human-readable `message`;
     # otherwise overflow events would fall through to the completion formatter as a

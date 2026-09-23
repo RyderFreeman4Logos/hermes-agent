@@ -542,6 +542,7 @@ class ProcessSession:
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
+    delegated_child: bool = False               # Spawned from a native delegate_task child
     completion_output_chars: int = 0            # Output chars the completion carries; 0 = COMPLETION_OUTPUT_CHARS
     watch_patterns: List[str] = field(default_factory=list)
     heartbeat_seconds: int = 0                  # 0 = off; else a "heartbeat" event every N s while running
@@ -588,7 +589,8 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+    "parent_session_id", "notify_on_complete", "delegated_child", "handoff_note",
+    "completion_output_chars", "watch_patterns",
     "heartbeat_seconds")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
@@ -720,6 +722,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         promote the session to notify_on_complete."""
         if not session.watch_patterns or session._watch_disabled:
             return
+        if session.delegated_child and not session.handoff_note:
+            return
         # Late chunks after the reader declared exit are post-exit noise; dropping them
         # avoids stale notifications minutes after the process ended.
         if session.exited:
@@ -807,6 +811,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             "task_id": session.task_id,
             "owner_task_id": session.owner_task_id or session.task_id,
             "command": session.command,
+            "delegated_child": session.delegated_child,
+            **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
             **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
         }
 
@@ -1092,8 +1098,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
+        from agent.delegation_context import is_delegated_child_process_context
         from gateway.session_context import get_session_env
 
+        extra.setdefault("delegated_child", is_delegated_child_process_context())
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id or task_id, session_key=session_key, cwd=cwd,
@@ -1600,6 +1608,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "task_id": session.task_id,
                 "owner_task_id": session.owner_task_id or session.task_id,
                 "command": session.command,
+                "delegated_child": session.delegated_child,
                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
                 **self._exit_fields(session),
                 # A consumer that relays the output (a bot DM's reply) must know it is not whole.
@@ -2358,6 +2367,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
+            self._write_checkpoint()
             return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:

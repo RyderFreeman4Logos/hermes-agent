@@ -240,7 +240,7 @@ def test_next_turn_replays_the_prior_decorated_prefix_byte_for_byte(tmp_path, mo
         assert replayed_first["content"] == first_user["content"]
         assert replayed_first["content"].count(MARKER) == 1
         assert current_second["content"].count(MARKER) == 1
-        assert "Latest successful completed loop stop: 2026-09-15T11:30:02-07:00" in current_second["content"]
+        assert "Previous loop ended: 2026-09-15T11:30:02-07:00" in current_second["content"]
     finally:
         db.close()
 
@@ -330,7 +330,7 @@ def test_public_failed_turn_keeps_last_successful_stop_for_next_turn(tmp_path, m
         third_request = agent.client.chat.completions.create.call_args_list[-1].kwargs["messages"]
         current = next(row for row in reversed(third_request) if row.get("role") == "user")
         text = _text(current["content"])
-        assert "Latest successful completed loop stop: 2026-09-15T12:00:03-07:00" in text
+        assert "Previous loop ended: 2026-09-15T12:00:03-07:00" in text
         assert "12:05:00" not in text
     finally:
         db.close()
@@ -379,7 +379,7 @@ def test_public_interrupted_turn_keeps_last_successful_stop_for_next_turn(
         third_request = agent.client.chat.completions.create.call_args_list[-1].kwargs["messages"]
         current = next(row for row in reversed(third_request) if row.get("role") == "user")
         text = _text(current["content"])
-        assert "Latest successful completed loop stop: 2026-09-15T12:20:03-07:00" in text
+        assert "Previous loop ended: 2026-09-15T12:20:03-07:00" in text
         assert "12:25:00" not in text
     finally:
         db.close()
@@ -448,7 +448,7 @@ def test_public_branch_and_new_session_do_not_inherit_parent_stop(
         assert fresh.run_conversation(f"{session_id} input")["completed"] is True
         sent = fresh.client.chat.completions.create.call_args.kwargs["messages"]
         current = next(row for row in reversed(sent) if row.get("role") == "user")
-        assert "Latest successful completed loop stop:" not in _text(current["content"])
+        assert "Previous loop ended:" not in _text(current["content"])
         assert db.get_session_model_config_value("main", loop_timing.LOOP_STOP_KEY)
     finally:
         db.close()

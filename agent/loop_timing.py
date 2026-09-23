@@ -60,11 +60,11 @@ def _latest_stop(agent: Any) -> Optional[str]:
 def _timing_block(agent: Any, *, now: Optional[datetime] = None) -> str:
     lines = [
         _HEADER,
-        f"Current loop start: {_iso(now or _now())}",
+        f"Current loop started: {_iso(now or _now())}",
     ]
     latest_stop = _latest_stop(agent)
     if latest_stop:
-        lines.append(f"Latest successful completed loop stop: {latest_stop}")
+        lines.append(f"Previous loop ended: {latest_stop}")
     return "\n".join(lines)
 
 

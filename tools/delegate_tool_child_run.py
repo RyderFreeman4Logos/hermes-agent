@@ -36,6 +36,8 @@ def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: f
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
         "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
+        "model": _str_or_none(getattr(child, "model", None)),
+        "provider": _str_or_none(getattr(child, "provider", None)),
     }
 
 def _append_missed_steer(entry: Dict[str, Any], late_steer: Optional[str]) -> None:
@@ -596,6 +598,7 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "model": _str_or_none(getattr(child, "model", None)),
+        "provider": _str_or_none(getattr(child, "provider", None)),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -929,6 +932,8 @@ class _ChildRun:
             "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,
+            "model": _str_or_none(getattr(child, "model", None)),
+            "provider": _str_or_none(getattr(child, "provider", None)),
             # How long the child had been silent when the wait ended: distinguishes a slow provider from a runaway
             # without transcript forensics (#116001).
             "last_event_age": _child_last_event_age(child) if is_timeout else None,

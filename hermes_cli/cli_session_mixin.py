@@ -535,9 +535,14 @@ class CLISessionMixin:
         self._pending_one_turn_model_restore = None
         self.service_tier = _parse_service_tier_config(CLI_CONFIG["agent"].get("service_tier", ""))
         _reset_model_to_config_default(self, silent)
-        # After the model reset: the effort belongs to the model the fresh session lands on (a /reasoning
-        # session override is dropped, the default model's per-model override is kept).
         _resolve_cli_reasoning(self)
+        from tools.memory_tool import get_memory_provider_mode
+        memory_config = CLI_CONFIG.get("memory") if isinstance(CLI_CONFIG, dict) else None
+        new_memory_mode = get_memory_provider_mode(memory_config if isinstance(memory_config, dict) else {})
+        self._memory_provider_mode_override = new_memory_mode
+        if self.agent:
+            from agent.agent_init import apply_memory_provider_mode
+            apply_memory_provider_mode(self.agent, new_memory_mode)
         _sync_process_session_id(self.session_id)
 
         if self.agent:
@@ -563,6 +568,7 @@ class CLISessionMixin:
                         model=self.model,
                         model_config={
                             "max_iterations": self.max_turns, "reasoning_config": self.reasoning_config,
+                            "memory_provider_mode": new_memory_mode,
                         })
                     self.agent._session_db_created = True
                 if title:

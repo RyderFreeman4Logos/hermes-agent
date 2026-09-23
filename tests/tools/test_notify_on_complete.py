@@ -18,6 +18,7 @@ from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
 )
+from tools.process_registry_notifications import format_process_notification
 
 
 @pytest.fixture()
@@ -399,6 +400,21 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
     assert "silent" in hint.lower() or "no way to learn" in hint.lower(), (
         "Hint must explain the failure mode, not just suggest the fix"
     )
+
+
+def test_routine_delegated_child_completion_is_silent():
+    """A child's ordinary exit-0 completion must not become a parent turn."""
+    event = {
+        "type": "completion",
+        "session_id": "proc_child",
+        "command": "echo child",
+        "started_at": 1.0,
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "delegated_child": True,
+    }
+    assert format_process_notification(event) is None
 
 
 def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):

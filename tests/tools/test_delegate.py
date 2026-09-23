@@ -539,7 +539,7 @@ class TestDelegateObservability(unittest.TestCase):
             mock_child.model = "claude-sonnet-4-6"
             mock_child.session_prompt_tokens = 5000
             mock_child.session_completion_tokens = 1200
-            mock_child.run_conversation.return_value = {
+            response = {
                 "final_response": "done",
                 "completed": True,
                 "interrupted": False,
@@ -553,6 +553,12 @@ class TestDelegateObservability(unittest.TestCase):
                     {"role": "assistant", "content": "done"},
                 ],
             }
+            def run_conversation(*_args, **_kwargs):
+                mock_child._delegate_successful_llm_route = (
+                    "claude-sonnet-4-6", mock_child.provider,
+                )
+                return response
+            mock_child.run_conversation.side_effect = run_conversation
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test observability", parent_agent=parent))
@@ -2344,6 +2350,29 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials({"provider": "copilot", "model": "gpt-5"}, parent)
         self.assertIn("without a base_url", str(ctx.exception))
+
+
+class TestStandardProfileAttached(unittest.TestCase):
+    """Standard-tier runtime policy flags must ride on delegate children."""
+
+    def test_standard_profile_is_attached_to_child_runtime(self):
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test standard profile attach",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                model_profile="standard",
+            )
+        child = MockAgent.return_value
+        self.assertEqual(child._delegate_model_profile, "standard")
+        self.assertIsNone(child._delegate_successful_llm_route)
 
 
 if __name__ == "__main__":

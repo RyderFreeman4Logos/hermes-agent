@@ -148,6 +148,8 @@ def check_api_response(
             return _verdict(_iv.action, _iv.result)
 
     agent._turn_received_provider_response = True
+    if hasattr(agent, "_delegate_successful_llm_route"):
+        agent._delegate_successful_llm_route = (agent.model, agent.provider)
     finish_reason = _derive_finish_reason(agent, response, messages)
 
     # HTTP-200 refusals are deterministic: one fallback try, else return the refusal.

@@ -62,6 +62,16 @@ def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
     content = first.get("content")
     if isinstance(content, str):
         return content
+    if isinstance(content, list) and content:
+        # A cache plan marks the stable system prefix in the first block and
+        # leaves the rebuilt volatile suffix outside the routing key.
+        first_block = content[0]
+        if (
+            isinstance(first_block, dict)
+            and "cache_control" in first_block
+            and isinstance(first_block.get("text"), str)
+        ):
+            return first_block["text"]
     try:
         return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
@@ -546,7 +556,9 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs.update(params["request_overrides"])
         return _finish_kwargs(
             api_kwargs, sanitized, params,
-            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key")) or _is_openai_api_base_url(base_url),
+            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
+            or _is_openai_api_base_url(base_url)
+            or str(params.get("provider_name") or "").startswith("custom:"),
         )
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
@@ -595,7 +607,9 @@ class ChatCompletionsTransport(ProviderTransport):
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
         return _finish_kwargs(
-            api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
+            api_kwargs, sanitized, params,
+            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False))
+            or str(params.get("provider_name") or "").strip().lower().startswith("custom:"),
         )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

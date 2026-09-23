@@ -245,12 +245,12 @@ def _plugin_profile_pdef(name: str) -> Optional[ProviderDef]:
                        auth_type=prof.auth_type or "api_key", source="plugin-profile")
 
 
-def get_label(provider_id: str) -> str:
+def get_label(provider_id: str, *, allow_network: bool = True) -> str:
     """Human-readable display name: label override, else models.dev name, else the id."""
     canonical = normalize_provider(provider_id)
     if canonical in _LABEL_OVERRIDES:
         return _LABEL_OVERRIDES[canonical]
-    pdef = get_provider(canonical)
+    pdef = get_provider(canonical, allow_network=allow_network)
     return pdef.name if pdef else canonical
 
 
@@ -519,7 +519,8 @@ def _llamacpp_pdef() -> Optional[ProviderDef]:
 
 
 def resolve_provider_full(name: str, user_providers: Optional[Dict[str, Any]] = None,
-                          custom_providers: Optional[List[Dict[str, Any]]] = None) -> Optional[ProviderDef]:
+                          custom_providers: Optional[List[Dict[str, Any]]] = None, *,
+                          allow_network: bool = True) -> Optional[ProviderDef]:
     """Full resolution chain: user ``providers.<raw name>`` -> lossy-alias registry id -> built-in
     (models.dev + overlays) -> user providers (canonical, then raw) -> ``custom_providers`` ->
     managed llamacpp -> models.dev directly. User-defined ``providers.<name>`` is tried FIRST on
@@ -535,7 +536,7 @@ def resolve_provider_full(name: str, user_providers: Optional[Dict[str, Any]] = 
         pdef = _lossy_alias_registry_pdef(raw, canonical)
         if pdef is not None:
             return pdef
-    pdef = get_provider(canonical)
+    pdef = get_provider(canonical, allow_network=allow_network)
     if pdef is not None:
         if pdef.source == "plugin-profile" and user_providers:
             user_pdef = resolve_user_provider(pdef.id, user_providers)
@@ -555,7 +556,7 @@ def resolve_provider_full(name: str, user_providers: Optional[Dict[str, Any]] = 
         if pdef is not None:
             return pdef
     try:
-        mdev_info = _models_dev_info(canonical)
+        mdev_info = _models_dev_info(canonical, allow_network=allow_network)
         if mdev_info is not None:
             return ProviderDef(id=canonical, name=mdev_info.name, transport="openai_chat", api_key_env_vars=mdev_info.env,
                                base_url=mdev_info.api, source="models.dev")

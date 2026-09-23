@@ -2562,12 +2562,39 @@ def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode
 
 
 def _record_route_info(
-    route_info: Optional[Dict[str, str]], provider: Optional[str], model: Optional[str]
+    route_info: Optional[Dict[str, Any]], provider: Optional[str], model: Optional[str], *,
+    base_url: Optional[str] = None, api_key: Optional[str] = None,
+    api_mode: Optional[str] = None, timeout: Optional[float] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
-        route_info["provider"] = provider or "auto"
-        route_info["model"] = model or "default"
+        route_info.clear()
+        route_info.update(provider=provider or "auto", model=model or "default")
+        for key, value in (
+            ("base_url", base_url), ("api_key", api_key),
+            ("api_mode", api_mode), ("timeout", timeout),
+        ):
+            if value not in (None, ""):
+                route_info[key] = value
+
+
+def _record_physical_route(
+    route_info: Optional[Dict[str, Any]], provider: Optional[str], client: Any,
+    request_kwargs: Dict[str, Any], api_mode: Optional[str],
+) -> None:
+    """Publish the concrete destination immediately before a physical retry."""
+    concrete_provider = _fallback_provider_from_label(
+        _effective_provider_for_client(client, provider or "auto")
+    )
+    model = request_kwargs.get("model")
+    _set_relay_auxiliary_route(concrete_provider, model, api_mode)
+    _record_route_info(
+        route_info, concrete_provider, model,
+        base_url=str(getattr(client, "base_url", "") or ""),
+        api_key=str(getattr(client, "api_key", "") or ""),
+        api_mode=api_mode,
+        timeout=request_kwargs.get("timeout"),
+    )
 
 
 def _relay_auxiliary_metadata(
@@ -3720,19 +3747,27 @@ def _prepare_same_provider_retry(
     return retry_client, retry_kwargs
 
 
-def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+def _retry_same_provider_sync(
+    *, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str],
+    route_info: Optional[Dict[str, Any]] = None, **prep,
+) -> Any:
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
     )
+    _record_physical_route(route_info, resolved_provider, retry_client, retry_kwargs, resolved_api_mode)
     return _validate_llm_response(
         _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
     )
 
 
-async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+async def _retry_same_provider_async(
+    *, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str],
+    route_info: Optional[Dict[str, Any]] = None, **prep,
+) -> Any:
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=True, **prep,
     )
+    _record_physical_route(route_info, resolved_provider, retry_client, retry_kwargs, resolved_api_mode)
     return _validate_llm_response(
         await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
         task,
@@ -4042,6 +4077,7 @@ def _call_fallback_candidate_sync(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery: on an auth error refresh its
     credentials and retry once with a rebuilt client; if that also auth-fails, quarantine the
@@ -4061,6 +4097,7 @@ def _call_fallback_candidate_sync(
     )
 
     def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
+        _record_physical_route(route_info, dest.provider, client, request_kwargs, dest.api_mode)
         return _validate_llm_response(
             _relay_sync_completion(
                 client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
@@ -4107,6 +4144,7 @@ async def _call_fallback_candidate_async(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire)."""
     destination, fb_kwargs, rebuild = _plan_fallback_candidate(
@@ -4117,6 +4155,7 @@ async def _call_fallback_candidate_async(
     )
 
     async def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
+        _record_physical_route(route_info, dest.provider, client, request_kwargs, dest.api_mode)
         return _validate_llm_response(
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
             task,
@@ -7870,11 +7909,13 @@ def _plan_aux_call(
         task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, effective_timeout=req.effective_timeout,
         effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
+        route_info=route_info,
     )
     retry_kwargs = dict(
         candidate_kwargs, resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
+        route_info=route_info,
     )
     return req, retry_kwargs, candidate_kwargs
 
@@ -8002,6 +8043,7 @@ def _call_llm_impl(
         def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
+                _record_physical_route(route_info, kw["provider"], args[0], args[1], kw["api_mode"])
                 return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
             if kind == "retry":
                 return _retry_same_provider_sync(**kw)
@@ -8149,6 +8191,7 @@ async def _async_call_llm_impl(
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
+                _record_physical_route(route_info, kw["provider"], args[0], args[1], kw["api_mode"])
                 return _validate_llm_response(await _relay_async_completion(*args, **kw), task)
             if kind == "retry":
                 return await _retry_same_provider_async(**kw)

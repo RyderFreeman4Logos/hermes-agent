@@ -1444,7 +1444,11 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         qwen_session_metadata=_qwen_meta)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
-        return transport.build_kwargs(provider_profile=_profile, **_common)
+        return transport.build_kwargs(
+            provider_profile=_profile,
+            provider_name=getattr(agent, "requested_provider", None),
+            **_common,
+        )
 
     # Legacy flag path: only for a provider absent from the providers/ registry.
     return transport.build_kwargs(

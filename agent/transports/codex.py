@@ -435,6 +435,25 @@ def _content_cache_key(instructions: str, tools: Optional[list[dict[str, Any]]],
     return "pck_" + hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
+def _cache_key_instructions(
+    messages: list[dict[str, Any]], instructions: str
+) -> str:
+    """Use the marked stable system prefix for cache routing when present."""
+    if messages and isinstance(messages[0], dict):
+        first = messages[0]
+        if first.get("role") in {"system", "developer"}:
+            content = first.get("content")
+            if isinstance(content, list) and content:
+                first_block = content[0]
+                if (
+                    isinstance(first_block, dict)
+                    and "cache_control" in first_block
+                    and isinstance(first_block.get("text"), str)
+                ):
+                    return first_block["text"]
+    return instructions
+
+
 def _profile_declared_efforts(provider: Any, model: Optional[str], base_url: Any = None) -> Optional[tuple]:
     """Provider-profile-declared reasoning-effort vocabulary, or None (fail-open).
 
@@ -730,7 +749,9 @@ class ResponsesApiTransport(ProviderTransport):
         # Content-addressed (instructions + tools) within a logical scope that survives
         # compression rotation; session_id itself stays untouched for transcript isolation.
         _cache_scope = _cache_scope_from_session_id(params.get("cache_scope_id") or session_id)
-        cache_key = _content_cache_key(instructions, response_tools, _cache_scope) or _cache_scope
+        cache_key = _content_cache_key(
+            _cache_key_instructions(messages, instructions), response_tools, _cache_scope
+        ) or _cache_scope
         # xAI takes prompt_cache_key in extra_body (below); GitHub Models opts out entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
             kwargs["prompt_cache_key"] = cache_key

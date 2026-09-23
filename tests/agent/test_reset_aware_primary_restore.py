@@ -338,3 +338,48 @@ class TestResetAwareRestoreGate:
         assert agent._restore_primary_runtime() is False
         # Reset-aware gate never consulted — short-circuited by the 60s gate.
         assert pool.next_available_calls == 0
+
+    def test_codex_weekly_stamp_does_not_block_when_quota_probe_says_open(self):
+        """A days-out Codex reset stamp must not pin fallback after the window reopens.
+
+        ``select()`` already lifts that stamp via ``_codex_quota_restored_upstream``.
+        ``next_available_at`` is read-only and never runs the probe, so the restore
+        gate stays on fallback until the stamp — a multi-day prompt-cache break.
+        A short cooldown with no restored probe must still block.
+        """
+        agent = _make_agent(fallback_model=self.FB)
+        _activate_fallback(agent)
+        agent._rate_limited_until = 0
+        agent.provider = "openai-codex"
+        agent.model = "gpt-6-sol"
+        agent._primary_runtime = {
+            **agent._primary_runtime,
+            "provider": "openai-codex",
+            "model": "gpt-6-sol",
+        }
+        pool = _FakePool("openai-codex", next_at=time.time() + 6 * 86400)
+        pool._codex_quota_restored_upstream = lambda entry: True
+        pool.current = lambda: object()
+        agent._credential_pool = pool
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent._fallback_activated is False
+        assert agent.provider == "openai-codex"
+
+        blocked = _make_agent(fallback_model=self.FB)
+        _activate_fallback(blocked)
+        blocked._rate_limited_until = 0
+        blocked.provider = "openai-codex"
+        blocked.model = "gpt-6-sol"
+        blocked._primary_runtime = {
+            **blocked._primary_runtime,
+            "provider": "openai-codex",
+            "model": "gpt-6-sol",
+        }
+        still = _FakePool("openai-codex", next_at=time.time() + 3600)
+        still._codex_quota_restored_upstream = lambda entry: False
+        still.current = lambda: object()
+        blocked._credential_pool = still
+        assert blocked._restore_primary_runtime() is False
+        assert blocked._fallback_activated is True

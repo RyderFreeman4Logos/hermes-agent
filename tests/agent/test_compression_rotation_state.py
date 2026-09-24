@@ -191,6 +191,11 @@ class TestWorkspaceMetadataFollowsRotation:
         db.update_session_cwd(
             parent, "/work/repo", git_branch="main", git_repo_root="/work/repo"
         )
+        from agent.loop_timing import LOOP_STOP_KEY
+        db.patch_session_model_config(
+            parent,
+            {LOOP_STOP_KEY: "2026-09-15T13:00:00-07:00"},
+        )
         agent = _build_agent_with_db(db, parent, platform="telegram")
 
         agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
@@ -210,6 +215,9 @@ class TestWorkspaceMetadataFollowsRotation:
         assert row["chat_id"] == "c1"
         assert row["chat_type"] == "private"
         assert row["user_id"] == "u1"
+        assert db.get_session_model_config_value(child, LOOP_STOP_KEY) == (
+            "2026-09-15T13:00:00-07:00"
+        )
 
 
 class TestRotationChildFlushDedup:

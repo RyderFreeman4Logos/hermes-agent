@@ -558,7 +558,8 @@ class TestWireInvariant:
         assert len(reqs) == 2
         sent_1 = _user_messages(reqs[0])[0]["content"]
         sent_2 = _user_messages(reqs[1])[0]["content"]
-        assert sent_1 == "hello please\n\nPLUGIN-CTX"
+        assert sent_1.startswith("hello please\n\n[Agent loop timing]\nCurrent loop start: ")
+        assert sent_1.endswith("\n\nPLUGIN-CTX")
         assert sent_2 == sent_1  # repeated builds: identical bytes
 
         # The sidecar never reaches the provider.
@@ -599,7 +600,11 @@ class TestWireInvariant:
 
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
-        assert current["content"] == "second question\n\nPLUGIN-CTX"
+        assert current["content"].startswith(
+            "second question\n\n[Agent loop timing]\nCurrent loop start: "
+        )
+        assert "\nLatest successful completed loop stop: " in current["content"]
+        assert current["content"].endswith("\n\nPLUGIN-CTX")
 
     def test_multimodal_turn_sends_persists_and_replays_context_part(self, wire_env):
         """#71998: on a list-content (image) turn the ``pre_llm_call`` context reaches the
@@ -615,17 +620,27 @@ class TestWireInvariant:
             agent1.run_conversation(list(turn), conversation_history=[], task_id="t1")
 
         sent = _user_messages(_chat_requests(handler)[0])[0]["content"]
-        assert sent == [*turn, {"type": "text", "text": "PLUGIN-CTX"}]
+        assert sent[0] == turn[0]
+        assert sent[1] == image
+        assert sent[2]["type"] == "text"
+        assert sent[2]["text"].startswith("[Agent loop timing]\nCurrent loop start: ")
+        assert sent[3] == {"type": "text", "text": "PLUGIN-CTX"}
 
         history = db.get_messages_as_conversation(sid)
-        assert "PLUGIN-CTX" in history[0]["content"]  # persisted with the turn, not dropped
+        assert history[0]["content"] == "what is this\n[screenshot]"
+        sidecar = history[0]["api_content"]
+        assert sidecar[0] == turn[0]
+        assert sidecar[1] == image
+        assert sidecar[2]["type"] == "text"
+        assert sidecar[2]["text"].startswith("[Agent loop timing]\nCurrent loop start: ")
+        assert sidecar[3] == {"type": "text", "text": "PLUGIN-CTX"}
 
         handler.captured_requests = []
         agent2 = make_agent()
         with patch.object(AIAgent, "_model_supports_vision", return_value=True):
             agent2.run_conversation("second question", conversation_history=history, task_id="t2")
         replayed = _user_messages(_chat_requests(handler)[0])[0]["content"]
-        assert replayed == history[0]["content"]
+        assert replayed == history[0]["api_content"]
 
 
 # ---------------------------------------------------------------------------

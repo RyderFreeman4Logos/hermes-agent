@@ -1028,7 +1028,9 @@ class _ChildRun:
             "api_calls": _num(entry["api_calls"]),
             "files_read": _files_read,
             "files_written": sorted({p for tid, paths in _files_written_map.items() if tid == self.child_task_id for p in paths})[:40],
-            "output_tail": _extract_output_tail(result, max_entries=8, max_chars=600),
+            # Public event: no raw tool output. A terminal tail can name the failed route
+            # and a provider body (xAI spending-limit). The parent still has the entry.
+            "output_tail": "",
         }
         if entry.get("failure_reason"):
             # Classified verdict rides the event so every surface glosses the failure the same way.

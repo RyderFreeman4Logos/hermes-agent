@@ -2753,6 +2753,18 @@ def reset_runtime_main(token: contextvars.Token) -> None:
 @contextlib.contextmanager
 def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
     """Temporarily bind an explicit runtime without touching legacy mirrors."""
+    # Partial snapshots (e.g. _current_main_runtime) omit session identity.
+    # Inherit only omitted fields; {} isolates, and explicit ""/override win.
+    if isinstance(main_runtime, dict) and main_runtime:
+        current = _RUNTIME_MAIN_CONTEXT.get()
+        if isinstance(current, dict):
+            merged = dict(main_runtime)
+            for field in ("session_id", "cache_scope"):
+                if field not in main_runtime:
+                    inherited = current.get(field)
+                    if isinstance(inherited, str) and inherited.strip():
+                        merged[field] = inherited
+            main_runtime = merged
     runtime = _normalize_main_runtime(main_runtime)
     token = _RUNTIME_MAIN_CONTEXT.set(runtime or None)
     try:
@@ -3066,6 +3078,9 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         value = main_runtime.get(field)
         if field == "api_key" and callable(value) and not isinstance(value, str):
             normalized[field] = value
+        elif field in ("session_id", "cache_scope") and field in main_runtime and isinstance(value, str):
+            # Explicit "" is a deliberate clear; omitted keys stay absent so callers can inherit.
+            normalized[field] = value.strip()
         elif isinstance(value, str) and value.strip():
             normalized[field] = value.strip()
     for identity_field in ("provider", "requested_provider"):
@@ -3709,12 +3724,8 @@ def _prepare_same_provider_retry(
         base_url=retry_base or resolved_base_url, task=task,
     )
     # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
-    if extra_headers:
-        # Copilot's ``x-initiator: user``) across the rebuilt-client retry — dropping them here would let a
-        # recovery retry silently lose capability gating (#60293).
-        # Preserve per-request attribution headers across the rebuilt-client retry — see the sync variant
-        # above (#60293).
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+    # Caller values win, including an explicit session_id; generated opt-in headers stay.
+    _merge_auxiliary_extra_headers(retry_kwargs, extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return retry_client, retry_kwargs
@@ -6638,7 +6649,44 @@ def _build_call_kwargs(
     # Conversation affinity (OpenCode relay, opt-in custom-provider header) — same key as the main
     # turn so compression/title/vision calls stay on the conversation's warm backend.
     from agent.opencode_affinity import merge_session_affinity_headers
-    return merge_session_affinity_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
+    kwargs = merge_session_affinity_headers(kwargs, provider, base_url, _runtime_main_value("session_id") or None)
+    session_id = _configured_auxiliary_session_id(provider)
+    if session_id:
+        request_headers = kwargs.get("extra_headers")
+        request_headers = dict(request_headers) if isinstance(request_headers, dict) else {}
+        request_headers.setdefault("session_id", session_id)
+        kwargs["extra_headers"] = request_headers
+    return kwargs
+
+
+def _configured_auxiliary_session_id(provider: str) -> str:
+    """Return the stable session root for an opted-in named custom provider."""
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        entry = _get_named_custom_provider(str(provider or "").strip())
+    except Exception:
+        return ""
+    if not isinstance(entry, dict) or entry.get("send_session_id") is not True:
+        return ""
+    return str(
+        _runtime_main_value("cache_scope")
+        or _runtime_main_value("session_id")
+        or ""
+    ).strip()
+
+
+def _merge_auxiliary_extra_headers(
+    kwargs: Dict[str, Any], caller_headers: Optional[Dict[str, str]],
+) -> None:
+    """Merge per-call headers over generated headers without dropping either."""
+    if not caller_headers:
+        return
+    generated = kwargs.get("extra_headers")
+    merged = dict(generated) if isinstance(generated, dict) else {}
+    # Caller values intentionally win, including an explicit session_id.
+    merged.update(caller_headers)
+    kwargs["extra_headers"] = merged
 
 
 def _validate_llm_response(
@@ -7297,8 +7345,7 @@ def _prepare_aux_request(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
         no_progress_timeout=no_progress_timeout)
-    if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+    _merge_auxiliary_extra_headers(kwargs, extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(request_provider, client_base):
@@ -7803,7 +7850,7 @@ def call_llm(
     prior_progress_hook = getattr(_aux_progress, "hook", None)
     try:
         with (
-            scoped_runtime_main(main_runtime),
+            scoped_runtime_main(main_runtime) as runtime,
             aux_progress_hook(
                 prior_progress_hook
                 if callable(prior_progress_hook)
@@ -7814,9 +7861,9 @@ def call_llm(
             _aux_thread_local_hook(_aux_provider_response, functools.partial(
                 _stamp_latency_once, latency_info, "time_to_first_progress_ms", request_started_at)),
         ):
-            response = _call_llm_impl(
+            response = _call_llm_impl_unscoped(
                 task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
-                main_runtime=main_runtime, messages=messages, temperature=temperature,
+                main_runtime=runtime, messages=messages, temperature=temperature,
                 max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
                 reasoning_config=reasoning_config, extra_headers=extra_headers, api_mode=api_mode,
                 stream=stream, stream_options=stream_options, route_info=route_info,
@@ -7931,6 +7978,25 @@ def _call_llm_impl(
     overrides task config; timeout=None reads auxiliary.{task}.timeout; extra_headers override
     client defaults. stream=True returns the raw SDK stream (caller consumes/falls back)
     instead of a validated response. RuntimeError if no provider is configured."""
+    with scoped_runtime_main(main_runtime) as runtime:
+        return _call_llm_impl_unscoped(
+            task=task, provider=provider, model=model, base_url=base_url,
+            api_key=api_key, main_runtime=runtime, messages=messages,
+            temperature=temperature, max_tokens=max_tokens, tools=tools,
+            timeout=timeout, extra_body=extra_body, reasoning_config=reasoning_config,
+            extra_headers=extra_headers, api_mode=api_mode, stream=stream,
+            stream_options=stream_options, route_info=route_info,
+        )
+
+
+def _call_llm_impl_unscoped(
+    task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
+    api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
+    temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,
+    timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
+    stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+) -> Any:
     req, retry_kwargs, candidate_kwargs = _plan_aux_call(
         task, async_mode=False, provider=provider, model=model, base_url=base_url,
         api_key=api_key, main_runtime=main_runtime, messages=messages,
@@ -8093,10 +8159,10 @@ async def async_call_llm(
     if semaphore is not None:
         await semaphore.acquire()
     try:
-        with scoped_runtime_main(main_runtime):
-            return await _async_call_llm_impl(
+        with scoped_runtime_main(main_runtime) as runtime:
+            return await _async_call_llm_impl_unscoped(
                 task=task, provider=provider, model=model, base_url=base_url, api_key=api_key,
-                main_runtime=main_runtime, messages=messages, temperature=temperature,
+                main_runtime=runtime, messages=messages, temperature=temperature,
                 max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
                 reasoning_config=reasoning_config, route_info=route_info,
             )
@@ -8105,7 +8171,7 @@ async def async_call_llm(
             semaphore.release()
 
 
-async def _async_call_llm_impl(
+async def _async_call_llm_impl_unscoped(
     task: str = None, *, provider: str = None, model: str = None, base_url: str = None,
     api_key: str = None, main_runtime: Optional[Dict[str, Any]] = None, messages: list,
     temperature: Optional[float] = None, max_tokens: int = None, tools: list = None,

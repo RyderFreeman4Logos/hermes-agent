@@ -452,8 +452,7 @@ def _run_post_turn_followups(
                 return
             _enqueue_prompt(session, user_text, session.get("transport"))
 
-    if _drain_queued_prompt(rid, sid, session):
-        return
+    _drain_queued_prompt(rid, sid, session)
 
     def insert(completion_text: str, events: list) -> str | bool:
         with session["history_lock"]:

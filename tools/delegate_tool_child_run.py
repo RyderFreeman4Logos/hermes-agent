@@ -31,18 +31,17 @@ def _num(value: Any, default: int = 0) -> int:
 def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
+def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
+    """Route proven by a shape-valid response. Nothing else is public identity."""
+    route = getattr(child, "_delegate_successful_llm_route", None)
+    if not (isinstance(route, tuple) and len(route) == 2):
+        return None, None
+    return _str_or_none(route[0]), _str_or_none(route[1])
+
+
 def _route_fields(child: Any) -> Dict[str, Any]:
-    """Selected route. Prefer the string route frozen before the child ran;
-    a non-string credential (test doubles) keeps the live model."""
-    frozen = getattr(child, "_delegate_accepted_route", None)
-    if isinstance(frozen, dict):
-        model, provider = _str_or_none(frozen.get("model")), _str_or_none(frozen.get("provider"))
-        if model is not None or provider is not None:
-            return {"model": model, "provider": provider}
-    return {
-        "model": _str_or_none(getattr(child, "model", None)),
-        "provider": _str_or_none(getattr(child, "provider", None)),
-    }
+    model, provider = _accepted_route_identity(child)
+    return {"model": model, "provider": provider}
 
 
 def _unverified_xai_billing(result: Dict[str, Any]) -> bool:
@@ -391,7 +390,7 @@ def _register_child(
         "depth": max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0,
         "goal": goal,
         "delegation_id": _str_or_none(getattr(child, "_delegation_id", None)),
-        "model": _str_or_none(getattr(child, "model", None)),
+        "model": _accepted_route_identity(child)[0],
         "started_at": time.time(), "status": "running", "tool_count": 0, "agent": child,
         # Owning conversation's durable session id (same lineage completion delivery routes by), sourced from the
         # child's stamp so it survives a parent_agent rebuild between dispatch and run; used for list/steer/stop
@@ -943,7 +942,7 @@ class _ChildRun:
             if diagnostic_path:
                 logger.warning("Subagent %d 0-API-call timeout — diagnostic written to %s", task_index, diagnostic_path)
         if not is_timeout:
-            _err = str(exc)
+            _err = f"Subagent raised {type(exc).__name__}"
         elif stale_after is not None:
             _err = (
                 f"Subagent stopped making progress after {child_api_calls} API call(s) — no activity for "
@@ -962,9 +961,10 @@ class _ChildRun:
             )
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
+        _public = _err
         status = "timeout" if is_timeout else "error"
         _error_entry = {
-            "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
+            "task_index": task_index, "status": status, "summary": None, "error": _public, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
             "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
@@ -975,7 +975,7 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
-        self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
+        self.finish_failed(_error_entry, _late_pending_steer, preview=_public, summary=_public)
         close_deferred = is_timeout and not future.done()
         if close_deferred:
             _defer_close_after_timeout(child, future)

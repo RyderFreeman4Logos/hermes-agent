@@ -268,7 +268,9 @@ def _build_child_agent(
     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
     # reference), and no parent teardown can close it out from under a background child (#81267).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+    child_session_ref["child"] = child
     child._progress_identity_ref = child_session_ref
+    child._delegate_successful_llm_route = None
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     _apply_child_compression_cap(child, delegation_cfg)
@@ -420,7 +422,6 @@ def _build_children(
         except ValueError as exc:
             return [], str(exc)
         setattr(child, "_delegate_model_profile", resolved_profile)
-        setattr(child, "_delegate_accepted_route", {"model": creds["model"], "provider": creds["provider"]})
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema

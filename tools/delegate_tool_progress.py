@@ -315,7 +315,24 @@ class _ChildProgressRelay:
 
     def _identity_kwargs(self) -> Dict[str, Any]:
         kw: Dict[str, Any] = {"task_index": self.task_index, "task_count": self.task_count, "goal": self.goal_label}
+        child = self.session_ref.get("child") if isinstance(self.session_ref, dict) else None
+        route = getattr(child, "_delegate_successful_llm_route", None) if child is not None else None
+        app_server = getattr(child, "api_mode", None) == "codex_app_server"
+        if (
+            not app_server
+            and isinstance(route, tuple)
+            and len(route) == 2
+            and isinstance(route[0], str)
+            and isinstance(route[1], str)
+        ):
+            self.model, kw["provider"] = route
+        elif child is not None:
+            # Construction creds and a rejected fallback are not an accepted route.
+            self.model = None
         kw.update({k: getattr(self, k) for k in ("subagent_id", "parent_id", "depth", "model") if getattr(self, k) is not None})
+        if app_server:
+            kw["model"] = None
+            kw["provider"] = None
         if self.toolsets is not None:
             kw["toolsets"] = list(self.toolsets)
         # child_session_id / delegation_id are filled into the shared ref once

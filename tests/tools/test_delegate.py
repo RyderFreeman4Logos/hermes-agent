@@ -542,22 +542,28 @@ class TestDelegateObservability(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.model = "claude-sonnet-4-6"
+            mock_child.provider = "anthropic"
             mock_child.session_prompt_tokens = 5000
             mock_child.session_completion_tokens = 1200
-            mock_child.run_conversation.return_value = {
-                "final_response": "done",
-                "completed": True,
-                "interrupted": False,
-                "api_calls": 3,
-                "messages": [
-                    {"role": "user", "content": "do something"},
-                    {"role": "assistant", "tool_calls": [
-                        {"id": "tc_1", "function": {"name": "web_search", "arguments": '{"query": "test"}'}}
-                    ]},
-                    {"role": "tool", "tool_call_id": "tc_1", "content": '{"results": [1,2,3]}'},
-                    {"role": "assistant", "content": "done"},
-                ],
-            }
+
+            def _accepted(*_a, **_k):
+                mock_child._delegate_successful_llm_route = ("claude-sonnet-4-6", "anthropic")
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 3,
+                    "messages": [
+                        {"role": "user", "content": "do something"},
+                        {"role": "assistant", "tool_calls": [
+                            {"id": "tc_1", "function": {"name": "web_search", "arguments": '{"query": "test"}'}}
+                        ]},
+                        {"role": "tool", "tool_call_id": "tc_1", "content": '{"results": [1,2,3]}'},
+                        {"role": "assistant", "content": "done"},
+                    ],
+                }
+
+            mock_child.run_conversation.side_effect = _accepted
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test observability", parent_agent=parent))
@@ -2396,7 +2402,12 @@ class TestModelPoolRouting(unittest.TestCase):
         parent = _make_mock_parent(depth=0)
         with patch("tools.delegate_tool._load_config", return_value=cfg), patch("run_agent.AIAgent") as MockAgent:
             child = MagicMock()
-            child.run_conversation.return_value = {"final_response": "done", "completed": True, "api_calls": 1}
+
+            def _accepted(*_a, **_k):
+                child._delegate_successful_llm_route = ("main-model", "custom")
+                return {"final_response": "done", "completed": True, "api_calls": 1}
+
+            child.run_conversation.side_effect = _accepted
             child.model = "main-model"
             child.provider = "custom"
             MockAgent.return_value = child
@@ -2425,8 +2436,7 @@ class TestModelPoolRouting(unittest.TestCase):
         self.assertEqual(MockAgent.call_args.kwargs["model"], "fast-model")
 
     def test_selected_pool_route_survives_later_model_mutation(self):
-        """The profile chosen before the child runs stays the result route
-        after a fallback mutates the live model."""
+        """A later mutation is not the billed route unless that response was accepted."""
         cfg = {
             "model_pool": {
                 "standard": {"provider": "custom", "model": "main-model", "base_url": "http://main/v1", "api_key": "k"},
@@ -2439,6 +2449,7 @@ class TestModelPoolRouting(unittest.TestCase):
         real_run = delegate_mod._run_single_child
 
         def _run(task_index, goal, child=None, parent_agent=None, **_kwargs):
+            child._delegate_successful_llm_route = ("fast-model", "custom")
             child.model, child.provider = "fallback-model", "fallback-provider"
             return real_run(task_index, goal, child, parent_agent)
 
@@ -2457,6 +2468,7 @@ class TestModelPoolRouting(unittest.TestCase):
             ))
         self.assertEqual(result["results"][0]["model"], "fast-model")
         self.assertEqual(result["results"][0]["provider"], "custom")
+        self.assertNotIn("fallback-model", json.dumps(result))
 
     def test_unknown_profile_fails_closed(self):
         cfg = {"model_pool": {"standard": {"provider": "custom", "model": "main-model"}}}

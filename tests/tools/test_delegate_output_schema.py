@@ -319,6 +319,7 @@ class TestRunSingleChildSchemaValidation:
                         "messages": [],
                     }
                 self.provider, self.model = "openrouter", "accepted-model"
+                self._delegate_successful_llm_route = (self.model, self.provider)
                 return {
                     "final_response": '{"city": "Oslo"}',
                     "completed": True,
@@ -330,6 +331,7 @@ class TestRunSingleChildSchemaValidation:
 
         child = _Retry([])
         child._delegate_output_schema = ADDRESS_SCHEMA
+        child._delegate_accepted_route = {"model": "construction-model", "provider": "xai-oauth"}
         entry = _run(child)
         assert entry["summary"] == '{"city": "Oslo"}'
         assert entry["status"] == "completed"
@@ -339,6 +341,29 @@ class TestRunSingleChildSchemaValidation:
         assert "error" not in entry
         assert "failure_reason" not in entry
         assert "synthetic spending-limit body" not in json.dumps(entry)
+
+    def test_accepted_route_not_construction_creds(self):
+        """Billing uses the route of the shape-valid answer, not the creds frozen at construction."""
+        class _Retry(_StubChild):
+            provider = "rejected-provider"
+            model = "rejected-model"
+
+            def run_conversation(self, user_message, task_id=None, **_kwargs):
+                self.calls.append(user_message)
+                if len(self.calls) == 1:
+                    return {"final_response": "not json", "completed": True, "api_calls": 1, "messages": []}
+                self.provider, self.model = "accepted-provider", "accepted-model"
+                self._delegate_successful_llm_route = (self.model, self.provider)
+                return {"final_response": '{"city": "Oslo"}', "completed": True, "api_calls": 1, "messages": []}
+
+        child = _Retry([])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        child._delegate_accepted_route = {"model": "construction-model", "provider": "construction-provider"}
+        entry = _run(child)
+        assert entry["model"] == "accepted-model"
+        assert entry["provider"] == "accepted-provider"
+        assert "construction-model" not in json.dumps(entry)
+        assert "rejected-provider" not in json.dumps(entry)
 
     def test_retry_turn_runs_in_delegated_child_context(self, monkeypatch):
         """The retry is a second run_conversation on the child, issued from the parent's

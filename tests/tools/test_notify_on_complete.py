@@ -168,6 +168,41 @@ class TestCompletionQueue:
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
 
+    @pytest.mark.parametrize(
+        ("changes", "missing"),
+        (
+            pytest.param({"exit_code": True}, (), id="boolean-exit-code"),
+            pytest.param({"completion_reason": "lost"}, (), id="mismatched-reason-source"),
+            pytest.param({"started_at": True}, (), id="boolean-start-time"),
+            pytest.param({"handoff_note": "parent requested this process"}, (), id="handed-off"),
+            pytest.param({}, ("session_id",), id="missing-session-id"),
+        ),
+    )
+    def test_malformed_child_completion_is_not_silently_dropped(self, registry, changes, missing):
+        evt = {
+            "type": "completion",
+            "session_id": "proc_child_malformed",
+            "task_id": "container-child",
+            "owner_task_id": "sa-child-owner",
+            "command": "echo child",
+            "started_at": 1.0,
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "output": "child output",
+        }
+        for key in missing:
+            evt.pop(key)
+        evt.update(changes)
+        registry.completion_queue.put(evt)
+
+        delivered = registry.drain_notifications()
+
+        assert len(delivered) == 1
+        assert delivered[0][0] == evt
+        assert delivered[0][1]
+
+
 # =========================================================================
 # Checkpoint persistence
 # =========================================================================

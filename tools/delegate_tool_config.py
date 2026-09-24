@@ -606,11 +606,9 @@ def _resolve_child_runtime(
     effective_acp_args = list(
         override_acp_args if override_acp_args is not None else (getattr(parent_agent, "acp_args", []) or [])
     )
-    # A pinned provider must use direct API calls; inheriting the parent's ACP
-    # transport would bypass the override credentials entirely.
-    # Inheriting acp_command unconditionally causes run_agent.py to initialize CopilotACPClient, bypassing
-    # override credentials entirely (issue #16816).
-    if override_provider and not override_acp_command:
+    # A pinned provider, or a selected pool tier, must use direct API calls.
+    # Inheriting the parent's ACP transport would bypass the selected route.
+    if (pool_route or override_provider) and not override_acp_command:
         effective_acp_command, effective_acp_args = None, []
     # Defensive: validate trusted delegation.command exists on PATH before honoring it. An explicitly pinned
     # transport that cannot run must fail the spawn loudly (#80450) — silently falling back to the default
@@ -623,10 +621,11 @@ def _resolve_child_runtime(
         if profile is None or profile.auth_type != "external_process":
             effective_provider, effective_api_mode = "copilot-acp", "chat_completions"
 
-    # A named provider identity is endpoint-scoped. Preserve it only when the
-    # child inherits the exact parent route; an override owns its final identity.
+    # A named provider identity is endpoint-scoped. A selected pool tier owns
+    # its identity even when provider and endpoint are unset. Preserve the
+    # parent name only when the child inherits the exact parent route.
     effective_requested_provider = effective_provider
-    if not override_provider and not override_base_url and not override_acp_command:
+    if not pool_route and not override_provider and not override_base_url and not override_acp_command:
         effective_requested_provider = (
             getattr(parent_agent, "requested_provider", None) or effective_provider
         )
@@ -651,7 +650,7 @@ def _resolve_child_runtime(
         "api_key": override_api_key if pool_route else (override_api_key or parent_api_key),
         "model": effective_model,
         "provider": effective_provider, "requested_provider": effective_requested_provider,
-        "capabilities": _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
+        "capabilities": None if pool_route else _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,
         "reasoning_config": child_reasoning,
         # Profile fallback_chain wins when provided. Else the routing owner
@@ -663,10 +662,10 @@ def _resolve_child_runtime(
                 pinned=bool(override_provider or override_base_url or model))
         ),
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
-        # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
-        **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},
+        # Routing filters reset under a pinned provider or a selected pool tier.
+        **{a: d if (pool_route or override_provider) else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},
     }
-    if not override_provider:
+    if not (pool_route or override_provider):
         kwargs["provider_data_collection"] = kwargs["provider_data_collection"] or ""
     child_max_tokens = getattr(parent_agent, "max_tokens", None)
     if isinstance(child_max_tokens, int):

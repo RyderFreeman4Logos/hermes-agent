@@ -71,6 +71,28 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     )
 
 
+def test_transfer_ownership_checkpoints_after_releasing_registry_lock(registry):
+    """Handoff must persist the new owner without re-entering the registry lock."""
+    session = _make_session(sid="proc_handoff", task_id="child")
+    session.owner_task_id = "child"
+    registry._running[session.id] = session
+    held = {"inside": False}
+
+    def checkpoint():
+        held["inside"] = registry._lock.locked()
+        assert not held["inside"]
+
+    with patch.object(registry, "_write_checkpoint", side_effect=checkpoint) as write:
+        moved = registry.transfer_ownership(
+            session.id, from_owner="child", to_owner="parent",
+            to_task_id="parent-task", to_session_key="parent-key", note="handoff")
+
+    assert moved is session
+    assert session.owner_task_id == "parent"
+    assert not held["inside"]
+    write.assert_called_once()
+
+
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
     old = _make_session(sid="proc_old", task_id="session-a")
     finished = _make_session(

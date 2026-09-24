@@ -110,9 +110,12 @@ class TestDelegateRequirements(unittest.TestCase):
             "respond in Chinese",  # language example (weak models regress without it)
             "SELF-REPORTS",        # verification contract
             "clarify",             # child blocked-tool list
-            "delegation.provider", # model inheritance / pinning
+            "model_profile",       # pool routing (omitted uses standard)
+            "standard",            # required pool profile
+            "fail closed",         # unknown names / pool without standard
         ):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
+        self.assertNotIn("delegation.provider", desc)
         # send_message must NOT be named: gateway-internal vocabulary most
         # sessions never see (still enforced via DELEGATE_BLOCKED_TOOLS).
         self.assertNotIn("send_message", desc)
@@ -1152,7 +1155,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
     @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     def test_config_provider_credentials_reach_child_agent(self, mock_creds, mock_cfg):
         """When delegation.provider is configured, child agent gets resolved credentials."""
         mock_cfg.return_value = {
@@ -1186,7 +1189,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["api_mode"], "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     def test_cross_provider_delegation(self, mock_creds, mock_cfg):
         """Parent on Nous, subagent on OpenRouter — full credential switch."""
         mock_cfg.return_value = {
@@ -1224,7 +1227,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertNotEqual(kwargs["api_key"], parent.api_key)
 
     @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     def test_direct_endpoint_credentials_reach_child_agent(self, mock_creds, mock_cfg):
         mock_cfg.return_value = {
             "max_iterations": 45,
@@ -1258,7 +1261,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["api_mode"], "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     def test_credential_error_returns_json_error(self, mock_creds, mock_cfg):
         """When credential resolution fails, delegate_task returns a JSON error."""
         mock_cfg.return_value = {"model": "bad-model", "provider": "nonexistent"}
@@ -1861,7 +1864,7 @@ class TestMaxSpawnDepth(unittest.TestCase):
 class TestOrchestratorRoleSchema(unittest.TestCase):
     """Tests that the role param reaches the child via dispatch."""
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def _run_with_mock_child(self, role_arg, mock_cfg, mock_creds):
@@ -1944,7 +1947,7 @@ def _make_role_mock_child():
 class TestOrchestratorRoleBehavior(unittest.TestCase):
     """Tests that role='orchestrator' actually changes toolset + prompt."""
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def test_orchestrator_role_keeps_delegation_at_depth_1(
@@ -1968,7 +1971,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             self.assertIn("delegation", kwargs["enabled_toolsets"])
             self.assertEqual(mock_child._delegate_role, "orchestrator")
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def test_orchestrator_blocked_at_max_spawn_depth(
@@ -2021,7 +2024,7 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
     the test in one patch context and avoids depth-indexed nesting.
     """
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def test_end_to_end_nested_orchestration(self, mock_cfg, mock_creds):
@@ -2344,6 +2347,60 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials({"provider": "copilot", "model": "gpt-5"}, parent)
         self.assertIn("without a base_url", str(ctx.exception))
+
+
+class TestModelPoolRouting(unittest.TestCase):
+    def test_omitted_profile_uses_standard_and_stamps_route(self):
+        cfg = {
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main-model", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"provider": "custom", "model": "fast-model", "base_url": "http://fast/v1", "api_key": "k"},
+            }
+        }
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.run_conversation.return_value = {"final_response": "done", "completed": True, "api_calls": 1}
+            child.model = "main-model"
+            child.provider = "custom"
+            MockAgent.return_value = child
+            result = json.loads(delegate_task(goal="route", parent_agent=parent))
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "main-model")
+        self.assertEqual(result["results"][0]["model"], "main-model")
+        self.assertEqual(result["results"][0]["provider"], "custom")
+
+    def test_task_profile_overrides_top_level(self):
+        cfg = {
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main-model", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"provider": "custom", "model": "fast-model", "base_url": "http://fast/v1", "api_key": "k"},
+            }
+        }
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._run_single_child", return_value={"status": "completed"}
+        ):
+            MockAgent.return_value = MagicMock()
+            delegate_task(
+                tasks=[{"goal": "fast", "model_profile": "fast"}],
+                model_profile="standard",
+                parent_agent=parent,
+            )
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "fast-model")
+
+    def test_unknown_profile_fails_closed(self):
+        cfg = {"model_pool": {"standard": {"provider": "custom", "model": "main-model"}}}
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            result = json.loads(delegate_task(goal="nope", model_profile="missing", parent_agent=parent))
+        self.assertIn("Unknown", result["error"])
+
+    def test_nonempty_pool_without_standard_fails_closed(self):
+        cfg = {"model_pool": {"fast": {"provider": "custom", "model": "tiny"}}}
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            result = json.loads(delegate_task(goal="nope", parent_agent=parent))
+        self.assertIn("standard", result["error"])
 
 
 if __name__ == "__main__":

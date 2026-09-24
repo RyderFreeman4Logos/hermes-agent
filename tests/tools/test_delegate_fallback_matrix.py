@@ -61,7 +61,7 @@ def _spawn_kwargs(parent, cfg, **overrides):
     ("overrides", "expected"),
     [
         ({}, PARENT_CHAIN),                                                    # unpinned inherits
-        ({"model": "deepseek-chat"}, None),                                    # model-only pin (#80450 model arm)
+        ({"model": "deepseek-chat"}, PARENT_CHAIN),                            # bare model is not a route pin
         ({"override_provider": "minimax", "override_base_url": "https://api.minimax.example/v1",
           "override_api_key": "sk-mm"}, None),                                 # provider pin
     ],

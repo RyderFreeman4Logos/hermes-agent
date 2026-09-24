@@ -82,6 +82,14 @@ def _warn_once(flag_name: str, message: str, *args: Any) -> None:
         globals()[flag_name] = True
         logger.warning(message, *args)
 
+def _get_oneshot_max_children() -> int:
+    """delegation.oneshot_max_children (total children per finite one-shot session; 0 = unlimited)."""
+    return _knob(
+        "oneshot_max_children", None, lambda v: max(0, int(v)), 2,
+        "delegation.oneshot_max_children=%r is not a valid integer; using default 2",
+    )
+
+
 def _get_max_concurrent_children() -> int:
     """delegation.max_concurrent_children > DELEGATION_MAX_CONCURRENT_CHILDREN env > 10.
 
@@ -129,10 +137,12 @@ def _parse_timeout(raw: Any) -> Optional[float]:
     return None if parsed <= 0 else max(30.0, parsed)
 
 def _get_child_timeout() -> Optional[float]:
-    """Hard wall-clock cap for one child, or None (default: no timeout). Failures should come from what the child does
-    (API/tool errors, iteration budget), not a stopwatch; stuck children are caught by the heartbeat staleness
-    monitor. delegation.child_timeout_seconds > 0 opts in (floor 30 s); 0 or negative disables. Env fallback:
-    DELEGATION_CHILD_TIMEOUT_SECONDS."""
+    """Inactivity cap for one child (seconds of NO progress), or None (default: no cap). Failures should come from
+    what the child does (API/tool errors, iteration budget), not a stopwatch: the cap restarts on every sign of
+    progress — a completed call, a tool change, an activity-clock tick — so a slow provider serving multi-minute
+    completions never loses a live child, and a child frozen for the whole window is still caught. A configured
+    value pre-empts nothing the heartbeat staleness monitor would not also catch. delegation.child_timeout_seconds
+    > 0 opts in (floor 30 s); 0 or negative disables. Env fallback: DELEGATION_CHILD_TIMEOUT_SECONDS."""
     return _knob(
         "child_timeout_seconds", "DELEGATION_CHILD_TIMEOUT_SECONDS", _parse_timeout, DEFAULT_CHILD_TIMEOUT,
         "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
@@ -183,22 +193,25 @@ def _inherit_parent_capabilities(parent_agent, override_provider, override_base_
         return None
     return {key: value for key, value in parent_caps.items() if isinstance(key, str) and isinstance(value, bool)}
 
-def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> Optional[str]:
-    """Base URL the parent is actually calling (live client), not a stale attribute: ``parent_agent.base_url`` can lag
-    the live client (old OpenRouter URL vs local Ollama) and inheriting the stale one 401s with a dummy/local key."""
-    surface_url = _normalized_runtime_url(fallback_base_url)
+def _inherit_parent_endpoint(parent_agent, surface_base_url: Optional[str], surface_api_key: Any) -> tuple:
+    """``(base_url, api_key)`` the parent is actually calling, taken from ONE source. ``parent_agent.base_url`` /
+    ``api_key`` can lag the live client (old OpenRouter URL vs local Ollama; a fallback runtime the surface attributes
+    have not caught up with), and pairing the live endpoint with the surface key hands the child a (base_url, key)
+    pair that was never valid anywhere — an instant, non-retryable 401 (#90009). The live client's key travels with
+    its URL; the surface attributes are used only when there is no live OpenAI-wire client (native Anthropic/Bedrock
+    runtimes keep ``client=None``)."""
     client_kwargs = getattr(parent_agent, "_client_kwargs", None)
     client = getattr(parent_agent, "client", None)
     live_candidates = (
-        client_kwargs.get("base_url") if isinstance(client_kwargs, dict) else None,
+        (client_kwargs.get("base_url"), client_kwargs.get("api_key")) if isinstance(client_kwargs, dict) else (None, None),
         # OpenAI SDK exposes base_url as httpx.URL — coerce before comparing.
-        getattr(client, "base_url", "") if client is not None else None,
+        (getattr(client, "base_url", ""), getattr(client, "api_key", None)) if client is not None else (None, None),
     )
-    for raw in live_candidates:
-        url = _normalized_runtime_url(raw)
-        if url and url != surface_url and url.startswith(("http://", "https://")):
-            return url
-    return fallback_base_url or None
+    for raw_url, live_key in live_candidates:
+        url = _normalized_runtime_url(raw_url)
+        if url and url.startswith(("http://", "https://")):
+            return url, (live_key or surface_api_key)
+    return (surface_base_url or None), surface_api_key
 
 def _loaded_pool(key: Any):
     """``load_pool(key)`` when it holds credentials, else None."""
@@ -206,8 +219,22 @@ def _loaded_pool(key: Any):
     pool = load_pool(key)
     return pool if pool is not None and pool.has_credentials() else None
 
+def _pool_serves_endpoint(pool: Any, provider: Optional[str], base_url: Optional[str]) -> bool:
+    """Provider identity AND at least one entry for the child's endpoint; pools without entry metadata pass."""
+    from agent.credential_pool import (
+        credential_pool_entry_serves_endpoint as _entry_serves_endpoint, credential_pool_matches_provider,
+    )
+    if not credential_pool_matches_provider(pool, provider, base_url=base_url):
+        return False
+    entries_fn = getattr(pool, "entries", None)
+    if not callable(entries_fn):
+        return True
+    entries = entries_fn()
+    return not isinstance(entries, list) or any(_entry_serves_endpoint(entry, base_url) for entry in entries)
+
 def _resolve_child_credential_pool(
     effective_provider: Optional[str], parent_agent, effective_base_url: Optional[str] = None,
+    effective_requested_provider: Optional[str] = None,
 ):
     """Credential pool for the child: parent's pool (same provider), that provider's own pool, or None (child keeps
     its fixed credential). Custom endpoints all collapse to ``provider="custom"``, so they are matched by endpoint
@@ -220,6 +247,10 @@ def _resolve_child_credential_pool(
     interchangeable and let the child inherit the parent's pool. We therefore resolve custom runtimes by
     endpoint identity (the ``custom:<name>`` pool key derived from the base_url) and only share the parent's
     pool when both resolve to the *same* custom endpoint. See #7833.
+
+    Named custom providers may share one gateway URL with different credentials, so the inherited
+    ``requested_provider`` identity takes precedence over URL-only matching (#45763): the child must not
+    lease the first pool registered for the shared endpoint.
     """
     parent_pool = getattr(parent_agent, "_credential_pool", None)
     if not effective_provider:
@@ -228,16 +259,24 @@ def _resolve_child_credential_pool(
     try:
         if effective_provider == "custom":
             from agent.credential_pool import get_custom_provider_pool_key
-            child_key = get_custom_provider_pool_key(effective_base_url)
+            child_key = get_custom_provider_pool_key(effective_base_url, provider_name=effective_requested_provider)
             if child_key is None:
                 return None
-            parent_key = get_custom_provider_pool_key(getattr(parent_agent, "base_url", None))
+            parent_key = get_custom_provider_pool_key(
+                getattr(parent_agent, "base_url", None), provider_name=getattr(parent_agent, "requested_provider", None),
+            )
             if parent_pool is not None and parent_provider == "custom" and parent_key is not None and parent_key == child_key:
                 return parent_pool
             return _loaded_pool(child_key)
         if parent_pool is not None and effective_provider == parent_provider:
-            return parent_pool
-        return _loaded_pool(effective_provider)
+            if not effective_base_url or _pool_serves_endpoint(parent_pool, effective_provider, effective_base_url):
+                return parent_pool
+            logger.debug("Parent %s pool has no entry for child endpoint %s; not sharing it",
+                         effective_provider, effective_base_url)
+        pool = _loaded_pool(effective_provider)
+        if pool is not None and effective_base_url and not _pool_serves_endpoint(pool, effective_provider, effective_base_url):
+            return None  # child keeps its fixed credential
+        return pool
     except Exception as exc:
         if effective_provider == "custom":
             logger.debug("Could not resolve custom credential pool for child endpoint '%s': %s", effective_base_url, exc)
@@ -303,8 +342,10 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         provider, api_mode = "anthropic", "anthropic_messages"
     elif "api.kimi.com/coding" in base_lower:
         api_mode = "anthropic_messages"
-    # Explicit delegation.api_mode always wins over the URL heuristic.
-    if v["api_mode"] in _EXPLICIT_API_MODES:
+    # Explicit delegation.api_mode always wins over the URL heuristic; a provider plugin's
+    # registered dialect counts as explicit.
+    from agent.transports import registered_api_modes
+    if v["api_mode"] in _EXPLICIT_API_MODES or (v["api_mode"] and v["api_mode"] in registered_api_modes()):
         api_mode = v["api_mode"]
 
     # Preserve the configured provider's request personality on an explicit endpoint.
@@ -354,6 +395,16 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         f"'{pinned_command}' command, which was not found on PATH. "
         f"Install it or choose a different delegation provider.",
     )
+    # A provider override is assembled into the child as one bundle (see _resolve_child_runtime), so it must
+    # carry its own endpoint. ACP transports are addressed by command and native-SDK providers by their SDK,
+    # so neither needs a URL; anything else without one would otherwise be built with no endpoint at all.
+    if (not runtime.get("base_url") and not pinned_command
+            and configured_provider.strip().lower() not in _NATIVE_SDK_PROVIDERS):
+        raise ValueError(
+            f"Delegation provider '{configured_provider}' resolved without a base_url. "
+            f"Refusing to build a subagent with an incomplete credential bundle — check the provider's "
+            f"configuration / auth, or set delegation.base_url for a direct endpoint."
+        )
     return _credential_bundle(
         v["model"] or runtime.get("model") or None,
         configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
@@ -382,6 +433,77 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
+
+def _model_pool(cfg: dict) -> dict:
+    pool = cfg.get("model_pool") or {}
+    return pool if isinstance(pool, dict) else {}
+
+def _available_model_profile_names(cfg: Optional[dict] = None) -> List[str]:
+    if cfg is None:
+        cfg = _load_config()
+    return [str(name) for name in _model_pool(cfg) if str(name).strip()]
+
+def _profile_fallback_chain(raw: Any) -> Optional[List[Dict[str, Any]]]:
+    """Normalize a profile chain. ``None`` means the profile did not set one;
+    an explicit list, including ``[]``, is the profile's chain."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        return []
+    chain: List[Dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        normalized = dict(entry)
+        normalized["provider"] = provider
+        normalized["model"] = model
+        chain.append(normalized)
+    return chain
+
+def _credentials_for_model_profile(cfg: dict, parent_agent, profile_name: Optional[str]) -> dict:
+    """Child creds for one pool tier. Unknown or non-mapping names fail closed.
+
+    A non-empty pool is the only route source: omitted uses ``standard``, and a
+    pool without that profile refuses the spawn. An empty pool keeps the global
+    delegation route.
+    """
+    name = str(profile_name or "").strip() or None
+    pool = _model_pool(cfg)
+    if pool and "standard" not in _available_model_profile_names(cfg):
+        raise ValueError("Non-empty model_pool requires an explicit 'standard' profile.")
+    if name is None:
+        if not pool:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
+            creds.setdefault("fallback_chain", None)
+            return creds
+        name = "standard"
+    if name not in pool:
+        available = ", ".join(_available_model_profile_names(cfg)) or "(none)"
+        raise ValueError(f"Unknown {name!r}. Configured: {available}.")
+    profile = pool[name]
+    if not isinstance(profile, dict):
+        raise ValueError(f"{name!r} is not a mapping.")
+    overlay = {
+        key: str(profile.get(key) or "").strip() or None
+        for key in ("model", "provider", "base_url", "api_key")
+    }
+    overlay["api_mode"] = str(profile.get("api_mode") or "").strip().lower() or None
+    # A selected tier is the only route source. Unset keys stay unset so a
+    # model-only profile cannot inherit the global provider, endpoint, or key.
+    merged = {k: v for k, v in cfg.items() if k not in overlay}
+    for key, value in overlay.items():
+        merged[key] = value
+    creds = _resolve_delegation_credentials(merged, parent_agent)
+    # Model-only: no provider or endpoint, so parent/global request_overrides
+    # do not belong to this tier. An explicit profile chain still wins below.
+    if overlay["provider"] is None and overlay["base_url"] is None:
+        creds["request_overrides"] = None
+    creds["fallback_chain"] = _profile_fallback_chain(profile.get("fallback_chain"))
+    return creds
 
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
@@ -439,6 +561,8 @@ def _resolve_child_runtime(
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
     routing_cfg: Optional[Dict[str, Any]] = None,
+    override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
+    pool_route: bool = False,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -446,8 +570,17 @@ def _resolve_child_runtime(
     ``override_provider`` clears the parent's ACP transport, fallback chain and OpenRouter routing filters so the
     pinned provider is actually honoured."""
     effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or _inherit_parent_base_url(parent_agent, parent_agent.base_url)
+    # provider/base_url are one bundle: all from the override, or all from the parent. Per-field fallback built
+    # children like an override provider pointed at the PARENT's endpoint (e.g. copilot credentials on the
+    # parent's Codex URL), which 404s on every request and can't be rescued by the fallback chain, whose dedup
+    # matches provider+model and so skips the entry as a self-loop. _inherit_parent_endpoint recovers the
+    # parent's live endpoint (with its key), which is meaningless for a different provider.
+    if pool_route or override_provider or override_base_url:
+        effective_provider = override_provider
+        effective_base_url = override_base_url
+    else:
+        effective_provider = getattr(parent_agent, "provider", None)
+        effective_base_url, parent_api_key = _inherit_parent_endpoint(parent_agent, parent_agent.base_url, parent_api_key)
     # api_mode: each provider has its own wire, so a different provider re-derives (None) instead of inheriting (404s
     # otherwise). Nous Portal is dual-wire within one provider (anthropic/* → Messages, else chat_completions), so
     # same-provider inheritance would pin the child on the wrong wire — re-derive.
@@ -477,19 +610,29 @@ def _resolve_child_runtime(
     effective_acp_args = list(
         override_acp_args if override_acp_args is not None else (getattr(parent_agent, "acp_args", []) or [])
     )
-    # A pinned provider must use direct API calls; inheriting the parent's ACP
-    # transport would bypass the override credentials entirely.
-    # Inheriting acp_command unconditionally causes run_agent.py to initialize CopilotACPClient, bypassing
-    # override credentials entirely (issue #16816).
-    if override_provider and not override_acp_command:
+    # A pinned provider, or a selected pool tier, must use direct API calls.
+    # Inheriting the parent's ACP transport would bypass the selected route.
+    if (pool_route or override_provider) and not override_acp_command:
         effective_acp_command, effective_acp_args = None, []
     # Defensive: validate trusted delegation.command exists on PATH before honoring it. An explicitly pinned
     # transport that cannot run must fail the spawn loudly (#80450) — silently falling back to the default
     # transport would run the child somewhere the user explicitly routed it away from. Normally unreachable
     # via delegate_task, which pre-validates the command in _resolve_delegation_credentials.
     if override_acp_command:
-        # Forced ACP transport requires provider copilot-acp for run_agent to init the client.
-        effective_provider, effective_api_mode = "copilot-acp", "chat_completions"
+        from providers import get_provider_profile
+        profile = get_provider_profile(effective_provider or "")
+        # A generic process command does not imply the legacy ACP protocol.
+        if profile is None or profile.auth_type != "external_process":
+            effective_provider, effective_api_mode = "copilot-acp", "chat_completions"
+
+    # A named provider identity is endpoint-scoped. A selected pool tier owns
+    # its identity even when provider and endpoint are unset. Preserve the
+    # parent name only when the child inherits the exact parent route.
+    effective_requested_provider = effective_provider
+    if not pool_route and not override_provider and not override_base_url and not override_acp_command:
+        effective_requested_provider = (
+            getattr(parent_agent, "requested_provider", None) or effective_provider
+        )
 
     # Reasoning: delegation.reasoning_effort > parent. Keep the raw value — a
     # YAML ``false`` must disable thinking, not coerce to "" and inherit.
@@ -506,22 +649,36 @@ def _resolve_child_runtime(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    # A model name is not a route pin. Only a provider, endpoint, or selected
+    # pool tier stops the child from inheriting the parent chain.
+    inherit_parent_chain = not pool_route and not override_provider and not override_base_url
+    fallback_model = (
+        override_fallback_chain if override_fallback_chain is not None
+        else _resolve_child_fallback_chain(
+            parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
+            pinned=not inherit_parent_chain)
+    )
+    # Model-only pool tier: omitted profile chain means no chain. A routed
+    # tier still inherits delegation.fallback_providers via override_fallback_chain.
+    if pool_route and override_fallback_chain is None and not override_provider and not override_base_url:
+        fallback_model = None
     kwargs: Dict[str, Any] = {
-        "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
-        "provider": effective_provider,
-        "capabilities": _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
+        "base_url": effective_base_url,
+        "api_key": override_api_key if pool_route else (override_api_key or parent_api_key),
+        "model": effective_model,
+        "provider": effective_provider, "requested_provider": effective_requested_provider,
+        "capabilities": None if pool_route else _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,
         "reasoning_config": child_reasoning,
-        # Resolve routing and recovery policy from the same configuration owner. A pinned provider, endpoint, or
-        # model never borrows the parent's chain; an explicitly declared child chain still remains available.
-        "fallback_model": _resolve_child_fallback_chain(
-            parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
-            pinned=bool(override_provider or override_base_url or model)),
-        "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
-        # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
-        **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},
+        "fallback_model": fallback_model,
+        "openrouter_min_coding_score": (
+            None if (pool_route and not override_provider and not override_base_url)
+            else getattr(parent_agent, "openrouter_min_coding_score", None)
+        ),
+        # Routing filters reset under a pinned provider or a selected pool tier.
+        **{a: d if (pool_route or override_provider) else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},
     }
-    if not override_provider:
+    if not (pool_route or override_provider):
         kwargs["provider_data_collection"] = kwargs["provider_data_collection"] or ""
     child_max_tokens = getattr(parent_agent, "max_tokens", None)
     if isinstance(child_max_tokens, int):

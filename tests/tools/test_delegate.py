@@ -30,6 +30,8 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _credentials_for_model_profile,
+    _resolve_child_runtime,
 )
 from hermes_state import SessionDB
 
@@ -110,9 +112,12 @@ class TestDelegateRequirements(unittest.TestCase):
             "respond in Chinese",  # language example (weak models regress without it)
             "SELF-REPORTS",        # verification contract
             "clarify",             # child blocked-tool list
-            "delegation.provider", # model inheritance / pinning
+            "model_profile",       # pool routing (omitted uses standard)
+            "standard",            # required pool profile
+            "fail closed",         # unknown names / pool without standard
         ):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
+        self.assertNotIn("delegation.provider", desc)
         # send_message must NOT be named: gateway-internal vocabulary most
         # sessions never see (still enforced via DELEGATE_BLOCKED_TOOLS).
         self.assertNotIn("send_message", desc)
@@ -141,10 +146,10 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("up to 7", overrides["description"])
 
 class TestChildSystemPrompt(unittest.TestCase):
-    def test_goal_only(self):
-        prompt = _build_child_system_prompt("Fix the tests")
-        self.assertIn("Fix the tests", prompt)
-        self.assertIn("YOUR TASK", prompt)
+    def test_goal_is_not_duplicated_in_system_prompt(self):
+        """The goal is the child's first user turn; the system prompt must not carry a second copy."""
+        prompt = _build_child_system_prompt("Reply with the single word PONG and stop.")
+        self.assertNotIn("Reply with the single word PONG and stop.", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
 class TestStripBlockedTools(unittest.TestCase):
@@ -1152,7 +1157,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
     @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     def test_config_provider_credentials_reach_child_agent(self, mock_creds, mock_cfg):
         """When delegation.provider is configured, child agent gets resolved credentials."""
         mock_cfg.return_value = {
@@ -1186,7 +1191,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["api_mode"], "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     def test_cross_provider_delegation(self, mock_creds, mock_cfg):
         """Parent on Nous, subagent on OpenRouter — full credential switch."""
         mock_cfg.return_value = {
@@ -1224,7 +1229,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertNotEqual(kwargs["api_key"], parent.api_key)
 
     @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     def test_direct_endpoint_credentials_reach_child_agent(self, mock_creds, mock_cfg):
         mock_cfg.return_value = {
             "max_iterations": 45,
@@ -1258,7 +1263,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["api_mode"], "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     def test_credential_error_returns_json_error(self, mock_creds, mock_cfg):
         """When credential resolution fails, delegate_task returns a JSON error."""
         mock_cfg.return_value = {"model": "bad-model", "provider": "nonexistent"}
@@ -1281,7 +1286,46 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         result = _resolve_child_credential_pool("openrouter", parent)
         self.assertIs(result, mock_pool)
 
+    def test_same_provider_pool_for_another_endpoint_is_not_shared(self):
+        """#68237: an Azure child must not lease the parent's public-OpenAI ``openai`` pool — the lease swaps the
+        child's base_url too, sending the pooled key to the wrong host. A pool with an entry for the child's endpoint
+        is still shared."""
+        from agent.credential_pool import CredentialPool, PooledCredential
+
+        azure = "https://res.cognitiveservices.azure.com/openai/v1"
+        def _pool(url):
+            return CredentialPool("openai", [PooledCredential(
+                provider="openai", id=url, label=url, auth_type="api_key", priority=0, source="env:X",
+                access_token="k", base_url=url)])
+        parent = _make_mock_parent()
+        parent.provider, parent.base_url = "openai", azure
+
+        parent._credential_pool = _pool("https://api.openai.com/v1")
+        with patch("tools.delegate_tool_config._loaded_pool", return_value=None):
+            self.assertIsNone(_resolve_child_credential_pool("openai", parent, azure))
+        parent._credential_pool = _pool(azure)
+        self.assertIs(_resolve_child_credential_pool("openai", parent, azure), parent._credential_pool)
+
     # --- Custom-endpoint identity resolution (issue #7833) ---
+
+    def test_named_custom_child_pool_follows_requested_provider_not_endpoint_order(self):
+        """#45763 (salvage #89021): two named custom providers on one gateway URL keep separate pools; the child
+        leases the pool of the identity it inherited, not the first entry registered for that URL."""
+        from hermes_constants import get_hermes_home
+
+        url = "https://gateway.invalid/v1"
+        get_hermes_home().joinpath("config.yaml").write_text(
+            f"providers:\n  claude-ai:\n    api: {url}\n  open-ai:\n    api: {url}\n", encoding="utf-8",
+        )
+        parent = _make_mock_parent()
+        parent.provider, parent.base_url, parent.requested_provider = "custom", url, "custom:open-ai"
+        parent._credential_pool = None
+
+        with patch("tools.delegate_tool_config._loaded_pool", side_effect=lambda key: key) as loaded:
+            key = _resolve_child_credential_pool("custom", parent, url, effective_requested_provider="custom:open-ai")
+        loaded.assert_called_once()
+        self.assertIn("open-ai", key)
+        self.assertNotIn("claude", key)
 
 
     @patch(
@@ -1323,7 +1367,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child = MagicMock()
         child._credential_pool = MagicMock()
         child._credential_pool.acquire_lease.return_value = "cred-b"
-        child._credential_pool.current.return_value = leased_entry
+        child._credential_pool.entries.return_value = [leased_entry]  # bound by leased id, not the shared cursor
         child.run_conversation.return_value = {
             "final_response": "done",
             "completed": True,
@@ -1362,6 +1406,26 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
+
+    def test_lease_binds_only_an_entry_for_the_child_endpoint(self):
+        """#68237: on a mixed same-provider pool the least-leased pick may target another host; the child must end up
+        bound to the entry for its own base_url, with the wrong-host lease released."""
+        from agent.credential_pool import CredentialPool, PooledCredential
+        from tools.delegate_tool_child_run import _lease_child_credential
+
+        azure = "https://res.cognitiveservices.azure.com/openai/v1"
+        def _entry(eid, url):
+            return PooledCredential(provider="openai", id=eid, label=eid, auth_type="api_key", priority=0,
+                                    source=f"env:{eid}", access_token=f"key-{eid}", base_url=url)
+        pool = CredentialPool("openai", [_entry("pub", "https://api.openai.com/v1"), _entry("az", azure)])
+        pool.acquire_lease("az")  # tilt least-leased selection toward the public entry
+        child = MagicMock(provider="openai", base_url=azure, _credential_pool=pool)
+
+        _pool, lease_id = _lease_child_credential(child)
+
+        self.assertEqual(lease_id, "az")
+        self.assertEqual(child._swap_credential.call_args[0][0].base_url, azure)
+        self.assertEqual(pool._active_leases, {"az": 2})
 
 
 class TestDelegateHeartbeat(unittest.TestCase):
@@ -1802,7 +1866,7 @@ class TestMaxSpawnDepth(unittest.TestCase):
 class TestOrchestratorRoleSchema(unittest.TestCase):
     """Tests that the role param reaches the child via dispatch."""
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def _run_with_mock_child(self, role_arg, mock_cfg, mock_creds):
@@ -1885,7 +1949,7 @@ def _make_role_mock_child():
 class TestOrchestratorRoleBehavior(unittest.TestCase):
     """Tests that role='orchestrator' actually changes toolset + prompt."""
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def test_orchestrator_role_keeps_delegation_at_depth_1(
@@ -1909,7 +1973,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             self.assertIn("delegation", kwargs["enabled_toolsets"])
             self.assertEqual(mock_child._delegate_role, "orchestrator")
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def test_orchestrator_blocked_at_max_spawn_depth(
@@ -1962,7 +2026,7 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
     the test in one patch context and avoids depth-indexed nesting.
     """
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._credentials_for_model_profile")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
     def test_end_to_end_nested_orchestration(self, mock_cfg, mock_creds):
@@ -2242,6 +2306,337 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     _resolve_delegation_credentials(cfg, parent)
         self.assertIn("missing-acp-binary", str(ctx.exception))
+
+
+class TestAtomicChildCredentialBundle(unittest.TestCase):
+    """provider/base_url/api_key reach the child as one bundle: all override, or all from the parent's live runtime.
+
+    #90009: a parent that flipped onto a fallback runtime handed the child the live endpoint paired with the
+    surface (stale) key — an instant 401 the child could never retry out of.
+    """
+
+    def _build(self, parent, **overrides):
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0, goal="bundle", context=None, toolsets=None, model=None,
+                max_iterations=10, parent_agent=parent, task_count=1, **overrides,
+            )
+        return MockAgent.call_args[1]
+
+    def test_provider_override_never_borrows_parent_base_url(self):
+        parent = _make_mock_parent(depth=0)
+        kwargs = self._build(parent, override_provider="copilot", override_base_url=None, override_api_key="gh-x")
+        self.assertEqual(kwargs["provider"], "copilot")
+        self.assertIsNone(kwargs["base_url"])
+        self.assertNotEqual(kwargs["base_url"], parent.base_url)
+
+    def test_no_override_inherits_live_endpoint_and_key_together(self):
+        parent = _make_mock_parent(depth=0)
+        parent.base_url = "https://fallback.example/v1"
+        parent.api_key = "FAKE-KEY-STALE-PRIMARY"  # surface attribute lagging the live runtime
+        parent._client_kwargs = {"api_key": "FAKE-KEY-FALLBACK", "base_url": "https://fallback.example/v1/"}
+        parent.client = MagicMock(base_url="https://fallback.example/v1/", api_key="FAKE-KEY-FALLBACK")
+        kwargs = self._build(parent)
+        self.assertEqual(kwargs["provider"], parent.provider)
+        self.assertEqual(kwargs["base_url"], "https://fallback.example/v1")
+        self.assertEqual(kwargs["api_key"], "FAKE-KEY-FALLBACK")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_without_base_url_is_refused(self, mock_resolve):
+        mock_resolve.return_value = {"provider": "copilot", "base_url": "", "api_key": "gh-x", "api_mode": None}
+        parent = _make_mock_parent(depth=0)
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_delegation_credentials({"provider": "copilot", "model": "gpt-5"}, parent)
+        self.assertIn("without a base_url", str(ctx.exception))
+
+
+class TestModelPoolRouting(unittest.TestCase):
+    def test_omitted_profile_uses_standard_and_stamps_route(self):
+        cfg = {
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main-model", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"provider": "custom", "model": "fast-model", "base_url": "http://fast/v1", "api_key": "k"},
+            }
+        }
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.run_conversation.return_value = {"final_response": "done", "completed": True, "api_calls": 1}
+            child.model = "main-model"
+            child.provider = "custom"
+            MockAgent.return_value = child
+            result = json.loads(delegate_task(goal="route", parent_agent=parent))
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "main-model")
+        self.assertEqual(result["results"][0]["model"], "main-model")
+        self.assertEqual(result["results"][0]["provider"], "custom")
+
+    def test_task_profile_overrides_top_level(self):
+        cfg = {
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main-model", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"provider": "custom", "model": "fast-model", "base_url": "http://fast/v1", "api_key": "k"},
+            }
+        }
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._run_single_child", return_value={"status": "completed"}
+        ):
+            MockAgent.return_value = MagicMock()
+            delegate_task(
+                tasks=[{"goal": "fast", "model_profile": "fast"}],
+                model_profile="standard",
+                parent_agent=parent,
+            )
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "fast-model")
+
+    def test_unknown_profile_fails_closed(self):
+        cfg = {"model_pool": {"standard": {"provider": "custom", "model": "main-model"}}}
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            result = json.loads(delegate_task(goal="nope", model_profile="missing", parent_agent=parent))
+        self.assertIn("Unknown", result["error"])
+
+    def test_nonempty_pool_without_standard_fails_closed(self):
+        cfg = {"model_pool": {"fast": {"provider": "custom", "model": "tiny"}}}
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            result = json.loads(delegate_task(goal="nope", parent_agent=parent))
+        self.assertIn("standard", result["error"])
+
+    def test_model_only_profile_does_not_inherit_global_route(self):
+        cfg = {
+            "provider": "openrouter",
+            "base_url": "https://global.example/v1",
+            "api_key": "global-key",
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"model": "tiny-model"},
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        creds = _credentials_for_model_profile(cfg, parent, "fast")
+        kwargs = _resolve_child_runtime(
+            parent, cfg, parent.api_key, model=creds["model"], override_provider=creds["provider"],
+            override_base_url=creds["base_url"], override_api_key=creds["api_key"], override_api_mode=creds.get("api_mode"),
+            override_acp_command=None, override_acp_args=None, routing_cfg=cfg,
+            override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+        )
+        self.assertEqual(kwargs["model"], "tiny-model")
+        self.assertIsNone(kwargs["provider"])
+        self.assertIsNone(kwargs["base_url"])
+        self.assertIsNone(kwargs["api_key"])
+
+    def test_explicit_empty_profile_fallback_chain_disables_fallback(self):
+        cfg = {
+            "fallback_providers": [{"provider": "openrouter", "model": "global-fallback"}],
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {
+                    "provider": "custom", "model": "tiny", "base_url": "http://fast/v1", "api_key": "k",
+                    "fallback_chain": [],
+                },
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        creds = _credentials_for_model_profile(cfg, parent, "fast")
+        kwargs = _resolve_child_runtime(
+            parent, cfg, parent.api_key, model=creds["model"], override_provider=creds["provider"],
+            override_base_url=creds["base_url"], override_api_key=creds["api_key"], override_api_mode=None,
+            override_acp_command=None, override_acp_args=None, routing_cfg=cfg,
+            override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+        )
+        self.assertEqual(kwargs["fallback_model"], [])
+
+    def test_omitted_standard_chain_reaches_real_child_not_parent_chain(self):
+        """None from an omitted standard chain must not fall through to the parent chain."""
+        declared = [{"provider": "deepseek", "model": "deepseek-chat"}]
+        parent_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        cfg = {
+            "fallback_providers": declared,
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = parent_chain
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value=cfg):
+            MockAgent.return_value = MagicMock()
+            creds = _credentials_for_model_profile(cfg, parent, None)
+            _build_child_agent(
+                task_index=0, goal="route", context=None, toolsets=None, model=creds["model"],
+                max_iterations=10, parent_agent=parent, task_count=1,
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"], override_api_mode=creds.get("api_mode"),
+                override_request_overrides=creds.get("request_overrides"),
+                override_acp_command=creds.get("command"), override_acp_args=creds.get("args"),
+                routing_cfg=cfg, override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+            )
+        built = MockAgent.call_args.kwargs["fallback_model"]
+        self.assertEqual(built, declared)
+        self.assertNotEqual(built, parent_chain)
+
+    def test_model_only_profile_isolates_parent_route_on_real_child(self):
+        """A model-only tier nulls provider, endpoint, and key, and does not keep parent route state."""
+        cfg = {
+            "provider": "openrouter",
+            "base_url": "https://global.example/v1",
+            "api_key": "global-key",
+            "fallback_providers": [{"provider": "openrouter", "model": "global-fallback"}],
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"model": "tiny-model"},
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.requested_provider = "custom:parent-name"
+        parent.acp_command = "parent-acp"
+        parent.acp_args = ["--parent"]
+        parent.capabilities = {"vision": True}
+        parent.providers_allowed = ["Anthropic"]
+        parent._credential_pool = object()
+        parent._fallback_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value=cfg):
+            child = type("Child", (), {})()
+            MockAgent.return_value = child
+            creds = _credentials_for_model_profile(cfg, parent, "fast")
+            built = _build_child_agent(
+                task_index=0, goal="iso", context=None, toolsets=None, model=creds["model"],
+                max_iterations=10, parent_agent=parent, task_count=1,
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"], override_api_mode=creds.get("api_mode"),
+                override_request_overrides=creds.get("request_overrides"),
+                override_acp_command=creds.get("command"), override_acp_args=creds.get("args"),
+                routing_cfg=cfg, override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+            )
+        kw = MockAgent.call_args.kwargs
+        self.assertEqual(kw["model"], "tiny-model")
+        for key in ("provider", "requested_provider", "base_url", "api_key", "acp_command", "capabilities"):
+            self.assertIsNone(kw[key], key)
+        self.assertEqual(kw["acp_args"], [])
+        self.assertIsNone(kw["providers_allowed"])
+        self.assertFalse(hasattr(built, "_credential_pool"))
+
+    def test_bare_model_override_still_inherits_parent_route(self):
+        """A model override without a pool tier keeps the parent provider and endpoint."""
+        parent = _make_mock_parent(depth=0)
+        parent.requested_provider = "custom:parent-name"
+        parent.acp_command = "parent-acp"
+        parent.acp_args = ["--parent"]
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value={}):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0, goal="bare", context=None, toolsets=None, model="tiny-model",
+                max_iterations=10, parent_agent=parent, task_count=1,
+            )
+        kw = MockAgent.call_args.kwargs
+        self.assertEqual(kw["model"], "tiny-model")
+        self.assertEqual(kw["provider"], "openrouter")
+        self.assertEqual(kw["requested_provider"], "custom:parent-name")
+        self.assertEqual(kw["base_url"], parent.base_url)
+        self.assertEqual(kw["acp_command"], "parent-acp")
+        self.assertEqual(kw["acp_args"], ["--parent"])
+
+    def test_model_only_builder_drops_parent_overrides_score_and_global_fallback(self):
+        """A model-only tier keeps neither parent overrides, the OpenRouter score, nor the global chain."""
+        global_chain = [{"provider": "openrouter", "model": "global-fallback"}]
+        cfg = {
+            "fallback_providers": global_chain,
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"model": "tiny-model"},
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {"extra_body": {"thinking": {"type": "disabled"}}}
+        parent.openrouter_min_coding_score = 0.42
+        parent._fallback_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value=cfg):
+            MockAgent.return_value = MagicMock()
+            creds = _credentials_for_model_profile(cfg, parent, "fast")
+            _build_child_agent(
+                task_index=0, goal="iso", context=None, toolsets=None, model=creds["model"],
+                max_iterations=10, parent_agent=parent, task_count=1,
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"], override_api_mode=creds.get("api_mode"),
+                override_request_overrides=creds.get("request_overrides"),
+                override_acp_command=creds.get("command"), override_acp_args=creds.get("args"),
+                routing_cfg=cfg, override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+            )
+        kw = MockAgent.call_args.kwargs
+        self.assertEqual(kw["request_overrides"], {})
+        self.assertIsNone(kw["openrouter_min_coding_score"])
+        self.assertIsNone(kw["fallback_model"])
+
+    def test_routed_omitted_chain_keeps_global_fallback_not_parent(self):
+        """A routed tier with no profile chain inherits delegation.fallback_providers."""
+        global_chain = [{"provider": "deepseek", "model": "deepseek-chat"}]
+        cfg = {
+            "fallback_providers": global_chain,
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value=cfg):
+            MockAgent.return_value = MagicMock()
+            creds = _credentials_for_model_profile(cfg, parent, None)
+            _build_child_agent(
+                task_index=0, goal="route", context=None, toolsets=None, model=creds["model"],
+                max_iterations=10, parent_agent=parent, task_count=1,
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"], override_api_mode=creds.get("api_mode"),
+                override_request_overrides=creds.get("request_overrides"),
+                routing_cfg=cfg, override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+            )
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], global_chain)
+
+    def test_explicit_profile_chain_reaches_builder(self):
+        """An explicit profile chain, including [], is the child's chain."""
+        profile_chain = [{"provider": "custom", "model": "backup"}]
+        cfg = {
+            "fallback_providers": [{"provider": "openrouter", "model": "global-fallback"}],
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {
+                    "provider": "custom", "model": "tiny", "base_url": "http://fast/v1", "api_key": "k",
+                    "fallback_chain": profile_chain,
+                },
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value=cfg):
+            MockAgent.return_value = MagicMock()
+            creds = _credentials_for_model_profile(cfg, parent, "fast")
+            _build_child_agent(
+                task_index=0, goal="chain", context=None, toolsets=None, model=creds["model"],
+                max_iterations=10, parent_agent=parent, task_count=1,
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"], override_api_mode=None,
+                override_request_overrides=creds.get("request_overrides"),
+                routing_cfg=cfg, override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+            )
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], profile_chain)
+
+    def test_non_pool_bare_model_keeps_parent_fallback_overrides_and_score(self):
+        """A bare model override is not a pool tier and still inherits the parent route extras."""
+        parent_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = parent_chain
+        parent.request_overrides = {"extra_body": {"x": 1}}
+        parent.openrouter_min_coding_score = 0.7
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value={}):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0, goal="bare", context=None, toolsets=None, model="tiny-model",
+                max_iterations=10, parent_agent=parent, task_count=1,
+            )
+        kw = MockAgent.call_args.kwargs
+        self.assertEqual(kw["fallback_model"], parent_chain)
+        self.assertEqual(kw["request_overrides"], {"extra_body": {"x": 1}})
+        self.assertEqual(kw["openrouter_min_coding_score"], 0.7)
 
 
 if __name__ == "__main__":

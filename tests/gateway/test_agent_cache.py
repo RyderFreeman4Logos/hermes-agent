@@ -13,6 +13,7 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from tools import browser_tool_lifecycle as bt_lifecycle
 
 
@@ -89,7 +90,7 @@ class TestAgentConfigSignature:
         monkeypatch.setattr(
             runtime_provider,
             "resolve_runtime_provider",
-            lambda: {
+            lambda **_kw: {
                 "api_key": "test-key",
                 "base_url": "https://trusted-proxy.example/v1",
                 "provider": "custom",
@@ -186,25 +187,45 @@ class TestExtractCacheBustingConfig:
         assert out["compression.codex_app_server_auto"] == "hermes"
 
 
-    def test_missing_keys_yield_none(self):
-        """Absent config keys must produce None values (still contribute to signature)."""
+    def test_missing_keys_yield_the_shipped_default(self):
+        """An absent key carries the value in force — DEFAULT_CONFIG's — for every documented key."""
         from gateway.run import GatewayRunner
 
         out = GatewayRunner._extract_cache_busting_config({})
-        # Every documented cache-busting key must be present, even if None
         for section, key in GatewayRunner._CACHE_BUSTING_CONFIG_KEYS:
-            assert f"{section}.{key}" in out
-            assert out[f"{section}.{key}"] is None
+            assert out[f"{section}.{key}"] == cfg_get(DEFAULT_CONFIG, section, key)
+
+    def test_explicit_null_differs_from_absent_when_default_is_set(self):
+        """`threshold_tokens: null` opts out of the shipped cap; the signature must keep it distinct from
+        'absent' (= the default) so the opt-out rebuilds the cached agent instead of waiting for a restart."""
+        from gateway.run import GatewayRunner
+
+        default_cap = DEFAULT_CONFIG["compression"]["threshold_tokens"]
+        assert default_cap is not None  # the premise: a non-None default whose opt-out is null
+        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)["compression.threshold_tokens"]  # noqa: E731
+        assert sig({}) == sig({"compression": {"threshold_tokens": default_cap}}) == default_cap
+        assert sig({"compression": {"threshold_tokens": None}}) is None
+
+    def test_legacy_checkpoints_bool_carries_defaults_for_the_other_keys(self):
+        """`checkpoints: true` builds the agent with DEFAULT_CONFIG's limits (`_checkpoint_agent_kwargs`), so
+        migrating to `checkpoints: {enabled: true}` must not change the signature."""
+        from gateway.run import GatewayRunner
+
+        legacy = GatewayRunner._extract_cache_busting_config({"checkpoints": True})
+        explicit = GatewayRunner._extract_cache_busting_config({"checkpoints": {"enabled": True}})
+        assert legacy["checkpoints.enabled"] is True
+        assert {k: v for k, v in legacy.items() if k.startswith("checkpoints.")} == {
+            k: v for k, v in explicit.items() if k.startswith("checkpoints.")}
 
     def test_non_dict_section_treated_as_missing(self):
         from gateway.run import GatewayRunner
 
-        # compression is a string — should not crash, all compression.* keys None
+        # compression is a string — should not crash; compression.* keys fall back to the shipped defaults
         out = GatewayRunner._extract_cache_busting_config(
             {"compression": "broken", "model": {"context_length": 100_000}}
         )
-        assert out["compression.enabled"] is None
-        assert out["compression.threshold"] is None
+        assert out["compression.enabled"] == DEFAULT_CONFIG["compression"]["enabled"]
+        assert out["compression.threshold"] == DEFAULT_CONFIG["compression"]["threshold"]
         assert out["model.context_length"] == 100_000
 
     def test_none_config_is_safe(self):
@@ -212,7 +233,7 @@ class TestExtractCacheBustingConfig:
 
         out = GatewayRunner._extract_cache_busting_config(None)
         for section, key in GatewayRunner._CACHE_BUSTING_CONFIG_KEYS:
-            assert out[f"{section}.{key}"] is None
+            assert out[f"{section}.{key}"] == cfg_get(DEFAULT_CONFIG, section, key)
         assert "tools.registry_generation" in out
 
     def test_extract_includes_live_tool_registry_generation(self, monkeypatch):
@@ -224,6 +245,73 @@ class TestExtractCacheBustingConfig:
         out = GatewayRunner._extract_cache_busting_config({})
 
         assert out["tools.registry_generation"] == 12345
+
+    # -- Provider-declared identity (MemoryProvider.identity_signature) ------
+
+    @staticmethod
+    def _provider_declared_keys(out):
+        """``memory.*`` keys a provider added, excluding the config.yaml keys already documented."""
+        from gateway.run import GatewayRunner
+
+        documented = {f"{s}.{k}" for s, k in GatewayRunner._CACHE_BUSTING_CONFIG_KEYS if s == "memory"}
+        return sorted(k for k in out if k.startswith("memory.") and k not in documented)
+
+    @staticmethod
+    def _install_fake_provider(monkeypatch, provider):
+        """Route ``load_memory_provider`` to ``provider`` and start from an empty memo."""
+        import plugins.memory as plugins_memory
+        from gateway.run_agent_cache import GatewayAgentCacheMixin
+
+        calls = []
+
+        def _load(name, *, register_skills=None):
+            calls.append((name, register_skills))
+            return provider
+
+        monkeypatch.setattr(plugins_memory, "load_memory_provider", _load)
+        monkeypatch.setattr(GatewayAgentCacheMixin, "_MEMORY_IDENTITY_PROVIDER_MEMO", {})
+        return calls
+
+    def test_provider_identity_signature_enters_under_memory_prefix_and_is_re_read_from_one_instance(self, monkeypatch):
+        from gateway.run import GatewayRunner
+        from tests.agent.test_memory_provider import FakeMemoryProvider
+
+        class IdentityProvider(FakeMemoryProvider):
+            writer = "alice"
+
+            def identity_signature(self):
+                return {"fakeprov.writer": self.writer, "fakeprov.aliases": [("a", "b")]}
+
+        provider = IdentityProvider("fakeprov")
+        calls = self._install_fake_provider(monkeypatch, provider)
+        cfg = {"memory": {"provider": "fakeprov"}}
+
+        first = GatewayRunner._extract_cache_busting_config(cfg)
+        provider.writer = "bob"
+        second = GatewayRunner._extract_cache_busting_config(cfg)
+
+        assert self._provider_declared_keys(first) == ["memory.fakeprov.aliases", "memory.fakeprov.writer"]
+        assert first["memory.fakeprov.aliases"] == [("a", "b")]
+        assert (first["memory.fakeprov.writer"], second["memory.fakeprov.writer"]) == ("alice", "bob")
+        assert calls == [("fakeprov", False)]
+
+    @pytest.mark.parametrize("kind", ["no hook", "no provider", "raising hook"])
+    def test_provider_contributes_nothing_without_a_working_identity_hook(self, monkeypatch, kind):
+        from gateway.run import GatewayRunner
+        from tests.agent.test_memory_provider import FakeMemoryProvider
+
+        class BrokenProvider(FakeMemoryProvider):
+            def identity_signature(self):
+                raise RuntimeError("boom")
+
+        provider = {"no hook": FakeMemoryProvider("p"), "no provider": None, "raising hook": BrokenProvider("p")}[kind]
+        calls = self._install_fake_provider(monkeypatch, provider)
+
+        out = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "p"}} if provider else {})
+
+        assert self._provider_declared_keys(out) == []
+        assert "tools.registry_generation" in out
+        assert calls == ([] if provider is None else [("p", False)])
 
 
 class TestAgentCacheLifecycle:

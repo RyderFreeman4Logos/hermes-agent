@@ -9,6 +9,7 @@ from __future__ import annotations
 from hermes_constants import get_hermes_home, translate_cwd_for_wsl_backend, windows_path_to_wsl
 
 import copy
+import inspect
 import json
 import logging
 import os
@@ -106,6 +107,30 @@ def _expand_acp_enabled_toolsets(toolsets: List[str] | None = None,
     names = [n for n in (toolsets or ["hermes-acp"]) if n]
     names += [f"mcp-{s}" for s in (mcp_server_names or []) if s]
     return list(dict.fromkeys(names))
+
+
+_FACTORY_IDENTITY = ("session_id", "cwd", "model")
+
+
+def _factory_kwargs(factory, **offered):
+    """Pass only parameters the factory declares. ``**kwargs`` receives all of them."""
+    params = inspect.signature(factory).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return {key: value for key, value in offered.items() if value is not None or key in _FACTORY_IDENTITY}
+    return {key: offered[key] for key in params if key in offered and (offered[key] is not None or key in _FACTORY_IDENTITY)}
+
+
+def _stamp_factory_identity(agent, factory, *, session_id, cwd, model):
+    """A factory that cannot take identity still has to return that session's agent."""
+    params = inspect.signature(factory).parameters
+    accepts = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()) or any(
+        name in params for name in _FACTORY_IDENTITY
+    )
+    if accepts:
+        return
+    for name, value in (("session_id", session_id), ("cwd", cwd), ("model", model)):
+        if value is not None and not hasattr(agent, name):
+            setattr(agent, name, value)
 
 
 def _session_memory_provider_mode(agent: Any) -> str | None:
@@ -488,17 +513,14 @@ class SessionManager:
         """``enabled_toolsets``/``disabled_toolsets`` carry a live session's toolsets into a rebuild; ``None`` derives
         them from the config-declared MCP servers (fresh session)."""
         if self._agent_factory is not None:
-            # Legacy test factories take no arguments. A factory that accepts the
-            # mode keyword still has to receive the session it is rebuilding.
-            if memory_provider_mode_override is not None:
-                try:
-                    return self._agent_factory(
-                        session_id=session_id, cwd=cwd, model=model,
-                        memory_provider_mode_override=memory_provider_mode_override,
-                    )
-                except TypeError:
-                    pass
-            return self._agent_factory()
+            # Test factories are zero-arg, mode-only, or **kwargs. Bind by signature
+            # so a TypeError raised inside the factory is not treated as a mismatch.
+            agent = self._agent_factory(**_factory_kwargs(
+                self._agent_factory, session_id=session_id, cwd=cwd, model=model,
+                memory_provider_mode_override=memory_provider_mode_override,
+            ))
+            _stamp_factory_identity(agent, self._agent_factory, session_id=session_id, cwd=cwd, model=model)
+            return agent
 
         from run_agent import AIAgent
         from hermes_cli.config import load_config

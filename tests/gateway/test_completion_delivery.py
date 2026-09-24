@@ -314,6 +314,65 @@ def test_delegated_child_watcher_keeps_terminal_outcomes(
         adapter.handle_message.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "completion_reason", "termination_source"),
+    (
+        (0, "exited", ""),
+        (-15, "killed", "kill_all"),
+        (-1, "lost", ""),
+    ),
+    ids=("success", "kill_all", "lost_empty_source"),
+)
+def test_delegated_child_watcher_keeps_parent_chat_receipt(
+    monkeypatch, exit_code, completion_reason, termination_source,
+):
+    """Child ownership suppresses only the parent model notice. The chat still gets the receipt."""
+    import tools.process_registry as pr_module
+
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_delegated_child_chat",
+        command="echo done",
+        task_id="sa-0-child",
+        owner_task_id="sa-0-child",
+        started_at=1.0,
+        output_buffer="done\n",
+        exited=True,
+        exit_code=exit_code,
+        completion_reason=completion_reason,
+        termination_source=termination_source,
+        notify_on_complete=True,
+    )
+    registry._finished[session.id] = session
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    adapter = SimpleNamespace(
+        handle_message=AdmittingHandler(),
+        send=AsyncMock(),
+        _active_sessions={},
+    )
+    runner = _runner(adapter)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    sent = adapter.send.await_args.args[1]
+    assert "Background task" in sent
+
+
 def test_process_tool_redacts_explicit_kill_output(monkeypatch):
     from tools import process_registry as pr_module
 

@@ -1791,6 +1791,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 ("exited", ""),
                 ("killed", "process.kill"),
                 ("killed", "kill_all"),
+                ("lost", ""),
                 ("lost", "backend_lost"),
                 ("failed_start", "failed_start"),
                 ("already_exited", ""),

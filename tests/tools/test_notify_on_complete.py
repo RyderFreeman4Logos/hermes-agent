@@ -514,10 +514,12 @@ class TestDelegatedChildCompletionOwnership:
         (
             (0, "exited", ""),
             (1, "exited", ""),
+            (-1, "lost", ""),
             (-1, "lost", "backend_lost"),
             (-15, "killed", "process.kill"),
+            (-15, "killed", "kill_all"),
         ),
-        ids=("success", "nonzero", "lost", "killed"),
+        ids=("success", "nonzero", "lost", "lost_backend", "killed", "kill_all"),
     )
     def test_terminal_outcomes_stay_child_owned(self, registry, exit_code, completion_reason, termination_source):
         registry.completion_queue.put(self._event(
@@ -537,7 +539,6 @@ class TestDelegatedChildCompletionOwnership:
         {"exit_code": False},
         {"exit_code": 0.0},
         {"completion_reason": "unknown"},
-        {"completion_reason": "lost"},
         {"session_id": ""},
         {"command": ""},
         {"started_at": True},

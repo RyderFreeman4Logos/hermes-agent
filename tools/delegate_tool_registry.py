@@ -170,11 +170,21 @@ def _capture_gateway_steer_authority(owner_session_id: Optional[str]) -> tuple[A
 # Registry record fields never exposed to the TUI/RPC snapshot.
 _PRIVATE_RECORD_KEYS = frozenset({"agent", "owner_session_id", "owner_transport", "owner_session_record", "accepting_steer"})
 
+def _public_route_model(agent: Any) -> Optional[str]:
+    route = getattr(agent, "_delegate_successful_llm_route", None)
+    if isinstance(route, tuple) and len(route) == 2 and isinstance(route[0], str):
+        return route[0]
+    return None
+
 def list_active_subagents() -> List[Dict[str, Any]]:
-    """Copy of the running subagent tree ({subagent_id, parent_id, depth, goal, model,
-    started_at, tool_count, status, ...}); safe from any thread."""
+    """Copy of the running subagent tree. ``model`` is the stamped route only."""
     with _active_subagents_lock:
-        return [{k: v for k, v in r.items() if k not in _PRIVATE_RECORD_KEYS} for r in _active_subagents.values()]
+        rows = []
+        for record in _active_subagents.values():
+            row = {k: v for k, v in record.items() if k not in _PRIVATE_RECORD_KEYS}
+            row["model"] = _public_route_model(record.get("agent"))
+            rows.append(row)
+        return rows
 
 def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
     """True when *child_agent* sits below *parent_agent* in the spawn tree (walks the ``_delegate_parent_ref`` weakref
@@ -246,7 +256,7 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
             "subagent_id": r.get("subagent_id"),
             "parent_id": r.get("parent_id"),
             "goal": r.get("goal"),
-            "model": r.get("model"),
+            "model": _public_route_model(r.get("agent")),
             "status": r.get("status"),
             "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
             "accepting_steer": bool(r.get("accepting_steer", False)),

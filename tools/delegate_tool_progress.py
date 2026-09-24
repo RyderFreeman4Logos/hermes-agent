@@ -318,6 +318,8 @@ class _ChildProgressRelay:
         child = self.session_ref.get("child") if isinstance(self.session_ref, dict) else None
         route = getattr(child, "_delegate_successful_llm_route", None) if child is not None else None
         app_server = getattr(child, "api_mode", None) == "codex_app_server"
+        # Construction model is not public. Publish only a stamped route.
+        self.model = None
         if (
             not app_server
             and isinstance(route, tuple)
@@ -326,9 +328,6 @@ class _ChildProgressRelay:
             and isinstance(route[1], str)
         ):
             self.model, kw["provider"] = route
-        elif child is not None:
-            # Construction creds and a rejected fallback are not an accepted route.
-            self.model = None
         kw.update({k: getattr(self, k) for k in ("subagent_id", "parent_id", "depth", "model") if getattr(self, k) is not None})
         if app_server:
             kw["model"] = None

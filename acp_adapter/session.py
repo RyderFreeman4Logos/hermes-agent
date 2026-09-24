@@ -488,10 +488,14 @@ class SessionManager:
         """``enabled_toolsets``/``disabled_toolsets`` carry a live session's toolsets into a rebuild; ``None`` derives
         them from the config-declared MCP servers (fresh session)."""
         if self._agent_factory is not None:
-            # Tests subclass this and inspect kwargs; factory itself stays arity-free.
+            # Legacy test factories take no arguments. A factory that accepts the
+            # mode keyword still has to receive the session it is rebuilding.
             if memory_provider_mode_override is not None:
                 try:
-                    return self._agent_factory(memory_provider_mode_override=memory_provider_mode_override)
+                    return self._agent_factory(
+                        session_id=session_id, cwd=cwd, model=model,
+                        memory_provider_mode_override=memory_provider_mode_override,
+                    )
                 except TypeError:
                     pass
             return self._agent_factory()

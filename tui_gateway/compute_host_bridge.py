@@ -307,12 +307,12 @@ def _compute_host_compress_wait_seconds(cfg: dict | None = None) -> float:
     """
     from agent.conversation_compression import resolve_context_compression_timeouts
     try:
-        compression_cfg = (cfg if cfg is not None else _load_cfg()).get("compression", {})
+        config_root = cfg if cfg is not None else _load_cfg()
     except Exception:
-        compression_cfg = {}
-    if not isinstance(compression_cfg, dict):
-        compression_cfg = {}
-    _idle, ceiling = resolve_context_compression_timeouts(compression_cfg)
+        config_root = {}
+    if not isinstance(config_root, dict):
+        config_root = {}
+    _idle, ceiling = resolve_context_compression_timeouts(config_root)
     return float(min(max(ceiling + 30.0, 120.0), _COMPUTE_HOST_COMPRESS_WAIT_CAP_SECS))
 
 

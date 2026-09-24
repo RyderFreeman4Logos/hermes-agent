@@ -858,35 +858,22 @@ def test_session_resume_deferred_and_omitted_paths_guard_the_tip_only(server, mo
     assert calls == [True]
 
 
-def test_deferred_hydration_falls_back_to_tip_when_lineage_exceeds_limit(server, monkeypatch):
-    """The hydration worker never loads a lineage the guard would refuse."""
+def test_deferred_hydration_uses_bounded_window_when_lineage_exceeds_lineage_guard(server, monkeypatch):
+    """Hydration asks SQLite for the display window even when a full-lineage guard would refuse."""
     import threading
 
-    from hermes_state import SessionResumeTooLargeError
-
-    tip = [{"role": "user", "content": "tip"}]
+    tip = [{"role": "user", "content": "tip", "_row_id": 1}]
     reads = []
 
     class _DB:
         def reopen_session(self, _sid):
             return True
 
-        def assert_resume_safe(self, sid, max_messages=None, *, tip_only=False):
-            if not tip_only:
-                raise SessionResumeTooLargeError(20_001, 20_000)
-            return 1
-
-        def get_resume_conversations(self, _sid):
-            reads.append("lineage")
-            raise AssertionError("must not materialize the runaway lineage")
-
-        def get_ancestor_display_prefix(self, _sid):
-            reads.append("prefix")
-            raise AssertionError("must not materialize the runaway lineage")
-
-        def get_messages_as_conversation(self, sid, **kwargs):
-            reads.append(("tip", kwargs.get("repair_alternation")))
-            return list(tip)
+        def get_resume_conversations(self, _sid, *, max_display_messages=None):
+            reads.append(max_display_messages)
+            if max_display_messages is None:
+                raise AssertionError("must not materialize the unbounded lineage")
+            return list(tip), list(tip)
 
     built = threading.Event()
     monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: built.set())
@@ -907,7 +894,7 @@ def test_deferred_hydration_falls_back_to_tip_when_lineage_exceeds_limit(server,
         assert session["history"] == tip
         assert session["display_history_prefix"] == []
         assert session["resume_message_count"] == 1
-        assert reads == [("tip", True)]
+        assert reads == [20000]
     finally:
         server._sessions.pop("hyd", None)
 

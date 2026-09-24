@@ -2641,29 +2641,26 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
 
 
 def _load_resume_transcript(db, stored_id: str, *, model_history_only: bool = False) -> tuple[list, list, list]:
-    """(raw_history, display_history, ancestor_prefix) for a cold resume. The full lineage is materialized
-    only while it fits sessions.max_resume_messages (the transcript is REST-paginated), else the tip alone."""
-    from hermes_state import SessionResumeTooLargeError
+    """(raw_history, display_history, ancestor_prefix) for a cold resume.
+
+    Display history uses the same SQL window as a cold resume (``max_display_messages``).
+    Ancestor prefix is the non-tip rows already in that window — no second lineage scan.
+    """
     if model_history_only:
         raw_history = db.get_messages_as_conversation(
             stored_id, repair_alternation=True, include_row_ids=True)
         return raw_history, [], []
-    prefix_fits = True
-    guard = getattr(db, "assert_resume_safe", None)
-    if callable(guard):
-        try:
-            guard(stored_id)
-        except SessionResumeTooLargeError as exc:
-            prefix_fits = False
-            logger.info("resume %s: compression lineage exceeds the resume limit (%s); hydrating the tip segment only",
-                        stored_id, exc)
-        except Exception:
-            logger.debug("resume lineage guard failed; loading full lineage", exc_info=True)
-    if prefix_fits:
+    from hermes_state import resolved_max_resume_messages
+    limit = resolved_max_resume_messages() or None
+    try:
+        raw_history, display_history = db.get_resume_conversations(stored_id, max_display_messages=limit)
+    except TypeError as exc:
+        if "max_display_messages" not in str(exc):
+            raise
         raw_history, display_history = db.get_resume_conversations(stored_id)
-        return raw_history, display_history, db.get_ancestor_display_prefix(stored_id)
-    raw_history = db.get_messages_as_conversation(stored_id, repair_alternation=True, include_row_ids=True)
-    return raw_history, raw_history, []
+    tip_ids = {m.get("_row_id") for m in raw_history if isinstance(m, dict) and m.get("_row_id") is not None}
+    prefix = [m for m in display_history if m.get("_row_id") not in tip_ids]
+    return raw_history, display_history, prefix
 
 
 def _schedule_resume_hydration(sid: str, stored_id: str, db, *, close_db: bool = False,

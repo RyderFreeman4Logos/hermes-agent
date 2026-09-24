@@ -35,3 +35,24 @@ def test_record_physical_route_keeps_recovered_destination(monkeypatch):
     assert route["timeout"] == 12
     assert "stale" not in route.values()
     assert seen["relay"] == ("custom", "recovered-model", "chat_completions")
+    assert "fallback_label" not in route
+
+
+def test_record_physical_route_keeps_configured_chain_label(monkeypatch):
+    monkeypatch.setattr(aux, "_set_relay_auxiliary_route", lambda *_args: None)
+    monkeypatch.setattr(aux, "_fallback_provider_from_label", lambda label: "openai-codex")
+    monkeypatch.setattr(aux, "_effective_provider_for_client", lambda client, provider: provider)
+
+    route = {}
+    aux._record_physical_route(
+        route,
+        "openai-codex",
+        _Client(),
+        {"model": "codex-model", "timeout": 37},
+        "codex_responses",
+        fallback_label="fallback_chain[0](openai-codex)",
+    )
+
+    assert route["fallback_label"] == "fallback_chain[0](openai-codex)"
+    assert route["provider"] == "openai-codex"
+    assert route["base_url"] == "https://recovered.example/v1"

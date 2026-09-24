@@ -584,6 +584,35 @@ class TestChatCompletionsValidate:
 
 
 
+    @pytest.mark.parametrize("usage", [None, SimpleNamespace(completion_tokens=0)])
+    def test_rejects_known_router_timeout_shim_without_generated_tokens(self, transport, usage):
+        """#68396: an HTTP-200 router timeout shim with no generated tokens is not a completion."""
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="Connect timeout, please try again later.",
+                tool_calls=None,
+            ))],
+            usage=usage,
+        )
+
+        assert transport.validate_response(response) is False
+
+    @pytest.mark.parametrize(
+        ("content", "tool_calls", "usage"),
+        [
+            ("Connect timeout, please try again later.", None, SimpleNamespace(completion_tokens=1)),
+            ("Connect timeout, please try again later.", [SimpleNamespace()], None),
+        ],
+    )
+    def test_accepts_non_shim_timeout_text(self, transport, content, tool_calls, usage):
+        """Positive controls (#68396): generated tokens, embedded phrase, or tool calls stay valid."""
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))],
+            usage=usage,
+        )
+
+        assert transport.validate_response(response) is True
+
     def test_valid(self, transport):
         r = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))])
         assert transport.validate_response(r) is True
@@ -801,6 +830,41 @@ class TestPromptCacheKeyCapability:
                 list(result)
         return captured
 
+    def test_post_compress_request_reuses_unchanged_stable_prefix_key(self, transport):
+        """Compression may rebuild only the volatile system-prompt suffix."""
+        marker = {"type": "ephemeral"}
+
+        def key(volatile_suffix):
+            return transport.build_kwargs(
+                model="cache-model",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "stable prefix",
+                                "cache_control": marker,
+                            },
+                            {
+                                "type": "text",
+                                "text": volatile_suffix,
+                                "cache_control": marker,
+                            },
+                        ],
+                    },
+                    {"role": "user", "content": "next request"},
+                ],
+                tools=[],
+                session_id="session-after-compress",
+                supports_prompt_cache_key=True,
+            )["prompt_cache_key"]
+
+        before_compress = key("volatile before compression")
+        first_after_compress = key("rebuilt volatile suffix")
+
+        assert first_after_compress == before_compress
+
     def test_profile_capability_emits_content_key_in_nonstream_request_body(self, transport):
         from providers.base import ProviderProfile
 
@@ -879,6 +943,36 @@ class TestPromptCacheKeyCapability:
 
         assert "prompt_cache_key" not in kwargs
         assert "prompt_cache_key" not in body
+
+    def test_named_custom_same_route_reuses_stable_prefix_key(self, transport):
+        """Short-gap main requests keep one cache bucket for a stable prefix."""
+        stable = {
+            "type": "text",
+            "text": "stable prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+
+        def key(user_text):
+            return transport.build_kwargs(
+                model="grok-4.6",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [stable, {"type": "text", "text": "volatile"}],
+                    },
+                    {"role": "user", "content": user_text},
+                ],
+                tools=self._tools(),
+                session_id="same-route-session",
+                provider_name="custom:localrouter",
+                base_url="https://localrouter.invalid/v1",
+            )["prompt_cache_key"]
+
+        first = key("first request")
+        second = key("second request")
+
+        assert first.startswith("pck_")
+        assert second == first
 
     def test_explicit_top_level_and_extra_body_overrides_are_preserved(self, transport):
         from providers.base import ProviderProfile

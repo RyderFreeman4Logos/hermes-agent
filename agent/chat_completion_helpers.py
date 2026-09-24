@@ -2326,14 +2326,16 @@ def _try_activate_fallback_unlocked(
                 raise
             return True
         except Exception as e:
-            route_mutated = (
-                agent.model != old_model
-                or agent.provider != old_provider
-                or agent.base_url != old_base_url
-            )
-            if runtime_snapshot is not None and not route_mutated:
+            if runtime_snapshot is not None:
+                # Pre-accept snapshot always comes back. Route rollback stops once
+                # acceptance sets _provider_fallback_active; route identity alone is
+                # already true before rescope, so it cannot tell those cases apart.
+                accepted = bool(getattr(agent, "_provider_fallback_active", False))
                 with contextlib.suppress(Exception):
-                    _restore_fallback_runtime(agent, runtime_snapshot)
+                    if accepted:
+                        agent.request_overrides = runtime_snapshot["values"]["request_overrides"]
+                    else:
+                        _restore_fallback_runtime(agent, runtime_snapshot)
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)

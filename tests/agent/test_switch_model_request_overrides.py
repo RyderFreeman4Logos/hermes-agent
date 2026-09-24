@@ -440,3 +440,70 @@ def test_failed_fallback_restores_original_request_overrides_deeply():
     assert agent._primary_runtime["request_overrides"]["extra_body"]["nested"]["value"] == "primary"
     agent._primary_runtime["request_overrides"]["extra_body"]["nested"]["value"] = "poison"
     assert original["extra_body"]["nested"]["value"] == "primary"
+
+
+def test_post_accept_fallback_exception_keeps_route_and_restores_preaccept_snapshot():
+    """A raise after acceptance keeps the fallback route and restores the pre-accept snapshot."""
+    from unittest.mock import MagicMock, patch
+
+    from agent.chat_completion_helpers import try_activate_fallback
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.provider = "openrouter"
+    agent.model = "x-ai/grok-4"
+    agent.requested_provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.api_mode = "chat_completions"
+    agent.api_key = "or-key"
+    agent.client = MagicMock(name="OriginalClient")
+    agent._client_kwargs = {"api_key": "or-key", "base_url": agent.base_url}
+    agent.context_compressor = None
+    agent._anthropic_api_key = ""
+    agent._anthropic_base_url = None
+    agent._anthropic_client = None
+    agent._is_anthropic_oauth = False
+    agent._config_context_length = None
+    agent._reasoning_echo_flag = False
+    agent._transport_cache = {}
+    agent._fallback_activated = False
+    agent._fallback_index = 0
+    agent._fallback_chain = [{"provider": "xai", "model": "grok-4.5", "base_url": "https://api.x.ai/v1"}]
+    agent._fallback_model = None
+    agent._unavailable_fallback_keys = set()
+    agent._provider_fallback_active = False
+    original = {"extra_body": {"nested": {"value": "primary"}}}
+    agent.request_overrides = original
+    agent._custom_providers = []
+    agent._print_fn = lambda *_a, **_k: None
+    agent._buffer_status = lambda *_a, **_k: None
+    agent._anthropic_prompt_cache_policy = lambda **_k: (False, False)
+    agent._ensure_lmstudio_runtime_loaded = lambda: None
+    agent.runtime_capabilities = {}
+    fb_client = MagicMock()
+    fb_client.base_url = "https://api.x.ai/v1"
+    fb_client.api_key = "fb-key"
+
+    def _accept_then_raise(agent_arg, *_args, **_kwargs):
+        agent_arg._provider_fallback_active = True
+        raise RuntimeError("post-accept log failure")
+
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(fb_client, "grok-4.5"),
+    ), patch(
+        "hermes_cli.model_normalize.normalize_model_for_provider",
+        side_effect=lambda m, p: m,
+    ), patch(
+        "agent.chat_completion_helpers._log_fallback_activated",
+        side_effect=_accept_then_raise,
+    ):
+        assert try_activate_fallback(agent) is False
+
+    assert (agent.model, agent.provider, agent.base_url) == (
+        "grok-4.5", "xai", "https://api.x.ai/v1",
+    )
+    assert agent._provider_fallback_active is True
+    assert agent.request_overrides == original
+    agent.request_overrides["extra_body"]["nested"]["value"] = "mutated"
+    assert original["extra_body"]["nested"]["value"] == "primary"

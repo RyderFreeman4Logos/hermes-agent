@@ -15,6 +15,20 @@ pytest.importorskip("nemo_relay")
 from agent import relay_llm, relay_runtime
 
 
+def _capture_attempt_diagnostics(monkeypatch):
+    contexts = []
+    real_send = relay_llm.physical_send
+
+    def capture(request, callback):
+        context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        if context is not None and context not in contexts:
+            contexts.append(context)
+        return real_send(request, callback)
+
+    monkeypatch.setattr(relay_llm, "physical_send", capture)
+    return contexts
+
+
 @pytest.fixture()
 def relay_turn(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
@@ -37,6 +51,121 @@ def relay_turn(tmp_path, monkeypatch):
         relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
         relay_runtime.SESSION_COORDINATOR.release_conversation(lease)
         relay_runtime._reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypatch):
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    def send(request):
+        sends.append(("sync", request))
+        return {"content": "sync"}
+
+    async def send_async(request):
+        sends.append(("async", request))
+        return {"content": "async"}
+
+    def send_stream(request):
+        sends.append(("stream", request))
+        return iter([{"delta": "stream"}])
+
+    common = {
+        "session_id": "",
+        "name": "provider",
+        "model_name": "model",
+        "metadata": {"api_mode": "chat_completions"},
+    }
+    relay_llm.execute(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send(request, send),
+        **common,
+    )
+    await relay_llm.execute_async(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send_async(request, send_async),
+        **common,
+    )
+    stream = relay_llm.stream_current(
+        {"model": "model", "messages": [], "stream": True},
+        lambda request: relay_llm.physical_send(request, send_stream),
+        name="provider",
+        model_name="model",
+        finalizer=dict,
+        metadata={"api_mode": "chat_completions"},
+    )
+    assert list(stream) == [{"delta": "stream"}]
+
+    assert [kind for kind, _request in sends] == ["sync", "async", "stream"]
+    assert [context.ordinals for context in contexts] == [[0], [0], [0]]
+    assert [context.requests for context in contexts] == [[request] for _kind, request in sends]
+
+
+def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
+    relay_turn, monkeypatch
+):
+    del relay_turn
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    relay_llm.execute(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send(
+            request, lambda final: sends.append(("sync", final)) or {"content": "sync"}
+        ),
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        metadata={"api_mode": "chat_completions"},
+    )
+    stream = relay_llm.stream(
+        {"model": "model", "messages": [], "stream": True},
+        lambda request: relay_llm.physical_send(
+            request,
+            lambda final: sends.append(("stream", final)) or iter([{"delta": "stream"}]),
+        ),
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        finalizer=dict,
+        metadata={"api_mode": "chat_completions"},
+    )
+    assert list(stream) == [{"delta": "stream"}]
+
+    assert [kind for kind, _request in sends] == ["sync", "stream"]
+    assert [context.ordinals for context in contexts] == [[0], [0]]
+    assert [context.requests for context in contexts] == [[request] for _kind, request in sends]
+
+
+@pytest.mark.asyncio
+async def test_managed_async_retry_records_each_provider_callback(
+    relay_turn, monkeypatch
+):
+    relay, _turn = relay_turn
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    async def retry_once(_name, request, callback, **_kwargs):
+        await callback(request)
+        return await callback(request)
+
+    async def send(request):
+        sends.append(request)
+        return {"content": f"attempt-{len(sends)}"}
+
+    monkeypatch.setattr(relay.llm, "execute", retry_once)
+    result = await relay_llm.execute_async(
+        {"model": "model", "messages": []},
+        lambda request: relay_llm.physical_send_async(request, send),
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        metadata={"api_mode": "chat_completions", "retry_count": 1},
+    )
+
+    assert result == {"content": "attempt-2"}
+    assert [context.ordinals for context in contexts] == [[0, 1]]
+    assert len(contexts[0].requests) == len(sends) == 2
 
 
 @pytest.mark.parametrize(
@@ -886,6 +1015,126 @@ def test_stream_flushes_buffered_provider_chunks_after_relay_failure(
     assert turn.logical_llm_calls == {}
 
 
+def test_wedged_relay_aclose_does_not_block_stream_close(
+    relay_turn, monkeypatch
+):
+    """close() on a live managed stream whose Relay aclose() never finishes
+    abandons the attempt instead of hanging the caller; the runtime lease is
+    released either way."""
+    relay, turn = relay_turn
+    monkeypatch.setattr(relay_llm, "_ACLOSE_TIMEOUT", 0.2)
+    raw_chunks = [{"delta": "first"}, {"delta": "second"}]
+
+    class _WedgedAclose:
+        def __init__(self, agen):
+            self._agen = agen
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self._agen.__anext__()
+
+        async def aclose(self):
+            await asyncio.Event().wait()  # never completes
+
+    async def yield_all(
+        _name,
+        request,
+        callback,
+        observe_chunk,
+        finalizer,
+        **_kwargs,
+    ):
+        async def generate():
+            upstream = callback(request)
+            yield await anext(upstream)
+            yield await anext(upstream)
+
+        return _WedgedAclose(generate())
+
+    monkeypatch.setattr(relay.llm, "stream_execute", yield_all)
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        lambda _request: iter(raw_chunks),
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=lambda: {"content": "complete"},
+        metadata={
+            "api_mode": "custom",
+            "api_request_id": "request-wedged-aclose-close",
+        },
+    )
+
+    assert next(stream) == raw_chunks[0]
+    stream.close()  # must return despite the wedged aclose
+    assert stream._runtime_lease is None
+    # shutdown() waits on _operations_idle before finishing; an abandoned close
+    # must still release the operation lease so the runtime can drain.
+    assert turn.lease.host._operations_idle.wait(timeout=1.0)
+
+
+def test_wedged_relay_aclose_does_not_block_provider_fallback(
+    relay_turn, monkeypatch
+):
+    """A Relay stream whose aclose() never finishes must not wedge the provider
+    fallback: the close is bounded, the private loop is abandoned rather than
+    closed under a running attempt, pending provider chunks still deliver, and
+    the runtime lease is released."""
+    relay, turn = relay_turn
+    monkeypatch.setattr(relay_llm, "_ACLOSE_TIMEOUT", 0.2)
+    raw_chunks = [{"delta": "first"}, {"delta": "second"}]
+
+    class _WedgedAclose:
+        def __init__(self, agen):
+            self._agen = agen
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self._agen.__anext__()
+
+        async def aclose(self):
+            await asyncio.Event().wait()  # never completes
+
+    async def fail_after_buffering(
+        _name,
+        request,
+        callback,
+        observe_chunk,
+        finalizer,
+        **_kwargs,
+    ):
+        async def generate():
+            upstream = callback(request)
+            await anext(upstream)  # buffered via _raw_chunks, never yielded
+            await anext(upstream)  # buffered via _raw_chunks, never yielded
+            with pytest.raises(StopAsyncIteration):
+                await anext(upstream)  # provider completed; chunks still undelivered
+            raise RuntimeError("simulated Relay failure after buffering")
+            yield  # unreachable: keeps generate() an async generator
+
+        return _WedgedAclose(generate())
+
+    monkeypatch.setattr(relay.llm, "stream_execute", fail_after_buffering)
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        lambda _request: iter(raw_chunks),
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=lambda: {"content": "complete"},
+        metadata={
+            "api_mode": "custom",
+            "api_request_id": "request-wedged-aclose",
+        },
+    )
+
+    assert list(stream) == raw_chunks
+    assert turn.logical_llm_calls == {}
+    assert stream._runtime_lease is None
 
 
 
@@ -898,6 +1147,108 @@ def test_stream_flushes_buffered_provider_chunks_after_relay_failure(
 
 
 
+
+
+
+
+def test_stream_refuses_replay_after_transformed_relay_output(
+    relay_turn, monkeypatch
+):
+    """A transformed delivered chunk consumes an unknown provider source; replaying the
+    pending raw list would emit that source a second time after its transformed form."""
+    relay, turn = relay_turn
+    raw_chunks = [{"delta": "first"}, {"delta": "second"}]
+
+    async def transform_then_fail(
+        _name,
+        request,
+        callback,
+        observe_chunk,
+        finalizer,
+        **_kwargs,
+    ):
+        async def generate():
+            upstream = callback(request)
+            await anext(upstream)  # provider chunk A enters _raw_chunks
+            transformed = {"delta": "first (rewritten)"}
+            observe_chunk(transformed)
+            yield transformed  # delivered with no provider-source match
+            await anext(upstream)  # provider chunk B enters _raw_chunks
+            with pytest.raises(StopAsyncIteration):
+                await anext(upstream)
+            finalizer()
+            raise RuntimeError("simulated buffered Relay failure")
+
+        return generate()
+
+    monkeypatch.setattr(relay.llm, "stream_execute", transform_then_fail)
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        lambda _request: iter(raw_chunks),
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=lambda: {"content": "complete"},
+        metadata={
+            "api_mode": "custom",
+            "api_request_id": "request-transformed-failure",
+        },
+    )
+
+    iterator = iter(stream)
+    first = next(iterator)
+    assert getattr(first, "delta", first) == "first (rewritten)"
+    # The fallback must not replay raw chunks behind already-delivered
+    # transformed output; the Relay failure propagates instead.
+    with pytest.raises(RuntimeError, match="simulated buffered Relay failure"):
+        next(iterator)
+
+
+def test_stream_does_not_replay_chunks_relay_passed_over(
+    relay_turn, monkeypatch
+):
+    """A match at index > 0 means Relay saw and skipped the earlier chunks — they were
+    suppressed, not merely pending, and the fallback must not resurrect them."""
+    relay, turn = relay_turn
+    raw_chunks = [{"delta": "first"}, {"delta": "second"}]
+
+    async def reorder_then_fail(
+        _name,
+        request,
+        callback,
+        observe_chunk,
+        finalizer,
+        **_kwargs,
+    ):
+        async def generate():
+            upstream = callback(request)
+            await anext(upstream)  # A pending
+            second = await anext(upstream)  # B pulled
+            observe_chunk(second)
+            yield second  # matches at index 1: A genuinely pending
+            with pytest.raises(StopAsyncIteration):
+                await anext(upstream)
+            finalizer()
+            raise RuntimeError("simulated buffered Relay failure")
+
+        return generate()
+
+    monkeypatch.setattr(relay.llm, "stream_execute", reorder_then_fail)
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        lambda _request: iter(raw_chunks),
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=lambda: {"content": "complete"},
+        metadata={
+            "api_mode": "custom",
+            "api_request_id": "request-reordered-failure",
+        },
+    )
+
+    # B delivered from Relay; A was passed over and stays suppressed.
+    assert list(stream) == [{"delta": "second"}]
 
 
 def test_bypassed_stream_still_honors_chunk_acceptance(relay_turn):
@@ -1190,6 +1541,64 @@ def test_stream_current_streams_iterators_with_predicate(tmp_path, monkeypatch):
         relay_runtime._reset_for_tests()
 
 
+def test_stream_current_completed_response_releases_managed_stream(relay_turn, monkeypatch):
+    """A completed response detected while Relay still emitted an item leaves
+    the managed stream open; returning final_response must close it
+    deterministically rather than leaving the loop, Relay stream, and runtime
+    lease for __del__/GC."""
+    relay, turn = relay_turn
+    completed = _completed_response()
+
+    async def inject_after_completion(
+        _name, request, callback, observe_chunk, finalizer, **_kwargs
+    ):
+        async def generate():
+            upstream = callback(request)
+            try:
+                yield await anext(upstream)
+            except StopAsyncIteration:
+                yield {"injected": "relay-chunk"}
+            finalizer()
+
+        return generate()
+
+    monkeypatch.setattr(relay.llm, "stream_execute", inject_after_completion)
+
+    pop_outputs = []
+    real_pop = relay_runtime.pop_relay_scope
+    monkeypatch.setattr(
+        relay_runtime, "pop_relay_scope",
+        lambda *a, **k: pop_outputs.append(k.get("output")) or real_pop(*a, **k),
+    )
+
+    captured = []
+    real_stream = relay_llm.stream
+    monkeypatch.setattr(
+        relay_llm, "stream",
+        lambda *a, **k: captured.append(real_stream(*a, **k)) or captured[-1],
+    )
+
+    result = relay_llm.stream_current(
+        {"model": "test-model", "messages": [], "stream": True},
+        lambda request: completed,
+        name="test-provider",
+        model_name="test-model",
+        finalizer=dict,
+        metadata={"api_request_id": "request-completed-drop"},
+        completed_response_predicate=_choices_predicate,
+    )
+
+    assert result is completed
+    managed = captured[0]
+    assert managed._closed
+    assert managed._runtime_lease is None
+    assert turn.lease.host._operations_idle.is_set()
+    # The provider call succeeded, so its logical call completes as success,
+    # not the cancelled outcome __del__ would record.
+    assert turn.logical_llm_calls == {}
+    assert {"outcome": "success"} in pop_outputs
+
+
 def test_stream_current_primes_lazy_completed_response(relay_turn, monkeypatch):
     """A lazy Relay stream must run once before Hermes decides its shape."""
     _relay, _turn = relay_turn
@@ -1200,6 +1609,12 @@ def test_stream_current_primes_lazy_completed_response(relay_turn, monkeypatch):
 
         def _prime_completed_response(self):
             self.final_response = completed
+
+        def _finish_logical(self, _outcome):
+            pass
+
+        def _close(self, *, logical_outcome):
+            pass
 
     lazy_stream = LazyCompletedStream()
     monkeypatch.setattr(relay_llm, "stream", lambda *args, **kwargs: lazy_stream)

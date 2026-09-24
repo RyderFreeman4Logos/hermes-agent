@@ -1071,10 +1071,12 @@ def _commit_tool_result(
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
+    subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args) or ""
     persisted_result = function_result
     if _is_multimodal_tool_result(persisted_result):
         persisted_result = _persist_multimodal_text_parts(
             persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
+            history_suffix=subdir_hints,
         )
     else:
         persisted_result = maybe_persist_tool_result(
@@ -1083,16 +1085,9 @@ def _commit_tool_result(
             tool_use_id=tool_call_id,
             env=get_active_env(effective_task_id),
             config=budget,
+            history_suffix=subdir_hints,
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
-
-    subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
-    if subdir_hints:
-        if _is_multimodal_tool_result(persisted_result):
-            # Hint goes on the text summary part so the model still sees it; image blocks untouched.
-            _append_subdir_hint_to_multimodal(persisted_result, subdir_hints)
-        else:
-            persisted_result += subdir_hints
 
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.
@@ -1114,7 +1109,7 @@ def _commit_tool_result(
     return persisted_result, function_result, tool_message.get("_tool_output_risk")
 
 
-def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: str, env, budget: BudgetConfig) -> dict:
+def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: str, env, budget: BudgetConfig, history_suffix: str = "") -> dict:
     """Spill oversized TEXT parts of a multimodal envelope through the same persistence policy as
     string results (#95429). A ``browser_exec`` call that captured a screenshot bakes its full
     stdout into the envelope's text part, which used to bypass ``maybe_persist_tool_result``
@@ -1126,12 +1121,14 @@ def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: s
         text = part.get("text") if isinstance(part, dict) and part.get("type") == "text" else None
         if isinstance(text, str):
             replaced = maybe_persist_tool_result(content=text, tool_name=tool_name, tool_use_id=tool_call_id,
-                                                 env=env, config=budget)
+                                                 env=env, config=budget, history_suffix=history_suffix)
             if replaced != text:
                 part = {**part, "text": replaced}
                 first_replacement = first_replacement or replaced
         bounded_parts.append(part)
     if first_replacement is None:
+        if history_suffix:
+            _append_subdir_hint_to_multimodal(result, history_suffix)
         return result
     bounded = {**result, "content": bounded_parts}
     summary = bounded.get("text_summary")

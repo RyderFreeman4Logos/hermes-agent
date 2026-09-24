@@ -24,6 +24,9 @@ _HINT_FILENAMES = ["AGENTS.override.md", "AGENTS.md", "agents.md", "CLAUDE.md", 
 # touch of that directory. Over the ceiling: head+tail kept, marker with the path so the agent can read_file it,
 # and a WARNING in the log (the old 8k silent tail-chop cut apps/desktop/AGENTS.md for months unnoticed).
 _MAX_HINT_CHARS = 32_000
+# Combined ceiling for one tool result. Above one full area file (~12k) so a
+# single hint stays whole, below two per-file ceilings that would blow 32k.
+_MAX_TOTAL_HINT_CHARS = 16_000
 _PATH_ARG_KEYS = {"path", "file_path", "workdir"}
 _COMMAND_TOOLS = {"terminal"}
 _MAX_ANCESTOR_WALK = 5  # ancestor levels walked per path — bounds deep-path scans
@@ -138,7 +141,16 @@ class SubdirectoryHintTracker:
         if not self.enabled:
             return None
         all_hints = [h for d in self._extract_directories(tool_name, tool_args) if (h := self._load_hints_for_directory(d))]
-        return "\n\n" + "\n\n".join(all_hints) if all_hints else None
+        if not all_hints:
+            return None
+        combined = "\n\n" + "\n\n".join(all_hints)
+        overhead = 2 + 2 * max(0, len(all_hints) - 1)
+        if len(combined) > _MAX_TOTAL_HINT_CHARS and len(all_hints) > 1:
+            share = max(1, (_MAX_TOTAL_HINT_CHARS - overhead) // len(all_hints))
+            # ponytail: equal split, not nearest-first ranking; add ranking if order matters.
+            all_hints = [_truncate_content(h, "subdirectory hints", max_chars=share, queue_warning=False) for h in all_hints]
+            combined = "\n\n" + "\n\n".join(all_hints)
+        return combined
 
     def _extract_directories(self, tool_name: str, args: Dict[str, Any]) -> list:
         """Extract directory paths from tool call arguments."""

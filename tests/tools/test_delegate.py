@@ -1407,6 +1407,40 @@ class TestChildCredentialLeasing(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
+    def test_unverified_xai_fallback_stays_off_caller_result(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "grok-4.6"
+        child.provider = "xai-oauth"
+        child._credential_pool = None
+        raw = "personal-team-blocked:spending-limit"
+        child.run_conversation.return_value = {
+            "final_response": raw,
+            "error": raw,
+            "failure_reason": "billing",
+            "billing_block": {"provider": "xai-oauth"},
+            "billing_unverified": True,
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("spending-limit", result["summary"])
+        self.assertNotIn("spending-limit", result.get("error", ""))
+        self.assertIsNone(result["model"])
+        self.assertIsNone(result["provider"])
+        self.assertNotIn("failure_reason", result)
+
     def test_lease_binds_only_an_entry_for_the_child_endpoint(self):
         """#68237: on a mixed same-provider pool the least-leased pick may target another host; the child must end up
         bound to the entry for its own base_url, with the wrong-host lease released."""

@@ -1007,6 +1007,9 @@ def _status_403(c: _Ctx) -> Verdict:
     xai_spend = c.provider_slug == "xai-oauth" and c.code == _XAI_SPENDING_LIMIT_ERROR_CODE
     billing = xai_spend or any(p in c.msg for p in ("key limit exceeded", "spending limit") + _BILLING_PATTERNS)
     if billing:
+        if xai_spend:
+            # Same xAI OAuth session can still answer after this 403.
+            return {**_V_BILLING, "error_context": {"billing_unverified": True}}
         return _V_BILLING
     # A WAF/CDN in front of the provider answered, not the provider: the credential never
     # reached it, so key guidance and credential rotation are wrong (#53099, #70566). Gated on

@@ -38,6 +38,17 @@ def _route_fields(child: Any) -> Dict[str, Any]:
         "provider": _str_or_none(getattr(child, "provider", None)),
     }
 
+
+def _unverified_xai_billing(result: Dict[str, Any]) -> bool:
+    """An xAI spending-limit 403 is not proof the credential is spent."""
+    block = result.get("billing_block")
+    return (
+        result.get("billing_unverified") is True
+        and isinstance(block, dict)
+        and block.get("provider") in {"xai", "xai-oauth"}
+    )
+
+
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
     return {
@@ -565,6 +576,9 @@ def _build_result_entry(
     ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
     wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
     summary = result.get("final_response") or ""
+    hide_xai = _unverified_xai_billing(result)
+    if hide_xai:
+        summary = "Subagent failed after an unverified provider billing error."
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
@@ -604,7 +618,7 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "exit_reason": exit_reason,
-        **_route_fields(child),
+        **({"model": None, "provider": None} if hide_xai else _route_fields(child)),
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
         "truncated": exit_reason == "max_iterations",
@@ -623,11 +637,11 @@ def _build_result_entry(
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
     if status == "failed":
-        entry["error"] = result.get("error", "Subagent did not produce a response.")
-        # Classified reason from the child loop (e.g. "rate_limit", "billing")
-        # lets the parent tell a quota wall from a task error without parsing prose.
+        entry["error"] = (
+            summary if hide_xai else result.get("error", "Subagent did not produce a response.")
+        )
         _failure_reason = result.get("failure_reason")
-        if isinstance(_failure_reason, str) and _failure_reason:
+        if not hide_xai and isinstance(_failure_reason, str) and _failure_reason:
             entry["failure_reason"] = _failure_reason
     elif interrupt_note:
         entry["error"] = interrupt_note

@@ -2358,7 +2358,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
-            return session
+        # Checkpoint takes this same lock. Write after release so the new owner
+        # is durable without re-entering it.
+        self._write_checkpoint()
+        return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
         """Active processes for a gateway session key. Processes older than

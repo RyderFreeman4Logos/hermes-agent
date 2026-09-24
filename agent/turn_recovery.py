@@ -39,6 +39,23 @@ from utils import base_url_host_matches
 
 logger = logging.getLogger("agent.conversation_loop")
 
+# Same-route repairs a standard child still runs before a pending fallback hop.
+_STANDARD_CHILD_SAME_ROUTE_REASONS = frozenset({
+    FailoverReason.context_overflow,
+    FailoverReason.payload_too_large,
+    FailoverReason.image_too_large,
+    FailoverReason.image_corrupt,
+    FailoverReason.format_error,
+    FailoverReason.role_alternation,
+    FailoverReason.invalid_encrypted_content,
+    FailoverReason.multimodal_tool_content_unsupported,
+    FailoverReason.reasoning_mandatory,
+    FailoverReason.thinking_signature,
+    FailoverReason.long_context_tier,
+    FailoverReason.oauth_long_context_beta_forbidden,
+    FailoverReason.llama_cpp_grammar_pattern,
+})
+
 
 def _runtime_uses_ascii_encoding() -> bool:
     """Return whether the process genuinely needs an ASCII-only request fallback."""
@@ -619,10 +636,13 @@ def recover_after_classification(
         _is_nous_inference_route, _is_standard_profile_child, _standard_child_can_fallback,
     )
 
+    # A pending standard-child fallback owns provider failures. Same-route
+    # request repairs (and content-policy denials) still run first.
     if (
         _is_standard_profile_child(agent)
         and agent._has_pending_fallback()
         and _standard_child_can_fallback(agent, reason=classified.reason)
+        and classified.reason not in _STANDARD_CHILD_SAME_ROUTE_REASONS
     ):
         return False, False
 

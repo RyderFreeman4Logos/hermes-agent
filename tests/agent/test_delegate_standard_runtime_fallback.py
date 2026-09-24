@@ -196,6 +196,38 @@ def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldo
     assert all("Primary retry eligible" not in notice for notice in notices)
 
 
+def test_standard_child_request_shape_repair_retries_same_route_before_fallback():
+    """A same-route request repair is not a failed provider hop."""
+    agent = _make_standard_child(max_retries=1)
+    agent.api_mode = "chat_completions"
+    agent.reasoning_config = {"enabled": False, "effort": "none"}
+    agent._wire_reasoning_config = {"enabled": False, "effort": "none"}
+    calls = []
+    fallback = MagicMock(return_value=True)
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(400, "reasoning_effort 'none' unsupported; use minimal|low|medium|high")
+        return _response("repaired on the same route")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(patch.object(agent, "_try_activate_fallback", fallback))
+        stack.enter_context(patch("hermes_cli.models_reasoning_caps.refresh_reasoning_caps_async"))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert agent._reasoning_disable_rejected is True
+    assert result["completed"] is True
+    assert calls == [
+        (PRIMARY["provider"], PRIMARY["model"]),
+        (PRIMARY["provider"], PRIMARY["model"]),
+    ]
+    fallback.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "error",
     [

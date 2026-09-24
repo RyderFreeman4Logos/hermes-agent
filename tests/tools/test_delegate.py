@@ -1912,6 +1912,28 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertNotIn("role", props)
         self.assertNotIn("role", props["tasks"]["items"]["properties"])
 
+    def test_tasks_model_profile_reaches_child_without_top_level_field(self):
+        """Public schema omits model_profile. A task entry still carries it to the child."""
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertNotIn("model_profile", props)
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value={"provider": None, "model": None, "base_url": None, "api_key": None, "api_mode": None},
+        ), patch("tools.delegate_tool._load_config", return_value={"max_iterations": 2}):
+            MockAgent.return_value = MagicMock()
+            MockAgent.return_value.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 0,
+            }
+            delegate_task(
+                tasks=[{"goal": "carry the standard profile", "model_profile": "standard"}],
+                parent_agent=parent,
+                background=False,
+            )
+        self.assertEqual(MockAgent.return_value._delegate_model_profile, "standard")
+
     def test_schema_omits_acp_transport_fields(self):
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]

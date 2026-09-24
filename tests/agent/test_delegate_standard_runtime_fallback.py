@@ -133,7 +133,9 @@ def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldo
             raise _HTTPError(429, message)
         return _response("fallback result")
 
-    pool_recovery = MagicMock(return_value=(True, True))
+    pool_recovery = MagicMock(
+        side_effect=lambda **kwargs: (False, kwargs.get("has_retried_429", False))
+    )
     fallback_client = MagicMock()
     fallback_client.api_key = "fallback-key"
     fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
@@ -191,7 +193,7 @@ def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldo
         (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]),
     ]
     nous_refresh.assert_not_called()
-    pool_recovery.assert_not_called()
+    pool_recovery.assert_called_once()
     assert getattr(agent, "_rate_limited_until", 0) == 0
     assert all("Primary retry eligible" not in notice for notice in notices)
 
@@ -226,6 +228,255 @@ def test_standard_child_request_shape_repair_retries_same_route_before_fallback(
         (PRIMARY["provider"], PRIMARY["model"]),
     ]
     fallback.assert_not_called()
+
+
+def test_standard_child_pending_fallback_still_switches_free_model():
+    """A usable fallback hop does not skip the free-model switch on the current route."""
+    agent = _make_standard_child(max_retries=1, route=NOUS)
+    agent.model = "paid-model"
+    calls = []
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(429, "model_not_free")
+        return _response("free model result")
+
+    classified = ClassifiedError(
+        reason=FailoverReason.model_not_found,
+        status_code=429,
+        retryable=False,
+        should_fallback=True,
+        error_context={"welcome_refusal": {
+            "reason": "model_not_free",
+            "alternates": ["nous-free"],
+        }},
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(patch("agent.turn_api_error.classify_api_error", return_value=classified))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [(NOUS["provider"], "paid-model"), (NOUS["provider"], "nous-free")]
+    assert agent._fallback_index == 0
+
+
+def test_standard_child_pending_fallback_still_heals_wrong_host():
+    """A usable fallback hop does not skip a same-route credential refresh."""
+    from tests.hermes_cli.anon_portal import make_jwt
+
+    agent = _make_standard_child(max_retries=1, route=NOUS)
+    agent.api_key = make_jwt()
+    calls = []
+    refreshed = MagicMock(return_value=True)
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(400, "Anonymous accounts must use https://welcome-api.nousresearch.com for inference.")
+        return _response("healed result")
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(patch.object(agent, "_try_refresh_nous_client_credentials", refreshed))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [(NOUS["provider"], NOUS["model"])] * 2
+    refreshed.assert_called_once_with(force=True)
+    assert agent._fallback_index == 0
+
+
+def test_standard_child_pending_fallback_still_strips_expired_codex_replay():
+    """A usable fallback hop does not skip stripping a stale Codex replay."""
+    agent = _make_standard_child(max_retries=1)
+    agent.provider = "openai-codex"
+    agent.api_mode = "codex_responses"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent._codex_reasoning_replay_enabled = True
+    calls = []
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(401, "Provided authentication token is expired.")
+        return SimpleNamespace(
+            output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="stripped result")])],
+            output_text="stripped result",
+            status="completed",
+            model=agent.model,
+            usage=None,
+        )
+
+    classified = ClassifiedError(
+        reason=FailoverReason.auth,
+        status_code=401,
+        retryable=False,
+        should_fallback=True,
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(patch("agent.turn_api_error.classify_api_error", return_value=classified))
+        stack.enter_context(patch.object(
+            agent, "_extract_api_error_context",
+            return_value={"reason": "token_expired"},
+        ))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation(
+            "hello",
+            conversation_history=[{
+                "role": "assistant",
+                "content": "prior",
+                "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "gAAA"}],
+            }],
+        )
+
+    assert result["completed"] is True
+    assert calls == [(agent.provider, PRIMARY["model"])] * 2
+    assert agent._codex_reasoning_replay_enabled is False
+    assert agent._fallback_index == 0
+
+
+def test_standard_child_pending_fallback_still_refreshes_paid_entitlement():
+    """An unusable fallback hop still reaches the paid-entitlement refresh."""
+    agent = _make_standard_child(max_retries=1, route=NOUS)
+    agent._fallback_chain = [dict(NOUS)]
+    calls = []
+    refreshed = MagicMock(return_value=True)
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(429, "usage limit has been reached")
+        return _response("refreshed result")
+
+    classified = ClassifiedError(
+        reason=FailoverReason.billing,
+        status_code=429,
+        retryable=False,
+        should_fallback=True,
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(patch("agent.turn_api_error.classify_api_error", return_value=classified))
+        stack.enter_context(patch(
+            "agent.turn_recovery._try_refresh_nous_paid_entitlement_credentials",
+            refreshed,
+        ))
+        stack.enter_context(patch(
+            "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+            return_value=None,
+        ))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [(NOUS["provider"], NOUS["model"])] * 2
+    refreshed.assert_called_once_with(agent)
+    assert agent._fallback_index == 1
+
+
+def test_standard_child_pending_fallback_keeps_pool_on_existing_path():
+    """A pending fallback still leaves credential-pool rotation on its existing path."""
+    agent = _make_standard_child(max_retries=1)
+    calls = []
+    rotated = MagicMock(side_effect=lambda **kwargs: (False, kwargs.get("has_retried_429", False)))
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(429, "rate limit exceeded")
+        return _response("fallback result")
+
+    classified = ClassifiedError(
+        reason=FailoverReason.rate_limit,
+        status_code=429,
+        retryable=True,
+        should_fallback=True,
+    )
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(patch("agent.turn_api_error.classify_api_error", return_value=classified))
+        stack.enter_context(patch.object(agent, "_recover_with_credential_pool", rotated))
+        stack.enter_context(patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, FALLBACK_CHAIN[0]["model"]),
+        ))
+        stack.enter_context(patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, _provider: model,
+        ))
+        stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200000))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [
+        (PRIMARY["provider"], PRIMARY["model"]),
+        (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]),
+    ]
+    rotated.assert_called_once()
+
+
+def test_standard_child_pending_fallback_still_advances_when_repairs_fail():
+    """No successful same-route repair still advances the pending fallback hop."""
+    agent = _make_standard_child(max_retries=1)
+    calls = []
+    rotated = MagicMock(return_value=(False, False))
+
+    def api_call(_kwargs):
+        calls.append((agent.provider, agent.model))
+        if len(calls) == 1:
+            raise _HTTPError(503, "auth_unavailable: no auth available")
+        return _response("fallback result")
+
+    classified = ClassifiedError(
+        reason=FailoverReason.auth,
+        status_code=503,
+        retryable=False,
+        should_fallback=True,
+    )
+    fallback_client = MagicMock()
+    fallback_client.api_key = "fallback-key"
+    fallback_client.base_url = FALLBACK_CHAIN[0]["base_url"]
+    fallback_client._custom_headers = None
+    fallback_client.default_headers = None
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(agent, "_interruptible_api_call", side_effect=api_call))
+        stack.enter_context(patch("agent.turn_api_error.classify_api_error", return_value=classified))
+        stack.enter_context(patch.object(agent, "_recover_with_credential_pool", rotated))
+        stack.enter_context(patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, FALLBACK_CHAIN[0]["model"]),
+        ))
+        stack.enter_context(patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, _provider: model,
+        ))
+        stack.enter_context(patch("agent.model_metadata.get_model_context_length", return_value=200000))
+        for context in _common_patches(agent):
+            stack.enter_context(context)
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert calls == [
+        (PRIMARY["provider"], PRIMARY["model"]),
+        (FALLBACK_CHAIN[0]["provider"], FALLBACK_CHAIN[0]["model"]),
+    ]
+    rotated.assert_called_once()
 
 
 @pytest.mark.parametrize(

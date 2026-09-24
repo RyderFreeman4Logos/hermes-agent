@@ -134,7 +134,8 @@ def _ac_inflight_original(session: dict) -> str:
 
 
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
-                    turn_author: dict | None = None) -> None:
+                    turn_author: dict | None = None, *, structured_completion: bool = False,
+                    completion_events: list[dict] | None = None) -> None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
@@ -146,13 +147,21 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     _drop_queued_duplicates_of_inflight_user(session)
     text_only = not image_paths and isinstance(text, str)
     # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
-    if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
+    if not structured_completion and text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
         return
-    queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {}),
-              **({"turn_author": turn_author} if turn_author else {})}
+    queued = {
+        "text": text,
+        "transport": transport,
+        **({"image_paths": image_paths} if image_paths else {}),
+        **({"turn_author": turn_author} if turn_author else {}),
+        **({"structured_completion": True} if structured_completion else {}),
+        **({"completion_events": [dict(event) for event in completion_events or []]}
+           if completion_events else {}),
+    }
     existing = session.get("queued_prompt")
     if (existing and text_only and not turn_author and isinstance(existing.get("text"), str)
             and not existing.get("image_paths") and not existing.get("turn_author")
+            and not existing.get("structured_completion") and not structured_completion
             and not session.get("queued_prompts")):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -174,7 +183,8 @@ def _sanitize_queued_entry_vs_inflight_user(entry: Any, original: str) -> dict |
     if not isinstance(entry, dict):
         return None
     text = entry.get("text")
-    if not original or entry.get("image_paths") or entry.get("turn_author") or not isinstance(text, str):
+    if (not original or entry.get("image_paths") or entry.get("turn_author")
+            or entry.get("structured_completion") or not isinstance(text, str)):
         return entry
     # A lossless text-merge may have glued the live original onto a later follow-up: keep the remainder.
     rest = next((text[len(original + sep):] for sep in ("\n\n", "\n") if text.startswith(original + sep)), text).strip()
@@ -205,6 +215,25 @@ def _ac_set_queue(session: dict, entries: list) -> None:
         session["queued_prompts"] = entries[1:]
     else:
         session.pop("queued_prompts", None)
+
+
+def _reclaim_queued_completion_receipts(session: dict) -> None:
+    """Return uninserted completion envelopes to the session owner before a lifecycle clear."""
+    entries = [entry for entry in [session.get("queued_prompt"), *(session.get("queued_prompts") or [])]
+               if isinstance(entry, dict)]
+    retained, events = [], []
+    for entry in entries:
+        receipt = entry.get("completion_events") if entry.get("structured_completion") else None
+        if isinstance(receipt, list):
+            events.extend(dict(event) for event in receipt if isinstance(event, dict))
+        else:
+            retained.append(entry)
+    active = session.pop("_completion_active_receipt", None)
+    if isinstance(active, dict):
+        events.extend(dict(event) for event in active.get("events") or [] if isinstance(event, dict))
+    _ac_set_queue(session, retained)
+    if events:
+        session["_completion_pending"] = events + list(session.get("_completion_pending") or [])
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -307,7 +336,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         # prompt still runs, only the dead pin is dropped.
         if queued_transport is not None and not _transport_is_dead(queued_transport):
             _attach_session_transport(session, queued_transport)
-    use_compute_host = _session_uses_compute_host(session)
+        completion_events = queued.get("completion_events") if queued.get("structured_completion") else None
+        if isinstance(completion_events, list) and completion_events:
+            session["_completion_active_receipt"] = {
+                "events": [dict(event) for event in completion_events if isinstance(event, dict)],
+                "generation": queue_generation,
+            }
+    # A structured receipt belongs to the local turn's core-ingestion hook.
+    # A compute-host bridge cannot consume that hook, so an otherwise active
+    # host must not receive this particular queued envelope.
+    use_compute_host = _session_uses_compute_host(session) and not completion_events
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             # Generation bump cancelled the claim (Stop, compress re-anchor, …): don't dispatch, but restore the
@@ -318,6 +356,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     kwargs: dict = {"queued_prompt_generation": queue_generation}
+    if isinstance(completion_events, list) and completion_events:
+        kwargs["completion_receipt"] = session.get("_completion_active_receipt")
     if queued.get("image_paths"):
         kwargs["image_paths"] = queued["image_paths"]
     # The compute-host frame has no author field, so only the inline runner receives it.
@@ -325,7 +365,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     dispatch_failed = False
     try:
         if not use_compute_host:
-            _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
+            accepted = _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
+            if not accepted and completion_events and kwargs.get("completion_receipt") is not None:
+                with session["history_lock"]:
+                    active = session.get("_completion_active_receipt")
+                    if active is kwargs["completion_receipt"]:
+                        session.pop("_completion_active_receipt", None)
+                        session["_completion_pending"] = list(active["events"]) + list(
+                            session.get("_completion_pending") or [])
         elif (resp := _submit_prompt_to_compute_host(rid, sid, session, queued["text"], **kwargs)).get("error"):
             with session["history_lock"]:
                 session["running"] = False
@@ -335,6 +382,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     except Exception as exc:
         _notif_log_failure("queued prompt dispatch failed", exc)
         _notif_release_turn(session)
+        if completion_events:
+            with session["history_lock"]:
+                active = session.get("_completion_active_receipt")
+                if active is kwargs.get("completion_receipt"):
+                    session.pop("_completion_active_receipt", None)
+                    session["_completion_pending"] = list(active.get("events") or []) + list(
+                        session.get("_completion_pending") or [])
         dispatch_failed = True
     if dispatch_failed:
         with session["history_lock"]:

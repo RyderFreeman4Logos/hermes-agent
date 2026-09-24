@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -1767,6 +1769,305 @@ class TestTerminateHostPidPosix:
             if parent.poll() is None:
                 parent.kill()
             parent.wait()
+    def test_posix_grandchild_signal_error_still_terminates_owner(self, monkeypatch):
+        """A reparented/foreign grandchild must not abort the owner SIGTERM.
+
+        Official close-reclaim: psutil.Process.terminate() calls os.kill;
+        tests/conftest.py _guarded_kill raises RuntimeError for a PID outside
+        the pytest subtree. suppress(NoSuchProcess, AccessDenied, OSError)
+        does not catch RuntimeError, so the owner Popen was never signaled
+        and poll() stayed running.
+        """
+        from tools import process_registry as pr
+        import psutil
+
+        terminate_order = []
+
+        class _FakeChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                terminate_order.append(self.pid)
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                raise AssertionError("grace=0 must not SIGKILL")
+
+        class _FakeParent:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [_FakeChild(101)]
+
+            def terminate(self):
+                terminate_order.append(self.pid)
+
+            def kill(self):
+                raise AssertionError("grace=0 must not SIGKILL")
+
+        monkeypatch.setattr(psutil, "Process", _FakeParent)
+        monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                            staticmethod(lambda: 0.0))
+        pr.ProcessRegistry._terminate_host_pid(12345)
+        assert terminate_order == [12345, 101], (
+            "Parent receives SIGTERM first; a grandchild signal error must not abort it"
+        )
+
+    def test_posix_denied_descendant_is_not_escalated_via_sigkill(self, monkeypatch):
+        """Finding 2: a non-gone descendant denial must not retry SIGKILL.
+
+        The SIGTERM pass continues so the owned root still gets terminate().
+        The denied PID stays out of the SIGKILL pass and is not retried via
+        os.kill / killpg.
+        """
+        from tools import process_registry as pr
+        import psutil
+
+        calls = []
+        os_kills = []
+
+        class _DeniedChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                calls.append(("terminate", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                calls.append(("kill", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 9)"
+                )
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return "running"
+
+        class _FakeParent:
+            def __init__(self, pid):
+                self.pid = pid
+                self._terminated = False
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [_DeniedChild(101)]
+
+            def terminate(self):
+                calls.append(("terminate", self.pid))
+                self._terminated = True
+
+            def kill(self):
+                calls.append(("kill", self.pid))
+
+            def is_running(self):
+                return not self._terminated
+
+            def status(self):
+                return "running" if not self._terminated else "zombie"
+
+        def fake_os_kill(target, sig, *a, **kw):
+            os_kills.append((int(target), int(sig)))
+            raise AssertionError("denied descendant must not be retried via os.kill")
+
+        monkeypatch.setattr(psutil, "Process", _FakeParent)
+        monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                            staticmethod(lambda: 0.12))
+        monkeypatch.setattr(pr.os, "kill", fake_os_kill)
+        pr.ProcessRegistry._terminate_host_pid(12345)
+        assert ("terminate", 101) in calls
+        assert ("terminate", 12345) in calls
+        assert ("kill", 101) not in calls
+        assert os_kills == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-owned-process tree kill")
+    def test_posix_owner_signal_failure_keeps_root_running_and_retryable(self, registry, monkeypatch):
+        """Findings 1+3: owner RuntimeError must not invent whole-tree success.
+
+        Root-session contract: kill_process reports error while waitable.poll()
+        is None; poll stays running; completion stays unconsumed so close()/
+        kill_all can retry. Whole-tree contract: descendant denial does not
+        prevent owned-root SIGTERM, but owner signal failure is not success.
+        """
+        from tools import process_registry as pr
+        import psutil
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        session = _make_session(sid="proc_owner_denied", command="sleep 60")
+        session.process = proc
+        session.pid = proc.pid
+        session.pid_scope = "host"
+        session.host_start_time = ProcessRegistry._safe_host_start_time(proc.pid)
+        registry._running[session.id] = session
+        RealProcess = psutil.Process
+        orig_children = RealProcess.children
+        orig_terminate = RealProcess.terminate
+        orig_kill = RealProcess.kill
+        calls = []
+        owner_pid = proc.pid
+
+        class _DeniedChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                calls.append(("terminate", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                calls.append(("kill", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 9)"
+                )
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return "running"
+
+        def children(self, recursive=False):
+            if int(self.pid) == int(owner_pid):
+                assert recursive is True
+                return [_DeniedChild(101)]
+            return orig_children(self, recursive=recursive)
+
+        def terminate(self):
+            calls.append(("terminate", self.pid))
+            if int(self.pid) == int(owner_pid):
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+            return orig_terminate(self)
+
+        def kill(self):
+            calls.append(("kill", self.pid))
+            if int(self.pid) == int(owner_pid):
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 9)"
+                )
+            return orig_kill(self)
+
+        try:
+            monkeypatch.setattr(RealProcess, "children", children)
+            monkeypatch.setattr(RealProcess, "terminate", terminate)
+            monkeypatch.setattr(RealProcess, "kill", kill)
+            monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                                staticmethod(lambda: 0.12))
+            result = registry.kill_process(session.id, source="test", consume_output=True)
+            poll = registry.poll(session.id)
+            assert result["status"] == "error"
+            assert poll["status"] == "running"
+            assert session.exited is False
+            assert proc.poll() is None
+            assert session.id not in registry._completion_consumed
+            assert session.id in registry._running
+            assert ("kill", 101) not in calls
+            assert ("terminate", proc.pid) in calls
+        finally:
+            if proc.poll() is None:
+                with suppress(Exception):
+                    proc.kill()
+            with suppress(Exception):
+                proc.wait(timeout=2)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-owned-process tree kill")
+    def test_posix_descendant_denial_still_reaps_owned_root(self, registry, monkeypatch):
+        """Finding 1 inverted: descendant refusal must not prevent owned root cleanup."""
+        from tools import process_registry as pr
+        import psutil
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        session = _make_session(sid="proc_root_reaped", command="sleep 60")
+        session.process = proc
+        session.pid = proc.pid
+        session.pid_scope = "host"
+        session.host_start_time = ProcessRegistry._safe_host_start_time(proc.pid)
+        registry._running[session.id] = session
+        RealProcess = psutil.Process
+        orig_children = RealProcess.children
+        orig_terminate = RealProcess.terminate
+        orig_kill = RealProcess.kill
+        calls = []
+        owner_pid = proc.pid
+
+        class _DeniedChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                calls.append(("terminate", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                calls.append(("kill", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 9)"
+                )
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return "running"
+
+        def children(self, recursive=False):
+            if int(self.pid) == int(owner_pid):
+                assert recursive is True
+                return [_DeniedChild(101)]
+            return orig_children(self, recursive=recursive)
+
+        def terminate(self):
+            calls.append(("terminate", self.pid))
+            return orig_terminate(self)
+
+        def kill(self):
+            calls.append(("kill", self.pid))
+            return orig_kill(self)
+
+        try:
+            monkeypatch.setattr(RealProcess, "children", children)
+            monkeypatch.setattr(RealProcess, "terminate", terminate)
+            monkeypatch.setattr(RealProcess, "kill", kill)
+            monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                                staticmethod(lambda: 0.12))
+            result = registry.kill_process(session.id, source="test", consume_output=True)
+            deadline = time.monotonic() + 2.0
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert ("terminate", 101) in calls
+            assert ("terminate", proc.pid) in calls
+            assert ("kill", 101) not in calls
+            assert proc.poll() is not None
+            assert result["status"] == "killed"
+            assert session.exited is True
+        finally:
+            if proc.poll() is None:
+                with suppress(Exception):
+                    proc.kill()
+            with suppress(Exception):
+                proc.wait(timeout=2)
 
     def test_posix_oserror_falls_back_to_os_kill(self, monkeypatch):
         from tools import process_registry as pr

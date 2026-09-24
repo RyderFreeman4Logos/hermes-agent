@@ -8,6 +8,7 @@ import codecs
 from contextlib import suppress
 import json
 import logging
+import math
 import os
 import platform
 import shlex
@@ -1836,6 +1837,36 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # ownership, so leave them for the owner.
         return not (is_async_delegation and evt.get("restored"))
 
+    @staticmethod
+    def _is_routine_delegated_child_completion(evt: dict) -> bool:
+        """Whether a valid completion is still owned by a delegated child."""
+        if not isinstance(evt, dict) or evt.get("type") != "completion":
+            return False
+        owner_task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
+        if not owner_task_id.startswith("sa-") or evt.get("handoff_note"):
+            return False
+        started_at = evt.get("started_at")
+        return (
+            type(evt.get("exit_code")) is int
+            and (evt.get("completion_reason"), evt.get("termination_source"))
+            in {
+                ("exited", ""),
+                ("killed", "process.kill"),
+                ("killed", "kill_all"),
+                ("lost", "backend_lost"),
+                ("failed_start", "failed_start"),
+                ("already_exited", ""),
+            }
+            and isinstance(evt.get("session_id"), str)
+            and bool(evt["session_id"])
+            and isinstance(evt.get("command"), str)
+            and bool(evt["command"])
+            and isinstance(started_at, (int, float))
+            and not isinstance(started_at, bool)
+            and (not isinstance(started_at, float) or math.isfinite(started_at))
+            and started_at > 0
+        )
+
     def drain_notifications(
         self, session_key: str = "", owns_event=None, *, skip_poll_observed: bool = True,
     ) -> "list[tuple[dict, str]]":
@@ -1877,7 +1908,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if not is_async_delegation and _evt_task_id.startswith("sa-"):
                 if surface_child is None:
                     surface_child = self._surface_child_process_notifications()
-                if not surface_child:
+                if not surface_child and (
+                    evt.get("type") != "completion"
+                    or self._is_routine_delegated_child_completion(evt)
+                ):
                     logger.debug(
                         "Suppressed subagent-owned process notification "
                         "(delegation.surface_child_process_notifications=false): "

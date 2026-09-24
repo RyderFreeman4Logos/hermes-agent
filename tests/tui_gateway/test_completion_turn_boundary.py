@@ -237,6 +237,79 @@ def test_context_refusal_preserves_staged_completion_without_replaying_user_prom
         _clear(event_id)
 
 
+def test_real_context_refusal_keeps_staged_completion_after_second_drain(tmp_path, monkeypatch):
+    """A real @file refusal must not drop a completion staged behind the user turn.
+
+    Both drains are the production function. The user turn runs first and returns
+    from context refusal without its own followups; the second drain still has to
+    start the staged completion.
+    """
+    event_id = "proc_real_context_refusal"
+    _clear(event_id)
+    drains: list[str] = []
+    started: list[str] = []
+    real_drain = server._drain_queued_prompt
+    real_prepare = server._prepare_turn_input
+    try:
+        agent = _agent()
+        agent.steer = lambda _text: True
+        agent._config_context_length = 1_000
+        agent.model = ""
+        agent.base_url = ""
+        agent.api_key = ""
+        agent.provider = ""
+        session = _session(agent, running=True)
+        session["cwd"] = str(tmp_path)
+        sid = "real-context-refusal-ui"
+        server._sessions[sid] = session
+        for name in ("first.txt", "second.txt"):
+            (tmp_path / name).write_text("x" * 1_200, encoding="utf-8")
+
+        def record_drain(rid, drain_sid, drain_session):
+            head = (drain_session.get("queued_prompt") or {}).get("text") or ""
+            drains.append(f"{head[:40]}|run={drain_session.get('running')}")
+            started_turn = real_drain(rid, drain_sid, drain_session)
+            drains.append(f"returned={started_turn}|run={drain_session.get('running')}")
+            return started_turn
+
+        def refuse_only_file_prompt(sid_arg, session_arg, st, text, images, **kwargs):
+            if isinstance(text, str) and "@file:" in text:
+                return real_prepare(sid_arg, session_arg, st, text, images, **kwargs)
+            started.append(text)
+            return ("prompt", "run", 80, None)
+
+        monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_record_turn_marker", lambda *_a, **_k: "marker")
+        monkeypatch.setattr(server, "_retire_turn_marker", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_a, **_k: None)
+        monkeypatch.setattr(server, "_drain_queued_prompt", record_drain)
+        monkeypatch.setattr(server, "_prepare_turn_input", refuse_only_file_prompt)
+        assert server._deliver_completions_via_steer(
+            sid, session, [{**_completion(event_id), "session_id": event_id}], set()
+        )
+        with session["history_lock"]:
+            session["running"] = False
+            server._enqueue_prompt(
+                session, "Inspect @file:first.txt and @file:second.txt", None
+            )
+        server._run_post_turn_followups("rid", sid, session, {}, None)
+        thread = session.get("_run_thread")
+        if thread is not None:
+            thread.join(4)
+            assert not thread.is_alive()
+
+        assert len(drains) >= 2
+        assert "@file:first.txt" in drains[0]
+        assert started and event_id in started[0], "\n".join(drains)
+        assert "@file:" not in started[0]
+        assert session["running"] is False
+        assert not process_registry.is_completion_consumed(event_id)
+        assert session.get("_completion_transfer") in (None, [])
+    finally:
+        server._sessions.pop("real-context-refusal-ui", None)
+        _clear(event_id)
+
+
 def test_staged_completion_and_late_user_prompt_keep_separate_queue_entries(monkeypatch):
     event_id = "proc_completion_queue_interleaving"
     _clear(event_id)

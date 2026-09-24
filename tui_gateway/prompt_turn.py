@@ -452,8 +452,6 @@ def _run_post_turn_followups(
                 return
             _enqueue_prompt(session, user_text, session.get("transport"))
 
-    _drain_queued_prompt(rid, sid, session)
-
     def insert(completion_text: str, events: list) -> str | bool:
         with session["history_lock"]:
             if session.get("_closing") or session.get("_finalized"):
@@ -462,9 +460,15 @@ def _run_post_turn_followups(
                             structured_completion=True, completion_events=events)
             return "reserved"
 
+    # Queue the staged completion before the user drain. A refused @file turn
+    # returns without its own followups, so a later insert never runs.
     ingest_completion = getattr(agent, "_completion_steer_ingest", None)
     if callable(ingest_completion):
         ingest_completion(insert)
+    _drain_queued_prompt(rid, sid, session)
+    thread = session.get("_run_thread")
+    if thread is not None:
+        thread.join()
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:

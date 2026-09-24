@@ -824,6 +824,11 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     payload = {"text": raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt
+    first_usage = getattr(agent, "_first_turn_usage", None)
+    if first_usage:
+        payload["cache_info"] = _cache_info_from_usage(first_usage)
+    elif not getattr(agent, "_tui_first_provider_response_recorded", False):
+        payload["cache_info"] = {"state": "unavailable", "pct": 0}
     if last_reasoning:
         payload["reasoning"] = last_reasoning
     if status_note:
@@ -1007,6 +1012,10 @@ def _run_prompt_submit(
         muted = diagnostic_turn_muted(display_metadata, "tui", notification_config)
     if muted:
         display_kind = "hidden"
+    agent._tui_first_provider_response_record_enabled = True
+    agent._tui_first_provider_response_recorded = False
+    agent._first_turn_usage = None
+    session.pop("first_provider_response", None)
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
     # session_key and the agent's live session_id together.  No prompt content is logged.
     _turn_started_monotonic = time.monotonic()

@@ -52,6 +52,7 @@ class TurnResult:
     # Exact turn/start text distinguishes the input echo from a new user event.
     submitted_user_text: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
+    token_usage_first: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
     # Codex likely wedged (turn timeout, dead subprocess, token refresh failure): caller respawns next turn.
@@ -796,6 +797,8 @@ def _apply_accounting_notification(result: TurnResult, note: dict) -> None:
         if isinstance(token_usage, dict):
             last, window = token_usage.get("last"), token_usage.get("modelContextWindow")
             if isinstance(last, dict):
+                if result.token_usage_first is None:
+                    result.token_usage_first = dict(last)
                 result.token_usage_last = dict(last)
             if isinstance(window, int) and window > 0:
                 result.model_context_window = window

@@ -1,19 +1,66 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
 
+import { renderSync, Text } from '@hermes/ink'
+import React from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
-import { patchUiState, resetUiState } from '../app/uiStore.js'
+import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import {
   hydrateLiveSessionInflight,
   liveSessionInflightMessages,
   scheduleResumeScrollToBottom,
   signalFreshSessionBoundary,
+  useSessionLifecycle,
   writeActiveSessionFile
 } from '../app/useSessionLifecycle.js'
+
+const renderLifecycleHarness = () => {
+  let lifecycle: ReturnType<typeof useSessionLifecycle> | null = null
+
+  function Harness() {
+    lifecycle = useSessionLifecycle({
+      colsRef: { current: 80 },
+      composerActions: { setComposerTokens: vi.fn() },
+      gw: { request: vi.fn() },
+      panel: vi.fn(),
+      rpc: vi.fn(),
+      scrollRef: { current: null },
+      setHistoryItems: vi.fn(),
+      setLastUserMsg: vi.fn(),
+      setSessionStartedAt: vi.fn(),
+      setStickyPrompt: vi.fn(),
+      setVoiceProcessing: vi.fn(),
+      setVoiceRecording: vi.fn(),
+      sys: vi.fn()
+    } as any)
+
+    return React.createElement(Text, null, 'lifecycle')
+  }
+
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  Object.assign(stdin, { isTTY: false })
+  Object.assign(stdout, { columns: 80, isTTY: false, rows: 20 })
+  const instance = renderSync(React.createElement(Harness), {
+    patchConsole: false,
+    stderr: stderr as NodeJS.WriteStream,
+    stdin: stdin as NodeJS.ReadStream,
+    stdout: stdout as NodeJS.WriteStream
+  })
+
+  if (!lifecycle) {
+    instance.unmount()
+    throw new Error('session lifecycle harness did not mount')
+  }
+
+  return { instance, lifecycle }
+}
 
 describe('fresh session boundary', () => {
   it('signals only when a live session is replaced by a different session', () => {
@@ -26,6 +73,28 @@ describe('fresh session boundary', () => {
     expect(signalFreshSessionBoundary('old-session', 'new-session')).toBe(false)
     expect(onFreshSessionStarted).toHaveBeenCalledOnce()
     expect(onFreshSessionStarted).toHaveBeenCalledWith('new-session')
+  })
+})
+
+describe('session cache boundary', () => {
+  beforeEach(() => {
+    resetUiState()
+  })
+
+  it('clears prior cache telemetry on full and visible-history resets', () => {
+    const { instance, lifecycle } = renderLifecycleHarness()
+
+    try {
+      patchUiState({ cacheStatus: 'cache 95%' })
+      lifecycle.resetSession()
+      expect(getUiState().cacheStatus).toBeNull()
+
+      patchUiState({ cacheStatus: 'cache 95%' })
+      lifecycle.resetVisibleHistory(null)
+      expect(getUiState().cacheStatus).toBeNull()
+    } finally {
+      instance.unmount()
+    }
   })
 })
 

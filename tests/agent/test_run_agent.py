@@ -4187,9 +4187,29 @@ class TestRunConversation:
     def test_redirect_wins_race_with_response_completion(self, agent):
         """If the provider returns as redirect lands, discard the stale answer."""
         self._setup_agent(agent)
-        stale = _mock_response(content="Using SQLite.", finish_reason="stop")
-        corrected = _mock_response(content="Using Postgres.", finish_reason="stop")
+        stale = _mock_response(
+            content="Using SQLite.",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 2_000,
+                "completion_tokens": 10,
+                "total_tokens": 2_010,
+                "prompt_tokens_details": SimpleNamespace(cached_tokens=0),
+            },
+        )
+        corrected = _mock_response(
+            content="Using Postgres.",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 2_000,
+                "completion_tokens": 10,
+                "total_tokens": 2_010,
+                "prompt_tokens_details": SimpleNamespace(cached_tokens=1_900),
+            },
+        )
         calls = 0
+        cache_events = []
+        agent._tui_cache_callback = lambda *args: cache_events.append(args)
 
         def _fake_api_call(_api_kwargs):
             nonlocal calls
@@ -4209,6 +4229,9 @@ class TestRunConversation:
 
         assert calls == 2
         assert result["final_response"] == "Using Postgres."
+        assert [event[0] for event in cache_events] == ["miss"]
+        assert cache_events[0][4]["request_index"] == 1
+        assert agent._first_turn_usage["cache_read_tokens"] == 0
         assert all(
             message.get("content") != "Using SQLite."
             for message in result["messages"]

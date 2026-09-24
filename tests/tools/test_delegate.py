@@ -1725,6 +1725,39 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_public_model_profile_reaches_child_routing(self):
+        """Omitted uses standard; an explicit value is forwarded; a task key overrides it."""
+        import run_agent
+        from tools.registry import registry
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool._load_config", return_value={"model_pool": {"standard": {}, "review": {}}}):
+            definition = registry.get_definitions({"delegate_task"})[0]["function"]
+        props = definition["parameters"]["properties"]
+        self.assertEqual(props["model_profile"]["enum"], ["standard", "review"])
+        self.assertEqual(props["tasks"]["items"]["properties"]["model_profile"]["enum"], ["standard", "review"])
+
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(parent, {"tasks": [{"goal": "omit"}]})
+        self.assertEqual(captured["model_profile"], "standard")
+
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            registry.dispatch("delegate_task", {"tasks": [{"goal": "explicit"}], "model_profile": "review"}, parent_agent=parent)
+        self.assertEqual(captured["model_profile"], "review")
+
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent, {"tasks": [{"goal": "override", "model_profile": "standard"}], "model_profile": "review"},
+            )
+        self.assertEqual(captured["model_profile"], "review")
+        self.assertEqual(captured["tasks"][0]["model_profile"], "standard")
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
@@ -1913,11 +1946,12 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertNotIn("role", props["tasks"]["items"]["properties"])
 
     def test_tasks_model_profile_reaches_child_without_top_level_field(self):
-        """Public schema omits model_profile. A task entry still carries it to the child."""
+        """A task model_profile still reaches the child and overrides a top-level value."""
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
 
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-        self.assertNotIn("model_profile", props)
+        self.assertIn("model_profile", props)
+        self.assertIn("model_profile", props["tasks"]["items"]["properties"])
         parent = _make_mock_parent(depth=0)
         with patch("run_agent.AIAgent") as MockAgent, patch(
             "tools.delegate_tool._resolve_delegation_credentials",
@@ -1929,6 +1963,7 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
             }
             delegate_task(
                 tasks=[{"goal": "carry the standard profile", "model_profile": "standard"}],
+                model_profile="premium",
                 parent_agent=parent,
                 background=False,
             )

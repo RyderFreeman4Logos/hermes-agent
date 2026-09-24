@@ -366,10 +366,17 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
+def _effective_child_profile(task, top_profile):
+    """Task key wins. An omitted model-facing profile is the string standard."""
+    selected = str(task.get("model_profile") or "").strip() or top_profile
+    return selected or None
+
+
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    top_profile: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -395,7 +402,7 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
-                model_profile=str(t.get("model_profile") or "").strip() or None, **overrides,
+                model_profile=_effective_child_profile(t, top_profile), **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -446,7 +453,8 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    subagent_id: Optional[str] = None, message: Optional[str] = None,
+    model_profile: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
@@ -496,6 +504,7 @@ def delegate_task(
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    top_profile = str(model_profile or "").strip() or None
     try:
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
@@ -527,6 +536,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        top_profile=top_profile,
     )
     if err:
         return tool_error(err)
@@ -611,6 +621,13 @@ def _build_tasks_param_description() -> str:
         "is a one-entry array. Required when spawning."
     )
 
+def _available_model_profile_names(cfg: Optional[dict] = None) -> List[str]:
+    if cfg is None:
+        cfg = _load_config()
+    pool = cfg.get("model_pool") or {}
+    return [str(name) for name in pool if str(name).strip()] if isinstance(pool, dict) else []
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Per-call schema overrides (ToolEntry.dynamic_schema_overrides): every
     get_definitions() pass rewrites the descriptions to the user's actual limits."""
@@ -621,6 +638,25 @@ def _build_dynamic_schema_overrides() -> dict:
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    profile_names = _available_model_profile_names()
+    profile_prop = dict(overrides_params["properties"].get("model_profile") or {})
+    if profile_names:
+        profile_prop["enum"] = profile_names
+    else:
+        profile_prop.pop("enum", None)
+    overrides_params["properties"]["model_profile"] = profile_prop
+    tasks_prop = dict(overrides_params["properties"]["tasks"])
+    tasks_items = dict(tasks_prop.get("items") or {})
+    tasks_item_props = dict(tasks_items.get("properties") or {})
+    task_profile_prop = dict(tasks_item_props.get("model_profile") or {})
+    if profile_names:
+        task_profile_prop["enum"] = profile_names
+    else:
+        task_profile_prop.pop("enum", None)
+    tasks_item_props["model_profile"] = task_profile_prop
+    tasks_items["properties"] = tasks_item_props
+    tasks_prop["items"] = tasks_items
+    overrides_params["properties"]["tasks"] = tasks_prop
 
     if not independent_completions:
         tasks = overrides_params["properties"]["tasks"]
@@ -690,6 +726,10 @@ DELEGATE_TASK_SCHEMA = {
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
                         ),
+                        "model_profile": _p(
+                            "string",
+                            "Per-task pool tier. Overrides the top-level model_profile.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -712,6 +752,10 @@ DELEGATE_TASK_SCHEMA = {
                 "string",
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
+            ),
+            "model_profile": _p(
+                "string",
+                "Named pool tier. Omitted uses standard. Unknown names and a pool without standard fail closed. Per-task value overrides this.",
             ),
         },
         "required": [],
@@ -748,6 +792,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        model_profile=args.get("model_profile") or "standard",
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

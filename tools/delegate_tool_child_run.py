@@ -681,6 +681,10 @@ def _build_result_entry(
         model, provider = None, None
     elif app_server_success:
         model, provider = None, None
+    elif getattr(child, "api_mode", None) == "codex_app_server":
+        # An app-server result never names its route. Keep an accepted route
+        # for later failures; do not report the child's mutable model.
+        model, provider = accepted_model, accepted_provider
     elif accepted_model is not None or accepted_provider is not None:
         model, provider = accepted_model, accepted_provider
     elif selected_model is not None or selected_provider is not None:

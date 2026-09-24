@@ -465,10 +465,13 @@ def _run_post_turn_followups(
     ingest_completion = getattr(agent, "_completion_steer_ingest", None)
     if callable(ingest_completion):
         ingest_completion(insert)
-    _drain_queued_prompt(rid, sid, session)
-    thread = session.get("_run_thread")
-    if thread is not None:
-        thread.join()
+    # The worker that starts a turn is session["_run_thread"]. Joining it here
+    # deadlocks: this drain runs on that worker. A turn that is still running
+    # drains the rest from its own followups. A turn that already finished
+    # (a refused @file turn) leaves the queue here.
+    started = _drain_queued_prompt(rid, sid, session)
+    if started and session.get("running"):
+        return
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
@@ -1081,34 +1084,38 @@ def _run_prompt_submit(
                     st.terminal_callback({
                         "status": "failed", "text": "", "error": "Context injection refused."})
                     st.receipt_committed = True
-                return
-            prompt, run_message, cols, streamer = prepared
-            if completion_receipt:
-                def commit_completion_receipt() -> bool:
-                    with _completion_ownership_lock(session):
-                        active = session.get("_completion_active_receipt")
-                        if active is not completion_receipt:
-                            return False
-                        events = list(active.get("events") or [])
-                        session.pop("_completion_active_receipt", None)
-                        _mark_completion_events_consumed(events)
-                        return True
-                receipt_agent = st.agent
-                receipt_ingest = commit_completion_receipt
-                receipt_agent._completion_queue_ingest = receipt_ingest
-            _invoke_agent(
-                sid, session, st, prompt, run_message, streamer, images, display_kind,
-                display_metadata, turn_author, text)
-            status_note = _absorb_turn_result(
-                sid, session, st, text, display_kind, display_metadata)
-            payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
-            _emit("message.complete", sid, payload)
-            goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
-            if status == "complete":
-                _after_complete_turn(sid, session, st, raw)
-            # Goal judge + loop tick evaluation mutate persisted state AFTER message.complete: publish the
-            # structured control snapshot now so the Desktop card never paints the pre-judge turn count.
-            _publish_session_control_snapshot(sid, session, only_if_present=True)
+                # @file refusal never reaches the agent, but the queue behind this
+                # turn (a staged completion) still has to run. Fall through to the
+                # same post-turn followups; do not join this worker to wait.
+                goal_followup = None
+            else:
+                prompt, run_message, cols, streamer = prepared
+                if completion_receipt:
+                    def commit_completion_receipt() -> bool:
+                        with _completion_ownership_lock(session):
+                            active = session.get("_completion_active_receipt")
+                            if active is not completion_receipt:
+                                return False
+                            events = list(active.get("events") or [])
+                            session.pop("_completion_active_receipt", None)
+                            _mark_completion_events_consumed(events)
+                            return True
+                    receipt_agent = st.agent
+                    receipt_ingest = commit_completion_receipt
+                    receipt_agent._completion_queue_ingest = receipt_ingest
+                _invoke_agent(
+                    sid, session, st, prompt, run_message, streamer, images, display_kind,
+                    display_metadata, turn_author, text)
+                status_note = _absorb_turn_result(
+                    sid, session, st, text, display_kind, display_metadata)
+                payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
+                _emit("message.complete", sid, payload)
+                goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+                if status == "complete":
+                    _after_complete_turn(sid, session, st, raw)
+                # Goal judge + loop tick evaluation mutate persisted state AFTER message.complete: publish the
+                # structured control snapshot now so the Desktop card never paints the pre-judge turn count.
+                _publish_session_control_snapshot(sid, session, only_if_present=True)
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:

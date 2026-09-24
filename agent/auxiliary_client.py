@@ -2565,11 +2565,14 @@ def _record_route_info(
     route_info: Optional[Dict[str, Any]], provider: Optional[str], model: Optional[str], *,
     base_url: Optional[str] = None, api_key: Optional[str] = None,
     api_mode: Optional[str] = None, timeout: Optional[float] = None,
+    fallback_label: Optional[str] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
         route_info.clear()
         route_info.update(provider=provider or "auto", model=model or "default")
+        if fallback_label and str(fallback_label).startswith("fallback_chain["):
+            route_info["fallback_label"] = fallback_label
         for key, value in (
             ("base_url", base_url), ("api_key", api_key),
             ("api_mode", api_mode), ("timeout", timeout),
@@ -2580,7 +2583,8 @@ def _record_route_info(
 
 def _record_physical_route(
     route_info: Optional[Dict[str, Any]], provider: Optional[str], client: Any,
-    request_kwargs: Dict[str, Any], api_mode: Optional[str],
+    request_kwargs: Dict[str, Any], api_mode: Optional[str], *,
+    fallback_label: Optional[str] = None,
 ) -> None:
     """Publish the concrete destination immediately before a physical retry."""
     concrete_provider = _fallback_provider_from_label(
@@ -2594,6 +2598,7 @@ def _record_physical_route(
         api_key=str(getattr(client, "api_key", "") or ""),
         api_mode=api_mode,
         timeout=request_kwargs.get("timeout"),
+        fallback_label=fallback_label,
     )
 
 
@@ -4097,7 +4102,10 @@ def _call_fallback_candidate_sync(
     )
 
     def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
-        _record_physical_route(route_info, dest.provider, client, request_kwargs, dest.api_mode)
+        _record_physical_route(
+            route_info, dest.provider, client, request_kwargs, dest.api_mode,
+            fallback_label=fb_label,
+        )
         return _validate_llm_response(
             _relay_sync_completion(
                 client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
@@ -4155,7 +4163,10 @@ async def _call_fallback_candidate_async(
     )
 
     async def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
-        _record_physical_route(route_info, dest.provider, client, request_kwargs, dest.api_mode)
+        _record_physical_route(
+            route_info, dest.provider, client, request_kwargs, dest.api_mode,
+            fallback_label=fb_label,
+        )
         return _validate_llm_response(
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
             task,

@@ -106,7 +106,7 @@ def test_clear_later_user_steer_preserves_structured_transfer(monkeypatch):
                 "receipt-ui", session, [_completion(event_id)], set()
             )
             assert agent.steer("later user steer") is True
-            agent.clear_interrupt()
+            agent.clear_interrupt(hard_cancel=True)
             assert agent._pending_steer is None
             assert [event["session_id"] for event in session["_completion_transfer"]] == [event_id]
 

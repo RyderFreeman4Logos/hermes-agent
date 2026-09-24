@@ -635,7 +635,7 @@ def test_later_user_clear_cannot_erase_earlier_transfer(monkeypatch):
                 "owner-ui", session, [_completion(event_id)], set()
             )
             assert agent.steer("later user steer") is True
-            agent.clear_interrupt()
+            agent.clear_interrupt(hard_cancel=True)
             payload = _payload("tool", agent, session, monkeypatch)
             assert payload.count(event_id) == 1
             assert "later user steer" not in payload

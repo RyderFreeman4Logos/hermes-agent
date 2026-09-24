@@ -443,7 +443,11 @@ def _available_model_profile_names(cfg: Optional[dict] = None) -> List[str]:
         cfg = _load_config()
     return [str(name) for name in _model_pool(cfg) if str(name).strip()]
 
-def _profile_fallback_chain(raw: Any) -> List[Dict[str, Any]]:
+def _profile_fallback_chain(raw: Any) -> Optional[List[Dict[str, Any]]]:
+    """Normalize a profile chain. ``None`` means the profile did not set one;
+    an explicit list, including ``[]``, is the profile's chain."""
+    if raw is None:
+        return None
     if not isinstance(raw, list):
         return []
     chain: List[Dict[str, Any]] = []
@@ -488,16 +492,12 @@ def _credentials_for_model_profile(cfg: dict, parent_agent, profile_name: Option
         for key in ("model", "provider", "base_url", "api_key")
     }
     overlay["api_mode"] = str(profile.get("api_mode") or "").strip().lower() or None
-    # Ignore global route keys so a global pin cannot override the selected tier.
+    # A selected tier is the only route source. Unset keys stay unset so a
+    # model-only profile cannot inherit the global provider, endpoint, or key.
     merged = {k: v for k, v in cfg.items() if k not in overlay}
     for key, value in overlay.items():
-        if value:
-            merged[key] = value
+        merged[key] = value
     creds = _resolve_delegation_credentials(merged, parent_agent)
-    if overlay["model"]:
-        creds["model"] = overlay["model"]
-    if overlay["provider"]:
-        creds["provider"] = overlay["provider"]
     creds["fallback_chain"] = _profile_fallback_chain(profile.get("fallback_chain"))
     return creds
 
@@ -558,6 +558,7 @@ def _resolve_child_runtime(
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
     routing_cfg: Optional[Dict[str, Any]] = None,
     override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
+    pool_route: bool = False,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -570,11 +571,8 @@ def _resolve_child_runtime(
     # parent's Codex URL), which 404s on every request and can't be rescued by the fallback chain, whose dedup
     # matches provider+model and so skips the entry as a self-loop. _inherit_parent_endpoint recovers the
     # parent's live endpoint (with its key), which is meaningless for a different provider.
-    if override_provider:
+    if pool_route or override_provider or override_base_url:
         effective_provider = override_provider
-        effective_base_url = override_base_url
-    elif override_base_url:
-        effective_provider = getattr(parent_agent, "provider", None)
         effective_base_url = override_base_url
     else:
         effective_provider = getattr(parent_agent, "provider", None)
@@ -649,7 +647,9 @@ def _resolve_child_runtime(
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     kwargs: Dict[str, Any] = {
-        "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
+        "base_url": effective_base_url,
+        "api_key": override_api_key if pool_route else (override_api_key or parent_api_key),
+        "model": effective_model,
         "provider": effective_provider, "requested_provider": effective_requested_provider,
         "capabilities": _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,
@@ -657,7 +657,7 @@ def _resolve_child_runtime(
         # Profile fallback_chain wins when provided. Else the routing owner
         # (auxiliary.review vs delegation) still owns recovery policy.
         "fallback_model": (
-            (override_fallback_chain or None) if override_fallback_chain is not None
+            override_fallback_chain if override_fallback_chain is not None
             else _resolve_child_fallback_chain(
                 parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
                 pinned=bool(override_provider or override_base_url or model))

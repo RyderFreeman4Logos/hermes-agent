@@ -178,6 +178,9 @@ def _build_child_agent(
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[Dict[str, Any]] = None,
     override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
+    # A selected model_pool tier owns every unset route field. A bare model
+    # override still inherits the parent provider and endpoint.
+    pool_route: bool = False,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -225,6 +228,7 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
         override_fallback_chain=override_fallback_chain,
+        pool_route=pool_route,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -404,6 +408,7 @@ def _build_children(
             "override_acp_args": creds.get("args"),
             "routing_cfg": routing_cfg,
             "override_fallback_chain": creds.get("fallback_chain"),
+            "pool_route": bool(resolved_profile),
         }
         try:
             child = _build_child_preserving_parent_tools(

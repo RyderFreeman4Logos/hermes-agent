@@ -30,6 +30,8 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _credentials_for_model_profile,
+    _resolve_child_runtime,
 )
 from hermes_state import SessionDB
 
@@ -2401,6 +2403,51 @@ class TestModelPoolRouting(unittest.TestCase):
         with patch("tools.delegate_tool._load_config", return_value=cfg):
             result = json.loads(delegate_task(goal="nope", parent_agent=parent))
         self.assertIn("standard", result["error"])
+
+    def test_model_only_profile_does_not_inherit_global_route(self):
+        cfg = {
+            "provider": "openrouter",
+            "base_url": "https://global.example/v1",
+            "api_key": "global-key",
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"model": "tiny-model"},
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        creds = _credentials_for_model_profile(cfg, parent, "fast")
+        kwargs = _resolve_child_runtime(
+            parent, cfg, parent.api_key, model=creds["model"], override_provider=creds["provider"],
+            override_base_url=creds["base_url"], override_api_key=creds["api_key"], override_api_mode=creds.get("api_mode"),
+            override_acp_command=None, override_acp_args=None, routing_cfg=cfg,
+            override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+        )
+        self.assertEqual(kwargs["model"], "tiny-model")
+        self.assertIsNone(kwargs["provider"])
+        self.assertIsNone(kwargs["base_url"])
+        self.assertIsNone(kwargs["api_key"])
+
+    def test_explicit_empty_profile_fallback_chain_disables_fallback(self):
+        cfg = {
+            "fallback_providers": [{"provider": "openrouter", "model": "global-fallback"}],
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {
+                    "provider": "custom", "model": "tiny", "base_url": "http://fast/v1", "api_key": "k",
+                    "fallback_chain": [],
+                },
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        creds = _credentials_for_model_profile(cfg, parent, "fast")
+        kwargs = _resolve_child_runtime(
+            parent, cfg, parent.api_key, model=creds["model"], override_provider=creds["provider"],
+            override_base_url=creds["base_url"], override_api_key=creds["api_key"], override_api_mode=None,
+            override_acp_command=None, override_acp_args=None, routing_cfg=cfg,
+            override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+        )
+        self.assertEqual(kwargs["fallback_model"], [])
 
 
 if __name__ == "__main__":

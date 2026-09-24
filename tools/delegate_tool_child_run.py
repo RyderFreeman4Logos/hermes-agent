@@ -44,14 +44,18 @@ def _route_fields(child: Any) -> Dict[str, Any]:
     return {"model": model, "provider": provider}
 
 
-def _unverified_xai_billing(result: Dict[str, Any]) -> bool:
-    """An xAI spending-limit 403 is not proof the credential is spent."""
+def _hide_rejected_xai_billing(result: Dict[str, Any], child: Any) -> tuple[bool, bool]:
+    """(hide text, blank route). Unverified xAI blanks the route. Verified xAI
+    on a non-xAI accepted route keeps that route and drops only the text."""
     block = result.get("billing_block")
-    return (
-        result.get("billing_unverified") is True
-        and isinstance(block, dict)
-        and block.get("provider") in {"xai", "xai-oauth"}
-    )
+    xai = isinstance(block, dict) and block.get("provider") in {"xai", "xai-oauth"}
+    unverified = result.get("billing_unverified") is True
+    if not xai or not (unverified or result.get("failed") is True or result.get("error")):
+        return False, False
+    if unverified:
+        return True, True
+    _model, provider = _accepted_route_identity(child)
+    return provider not in {"xai", "xai-oauth"}, False
 
 
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
@@ -593,9 +597,16 @@ def _build_result_entry(
     ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
     wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
     summary = result.get("final_response") or ""
-    hide_xai = _unverified_xai_billing(result)
-    if hide_xai:
-        summary = "Subagent failed after an unverified provider billing error."
+    hide_text, blank_route = _hide_rejected_xai_billing(result, child)
+    if hide_text:
+        summary = (
+            "Subagent failed after an unverified provider billing error."
+            if result.get("billing_unverified") is True
+            else "Subagent failed after a provider billing error."
+        )
+        trace_messages: Any = []
+    else:
+        trace_messages = result.get("messages") or []
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
@@ -635,7 +646,7 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "exit_reason": exit_reason,
-        **({"model": None, "provider": None} if hide_xai else _route_fields(child)),
+        **({"model": None, "provider": None} if blank_route else _route_fields(child)),
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
         "truncated": exit_reason == "max_iterations",
@@ -643,7 +654,7 @@ def _build_result_entry(
             "input": _num(getattr(child, "session_prompt_tokens", 0)),
             "output": _num(getattr(child, "session_completion_tokens", 0)),
         },
-        "tool_trace": _build_tool_trace(result.get("messages") or []),
+        "tool_trace": _build_tool_trace(trace_messages),
         # Captured before the finally block calls child.close() so the parent thread can fire subagent_stop with the
         # correct role; stripped before the dict is serialised back to the model (as is _child_cost_usd, folded into
         # the parent's session cost by the aggregator).
@@ -655,10 +666,10 @@ def _build_result_entry(
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
     if status == "failed":
         entry["error"] = (
-            summary if hide_xai else result.get("error", "Subagent did not produce a response.")
+            summary if hide_text else result.get("error", "Subagent did not produce a response.")
         )
         _failure_reason = result.get("failure_reason")
-        if not hide_xai and isinstance(_failure_reason, str) and _failure_reason:
+        if not hide_text and isinstance(_failure_reason, str) and _failure_reason:
             entry["failure_reason"] = _failure_reason
     elif interrupt_note:
         entry["error"] = interrupt_note

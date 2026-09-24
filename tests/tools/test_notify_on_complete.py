@@ -487,3 +487,62 @@ def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_
     assert "hint" not in result, (
         f"Non-CI command using awk must not be flagged as homebrew CI poller, got: {result.get('hint')!r}"
     )
+
+
+class TestDelegatedChildCompletionOwnership:
+    """Well-formed terminal outcomes stay child-owned. Malformed envelopes fail open."""
+
+    @staticmethod
+    def _event(**overrides):
+        event = {
+            "type": "completion",
+            "session_id": "proc_child",
+            "command": "echo child",
+            "started_at": 1.0,
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "owner_task_id": "sa-0-child",
+            "task_id": "sa-0-child",
+            "output": "child output",
+        }
+        event.update(overrides)
+        return event
+
+    @pytest.mark.parametrize(
+        ("exit_code", "completion_reason", "termination_source"),
+        (
+            (0, "exited", ""),
+            (1, "exited", ""),
+            (-1, "lost", ""),
+            (-1, "lost", "backend_lost"),
+            (-15, "killed", "process.kill"),
+            (-15, "killed", "kill_all"),
+        ),
+        ids=("success", "nonzero", "lost", "lost_backend", "killed", "kill_all"),
+    )
+    def test_terminal_outcomes_stay_child_owned(self, registry, exit_code, completion_reason, termination_source):
+        registry.completion_queue.put(self._event(
+            exit_code=exit_code, completion_reason=completion_reason, termination_source=termination_source,
+        ))
+        assert registry.drain_notifications() == []
+
+    def test_parent_owned_success_still_notifies(self, registry):
+        registry.completion_queue.put(self._event(owner_task_id="parent-turn", task_id="parent-turn"))
+        assert len(registry.drain_notifications()) == 1
+
+    def test_handoff_stays_parent_visible(self, registry):
+        registry.completion_queue.put(self._event(handoff_note="CI watcher", owner_task_id="parent-turn"))
+        assert len(registry.drain_notifications()) == 1
+
+    @pytest.mark.parametrize("changes", (
+        {"exit_code": False},
+        {"exit_code": 0.0},
+        {"completion_reason": "unknown"},
+        {"session_id": ""},
+        {"command": ""},
+        {"started_at": True},
+    ))
+    def test_malformed_child_completion_fails_open(self, registry, changes):
+        registry.completion_queue.put(self._event(**changes))
+        assert len(registry.drain_notifications()) == 1

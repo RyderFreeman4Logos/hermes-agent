@@ -1976,6 +1976,8 @@ class GatewayNotificationsMixin:
             "parent_session_id": (
                 watcher.get("parent_session_id") or getattr(session, "parent_session_id", "") or ""
             ),
+            "owner_task_id": getattr(session, "owner_task_id", "") or "",
+            "task_id": getattr(session, "task_id", "") or "",
         }
 
     def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:
@@ -2055,24 +2057,29 @@ class GatewayNotificationsMixin:
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
-                    synth_text = format_process_notification(completion_evt)
-                    if not synth_text:
+                    # Child ownership suppresses only the parent model notice. The chat
+                    # receipt below still runs, so a finished sa-* process does not vanish.
+                    child_owned = process_registry._child_owned_terminal_completion(completion_evt)
+                    synth_text = None if child_owned else format_process_notification(completion_evt)
+                    if not child_owned and not synth_text:
                         break
                     # Captured before injection: afterwards the key is busy either way (the injected
                     # turn itself installs the guard).
                     turn_busy = await self._launching_turn_active(platform_name, watcher)
-                    delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
-                    if delivered is False:
-                        # The process remains terminal; retry after failed adapter injection instead
-                        # of suppressing the result.
-                        continue
+                    if synth_text is not None:
+                        delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
+                        if delivered is False:
+                            # The process remains terminal; retry after failed adapter injection instead
+                            # of suppressing the result.
+                            continue
                     # The agent normally reports the result itself, so the chat gets no separate receipt.
                     # While the launching turn is still running the injection only queues a follow-up, and
                     # the chat would stay mute for as long as that turn lasts (#112033): send the concise
-                    # receipt now.
-                    if turn_busy and (notify_mode in {"concise", "all", "result"} or (
+                    # receipt now. A child-owned completion has no parent turn to report it, so the
+                    # receipt always goes out.
+                    if child_owned or (turn_busy and (notify_mode in {"concise", "all", "result"} or (
                         notify_mode == "error" and session.exit_code not in {0, None}
-                    )):
+                    ))):
                         message_text = self._format_process_final_message(session_id, session, "concise")
                         await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
                     break

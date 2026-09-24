@@ -297,6 +297,49 @@ class TestRunSingleChildSchemaValidation:
         assert entry["status"] == "completed"
         assert "error" not in entry
 
+    def test_valid_retry_replaces_failed_turn_provenance(self):
+        """A valid schema retry owns the result. The rejected turn's billing
+        fields must not keep the accepted answer marked failed."""
+        class _Retry(_StubChild):
+            provider = "xai-oauth"
+            model = "grok-4.6"
+
+            def run_conversation(self, user_message, task_id=None, **_kwargs):
+                self.calls.append(user_message)
+                if len(self.calls) == 1:
+                    return {
+                        "final_response": "not json",
+                        "completed": False,
+                        "failed": True,
+                        "error": "synthetic spending-limit body",
+                        "failure_reason": "billing",
+                        "billing_unverified": True,
+                        "billing_block": {"provider": "xai-oauth"},
+                        "api_calls": 3,
+                        "messages": [],
+                    }
+                self.provider, self.model = "openrouter", "accepted-model"
+                return {
+                    "final_response": '{"city": "Oslo"}',
+                    "completed": True,
+                    "failed": False,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+        child = _Retry([])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        entry = _run(child)
+        assert entry["summary"] == '{"city": "Oslo"}'
+        assert entry["status"] == "completed"
+        assert entry["schema_valid"] is True
+        assert entry["model"] == "accepted-model"
+        assert entry["provider"] == "openrouter"
+        assert "error" not in entry
+        assert "failure_reason" not in entry
+        assert "synthetic spending-limit body" not in json.dumps(entry)
+
     def test_retry_turn_runs_in_delegated_child_context(self, monkeypatch):
         """The retry is a second run_conversation on the child, issued from the parent's
         thread where HERMES_KANBAN_TASK is set. Unwrapped it carries the worker's identity,

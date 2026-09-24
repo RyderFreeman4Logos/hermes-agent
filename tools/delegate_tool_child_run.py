@@ -32,7 +32,13 @@ def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 def _route_fields(child: Any) -> Dict[str, Any]:
-    """Selected route, kept on success and failure entries."""
+    """Selected route. Prefer the string route frozen before the child ran;
+    a non-string credential (test doubles) keeps the live model."""
+    frozen = getattr(child, "_delegate_accepted_route", None)
+    if isinstance(frozen, dict):
+        model, provider = _str_or_none(frozen.get("model")), _str_or_none(frozen.get("provider"))
+        if model is not None or provider is not None:
+            return {"model": model, "provider": provider}
     return {
         "model": _str_or_none(getattr(child, "model", None)),
         "provider": _str_or_none(getattr(child, "provider", None)),
@@ -535,6 +541,18 @@ def _validate_child_output_schema(
         if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
             result["messages"] = result["messages"] + _retry_messages
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
+        if _schema_valid:
+            # The accepted answer owns the result. Failure fields from the
+            # rejected turn would erase it or bill it to that old provider.
+            for key in (
+                "completed", "interrupted", "failed", "error",
+                "failure_reason", "failure_retryable",
+                "billing_block", "billing_unverified", "codex_turn_id",
+            ):
+                if key in _retry_result:
+                    result[key] = _retry_result[key]
+                else:
+                    result.pop(key, None)
     return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
 
 def _build_tool_trace(messages: Any) -> list[Dict[str, Any]]:

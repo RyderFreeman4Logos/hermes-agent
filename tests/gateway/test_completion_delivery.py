@@ -256,6 +256,57 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
     adapter.handle_message.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "completion_reason", "termination_source"),
+    (
+        pytest.param(0, "exited", "", id="success"),
+        pytest.param(1, "exited", "", id="nonzero"),
+        pytest.param(-1, "lost", "backend_lost", id="lost"),
+        pytest.param(-15, "killed", "process.kill", id="killed"),
+    ),
+)
+def test_delegated_child_watcher_stays_child_owned_for_all_terminal_outcomes(
+    monkeypatch, isolated_registry, exit_code, completion_reason, termination_source,
+):
+    import tools.process_registry as pr_module
+
+    registry = isolated_registry
+    session = ProcessSession(
+        id=f"proc_child_{abs(exit_code)}_{completion_reason}",
+        command="printf child-output",
+        task_id="container-child",
+        owner_task_id="sa-child-owner",
+        started_at=1.0,
+        output_buffer="child output\n",
+        exited=True,
+        exit_code=exit_code,
+        completion_reason=completion_reason,
+        termination_source=termination_source,
+        notify_on_complete=True,
+    )
+    registry._finished[session.id] = session
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    monkeypatch.setattr(registry, "_surface_child_process_notifications", lambda: False)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    async def _instant_sleep(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+
+    adapter.handle_message.assert_not_awaited()
+
+
 def test_process_tool_redacts_explicit_kill_output(monkeypatch):
     from tools import process_registry as pr_module
 

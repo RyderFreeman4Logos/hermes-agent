@@ -1971,6 +1971,8 @@ class GatewayNotificationsMixin:
             "exit_code": session.exit_code,
             "completion_reason": getattr(session, "completion_reason", "exited"),
             "termination_source": getattr(session, "termination_source", ""),
+            "owner_task_id": getattr(session, "owner_task_id", "") or getattr(session, "task_id", ""),
+            "handoff_note": getattr(session, "handoff_note", "") or "",
             "output": _redact_gateway_user_facing_secrets(_out),
             "delegated_child": bool(getattr(session, "delegated_child", False)),
             **({"handoff_note": session.handoff_note} if getattr(session, "handoff_note", "") else {}),
@@ -2057,6 +2059,12 @@ class GatewayNotificationsMixin:
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
+                    if (
+                        process_registry._is_routine_delegated_child_completion(completion_evt)
+                        and not process_registry._surface_child_process_notifications()
+                    ):
+                        logger.debug("Suppressed delegated-child completion watcher for %s", session_id)
+                        break
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break

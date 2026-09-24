@@ -9,6 +9,7 @@ from __future__ import annotations
 from hermes_constants import get_hermes_home, translate_cwd_for_wsl_backend, windows_path_to_wsl
 
 import copy
+import inspect
 import json
 import logging
 import os
@@ -108,6 +109,48 @@ def _expand_acp_enabled_toolsets(toolsets: List[str] | None = None,
     return list(dict.fromkeys(names))
 
 
+_FACTORY_IDENTITY = ("session_id", "cwd", "model")
+
+
+def _factory_kwargs(factory, **offered):
+    """Pass only parameters the factory declares. ``**kwargs`` receives all of them."""
+    params = inspect.signature(factory).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return {key: value for key, value in offered.items() if value is not None or key in _FACTORY_IDENTITY}
+    return {key: offered[key] for key in params if key in offered and (offered[key] is not None or key in _FACTORY_IDENTITY)}
+
+
+def _stamp_factory_identity(agent, factory, *, session_id, cwd, model):
+    """A factory that cannot take identity still has to return that session's agent."""
+    params = inspect.signature(factory).parameters
+    accepts = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()) or any(
+        name in params for name in _FACTORY_IDENTITY
+    )
+    if accepts:
+        return
+    for name, value in (("session_id", session_id), ("cwd", cwd), ("model", model)):
+        if value is not None and not hasattr(agent, name):
+            setattr(agent, name, value)
+
+
+def _session_memory_provider_mode(agent: Any) -> str | None:
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        mode = init_config.get("memory_provider_mode")
+        if mode in {"authoritative", "hybrid"}:
+            return mode
+    mode = getattr(agent, "_memory_provider_mode", None)
+    return mode if mode in {"authoritative", "hybrid"} else None
+
+
+def _merge_session_memory_provider_mode(model_config: dict, agent: Any) -> dict:
+    merged = dict(model_config)
+    mode = _session_memory_provider_mode(agent)
+    if mode:
+        merged["memory_provider_mode"] = mode
+    return merged
+
+
 def _parse_model_config(mc: Any) -> dict:
     """Decode a persisted model_config JSON blob; ``{}`` when absent/invalid/non-dict."""
     try:
@@ -201,7 +244,10 @@ class SessionManager:
         if original is None:
             return None
         new_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=new_id, cwd=cwd, model=original.model or None)
+        agent = self._make_agent(
+            session_id=new_id, cwd=cwd, model=original.model or None,
+            memory_provider_mode_override=_session_memory_provider_mode(original.agent),
+        )
         model = getattr(agent, "model", original.model) or original.model
         state = self._install_state(new_id, agent, cwd, model, copy.deepcopy(original.history))
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
@@ -324,6 +370,7 @@ class SessionManager:
             value = getattr(state.agent, key, None)
             if isinstance(value, str) and value.strip():
                 session_meta[key] = value.strip()
+        session_meta = _merge_session_memory_provider_mode(session_meta, state.agent)
 
         try:
             if db.get_session(state.session_id) is None:
@@ -334,6 +381,9 @@ class SessionManager:
                                   model_config=session_meta, cwd=state.cwd or None)
             else:
                 try:
+                    existing = db.get_session(state.session_id) or {}
+                    existing_config = _parse_model_config(existing.get("model_config"))
+                    session_meta = _merge_session_memory_provider_mode({**existing_config, **session_meta}, state.agent)
                     db.update_session_meta(state.session_id, json.dumps(session_meta), model_str)
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
@@ -430,6 +480,7 @@ class SessionManager:
 
         meta = _parse_model_config(row.get("model_config"))
         cwd, model = meta.get("cwd", "."), row.get("model") or None
+        memory_provider_mode = meta.get("memory_provider_mode") if meta.get("memory_provider_mode") in {"authoritative", "hybrid"} else None
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
@@ -443,7 +494,8 @@ class SessionManager:
             agent = self._make_agent(
                 session_id=session_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
                 requested_provider=meta.get("provider") or row.get("billing_provider"),
-                base_url=meta.get("base_url") or row.get("billing_base_url"))
+                base_url=meta.get("base_url") or row.get("billing_base_url"),
+                memory_provider_mode_override=memory_provider_mode)
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None
@@ -456,11 +508,19 @@ class SessionManager:
 
     def _make_agent(self, *, session_id: str, cwd: str, model: str | None = None,
                     requested_provider: str | None = None, base_url: str | None = None, api_mode: str | None = None,
-                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None):
+                    enabled_toolsets: list[str] | None = None, disabled_toolsets: list[str] | None = None,
+                    memory_provider_mode_override: str | None = None):
         """``enabled_toolsets``/``disabled_toolsets`` carry a live session's toolsets into a rebuild; ``None`` derives
         them from the config-declared MCP servers (fresh session)."""
         if self._agent_factory is not None:
-            return self._agent_factory()
+            # Test factories are zero-arg, mode-only, or **kwargs. Bind by signature
+            # so a TypeError raised inside the factory is not treated as a mismatch.
+            agent = self._agent_factory(**_factory_kwargs(
+                self._agent_factory, session_id=session_id, cwd=cwd, model=model,
+                memory_provider_mode_override=memory_provider_mode_override,
+            ))
+            _stamp_factory_identity(agent, self._agent_factory, session_id=session_id, cwd=cwd, model=model)
+            return agent
 
         from run_agent import AIAgent
         from hermes_cli.config import load_config
@@ -493,6 +553,8 @@ class SessionManager:
             # models). Resolved against the session's model so per-model overrides apply.
             "reasoning_config": resolve_reasoning_config(config, model or default_model),
         }
+        if memory_provider_mode_override in {"authoritative", "hybrid"}:
+            kwargs["memory_provider_mode_override"] = memory_provider_mode_override
         resolve_error: Exception | None = None
         try:
             runtime = resolve_runtime_provider(

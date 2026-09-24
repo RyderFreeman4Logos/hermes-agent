@@ -234,6 +234,25 @@ def _workdir_row_model_config(session: dict) -> tuple[str, dict]:
     # Same ``_branched_from`` marker the TUI /branch uses (list_sessions_rich + sidebar nesting).
     if parent_session_id := session.get("parent_session_id"):
         model_config["_branched_from"] = parent_session_id
+    try:
+        from tools.memory_tool import get_memory_provider_mode
+        resume_overrides = session.get("resume_runtime_overrides")
+        mode = (resume_overrides.get("memory_provider_mode_override")
+                if isinstance(resume_overrides, dict) else None)
+        if mode not in {"authoritative", "hybrid"}:
+            home_token = None
+            try:
+                if profile_home := session.get("profile_home"):
+                    home_token = set_hermes_home_override(profile_home)
+                memory_config = _load_cfg().get("memory", {})
+                mode = get_memory_provider_mode(memory_config if isinstance(memory_config, dict) else {})
+            finally:
+                if home_token is not None:
+                    reset_hermes_home_override(home_token)
+        if mode in {"authoritative", "hybrid"}:
+            model_config["memory_provider_mode"] = mode
+    except Exception:
+        logger.debug("memory provider mode stamp failed", exc_info=True)
     # Room plumbing always follows the member profile. Canonical Bot Chats do too until the composer records an
     # explicit chat-scoped pick plus the profile model it diverged from (see _stored_session_runtime_overrides).
     for flag in ("room_plumbing", "follow_profile_config"):

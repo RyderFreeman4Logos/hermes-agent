@@ -224,14 +224,22 @@ def _billing_pending_change(result: dict) -> dict:
 # ── session.create / list / most_recent / facts ──────────────────────
 def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list, *, source, cwd, profile_name,
                     copy_fields=(), compensate: bool = False, title_source: str = "user",
-                    user_id: str | None = None) -> None:
+                    user_id: str | None = None, memory_provider_mode: str | None = None) -> str | None:
     """Branch child row + parent transcript (bounded-chunk transactions) + title. ``_branched_from`` keeps the
     row visible in list_sessions_rich() (the live parent never matches the legacy end_reason='branched'
     heuristic); NULL ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate``
     deletes a committed row whose transcript/title failed (a durable-but-empty row would defeat the INSERT OR
     IGNORE first-prompt seed) — except on disk-full, where the delete cannot land. ``user_id`` is the creating
     login: the child is a Desktop session too, and the row only records identity at insert."""
-    db.create_session(new_key, source=source, model=_resolve_model(), model_config={"_branched_from": parent_key},
+    parent_row = {}
+    with contextlib.suppress(Exception):
+        parent_row = db.get_session(parent_key) or {}
+    parent_config = _parse_model_config(parent_row.get("model_config"), quiet=True) if parent_row else {}
+    branch_config = {"_branched_from": parent_key}
+    mode = memory_provider_mode or parent_config.get("memory_provider_mode")
+    if mode in {"authoritative", "hybrid"}:
+        branch_config["memory_provider_mode"] = mode
+    db.create_session(new_key, source=source, model=_resolve_model(), model_config=branch_config,
                       parent_session_id=parent_key, cwd=cwd, profile_name=profile_name, user_id=user_id)
     try:
         # Compensation guard (#93959 review): if the transcript copy or title write fails AFTER the row
@@ -256,6 +264,7 @@ def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list
             except Exception:
                 logger.debug("branch seed compensation delete failed for %s", new_key, exc_info=True)
         raise
+    return mode if mode in {"authoritative", "hybrid"} else None
 
 
 def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: list, source: str, profile_home):
@@ -266,10 +275,12 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
         with _session_db(record) as db:
             if db is None:
                 return
-            _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
+            mode = _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
                             source=source, cwd=record["cwd"],
                             profile_name=profile_name_for_home(profile_home) or _current_profile_name(),
                             compensate=True, title_source="derived", user_id=_session_auth_user_id(record))
+            if mode is not None:
+                record["resume_runtime_overrides"] = {"memory_provider_mode_override": mode}
             record["pending_title"] = None
             # The first submit's _persist_branch_seed is the fallback for a failed seed, not a second copy.
             record["_branch_seed_persisted"] = True
@@ -1980,6 +1991,17 @@ def _visible_branch_history(messages) -> list:
             and _coerce_message_text(message.get("content")).strip()]
 
 
+def _session_frozen_memory_provider_mode(session: dict | None) -> str | None:
+    agent = (session or {}).get("agent")
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        mode = init_config.get("memory_provider_mode")
+        if mode in {"authoritative", "hybrid"}:
+            return mode
+    mode = getattr(agent, "_memory_provider_mode", None)
+    return mode if mode in {"authoritative", "hybrid"} else None
+
+
 def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list, source: str):
     """Build + register the branched agent in the parent's profile; the DEDICATED db handle is ours until
     ``_transfer_db_to_agent`` (released here on failure)."""
@@ -1988,10 +2010,12 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
     branch_db, branch_owns_db = _profile_session_db(parent_home) if parent_home else (None, False)
     try:
         with _profile_build_scope(parent_home):
-            agent = _make_agent_in_context(new_sid, new_key, session_db=branch_db, platform_override=source,
-                                           cwd_override=_session_cwd(session),
-                                           context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
-                                           auth_user_id=parent_user_id)
+            agent = _make_agent_in_context(
+                new_sid, new_key, session_db=branch_db, platform_override=source,
+                cwd_override=_session_cwd(session),
+                context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
+                auth_user_id=parent_user_id,
+                memory_provider_mode_override=_session_frozen_memory_provider_mode(session))
             _init_session(new_sid, new_key, agent, list(history), cols=session.get("cols", 80),
                           cwd=_session_cwd(session), session_db=branch_db, source=source, profile_home=parent_home,
                           explicit_cwd=bool(session.get("explicit_cwd")))
@@ -2052,7 +2076,8 @@ def _(rid, params: dict, session: dict) -> dict:
                             profile_name=profile_name_for_home(home) or _current_profile_name(),
                             copy_fields=_BRANCH_COPY_FIELDS,
                             title_source="user" if params.get("name") else "derived",
-                            user_id=_session_auth_user_id(session))
+                            user_id=_session_auth_user_id(session),
+                            memory_provider_mode=_session_frozen_memory_provider_mode(session))
         except Exception as e:
             return _err(rid, 5008, f"branch failed: {e}")
     try:

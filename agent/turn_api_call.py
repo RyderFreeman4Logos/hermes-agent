@@ -199,11 +199,14 @@ def handle_api_interrupt(
             "api_content": _INTERRUPTED_PLACEHOLDER,
         })
         final_response = REPETITION_LOOP_INTERRUPTED
-    elif _partial:
-        append_message(messages, {"role": "assistant", "content": _partial})
-        final_response = _partial
     else:
-        final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
+        from agent.stream_payload_bound import persist_interrupted_stream_partial
+
+        final_response = persist_interrupted_stream_partial(
+            agent, messages, elapsed=api_elapsed,
+        ) or final_response
+        if not final_response:
+            final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
     agent._persist_session(messages, conversation_history)
     return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
 

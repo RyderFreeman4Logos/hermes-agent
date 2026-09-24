@@ -151,6 +151,7 @@ def check_api_response(
     finish_reason = _derive_finish_reason(agent, response, messages)
 
     # HTTP-200 refusals are deterministic: one fallback try, else return the refusal.
+    # A refusal is not an accepted route. Stamp only after this branch returns.
     if finish_reason == "content_filter":
         _rv = handle_content_policy_refusal(
             agent, response, _retry, thinking_spinner=thinking_spinner, messages=messages,
@@ -212,6 +213,8 @@ def check_api_response(
     from agent import relay_llm
 
     relay_llm.complete_logical_call(api_request_id, outcome="success")
+    if hasattr(agent, "_delegate_successful_llm_route"):
+        agent._delegate_successful_llm_route = (agent.model, agent.provider)
     agent._touch_activity(f"API call #{api_call_count} completed")
     return _verdict("break")
 

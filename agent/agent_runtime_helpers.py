@@ -943,6 +943,10 @@ def recover_with_credential_pool(
     if effective_reason == FailoverReason.billing:
         # A separate pool instance may have resolved runtime credentials, leaving no ``current_id``;
         # match the key that failed, not a different account.
+        # Unverified billing (xAI OAuth spending-limit 403) is not proof the session is spent.
+        # One same-session retry, then the short-cooldown rotation. A second hit still rotates.
+        if billing_unverified and not has_retried_429:
+            return False, True
         return (True, False) if _rotate_and_swap(402, "billing") else (False, has_retried_429)
     if effective_reason == FailoverReason.rate_limit:
         return _recover_rate_limit(

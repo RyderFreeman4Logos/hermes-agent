@@ -1393,6 +1393,18 @@ class TestAdversarialEdgeCases:
         assert result.reason == FailoverReason.billing
         assert result.billing_unverified is False
 
+    def test_xai_oauth_spending_limit_403_is_unverified_billing(self):
+        """The same xAI OAuth session can still answer after this 403."""
+        e = MockAPIError(
+            "You have run out of credits or need a Grok subscription.",
+            status_code=403,
+            body={"code": "personal-team-blocked:spending-limit", "error": "synthetic"},
+        )
+        result = classify_api_error(e, provider="xai-oauth", model="grok-4.6")
+        assert result.reason == FailoverReason.billing
+        assert result.should_fallback is True
+        assert result.billing_unverified is True
+
     def test_statusless_extra_usage_is_marked_unverified(self):
         """Adapters can strip the HTTP status from the Anthropic 400; the
         message-only path must carry the same ambiguity marking (#82154)."""

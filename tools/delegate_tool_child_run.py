@@ -31,12 +31,32 @@ def _num(value: Any, default: int = 0) -> int:
 def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
+def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
+    """Route proven by a shape-valid response. Nothing else is public identity."""
+    route = getattr(child, "_delegate_successful_llm_route", None)
+    if not (isinstance(route, tuple) and len(route) == 2):
+        return None, None
+    return _str_or_none(route[0]), _str_or_none(route[1])
+
+
 def _route_fields(child: Any) -> Dict[str, Any]:
-    """Selected route, kept on success and failure entries."""
-    return {
-        "model": _str_or_none(getattr(child, "model", None)),
-        "provider": _str_or_none(getattr(child, "provider", None)),
-    }
+    model, provider = _accepted_route_identity(child)
+    return {"model": model, "provider": provider}
+
+
+def _hide_rejected_xai_billing(result: Dict[str, Any], child: Any) -> tuple[bool, bool]:
+    """(hide text, blank route). Unverified xAI blanks the route. Verified xAI
+    on a non-xAI accepted route keeps that route and drops only the text."""
+    block = result.get("billing_block")
+    xai = isinstance(block, dict) and block.get("provider") in {"xai", "xai-oauth"}
+    unverified = result.get("billing_unverified") is True
+    if not xai or not (unverified or result.get("failed") is True or result.get("error")):
+        return False, False
+    if unverified:
+        return True, True
+    _model, provider = _accepted_route_identity(child)
+    return provider not in {"xai", "xai-oauth"}, False
+
 
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
@@ -374,7 +394,7 @@ def _register_child(
         "depth": max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0,
         "goal": goal,
         "delegation_id": _str_or_none(getattr(child, "_delegation_id", None)),
-        "model": _str_or_none(getattr(child, "model", None)),
+        "model": _accepted_route_identity(child)[0],
         "started_at": time.time(), "status": "running", "tool_count": 0, "agent": child,
         # Owning conversation's durable session id (same lineage completion delivery routes by), sourced from the
         # child's stamp so it survives a parent_agent rebuild between dispatch and run; used for list/steer/stop
@@ -524,6 +544,18 @@ def _validate_child_output_schema(
         if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
             result["messages"] = result["messages"] + _retry_messages
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
+        if _schema_valid:
+            # The accepted answer owns the result. Failure fields from the
+            # rejected turn would erase it or bill it to that old provider.
+            for key in (
+                "completed", "interrupted", "failed", "error",
+                "failure_reason", "failure_retryable",
+                "billing_block", "billing_unverified", "codex_turn_id",
+            ):
+                if key in _retry_result:
+                    result[key] = _retry_result[key]
+                else:
+                    result.pop(key, None)
     return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
 
 def _build_tool_trace(messages: Any) -> list[Dict[str, Any]]:
@@ -565,6 +597,16 @@ def _build_result_entry(
     ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
     wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
     summary = result.get("final_response") or ""
+    hide_text, blank_route = _hide_rejected_xai_billing(result, child)
+    if hide_text:
+        summary = (
+            "Subagent failed after an unverified provider billing error."
+            if result.get("billing_unverified") is True
+            else "Subagent failed after a provider billing error."
+        )
+        trace_messages: Any = []
+    else:
+        trace_messages = result.get("messages") or []
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
@@ -604,7 +646,7 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "exit_reason": exit_reason,
-        **_route_fields(child),
+        **({"model": None, "provider": None} if blank_route else _route_fields(child)),
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
         "truncated": exit_reason == "max_iterations",
@@ -612,7 +654,7 @@ def _build_result_entry(
             "input": _num(getattr(child, "session_prompt_tokens", 0)),
             "output": _num(getattr(child, "session_completion_tokens", 0)),
         },
-        "tool_trace": _build_tool_trace(result.get("messages") or []),
+        "tool_trace": _build_tool_trace(trace_messages),
         # Captured before the finally block calls child.close() so the parent thread can fire subagent_stop with the
         # correct role; stripped before the dict is serialised back to the model (as is _child_cost_usd, folded into
         # the parent's session cost by the aggregator).
@@ -623,11 +665,11 @@ def _build_result_entry(
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
     if status == "failed":
-        entry["error"] = result.get("error", "Subagent did not produce a response.")
-        # Classified reason from the child loop (e.g. "rate_limit", "billing")
-        # lets the parent tell a quota wall from a task error without parsing prose.
+        entry["error"] = (
+            summary if hide_text else result.get("error", "Subagent did not produce a response.")
+        )
         _failure_reason = result.get("failure_reason")
-        if isinstance(_failure_reason, str) and _failure_reason:
+        if not hide_text and isinstance(_failure_reason, str) and _failure_reason:
             entry["failure_reason"] = _failure_reason
     elif interrupt_note:
         entry["error"] = interrupt_note
@@ -911,7 +953,7 @@ class _ChildRun:
             if diagnostic_path:
                 logger.warning("Subagent %d 0-API-call timeout — diagnostic written to %s", task_index, diagnostic_path)
         if not is_timeout:
-            _err = str(exc)
+            _err = f"Subagent raised {type(exc).__name__}"
         elif stale_after is not None:
             _err = (
                 f"Subagent stopped making progress after {child_api_calls} API call(s) — no activity for "
@@ -930,9 +972,10 @@ class _ChildRun:
             )
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
+        _public = _err
         status = "timeout" if is_timeout else "error"
         _error_entry = {
-            "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
+            "task_index": task_index, "status": status, "summary": None, "error": _public, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
             "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
@@ -943,7 +986,7 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
-        self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
+        self.finish_failed(_error_entry, _late_pending_steer, preview=_public, summary=_public)
         close_deferred = is_timeout and not future.done()
         if close_deferred:
             _defer_close_after_timeout(child, future)
@@ -1014,7 +1057,9 @@ class _ChildRun:
             "api_calls": _num(entry["api_calls"]),
             "files_read": _files_read,
             "files_written": sorted({p for tid, paths in _files_written_map.items() if tid == self.child_task_id for p in paths})[:40],
-            "output_tail": _extract_output_tail(result, max_entries=8, max_chars=600),
+            # Public event: no raw tool output. A terminal tail can name the failed route
+            # and a provider body (xAI spending-limit). The parent still has the entry.
+            "output_tail": "",
         }
         if entry.get("failure_reason"):
             # Classified verdict rides the event so every surface glosses the failure the same way.

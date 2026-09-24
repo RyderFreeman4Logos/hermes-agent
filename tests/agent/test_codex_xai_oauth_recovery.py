@@ -425,8 +425,9 @@ def test_recover_with_credential_pool_skips_refresh_on_entitlement_403():
     assert refresh_calls["n"] == 0, "try_refresh_current must NOT be called on entitlement 403"
 
 
-def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
-    """xAI's explicit spending-limit 403 must rotate, not hit the entitlement guard."""
+def test_recover_with_credential_pool_retries_once_then_rotates_on_xai_spending_limit_403():
+    """First unverified spending-limit 403 stays on the session. The second rotates."""
+    from agent.credential_pool import FAILURE_REASON_BILLING_UNVERIFIED
     from agent.error_classifier import FailoverReason, classify_api_error
 
     agent = _make_codex_agent()
@@ -461,10 +462,8 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
         ):
             assert status_code == 403
             assert api_key_hint == "test-key"
-            # An xAI spending-limit 403 classifies as billing, and the pool
-            # must be told so — otherwise a sole-credential pool gives a spent
-            # account the transient 60s cooldown instead of the full bench.
-            assert failure_reason == "billing"
+            # Second hit: short cooldown, not the one-hour billing bench.
+            assert failure_reason == FAILURE_REASON_BILLING_UNVERIFIED
             assert error_context == {
                 "reason": "personal-team-blocked:spending-limit",
                 "message": (
@@ -485,18 +484,26 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
         has_retried_429=False,
         classified_reason=classified.reason,
         error_context=error_context,
+        billing_unverified=classified.billing_unverified,
     )
 
     assert classified.reason == FailoverReason.billing
+    assert classified.billing_unverified is True
+    assert recovered is False
+    assert retried_429 is True
+    assert refresh_calls["n"] == 0
+    agent._swap_credential.assert_not_called()
+
+    recovered, retried_429 = agent._recover_with_credential_pool(
+        status_code=error.status_code,
+        has_retried_429=True,
+        classified_reason=classified.reason,
+        error_context=error_context,
+        billing_unverified=classified.billing_unverified,
+    )
     assert recovered is True
     assert retried_429 is False
-    assert refresh_calls["n"] == 0
     agent._swap_credential.assert_called_once_with(next_entry)
-
-
-
-
-
 
 # ---------------------------------------------------------------------------
 # Fix D-bis: bad-credentials 403 must NOT be classified as entitlement (#29344)

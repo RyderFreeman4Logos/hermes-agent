@@ -155,7 +155,8 @@ class TestPoolFailureReason:
         recovered, _ = recover_with_credential_pool(
             agent,
             status_code=400,
-            has_retried_429=False,
+            # Unverified billing retries the same session once; the second hit rotates.
+            has_retried_429=billing_unverified,
             classified_reason=FailoverReason.billing,
             billing_unverified=billing_unverified,
         )

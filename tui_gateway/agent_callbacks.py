@@ -494,6 +494,8 @@ def _rebuild_session_agent(sid: str, session: dict, **kwargs):
         if opened:
             session_db = _open_profile_session_db(profile_home)
         agent = _make_agent(sid, session["session_key"], session_db=session_db, **kwargs)
+        # Adopt cold-restored intent before publishing the replacement through session["agent"].
+        _attach_model_switch_after_compression(sid, session, agent)
     except BaseException:
         if opened and session_db is not None:
             with contextlib.suppress(Exception):
@@ -527,6 +529,16 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         # /new is a full conversation boundary: session-scoped runtime overrides (/model,
         # /reasoning, /fast) do NOT carry forward and the pins are cleared so a rebuild can't
         # resurrect them. Global process state is never touched (see _apply_model_switch).
+        from hermes_cli.model_switch import (
+            clear_model_switch_after_compression,
+            get_model_switch_after_compression,
+        )
+        if (
+            (old_agent := session.get("agent")) is not None
+            and get_model_switch_after_compression(old_agent) is not None
+        ):
+            clear_model_switch_after_compression(old_agent)
+        session.pop("after_compression_model_switch", None)
         for k in ("model_override", "create_reasoning_override", "create_service_tier_override", "one_turn_model_restore"):
             session.pop(k, None)
         new_agent = _rebuild_session_agent(

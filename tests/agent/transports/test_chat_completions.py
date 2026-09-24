@@ -203,6 +203,46 @@ class TestChatCompletionsBasic:
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
 
+    def test_convert_messages_strips_persistence_only_display_fields(self, transport):
+        message = {
+            "role": "user",
+            "content": "ordinary decorated input",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "background"},
+        }
+
+        converted = transport.convert_messages([message])
+
+        assert converted == [{"role": "user", "content": "ordinary decorated input"}]
+        assert message["display_kind"] == "internal_notification"
+        assert message["display_metadata"] == {"source": "background"}
+
+    def test_iteration_summary_drops_display_fields_before_kwargs(self):
+        from agent.chat_completion_helpers import _iteration_summary_api_messages
+
+        message = {
+            "role": "user",
+            "content": "decorated input",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "background"},
+        }
+        agent = SimpleNamespace(
+            model="test/model",
+            provider="test",
+            _should_sanitize_tool_calls=lambda: False,
+            _copy_reasoning_content_for_api=lambda src, dst: None,
+            _cached_system_prompt="",
+            ephemeral_system_prompt="",
+            prefill_messages=(),
+            _sanitize_api_messages=lambda messages: messages,
+            _drop_thinking_only_and_merge_users=lambda messages: messages,
+        )
+
+        built = _iteration_summary_api_messages(agent, [message])
+
+        assert built == [{"role": "user", "content": "decorated input"}]
+        assert message["display_kind"] == "internal_notification"
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 

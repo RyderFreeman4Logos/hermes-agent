@@ -36,6 +36,7 @@ _XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
 _STRIP_MSG_KEYS = (
     "codex_reasoning_items", "codex_message_items", "tool_name", "effect_disposition", "timestamp",
     "platform_message_id", "api_content", "anthropic_content_blocks", "bedrock_content_blocks",
+    "display_kind", "display_metadata",
 )
 _STRIP_TC_KEYS = ("call_id", "response_item_id")
 _HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
@@ -378,7 +379,7 @@ def _sanitize_message(
 ) -> dict | None:
     """Sanitized copy of ``msg``, or None when nothing needs stripping.
 
-    Drops persistence sidecars, ``_``-prefixed scaffolding markers, tool-call ``call_id`` /
+    Drops persistence sidecars (including ``display_kind`` / ``display_metadata``), ``_``-prefixed scaffolding markers, tool-call ``call_id`` /
     ``response_item_id`` (and ``extra_content`` unless Gemini), an assistant
     ``tool_calls: []`` / ``null`` (strict providers reject both), ``name``
     on tool results (schema-valid only on user/assistant messages; strict

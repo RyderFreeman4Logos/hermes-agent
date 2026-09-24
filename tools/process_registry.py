@@ -1770,6 +1770,39 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return False
 
     @staticmethod
+    def _child_owned_terminal_completion(evt: dict) -> bool:
+        """Well-formed delegated-child terminal outcome stays child-owned.
+
+        Ownership, not the command result, decides. A malformed envelope fails
+        open so the parent still sees one bounded notice. An explicit handoff
+        is parent-owned and never matches.
+        """
+        if not isinstance(evt, dict) or evt.get("type") != "completion":
+            return False
+        if evt.get("handoff_note"):
+            return False
+        owner = str(evt.get("owner_task_id") or evt.get("task_id") or "")
+        if not owner.startswith("sa-"):
+            return False
+        started_at = evt.get("started_at")
+        return (
+            type(evt.get("exit_code")) is int
+            and (evt.get("completion_reason"), evt.get("termination_source")) in {
+                ("exited", ""),
+                ("killed", "process.kill"),
+                ("killed", "kill_all"),
+                ("lost", "backend_lost"),
+                ("failed_start", "failed_start"),
+                ("already_exited", ""),
+            }
+            and isinstance(evt.get("session_id"), str) and bool(evt["session_id"])
+            and isinstance(evt.get("command"), str) and bool(evt["command"])
+            and isinstance(started_at, (int, float)) and not isinstance(started_at, bool)
+            and started_at == started_at and started_at not in (float("inf"), float("-inf"))
+            and started_at > 0
+        )
+
+    @staticmethod
     def _owns_event(evt: dict, session_key: str, owns_event, is_async_delegation: bool) -> bool:
         """Routing verdict for one drained event (see drain_notifications); False = requeue."""
         evt_session_key = str(evt.get("session_key") or "")
@@ -1823,7 +1856,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # drain, so a requeue would pin the event forever. 'async_delegation'
             # is the result itself and is NEVER suppressed.
             _evt_task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
-            if not is_async_delegation and _evt_task_id.startswith("sa-"):
+            if (
+                not is_async_delegation
+                and _evt_task_id.startswith("sa-")
+                and self._child_owned_terminal_completion(evt)
+            ):
                 if surface_child is None:
                     surface_child = self._surface_child_process_notifications()
                 if not surface_child:

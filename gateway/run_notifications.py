@@ -1976,6 +1976,8 @@ class GatewayNotificationsMixin:
             "parent_session_id": (
                 watcher.get("parent_session_id") or getattr(session, "parent_session_id", "") or ""
             ),
+            "owner_task_id": getattr(session, "owner_task_id", "") or "",
+            "task_id": getattr(session, "task_id", "") or "",
         }
 
     def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:
@@ -2055,6 +2057,10 @@ class GatewayNotificationsMixin:
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
+                    # A well-formed delegated-child terminal outcome stays with the child.
+                    # A malformed envelope still gets one bounded parent-visible notice.
+                    if process_registry._child_owned_terminal_completion(completion_evt):
+                        break
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break

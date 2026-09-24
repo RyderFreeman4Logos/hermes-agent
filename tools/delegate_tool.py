@@ -235,7 +235,7 @@ def _build_child_agent(
         # _resolve_delegation_credentials already merged OVER the parent's
         request_overrides = dict(override_request_overrides)
     else:
-        request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
+        request_overrides = {} if (pool_route or override_provider) else dict(getattr(parent_agent, "request_overrides", {}) or {})
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():

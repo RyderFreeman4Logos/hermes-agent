@@ -498,6 +498,10 @@ def _credentials_for_model_profile(cfg: dict, parent_agent, profile_name: Option
     for key, value in overlay.items():
         merged[key] = value
     creds = _resolve_delegation_credentials(merged, parent_agent)
+    # Model-only: no provider or endpoint, so parent/global request_overrides
+    # do not belong to this tier. An explicit profile chain still wins below.
+    if overlay["provider"] is None and overlay["base_url"] is None:
+        creds["request_overrides"] = None
     creds["fallback_chain"] = _profile_fallback_chain(profile.get("fallback_chain"))
     return creds
 
@@ -645,6 +649,19 @@ def _resolve_child_runtime(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    # A model name is not a route pin. Only a provider, endpoint, or selected
+    # pool tier stops the child from inheriting the parent chain.
+    inherit_parent_chain = not pool_route and not override_provider and not override_base_url
+    fallback_model = (
+        override_fallback_chain if override_fallback_chain is not None
+        else _resolve_child_fallback_chain(
+            parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
+            pinned=not inherit_parent_chain)
+    )
+    # Model-only pool tier: omitted profile chain means no chain. A routed
+    # tier still inherits delegation.fallback_providers via override_fallback_chain.
+    if pool_route and override_fallback_chain is None and not override_provider and not override_base_url:
+        fallback_model = None
     kwargs: Dict[str, Any] = {
         "base_url": effective_base_url,
         "api_key": override_api_key if pool_route else (override_api_key or parent_api_key),
@@ -653,15 +670,11 @@ def _resolve_child_runtime(
         "capabilities": None if pool_route else _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,
         "reasoning_config": child_reasoning,
-        # Profile fallback_chain wins when provided. Else the routing owner
-        # (auxiliary.review vs delegation) still owns recovery policy.
-        "fallback_model": (
-            override_fallback_chain if override_fallback_chain is not None
-            else _resolve_child_fallback_chain(
-                parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
-                pinned=bool(override_provider or override_base_url or model))
+        "fallback_model": fallback_model,
+        "openrouter_min_coding_score": (
+            None if (pool_route and not override_provider and not override_base_url)
+            else getattr(parent_agent, "openrouter_min_coding_score", None)
         ),
-        "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset under a pinned provider or a selected pool tier.
         **{a: d if (pool_route or override_provider) else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},
     }

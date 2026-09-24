@@ -2538,6 +2538,106 @@ class TestModelPoolRouting(unittest.TestCase):
         self.assertEqual(kw["acp_command"], "parent-acp")
         self.assertEqual(kw["acp_args"], ["--parent"])
 
+    def test_model_only_builder_drops_parent_overrides_score_and_global_fallback(self):
+        """A model-only tier keeps neither parent overrides, the OpenRouter score, nor the global chain."""
+        global_chain = [{"provider": "openrouter", "model": "global-fallback"}]
+        cfg = {
+            "fallback_providers": global_chain,
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {"model": "tiny-model"},
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.request_overrides = {"extra_body": {"thinking": {"type": "disabled"}}}
+        parent.openrouter_min_coding_score = 0.42
+        parent._fallback_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value=cfg):
+            MockAgent.return_value = MagicMock()
+            creds = _credentials_for_model_profile(cfg, parent, "fast")
+            _build_child_agent(
+                task_index=0, goal="iso", context=None, toolsets=None, model=creds["model"],
+                max_iterations=10, parent_agent=parent, task_count=1,
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"], override_api_mode=creds.get("api_mode"),
+                override_request_overrides=creds.get("request_overrides"),
+                override_acp_command=creds.get("command"), override_acp_args=creds.get("args"),
+                routing_cfg=cfg, override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+            )
+        kw = MockAgent.call_args.kwargs
+        self.assertEqual(kw["request_overrides"], {})
+        self.assertIsNone(kw["openrouter_min_coding_score"])
+        self.assertIsNone(kw["fallback_model"])
+
+    def test_routed_omitted_chain_keeps_global_fallback_not_parent(self):
+        """A routed tier with no profile chain inherits delegation.fallback_providers."""
+        global_chain = [{"provider": "deepseek", "model": "deepseek-chat"}]
+        cfg = {
+            "fallback_providers": global_chain,
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value=cfg):
+            MockAgent.return_value = MagicMock()
+            creds = _credentials_for_model_profile(cfg, parent, None)
+            _build_child_agent(
+                task_index=0, goal="route", context=None, toolsets=None, model=creds["model"],
+                max_iterations=10, parent_agent=parent, task_count=1,
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"], override_api_mode=creds.get("api_mode"),
+                override_request_overrides=creds.get("request_overrides"),
+                routing_cfg=cfg, override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+            )
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], global_chain)
+
+    def test_explicit_profile_chain_reaches_builder(self):
+        """An explicit profile chain, including [], is the child's chain."""
+        profile_chain = [{"provider": "custom", "model": "backup"}]
+        cfg = {
+            "fallback_providers": [{"provider": "openrouter", "model": "global-fallback"}],
+            "model_pool": {
+                "standard": {"provider": "custom", "model": "main", "base_url": "http://main/v1", "api_key": "k"},
+                "fast": {
+                    "provider": "custom", "model": "tiny", "base_url": "http://fast/v1", "api_key": "k",
+                    "fallback_chain": profile_chain,
+                },
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value=cfg):
+            MockAgent.return_value = MagicMock()
+            creds = _credentials_for_model_profile(cfg, parent, "fast")
+            _build_child_agent(
+                task_index=0, goal="chain", context=None, toolsets=None, model=creds["model"],
+                max_iterations=10, parent_agent=parent, task_count=1,
+                override_provider=creds["provider"], override_base_url=creds["base_url"],
+                override_api_key=creds["api_key"], override_api_mode=None,
+                override_request_overrides=creds.get("request_overrides"),
+                routing_cfg=cfg, override_fallback_chain=creds.get("fallback_chain"), pool_route=True,
+            )
+        self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], profile_chain)
+
+    def test_non_pool_bare_model_keeps_parent_fallback_overrides_and_score(self):
+        """A bare model override is not a pool tier and still inherits the parent route extras."""
+        parent_chain = [{"provider": "openrouter", "model": "parent-fallback"}]
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = parent_chain
+        parent.request_overrides = {"extra_body": {"x": 1}}
+        parent.openrouter_min_coding_score = 0.7
+        with patch("run_agent.AIAgent") as MockAgent, patch("tools.delegate_tool._load_config", return_value={}):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0, goal="bare", context=None, toolsets=None, model="tiny-model",
+                max_iterations=10, parent_agent=parent, task_count=1,
+            )
+        kw = MockAgent.call_args.kwargs
+        self.assertEqual(kw["fallback_model"], parent_chain)
+        self.assertEqual(kw["request_overrides"], {"extra_body": {"x": 1}})
+        self.assertEqual(kw["openrouter_min_coding_score"], 0.7)
+
 
 if __name__ == "__main__":
     unittest.main()

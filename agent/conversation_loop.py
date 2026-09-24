@@ -492,6 +492,18 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     )
 
 
+def _is_standard_profile_child(agent) -> bool:
+    return getattr(agent, "_delegate_model_profile", None) == "standard"
+
+
+def _standard_child_can_fallback(agent, *, reason=None) -> bool:
+    """A standard child may switch after a provider failure, not a content-policy denial."""
+    if not _is_standard_profile_child(agent):
+        return True
+    from agent.error_classifier import FailoverReason
+    return reason != FailoverReason.content_policy_blocked
+
+
 def _billing_or_entitlement_message(
     *, capability: str, provider: str, base_url: str, model: str, unverified: bool = False
 ) -> str:

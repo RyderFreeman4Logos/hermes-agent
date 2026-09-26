@@ -507,6 +507,18 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    def test_503_auth_unavailable_rotates_instead_of_overloaded(self):
+        e = MockAPIError(
+            "HTTP 503: auth_unavailable: no auth available "
+            "(providers=xai, model=grok-4.6)",
+            status_code=503,
+        )
+        result = classify_api_error(e, provider="xai", model="grok-4.6")
+        assert result.reason == FailoverReason.auth
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server

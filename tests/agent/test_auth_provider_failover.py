@@ -98,6 +98,24 @@ class TestAuthFailoverActivation:
         assert advanced is True
         assert agent._fallback_index == 1
 
+    def test_503_auth_unavailable_advances_to_next_fallback(self):
+        agent = _make_agent(fallback_model=[{"provider": "openai", "model": "gpt-4o"}])
+        retry = TurnRetryState()
+        classified = classify_api_error(
+            _auth_error(503, "auth_unavailable: no auth available (providers=xai, model=grok-4.6)"),
+            provider="xai",
+            model="grok-4.6",
+        )
+        assert classified.is_auth is True
+        assert self._should_failover(agent, classified, retry) is True
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
+            advanced = agent._try_activate_fallback(reason=classified.reason)
+        assert advanced is True
+        assert agent._fallback_index == 1
+
     def test_no_failover_without_chain(self):
         """A user with no fallback configured (the common case for the
         original incident) does NOT failover — falls through to the

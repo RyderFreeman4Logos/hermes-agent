@@ -4,7 +4,7 @@
 The minimum-viable replacement for pytest-xdist + a subprocess-isolation
 plugin. Discovers test files under ``tests/`` (excluding integration/e2e
 unless explicitly requested), then runs one ``python -m pytest <file>``
-subprocess per file, with bounded parallelism (default: ``os.cpu_count()``).
+subprocess per file, with bounded parallelism (default: min(os.cpu_count(), 8)).
 
 Why per-file rather than per-test?
     Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
@@ -31,7 +31,8 @@ Usage:
     a literal ``--`` is also passed through, and stacks with bare flags.
 
 Environment:
-    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
+    HERMES_TEST_WORKERS  Requested worker count (default: min(os.cpu_count(), 8));
+                         values above the hard cap are clamped.
     HERMES_TEST_PATHS    Override discovery roots (colon-sep; on Windows
                          ';' also works and drive letters are handled;
                          default: 'tests')
@@ -58,6 +59,36 @@ from typing import Dict, List, Tuple
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
+_MAX_WORKERS = 8
+
+
+def _clamp_workers(requested: int) -> int:
+    """Keep caller-selected parallelism within the host and runner limits."""
+    return max(1, min(requested, os.cpu_count() or 1, _MAX_WORKERS))
+
+
+def _is_mise_shim_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").rstrip("/")
+    return normalized.endswith("/mise/shims") or "/mise/shims/" in normalized
+
+
+def _strip_mise_shims(path: str) -> str:
+    """Remove mise shim directories and PATH entries exposing a shim."""
+    clean: List[str] = []
+    for entry in path.split(os.pathsep):
+        if _is_mise_shim_path(entry):
+            continue
+        rustup = Path(entry) / "rustup"
+        try:
+            if rustup.is_symlink():
+                resolved = rustup.resolve()
+                if _is_mise_shim_path(str(resolved)) or resolved.name.casefold() in {"mise", "mise.exe"}:
+                    continue
+        except OSError:
+            pass
+        clean.append(entry)
+    return os.pathsep.join(clean)
+
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -399,6 +430,10 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
+    # A shim can also be exposed by a broader PATH entry (for example
+    # /usr/local/bin/rustup), so remove that entry instead of letting a
+    # version probe fall through to mise.
+    env["PATH"] = _strip_mise_shims(env.get("PATH", ""))
     temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
 
@@ -781,8 +816,8 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 1)),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count)",
     )
     parser.add_argument(
         "--paths",
@@ -926,6 +961,7 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+    args.jobs = _clamp_workers(args.jobs)
 
     # ── Node-id selectors → file + ``-k`` filter ────────────────────────────
     # This runner is FILE-granular: it spawns one ``pytest <file>`` per test

@@ -365,6 +365,9 @@ _AUTH_PATTERNS = (
     "failed to extract accountid from token",
 )
 
+# HTTP 503 credential-pool exhaustion is an auth failure, not overload.
+_AUTH_UNAVAILABLE_PATTERNS = ("auth_unavailable", "no auth available")
+
 # Empty-response advisories (OpenRouter / nano-gpt). Checked before overflow
 # because the text often mentions "max_tokens" (caused compression spirals).
 _EMPTY_PROVIDER_RESPONSE_PATTERNS = (
@@ -1071,6 +1074,12 @@ def _status_5xx(c: _Ctx) -> Verdict:
     return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
 
 
+def _status_503(c: _Ctx) -> Verdict:
+    if any(p in c.msg for p in _AUTH_UNAVAILABLE_PATTERNS):
+        return _V_AUTH_ROTATE
+    return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED
+
+
 def _classify_402(error_msg: str, result_fn: Callable[..., Any]) -> Any:
     """Disambiguate 402: "usage limit, try again in 5 minutes" is a periodic quota, not billing."""
     transient = any(p in error_msg for p in _USAGE_LIMIT_PATTERNS) and any(
@@ -1203,7 +1212,7 @@ _STATUS_HANDLERS: Dict[int, Callable[[_Ctx], Verdict]] = {
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _classify_image_tool_422(c),
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
-    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    503: _status_503,
     529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
 }
 

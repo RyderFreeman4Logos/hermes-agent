@@ -184,8 +184,78 @@ def test_production_codex_responses_map_forwards_cap_and_rejects_truncated_json(
     wire_kwargs = dict(real_client.responses.kwargs)
     wire_kwargs.update(wire_kwargs.get("extra_body") or {})
     assert wire_kwargs["max_output_tokens"] == 16_384
+    assert wire_kwargs["text"]["format"]["type"] == "json_schema"
+    assert wire_kwargs["text"]["format"]["name"] == "checkpoint_map"
+    assert wire_kwargs["text"]["format"]["schema"]["properties"]["facts"]["maxItems"] == 32
+    assert wire_kwargs["text"]["format"]["strict"] is True
     assert engine._map_attempt_records[-1].finish_reason == "length"
     assert "finish_reason=length" in (engine.last_rejection or "")
+
+
+def test_codex_responses_adapter_maps_controls_and_rejects_unsupported_format():
+    from agent.auxiliary_client import CodexAuxiliaryClient
+
+    class FakeResponses:
+        kwargs = None
+
+        def create(self, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(
+                output=[SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text='{"facts": []}')],
+                )],
+            )
+
+    responses = FakeResponses()
+    client = CodexAuxiliaryClient(
+        SimpleNamespace(
+            api_key="key", base_url="https://chatgpt.com/backend-api/codex",
+            responses=responses,
+        ),
+        "map-model",
+    )
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "checkpoint_map",
+            "schema": {"type": "object"},
+            "strict": True,
+        },
+    }
+
+    client.chat.completions.create(
+        messages=[{"role": "user", "content": "source"}],
+        max_completion_tokens=123,
+        reasoning_effort="low",
+        temperature=0.2,
+        extra_body={"response_format": response_format},
+    )
+
+    wire_kwargs = responses.kwargs
+    assert wire_kwargs is not None
+    assert wire_kwargs["max_output_tokens"] == 123
+    assert wire_kwargs["reasoning"] == {"effort": "low", "summary": "auto"}
+    assert wire_kwargs["include"] == ["reasoning.encrypted_content"]
+    assert wire_kwargs["text"]["format"] == {
+        "type": "json_schema",
+        "name": "checkpoint_map",
+        "schema": {"type": "object"},
+        "strict": True,
+    }
+    assert "temperature" not in wire_kwargs
+
+    for invalid_response_format in (
+        {"type": "json_object"},
+        {"type": "json_schema", "json_schema": {}},
+    ):
+        responses.kwargs = None
+        with pytest.raises(ValueError, match="json_schema"):
+            client.chat.completions.create(
+                messages=[{"role": "user", "content": "source"}],
+                extra_body={"response_format": invalid_response_format},
+            )
+        assert responses.kwargs is None
 
 
 def test_production_map_does_not_replay_structured_rejection_prompt_only():

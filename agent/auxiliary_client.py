@@ -1710,7 +1710,9 @@ class _CodexCompletionsAdapter:
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
 
-        max_tokens = kwargs.get("max_tokens")
+        max_tokens = kwargs.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = kwargs.get("max_tokens")
         if max_tokens is not None:
             resp_kwargs["max_output_tokens"] = max_tokens
 
@@ -1725,6 +1727,9 @@ class _CodexCompletionsAdapter:
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
             reasoning_cfg = extra_body.get("reasoning")
+            reasoning_effort = kwargs.get("reasoning_effort")
+            if reasoning_effort is not None:
+                reasoning_cfg = {"effort": reasoning_effort}
             if isinstance(reasoning_cfg, dict):
                 if reasoning_cfg.get("enabled") is False:
                     # Reasoning explicitly disabled — do not set reasoning
@@ -1754,6 +1759,42 @@ class _CodexCompletionsAdapter:
                         "summary": "auto",
                     }
                     resp_kwargs["include"] = ["reasoning.encrypted_content"]
+
+        response_format_present = "response_format" in kwargs
+        response_format = kwargs.get("response_format")
+        if isinstance(extra_body, dict) and "response_format" in extra_body:
+            extra_response_format = extra_body["response_format"]
+            if response_format_present and response_format != extra_response_format:
+                raise ValueError("Conflicting Codex response_format values")
+            response_format_present = True
+            response_format = extra_response_format
+        if response_format_present:
+            if (
+                not isinstance(response_format, dict)
+                or response_format.get("type") != "json_schema"
+            ):
+                raise ValueError("Codex Responses requires a json_schema response_format")
+            json_schema = response_format.get("json_schema")
+            if not isinstance(json_schema, dict):
+                raise ValueError("Codex json_schema response_format is malformed")
+            name = json_schema.get("name")
+            schema = json_schema.get("schema")
+            strict = json_schema.get("strict", True)
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(schema, dict)
+                or not isinstance(strict, bool)
+            ):
+                raise ValueError("Codex json_schema response_format is malformed")
+            resp_kwargs["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": name,
+                    "schema": schema,
+                    "strict": strict,
+                },
+            }
 
         # Tools support for auxiliary callers (e.g. skills_hub) that pass function schemas
         tools = kwargs.get("tools")

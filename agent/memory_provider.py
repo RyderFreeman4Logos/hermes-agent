@@ -7,15 +7,57 @@ prefetch / sync_turn per turn -> tool dispatch -> shutdown, plus optional ``on_*
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 import re
 import threading
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MemoryProviderExecutionContext:
+    """Caller-owned identity and bounded cancellation state for one provider call.
+
+    ``deadline`` is an absolute ``time.monotonic()`` value. ``operation_key`` is
+    copied only from the original tool arguments; Hermes never generates it.
+    """
+
+    operation_key: Any = None
+    deadline: Optional[float] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def remaining_seconds(self) -> Optional[float]:
+        if self.deadline is None:
+            return None
+        return max(0.0, self.deadline - time.monotonic())
+
+
+_current_execution_context: contextvars.ContextVar[Optional[MemoryProviderExecutionContext]] = contextvars.ContextVar(
+    "memory_provider_execution_context", default=None,
+)
+
+
+def current_memory_provider_execution_context() -> Optional[MemoryProviderExecutionContext]:
+    return _current_execution_context.get()
+
+
+@contextlib.contextmanager
+def bind_memory_provider_execution_context(context: Optional[MemoryProviderExecutionContext]):
+    token = _current_execution_context.set(context)
+    try:
+        yield
+    finally:
+        _current_execution_context.reset(token)
 
 
 def ctx_bound(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -191,13 +233,19 @@ class MemoryProvider(ABC):
         """Write non-secret setup ``values`` to the provider's native config. Plugins MUST either
         override this or use only env vars (every schema field carrying ``env_var``)."""
 
-    def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+    def on_memory_write(
+        self, action: str, target: str, content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        execution_context: Optional[MemoryProviderExecutionContext] = None,
+    ) -> None:
         """Mirror a built-in memory-tool write (``action``: add | replace | remove; ``target``:
         memory | user; ``metadata``: provenance such as write_origin, session_id, tool_name).
         For replace/remove, ``metadata["previous_content"]`` is the full entry selected
         under the native-store lock. Notifications follow a successful complete write
         or batch; each batch operation sees the preceding operation's result. Older
         callers may omit this field: ``old_text`` alone is not authoritative identity.
+        ``execution_context`` carries the caller-owned ``operation_key`` plus the
+        executor's monotonic deadline and cancellation event.
         """
 
     def backup_paths(self) -> List[str]:

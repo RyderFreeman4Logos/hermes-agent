@@ -733,6 +733,7 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    execution_context=None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -784,19 +785,22 @@ def _run_agent_tool_execution_middleware(
             **tool_hook_ids(agent, effective_task_id, tool_call_id),
         )
 
-    state.result, _relay_args = relay_tools.execute(
-        function_name,
-        function_args,
-        _hermes_pipeline,
-        session_id=str(getattr(agent, "session_id", "") or ""),
-        tool_call_id=tool_call_id or None,
-        metadata={
-            "task_id": effective_task_id or "",
-            "turn_id": getattr(agent, "_current_turn_id", "") or "",
-            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
-            "tool_call_id": tool_call_id or "",
-        },
-    )
+    from agent.memory_provider import bind_memory_provider_execution_context
+
+    with bind_memory_provider_execution_context(execution_context):
+        state.result, _relay_args = relay_tools.execute(
+            function_name,
+            function_args,
+            _hermes_pipeline,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            tool_call_id=tool_call_id or None,
+            metadata={
+                "task_id": effective_task_id or "",
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+                "tool_call_id": tool_call_id or "",
+            },
+        )
     return state
 
 
@@ -880,6 +884,12 @@ def _run_sequential_tool_execution_middleware(
     timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
+    from agent.memory_provider import MemoryProviderExecutionContext
+
+    execution_context = MemoryProviderExecutionContext(
+        operation_key=function_args.get("operation_key"),
+    )
+    kwargs["execution_context"] = execution_context
     from agent.terminal_approval_batch import take_prepared_call
     prepared = take_prepared_call(tool_call_id)
     if prepared is not None:
@@ -898,6 +908,9 @@ def _run_sequential_tool_execution_middleware(
         authorization_gate = _ConcurrentToolAuthorizationGate()
         worker_tid: list[int] = []
 
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+    execution_context.deadline = deadline
+
     def _run() -> _ManagedToolResult:
         with _registered_tool_worker(agent) as tid:
             worker_tid.append(tid)
@@ -908,13 +921,13 @@ def _run_sequential_tool_execution_middleware(
     if prepared is None:
         executor = DaemonThreadPoolExecutor(max_workers=1)
         future = executor.submit(propagate_context_to_thread(_run))
-    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     started = time.monotonic()
     abandoned = False
     try:
         state, result = _poll_sequential_future(agent, future, function_name, deadline, started, authorization_gate)
         if state == "done":
             return result
+        execution_context.cancel_event.set()
         if state == "interrupted":
             # interrupt() already fanned out to tracked tids, but this worker may have
             # registered after that ran; then 3s grace (mirrors the concurrent path).
@@ -1262,6 +1275,12 @@ class _ConcurrentBatch:
         self.gate = _StartOrderGate(_start_order_gate_timeout(timeout_s))
         self.authorization_gate = _ConcurrentToolAuthorizationGate()
         self.timed_out_indices: set[int] = set()
+        from agent.memory_provider import MemoryProviderExecutionContext
+
+        self.execution_contexts = [
+            MemoryProviderExecutionContext(operation_key=pc.args.get("operation_key"))
+            for pc in parsed_calls
+        ]
 
     def _dispatch_worker(self, index: int, ref: _ToolCallRef, scope_block, start_gate: _WorkerStartOnce) -> Optional[_ToolOutcome]:
         """Run one call through the middleware and synthesize its slot outcome; ``None`` when
@@ -1288,6 +1307,7 @@ class _ConcurrentBatch:
                 display_index=index + 1,
                 begin_execution=start_gate.advance,
                 authorization_gate=self.authorization_gate,
+                execution_context=self.execution_contexts[index],
             )
             result, ref.args, ref.trace = managed.result, managed.args, managed.middleware_trace
             blocked, dispatched = managed.blocked, managed.dispatched
@@ -1384,6 +1404,8 @@ class _ConcurrentBatch:
             timed_out = deadline is not None and time.monotonic() >= deadline + self.authorization_gate.excluded_seconds()
             if timed_out:
                 self.timed_out_indices = {future_to_index[f] for f in not_done if f in future_to_index}
+                for index in self.timed_out_indices:
+                    self.execution_contexts[index].cancel_event.set()
                 logger.warning(
                     "concurrent tool batch timed out after %.1fs; %d tool(s) still running: %s",
                     self.timeout_s,
@@ -1418,6 +1440,10 @@ class _ConcurrentBatch:
                 _interrupt_worker_tids(agent, worker_tids)
             else:
                 # Give running tools a moment to notice the per-thread interrupt and exit gracefully.
+                for future in not_done:
+                    index = future_to_index.get(future)
+                    if index is not None:
+                        self.execution_contexts[index].cancel_event.set()
                 concurrent.futures.wait(not_done, timeout=3.0)
             return True
 
@@ -1427,6 +1453,8 @@ class _ConcurrentBatch:
         if not runnable:
             return
         deadline = time.monotonic() + self.timeout_s if self.timeout_s is not None else None
+        for context in self.execution_contexts:
+            context.deadline = deadline
         max_workers = _max_workers_for_tool_batch([(i, None, self.parsed_calls[i].name) for i in runnable])
         # Daemon workers: the stdlib pool's atexit join would let one wedged tool block exit.
         from tools.daemon_pool import DaemonThreadPoolExecutor

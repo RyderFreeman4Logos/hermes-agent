@@ -485,10 +485,11 @@ def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
     configured) is not a usable credential.
     """
     from hermes_cli.auth import AuthError, has_usable_secret
+    from hermes_cli.fallback_config import resolve_entry_api_key
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     base_url = str(entry.get("base_url") or "").strip() or None
-    api_key = str(entry.get("api_key") or "").strip() or None
+    api_key = resolve_entry_api_key(entry)
     provider = entry["provider"].strip().lower()
     if provider == "custom" and base_url is None and api_key is None:
         return True

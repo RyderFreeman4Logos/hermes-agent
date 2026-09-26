@@ -2653,6 +2653,69 @@ class TestModelPoolRouting(unittest.TestCase):
         self.assertEqual([entry["provider"] for entry in chain], ["custom"])
         self.assertEqual(chain[0]["model"], "local-model")
 
+    def test_scoped_env_key_admits_profile_fallback_before_spawn(self):
+        """A scoped fallback key is resolved before the child is constructed."""
+        from hermes_cli.auth import AuthError
+
+        scoped_key = "k" * 32
+        cfg = {
+            "model_pool": {
+                "standard": {
+                    "provider": "custom",
+                    "model": "primary-model",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "api_key": "p" * 3,
+                    "fallback_chain": [
+                        {
+                            "provider": "openrouter",
+                            "model": "env-fallback",
+                            "key_env": "HERMES_TEST_SCOPED_FALLBACK",
+                        },
+                    ],
+                },
+            },
+        }
+        parent = _make_mock_parent(depth=0)
+        captured = {}
+
+        def _resolve(**kwargs):
+            if kwargs.get("requested") == "openrouter":
+                if kwargs.get("explicit_api_key") != scoped_key:
+                    raise AuthError(
+                        "scoped fallback key was not resolved",
+                        provider="openrouter",
+                        code="missing_api_key",
+                    )
+                return {
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": scoped_key,
+                }
+            return {
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "api_key": "p" * 3,
+            }
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "tools.delegate_tool._run_batch", return_value="BATCH_OK"
+        ), patch("run_agent.AIAgent", side_effect=_capture), patch(
+            "agent.secret_scope.get_secret", return_value=scoped_key
+        ) as get_secret, patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=_resolve
+        ):
+            result = delegate_task(tasks=[{"goal": "probe"}], parent_agent=parent)
+
+        self.assertEqual(result, "BATCH_OK")
+        get_secret.assert_called_with("HERMES_TEST_SCOPED_FALLBACK")
+        chain = captured["fallback_model"]
+        self.assertEqual([entry["model"] for entry in chain], ["env-fallback"])
+        self.assertEqual(chain[0]["key_env"], "HERMES_TEST_SCOPED_FALLBACK")
+
     def test_non_pool_bare_model_keeps_parent_fallback_overrides_and_score(self):
         """A bare model override is not a pool tier and still inherits the parent route extras."""
         parent_chain = [{"provider": "openrouter", "model": "parent-fallback"}]

@@ -25,6 +25,7 @@ from tools.delegate_tool import (
     _load_config,
     delegate_task,
     _build_child_agent,
+    _build_children,
     _build_child_progress_callback,
     _build_child_system_prompt,
     _strip_blocked_tools,
@@ -98,7 +99,7 @@ class TestDelegateRequirements(unittest.TestCase):
 
         desc = _build_top_level_description()
         # Compaction ceiling: the old description was ~4,000 chars.
-        self.assertLessEqual(len(desc), 2200)
+        self.assertLessEqual(len(desc), 2400)
         # Contracts only the top-level text carries:
         for keyword in (
             "background",          # async semantics
@@ -110,9 +111,14 @@ class TestDelegateRequirements(unittest.TestCase):
             "respond in Chinese",  # language example (weak models regress without it)
             "SELF-REPORTS",        # verification contract
             "clarify",             # child blocked-tool list
-            "delegation.provider", # model inheritance / pinning
+            "model_profile",       # pool routing (omitted uses standard)
+            "standard",            # required pool profile
+            "fail closed",         # unknown names / pool without standard
         ):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
+        # Runtime provider pinning still lives in delegate_tool_config/docs;
+        # the compact top-level text now carries the model_pool contract.
+        self.assertNotIn("delegation.provider", desc)
         # send_message must NOT be named: gateway-internal vocabulary most
         # sessions never see (still enforced via DELEGATE_BLOCKED_TOOLS).
         self.assertNotIn("send_message", desc)
@@ -539,7 +545,7 @@ class TestDelegateObservability(unittest.TestCase):
             mock_child.model = "claude-sonnet-4-6"
             mock_child.session_prompt_tokens = 5000
             mock_child.session_completion_tokens = 1200
-            mock_child.run_conversation.return_value = {
+            response = {
                 "final_response": "done",
                 "completed": True,
                 "interrupted": False,
@@ -553,6 +559,12 @@ class TestDelegateObservability(unittest.TestCase):
                     {"role": "assistant", "content": "done"},
                 ],
             }
+            def run_conversation(*_args, **_kwargs):
+                mock_child._delegate_successful_llm_route = (
+                    "claude-sonnet-4-6", mock_child.provider,
+                )
+                return response
+            mock_child.run_conversation.side_effect = run_conversation
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test observability", parent_agent=parent))
@@ -1421,6 +1433,77 @@ class TestChildCredentialLeasing(unittest.TestCase):
         self.assertEqual(lease_id, "az")
         self.assertEqual(child._swap_credential.call_args[0][0].base_url, azure)
         self.assertEqual(pool._active_leases, {"az": 2})
+
+    def test_non_xai_child_drops_xai_billing_terminal(self):
+        """A DeepSeek child must not relay an xAI billing terminal from its parent (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "deepseek-v4-flash"
+        child.provider = "deepseek"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Billing or credits exhausted: xAI spending-limit body",
+            "error": "xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertNotIn("xAI spending-limit body", result.get("error", ""))
+        self.assertNotIn("billing_block", result)
+        self.assertEqual(
+            result["error"],
+            "Subagent failed with a provider error unrelated to its effective model.",
+        )
+
+    def test_standard_child_hides_unverified_xai_fallback_terminal(self):
+        """A standard child must not relay an xAI fallback's unverified terminal (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child.model = "grok-4.6"
+        child.provider = "xai-oauth"
+        child._delegate_model_profile = "standard"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Provider reported usage/credit exhaustion (unverified): xAI spending-limit body",
+            "error": "xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "billing_unverified": True,
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertNotIn("xAI spending-limit body", result.get("error", ""))
+        self.assertNotIn("billing_block", result)
+        self.assertEqual(
+            result["error"],
+            "Subagent failed after an unverified provider billing error.",
+        )
+        self.assertIsNone(result["model"])
 
 
 class TestDelegateHeartbeat(unittest.TestCase):
@@ -2344,6 +2427,60 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials({"provider": "copilot", "model": "gpt-5"}, parent)
         self.assertIn("without a base_url", str(ctx.exception))
+
+    def test_selected_route_is_frozen_at_child_batch_boundary(self):
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        creds = {
+            "provider": "selected-provider",
+            "model": "selected-model",
+            "base_url": "https://selected.invalid/v1",
+            "api_key": "synthetic-key",
+            "api_mode": "chat_completions",
+        }
+        with patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            return_value=child,
+        ):
+            children, error = _build_children(
+                [{"goal": "freeze selected route", "model_profile": "fast"}],
+                [None],
+                [("fast", creds)],
+                top_role="leaf",
+                max_iterations=10,
+                parent_agent=parent,
+                routing_cfg={},
+                live_deleg_id=None,
+                live_writers=[],
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(children[0][2]._delegate_selected_llm_route, ("selected-model", "selected-provider"))
+        child.model, child.provider = "fallback-model", "fallback-provider"
+        self.assertEqual(child._delegate_selected_llm_route, ("selected-model", "selected-provider"))
+
+
+class TestStandardProfileAttached(unittest.TestCase):
+    """Standard-tier runtime policy flags must ride on delegate children."""
+
+    def test_standard_profile_is_attached_to_child_runtime(self):
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test standard profile attach",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                model_profile="standard",
+            )
+        child = MockAgent.return_value
+        self.assertEqual(child._delegate_model_profile, "standard")
+        self.assertIsNone(child._delegate_successful_llm_route)
 
 
 if __name__ == "__main__":

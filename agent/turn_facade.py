@@ -93,6 +93,9 @@ class TurnFacadeMixin:
                 return admission.early_result
             lease = admission.lease
             conversation_history = admission.conversation_history
+            # The lower prologue consumes this after any compression-tip recovery,
+            # when the canonical session (and its latest completed stop) is known.
+            self._loop_timing_external_start = True
 
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -149,6 +152,8 @@ class TurnFacadeMixin:
                     if lease is not None:
                         lease.stop_refresher()
             terminal = result if isinstance(result, dict) else {}
+            from agent.loop_timing import record_completed_loop_stop
+            record_completed_loop_stop(self, terminal)
             relay_outcome = (
                 "cancelled" if terminal.get("interrupted") is True
                 else "failed" if terminal.get("failed") is True
@@ -200,6 +205,7 @@ class TurnFacadeMixin:
                         reset_conversation_context(token)
                     if affinity_token is not None:
                         reset_affinity_scope(affinity_token)
+                    self._loop_timing_external_start = False
                     # Balance note_turn_started so the idle queue's live-turn count cannot leak.
                     with suppress(Exception):
                         _review_queue.note_turn_finished()

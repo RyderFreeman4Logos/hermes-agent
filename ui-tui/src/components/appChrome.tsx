@@ -2,7 +2,7 @@ import { Box, type ScrollBoxHandle, stringWidth, Text } from '@hermes/ink'
 import { compactNumber } from '@hermes/shared/format'
 import type { Usage } from '@hermes/shared/gateway-events'
 import { useStore } from '@nanostores/react'
-import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 import unicodeSpinners from 'unicode-animations'
 
 import { $delegationState } from '../app/delegationStore.js'
@@ -333,7 +333,17 @@ export function statusBarSegments(cols: number): StatusBarSegments {
   }
 }
 
-function SpawnHud({ t }: { t: Theme }) {
+function SpawnHud({
+  cols,
+  leadingRule = false,
+  standalone = false,
+  t
+}: {
+  cols?: number
+  leadingRule?: boolean
+  standalone?: boolean
+  t: Theme
+}) {
   // Tight HUD that only appears when the session is actually fanning out.
   // Colour escalates to warn/error as depth or concurrency approaches the cap.
   const delegation = useStore($delegationState)
@@ -386,11 +396,19 @@ function SpawnHud({ t }: { t: Theme }) {
 
   const atCap = depthRatio >= 1 || concRatio >= 1
 
-  return (
+  const content = (
     <Text color={color}>
-      {atCap ? ' │ ⚠ ' : ' │ '}
+      {standalone ? `${leadingRule ? '─ ' : ''}${atCap ? '⚠ ' : ''}` : atCap ? ' │ ⚠ ' : ' │ '}
       {pieces.join(' ')}
     </Text>
+  )
+
+  return standalone ? (
+    <Box flexShrink={0} height={1} overflow="hidden" width={Math.max(1, Math.floor(cols || 1))}>
+      {content}
+    </Box>
+  ) : (
+    content
   )
 }
 
@@ -470,6 +488,91 @@ const shortModelLabel = (model: string) =>
 const modelLabel = (model: string, effort?: string, fast?: boolean, effortWire?: string) =>
   [shortModelLabel(model), effortLabel(effort, effortWire), fast ? 'fast' : ''].filter(Boolean).join(' ')
 
+interface StatusRenderItem {
+  id: string
+  node: ReactNode
+  ownRow?: (leadingRule: boolean) => ReactNode
+  width: number
+}
+
+function packStatusRows(items: readonly StatusRenderItem[], cols: number): StatusRenderItem[][] {
+  const width = Math.max(1, Math.floor(cols || 1))
+  const separatorWidth = stringWidth(' │ ')
+  const rows: StatusRenderItem[][] = []
+  let row: StatusRenderItem[] = []
+  let used = stringWidth('─ ')
+
+  for (const item of items) {
+    if (item.ownRow) {
+      if (row.length) {
+        rows.push(row)
+        row = []
+      }
+      rows.push([item])
+      used = 0
+      continue
+    }
+    const itemWidth = Math.min(item.width, width)
+    const next = used + (row.length ? separatorWidth : 0) + itemWidth
+
+    if (row.length && next > width) {
+      rows.push(row)
+      row = []
+      used = 0
+    }
+
+    row.push(item)
+    used += (row.length > 1 ? separatorWidth : 0) + itemWidth
+  }
+
+  if (row.length) {
+    rows.push(row)
+  }
+
+  return rows
+}
+
+function StatusRows({ cols, items, t }: { cols: number; items: readonly StatusRenderItem[]; t: Theme }) {
+  const width = Math.max(1, Math.floor(cols || 1))
+  const rows = packStatusRows(items, width)
+
+  if (!rows.length) {
+    return null
+  }
+
+  return (
+    <Box flexDirection="column" flexShrink={0} width={width}>
+      {rows.map((row, rowIndex) =>
+        row.length === 1 && row[0]?.ownRow ? (
+          <Fragment key={row[0].id}>{row[0].ownRow(rowIndex === 0)}</Fragment>
+        ) : (
+          <Box flexDirection="row" flexShrink={0} height={1} key={row.map(item => item.id).join(':')} overflow="hidden">
+            {rowIndex === 0 ? <Text color={t.color.border}>─ </Text> : null}
+            {row.map((item, itemIndex) => (
+              <Box
+                flexDirection="row"
+                flexShrink={item.width > width ? 1 : 0}
+                key={item.id}
+                maxWidth={width}
+                overflow="hidden"
+              >
+                {itemIndex ? <Text color={t.color.muted}> │ </Text> : null}
+                {item.width > width ? (
+                  <Box overflow="hidden" width={width}>
+                    {item.node}
+                  </Box>
+                ) : (
+                  item.node
+                )}
+              </Box>
+            ))}
+          </Box>
+        )
+      )}
+    </Box>
+  )
+}
+
 export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   const [active, setActive] = useState(false)
   const [color, setColor] = useState(t.color.accent)
@@ -497,6 +600,7 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
 
 export function StatusRule({
   battery,
+  cacheStatus,
   focusView,
   cwdLabel,
   cols,
@@ -504,6 +608,7 @@ export function StatusRule({
   compacting = false,
   status,
   statusBarFields = null,
+  statusBarSegments: configuredStatusBarSegments = null,
   statusColor,
   model,
   modelFast,
@@ -632,7 +737,7 @@ export function StatusRule({
   // Cache-hit % + rolling latency / tokens-per-sec — mirrored from the classic
   // CLI bar (PR #98250). The server omits the keys when no data exists (zero
   // cache reads, Codex app-server with no latency), so these self-hide.
-  const cacheHitText = typeof usage.cache_hit_pct === 'number' ? `◎ ${usage.cache_hit_pct}%` : ''
+  const cacheHitText = cacheStatus || (typeof usage.cache_hit_pct === 'number' ? `◎ ${usage.cache_hit_pct}%` : '')
   const showCacheHit = segs.cacheHit && ok('cache_hit') && !!cacheHitText && fits(SEP + stringWidth(cacheHitText))
   const latencyText = typeof usage.avg_latency_s === 'number' ? `◷ ${usage.avg_latency_s.toFixed(1)}s` : ''
   const showLatency = segs.latency && ok('latency') && !!latencyText && fits(SEP + stringWidth(latencyText))
@@ -678,6 +783,205 @@ export function StatusRule({
   ) : (
     <Text color={t.color.muted}> │ {sessionCountText}</Text>
   )
+
+  // The historical `display.tui_statusbar_segments` key controls both
+  // visibility and order. Narrow terminals use the same item list, but wrap
+  // complete segments onto additional rows instead of silently dropping them.
+  if (cols < 72 || configuredStatusBarSegments !== null) {
+    if (configuredStatusBarSegments?.length === 0) {
+      return null
+    }
+
+    const configured = configuredStatusBarSegments === null ? null : new Set(configuredStatusBarSegments)
+    const legacy = (name: string) => configured === null || configured.has(name)
+
+    const contextTokens = usage.context_max
+      ? `${contextMark}${compactNumber(usage.context_used ?? 0)} tok`
+      : usage.total > 0
+        ? `${compactNumber(usage.total)} tok`
+        : ''
+
+    const contextBar = usage.context_max ? `[${ctxBar(pct)}]` : ''
+    const contextPercent = pct == null ? '' : `${contextMark}${pct}%`
+    const narrowRightLabel = sessionTitle && ok('title') ? ` ${sessionTitle} ` : cwdLabel
+
+    const customSessionCountNode = onSessionCountClick ? (
+      <Box flexShrink={0} onClick={handleSessionCountClick}>
+        <Text color={t.color.accent}>{sessionCountText}</Text>
+      </Box>
+    ) : (
+      <Text color={t.color.muted}>{sessionCountText}</Text>
+    )
+
+    const item = (id: string, node: ReactNode, text: number | string): StatusRenderItem => ({
+      id,
+      node,
+      width: typeof text === 'number' ? text : stringWidth(text)
+    })
+
+    const available: Record<string, StatusRenderItem | null> = {
+      battery:
+        legacy('battery') && showBattery
+          ? item('battery', <Text color={batteryColorVal}>{batteryText}</Text>, batteryText)
+          : null,
+      indicator:
+        legacy('indicator') && (busy || showNotice || status)
+          ? item(
+              'indicator',
+              busy ? (
+                <FaceTicker
+                  color={statusColor}
+                  startedAt={turnStartedAt}
+                  style={indicatorStyle}
+                  verbOverride={compacting ? 'compacting' : undefined}
+                />
+              ) : showNotice ? (
+                <Text color={noticeColor(notice!.level, t)} wrap="truncate-end">
+                  {notice!.text}
+                </Text>
+              ) : (
+                <Text color={statusColor}>{status}</Text>
+              ),
+              busy ? slotWidth : showNotice ? stringWidth(notice!.text) : stringWidth(status)
+            )
+          : null,
+      model:
+        legacy('model') && modelText ? item('model', <Text color={t.color.muted}>{modelText}</Text>, modelText) : null,
+      context_tokens:
+        legacy('context_tokens') && contextTokens && (configured !== null || ok('context_detail') || ok('context_pct'))
+          ? item('context_tokens', <Text color={t.color.muted}>{contextTokens}</Text>, contextTokens)
+          : null,
+      context_bar:
+        legacy('context_bar') && contextBar && (configured !== null || ok('context_pct'))
+          ? item('context_bar', <Text color={barColor}>{contextBar}</Text>, contextBar)
+          : null,
+      context_percent:
+        legacy('context_percent') && contextPercent && (configured !== null || ok('context_pct'))
+          ? item('context_percent', <Text color={barColor}>{contextPercent}</Text>, contextPercent)
+          : null,
+      focus: legacy('focus') && showFocus ? item('focus', <Text color={t.color.warn}>◉ focus</Text>, '◉ focus') : null,
+      session_duration:
+        legacy('session_duration') && ok('duration') && sessionStartedAt
+          ? {
+              id: 'session_duration',
+              node: (
+                <Text color={t.color.muted}>
+                  <SessionDuration startedAt={sessionStartedAt} />
+                </Text>
+              ),
+              width: MAX_DURATION_WIDTH
+            }
+          : null,
+      idle:
+        legacy('idle') && !busy && lastTurnEndedAt != null
+          ? {
+              id: 'idle',
+              node: (
+                <Text color={t.color.muted}>
+                  <IdleSince endedAt={lastTurnEndedAt} />
+                </Text>
+              ),
+              width: stringWidth('✓ ') + MAX_DURATION_WIDTH
+            }
+          : null,
+      compressions:
+        legacy('compressions') && ok('compressions') && compressions > 0
+          ? item(
+              'compressions',
+              <Text color={compressions >= 10 ? t.color.error : compressions >= 5 ? t.color.warn : t.color.muted}>
+                cmp {compressions}
+              </Text>,
+              `cmp ${compressions}`
+            )
+          : null,
+      cache_hit:
+        configured === null && ok('cache_hit') && cacheHitText
+          ? item('cache_hit', <Text color={t.color.muted}>{cacheHitText}</Text>, cacheHitText)
+          : null,
+      latency:
+        configured === null && ok('latency') && latencyText
+          ? item('latency', <Text color={t.color.muted}>{latencyText}</Text>, latencyText)
+          : null,
+      tps:
+        configured === null && ok('tps') && tpsText
+          ? item('tps', <Text color={t.color.muted}>{tpsText}</Text>, tpsText)
+          : null,
+      voice:
+        legacy('voice') && ok('voice') && voiceLabel
+          ? item('voice', <Text color={t.color.muted}>{voiceLabel}</Text>, voiceLabel)
+          : null,
+      sessions:
+        legacy('sessions') && sessionCountText ? item('sessions', customSessionCountNode, sessionCountText) : null,
+      bg_tasks:
+        legacy('bg_tasks') && ok('bg_tasks') && bgCount > 0
+          ? item('bg_tasks', <Text color={t.color.muted}>{bgCount} bg</Text>, `${bgCount} bg`)
+          : null,
+      subagents:
+        legacy('subagents') && ok('bg_subagents') && subagentCount > 0
+          ? item('subagents', <Text color={t.color.muted}>⛓ {subagentCount}</Text>, `⛓ ${subagentCount}`)
+          : null,
+      resume:
+        legacy('resume') && !busy && subagentCount > 0
+          ? item('resume', <Text color={t.color.muted}>{resumeHintText}</Text>, resumeHintText)
+          : null,
+      dev_credits:
+        legacy('dev_credits') && devCreditsText
+          ? item('dev_credits', <Text color={t.color.accent}>{devCreditsText}</Text>, devCreditsText)
+          : null,
+      cwd:
+        legacy('cwd') && narrowRightLabel
+          ? item(
+              'cwd',
+              <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
+                {narrowRightLabel}
+              </Text>,
+              narrowRightLabel
+            )
+          : null,
+      spawn_hud: legacy('spawn_hud')
+        ? {
+            id: 'spawn_hud',
+            node: null,
+            ownRow: leadingRule => <SpawnHud cols={Math.max(1, cols - 2)} leadingRule={leadingRule} standalone t={t} />,
+            width: cols
+          }
+        : null
+    }
+
+    const defaultOrder = [
+      'battery',
+      'indicator',
+      'model',
+      'context_tokens',
+      'context_bar',
+      'context_percent',
+      'focus',
+      'session_duration',
+      'idle',
+      'compressions',
+      'cache_hit',
+      'latency',
+      'tps',
+      'voice',
+      'sessions',
+      'bg_tasks',
+      'subagents',
+      'resume',
+      'dev_credits',
+      'cwd',
+      'spawn_hud'
+    ]
+
+    const ordered = (configuredStatusBarSegments ?? defaultOrder)
+      .map(id => available[id])
+      .filter((value): value is StatusRenderItem => value !== null && value !== undefined)
+
+    return (
+      <Box flexDirection="column" flexShrink={0}>
+        {StatusRows({ cols, items: ordered, t })}
+      </Box>
+    )
+  }
 
   return (
     <Box height={1}>
@@ -947,6 +1251,7 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
 
 interface StatusRuleProps {
   battery?: BatteryInfo | null
+  cacheStatus?: null | string
   // Focus view (/focus) badge — display-only reduced-output indicator.
   focusView?: boolean
   bgCount: number
@@ -969,6 +1274,7 @@ interface StatusRuleProps {
   // display.status_bar.fields — segment visibility filter shared with the
   // classic CLI bar. null = defaults (everything shows).
   statusBarFields?: null | ReadonlySet<string>
+  statusBarSegments?: null | readonly string[]
   statusColor: string
   t: Theme
   turnStartedAt?: null | number

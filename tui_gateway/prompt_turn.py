@@ -126,10 +126,10 @@ def _admit_prompt_turn(
             "Refusing turn for session %s at _run_prompt_submit: %s",
             session.get("session_key") or sid,
             getattr(ownership_refusal, "reason", None) or "refused")
+        _emit("error", sid, {"message": str(ownership_refusal)})
         with session["history_lock"]:
             session["running"] = False
             session.pop("_submit_user_row", None)  # no turn runs: the submit-time row stays as the send
-        _emit("error", sid, {"message": str(ownership_refusal)})
         return None
     with session["history_lock"]:
         if session.get("_closing") or (
@@ -151,6 +151,8 @@ def _admit_prompt_turn(
         if agent is None:
             session["running"] = False
         else:
+            # Same critical section as admission. A busy correction waits on
+            # this lock, so clearing after release wipes the correction it just stored.
             with contextlib.suppress(Exception):
                 agent.clear_interrupt()
     if agent is None:
@@ -165,6 +167,7 @@ def _admit_prompt_turn(
             sid, session, reason,
             error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
         return None
+    _bind_completion_ingest(session, agent)
     return images, agent
 
 
@@ -430,15 +433,39 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
 
 
 def _run_post_turn_followups(
-    rid, sid: str, session: dict, result: Any, goal_followup: str | None) -> None:
+    rid, sid: str, session: dict, result: Any, goal_followup: str | None,
+    pending_steer: str | None = None,
+) -> None:
     """Chain whatever should run after ``running`` was released.  Order: a mid-turn user
     prompt wins over every auto follow-up (drain it, skip the rest); a leftover /steer is
     requeued first so it isn't dropped; then goal continuation, then completion
     notifications.  Each nested submit re-checks ``running`` under the lock."""
-    steer = result.get("pending_steer") if isinstance(result, dict) else None
-    if isinstance(steer, str) and steer.strip():
+    agent = session.get("agent")
+    leftover = pending_steer
+    if leftover is None and isinstance(result, dict):
+        leftover = result.get("pending_steer")
+    user_text = leftover if isinstance(leftover, str) and leftover.strip() else ""
+
+    if user_text:
         with session["history_lock"]:
-            _enqueue_prompt(session, steer, session.get("transport"))
+            if session.get("_closing") or session.get("_finalized"):
+                return
+            _enqueue_prompt(session, user_text, session.get("transport"))
+
+    if _drain_queued_prompt(rid, sid, session):
+        return
+
+    def insert(completion_text: str, events: list) -> str | bool:
+        with session["history_lock"]:
+            if session.get("_closing") or session.get("_finalized"):
+                return False
+            _enqueue_prompt(session, completion_text, session.get("transport"),
+                            structured_completion=True, completion_events=events)
+            return "reserved"
+
+    ingest_completion = getattr(agent, "_completion_steer_ingest", None)
+    if callable(ingest_completion):
+        ingest_completion(insert)
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
@@ -541,8 +568,10 @@ def _adopt_out_of_band_turns(session: dict) -> None:
         session["history"] = tail if rewritten else history + tail
         session["history_version"] = version + 1
 
-
-def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
+def _prepare_turn_input(
+    sid: str, session: dict, st: _TurnRun, text: Any, images: list[str], *,
+    literal_completion: bool = False,
+):
     """Bind scopes, sync the agent, snapshot history, build the run message; returns
     ``(prompt, run_message, cols, streamer)`` or None when @-expansion was refused.
     Scopes fill field by field so a failure midway still leaves every bound token for the
@@ -587,7 +616,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     cols = session.get("cols", 80)
     streamer = make_stream_renderer(cols)
     prompt = text
-    if isinstance(prompt, str) and "@" in prompt:
+    if not literal_completion and isinstance(prompt, str) and "@" in prompt:
         from agent.context_references import preprocess_context_references
         from agent.model_metadata import get_model_context_length
         ctx_len = get_model_context_length(
@@ -824,6 +853,11 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     payload = {"text": raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt
+    first_usage = getattr(agent, "_first_turn_usage", None)
+    if first_usage:
+        payload["cache_info"] = _cache_info_from_usage(first_usage)
+    elif not getattr(agent, "_tui_first_provider_response_recorded", False):
+        payload["cache_info"] = {"state": "unavailable", "pct": 0}
     if last_reasoning:
         payload["reasoning"] = last_reasoning
     if status_note:
@@ -986,7 +1020,8 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None,
+    completion_receipt: dict | None = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1007,6 +1042,10 @@ def _run_prompt_submit(
         muted = diagnostic_turn_muted(display_metadata, "tui", notification_config)
     if muted:
         display_kind = "hidden"
+    agent._tui_first_provider_response_record_enabled = True
+    agent._tui_first_provider_response_recorded = False
+    agent._first_turn_usage = None
+    session.pop("first_provider_response", None)
     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
     # session_key and the agent's live session_id together.  No prompt content is logged.
     _turn_started_monotonic = time.monotonic()
@@ -1035,8 +1074,13 @@ def _run_prompt_submit(
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
+        followup_steer = None
+        receipt_agent = None
+        receipt_ingest = None
         try:
-            prepared = _prepare_turn_input(sid, session, st, text, images)
+            prepared = _prepare_turn_input(
+                sid, session, st, text, images, literal_completion=bool(completion_receipt)
+            )
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:
                     st.receipt_attempted = True
@@ -1045,6 +1089,19 @@ def _run_prompt_submit(
                     st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
+            if completion_receipt:
+                def commit_completion_receipt() -> bool:
+                    with _completion_ownership_lock(session):
+                        active = session.get("_completion_active_receipt")
+                        if active is not completion_receipt:
+                            return False
+                        events = list(active.get("events") or [])
+                        session.pop("_completion_active_receipt", None)
+                        _mark_completion_events_consumed(events)
+                        return True
+                receipt_agent = st.agent
+                receipt_ingest = commit_completion_receipt
+                receipt_agent._completion_queue_ingest = receipt_ingest
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata, turn_author, text)
@@ -1061,12 +1118,32 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            if completion_receipt:
+                with _completion_ownership_lock(session):
+                    active = session.get("_completion_active_receipt")
+                    if active is completion_receipt:
+                        session.pop("_completion_active_receipt", None)
+                        session["_completion_pending"] = list(active.get("events") or []) + list(
+                            session.get("_completion_pending") or [])
+                if receipt_agent is not None and getattr(receipt_agent, "_completion_queue_ingest", None) is receipt_ingest:
+                    receipt_agent._completion_queue_ingest = None
             _finish_turn(sid, session, st)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)
             # A stale interim closure must not fire during a later turn.
             st.agent.interim_assistant_callback = None
             with session["history_lock"]:
+                steer_parts = []
+                result_steer = st.result.get("pending_steer") if isinstance(st.result, dict) else None
+                if isinstance(result_steer, str) and result_steer.strip():
+                    steer_parts.append(result_steer)
+                drain = getattr(st.agent, "_drain_pending_steer", None)
+                if callable(drain):
+                    with contextlib.suppress(Exception):
+                        late_steer = drain()
+                        if isinstance(late_steer, str) and late_steer.strip():
+                            steer_parts.append(late_steer)
+                followup_steer = "\n".join(steer_parts) or None
                 session["running"] = False
                 session["last_active"] = time.time()
                 if not st.error_retained:
@@ -1094,7 +1171,7 @@ def _run_prompt_submit(
                     session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
-        return st.result, goal_followup
+        return st.result, goal_followup, followup_steer
     def run():
         from agent.notification_presentation import notification_turn
         # _prepare_turn_input owns profile binding for the worker. The context

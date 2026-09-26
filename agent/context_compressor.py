@@ -34,7 +34,7 @@ from agent.model_metadata import (
     strip_opaque_replay_items,
 )
 from agent.redact import redact_sensitive_text
-from agent.turn_context import drop_stale_api_content
+from agent.turn_context import drop_stale_api_content, substitute_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -1286,9 +1286,17 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     the full shape; a mismatched size class protects blob-heavy rows as "small" and compaction re-fires.
     ``charge_stale_thinking=False`` skips newest-turn-only thinking keys. Accounting only; never mutates."""
     # Charge the wire substitute, not both it and the clean display content.
-    sidecar = msg.get("api_content")
-    content = sidecar if isinstance(sidecar, str) and sidecar and msg.get("role") in ("user", "assistant") else msg.get("content") or ""
-    text_tokens = estimate_tokens_rough(content) if isinstance(content, str) else _content_length_for_budget(content) // _CHARS_PER_TOKEN
+    wire_msg = dict(msg)
+    substitute_api_content(wire_msg)
+    content = wire_msg.get("content") or ""
+    if isinstance(content, list) and any(_is_image_part(part) for part in content):
+        text_tokens = _content_length_for_budget(content) // _CHARS_PER_TOKEN
+    elif isinstance(content, dict) and content.get("_multimodal"):
+        text_tokens = _content_length_for_budget(
+            content.get("content") or content.get("text_summary") or ""
+        ) // _CHARS_PER_TOKEN
+    else:
+        text_tokens = estimate_tokens_rough(content)
     tokens = text_tokens + 10  # +10 for role/key overhead
     tokens += sum(estimate_tokens_rough(str(tc)) for tc in msg.get("tool_calls") or [] if isinstance(tc, dict))
     for key in _ALWAYS_REPLAYED_BUDGET_KEYS:
@@ -3109,6 +3117,56 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             )
         return demoted
 
+    def _demote_post_summary_protected_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        tail_start: int,
+    ) -> int:
+        """Demote bulky retained-tail tools before the single compression commit.
+
+        Bounded to the final protected tail. The compressor already invalidates the
+        prompt prefix once, so this rewrite is coalesced into that same durable
+        commit (Unit C). Unlike pre-compress pressure demote, this uses the raw
+        tail budget (1.0x), not the 1.5x soft ceiling.
+        """
+        if tail_start >= len(messages):
+            return 0
+
+        def _tail_tokens() -> int:
+            return sum(
+                _estimate_msg_budget_tokens(messages[idx])
+                for idx in range(tail_start, len(messages))
+            )
+
+        if _tail_tokens() <= self.tail_token_budget:
+            return 0
+
+        call_id_to_tool = _tool_calls_by_id(messages)
+        protected_skills = _collect_protected_skill_names(messages, tail_start)
+        demote_end = max(tail_start, len(messages) - _PRESSURE_KEEP_RECENT_MESSAGES)
+        demoted = 0
+        for idx in range(tail_start, demote_end):
+            if self._is_context_summary_message(messages[idx]):
+                continue
+            if self._demote_tool_result_at(
+                messages,
+                idx,
+                call_id_to_tool,
+                _PRUNE_MIN_CHARS,
+                protected_skills,
+            ):
+                demoted += 1
+                if _tail_tokens() <= self.tail_token_budget:
+                    break
+        if demoted and not self.quiet_mode:
+            logger.info(
+                "Post-summary protected-tail demotion: reclaimed %d tool result(s) "
+                "before the compression commit (tail now ~%s tokens)",
+                demoted,
+                f"{_tail_tokens():,}",
+            )
+        return demoted
+
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None, min_prune_chars: int = _PRUNE_MIN_CHARS,
@@ -3719,11 +3777,23 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         routes through main-model fallback + cooldown instead of wiping the compacted turns."""
         # call_llm writes the route it actually selected; never pre-resolve a second, stale pair.
         _aux_route: Dict[str, str] = {}
+        from agent.auxiliary_client import _runtime_main_value
+
+        _session_id = (
+            _runtime_main_value("session_id")
+            or getattr(self, "_session_id", "")
+        )
+        _cache_scope = (
+            _runtime_main_value("cache_scope")
+            or _session_id
+        )
         call_kwargs: Dict[str, Any] = {
             "task": "compression",
             "main_runtime": {
                 "model": self.model, "provider": self.provider, "base_url": self.base_url, "api_key": self.api_key,
                 "api_mode": self.api_mode,
+                "session_id": _session_id,
+                "cache_scope": _cache_scope,
             },
             "messages": [{"role": "user", "content": prompt}], "route_info": _aux_route,
             # NO max_tokens: Anthropic/NIM wires forward it and a hard cap truncates summaries
@@ -4845,8 +4915,13 @@ Write only the summary body. Do not include any preamble or prefix."""
             # A single oversized user message is indivisible and must stay verbatim in the tail; this
             # exception is only for aggregate turn growth after a normally sized opening request.
             and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
-            and len(_content_text_for_contains(messages[last_user_idx].get("content")).strip())
-            <= _ACTIVE_TASK_MAX_CHARS
+            and (
+                len(_content_text_for_contains(messages[last_user_idx].get("content")).strip())
+                <= _ACTIVE_TASK_MAX_CHARS
+                or _synthetic_user_row(
+                    _content_text_for_contains(messages[last_user_idx].get("content"))
+                )
+            )
             # Only split when there is real turn body to summarize: if the oversized weight is the
             # active turn's own newest group, the pre-anchor cut retains it anyway, so taking the
             # active request out of the tail buys no reclaim and loses the #10896 anchor.
@@ -4868,17 +4943,23 @@ Write only the summary body. Do not include any preamble or prefix."""
         else:
             cut_idx = user_anchored_cut
         # An older visible assistant reply can precede the active user turn; under the split above,
-        # pulling back to it would undo the bounded exception.
-        if not split_oversized_turn:
-            cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+        # pulling back to it would undo the bounded exception. Keep an assistant anchor that does
+        # not move the cut (#80449).
+        assistant_anchored_cut = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+        if not split_oversized_turn or assistant_anchored_cut == cut_idx:
+            cut_idx = assistant_anchored_cut
 
         # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
-        # the assistant anchor could re-trigger its forward turn-pair push. Runs even under the split: the
-        # N-user promise (#70250) is a user-facing setting and must outrank the budget, so it pulls the cut
-        # back to the Nth user turn — which is why the split only ever relaxes the single-user anchor.
+        # the assistant anchor could re-trigger its forward turn-pair push. The N-user promise
+        # (#70250) outranks the single-user budget exception, so it does not run under the split.
         # getattr: plugin engines and __new__ doubles skip __init__.
         _min_tail_users = getattr(self, "min_tail_user_messages", 1)
-        if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
+        if (
+            not split_oversized_turn
+            and isinstance(_min_tail_users, int)
+            and not isinstance(_min_tail_users, bool)
+            and _min_tail_users > 1
+        ):
             cut_idx = self._ensure_last_n_user_messages_in_tail(messages, cut_idx, head_end, _min_tail_users)
 
         # Floor guarantees progress (>= 1 message claimed); re-align FORWARD only so a raised cut
@@ -5360,6 +5441,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Default carrier is tail[0]: an exempt row absorbs the summary invisibly. The forced repair
         # path needs a non-empty role=user row, so it targets the template-visible row.
         merge_target_idx = first_tail_visible_idx if force_user_leading and first_tail_visible_idx is not None else 0
+        post_summary_tail_start = len(compressed)
         for tail_idx, msg in enumerate(tail_messages):
             # Tag carried-forward tail rows so archive_and_compact treats their originals as
             # superseded duplicates (#86366).
@@ -5368,6 +5450,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             if merge_into_tail and tail_idx == merge_target_idx:
                 self._merge_summary_into_tail_row(msg, summary, summary_role, force_user_leading)
             compressed.append(msg)
+        self._demote_post_summary_protected_tail(compressed, post_summary_tail_start)
         return compressed
 
 

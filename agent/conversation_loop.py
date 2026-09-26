@@ -37,7 +37,12 @@ from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.stream_payload_bound import (
+    DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+    StreamPayloadBoundExceeded,
+    persist_interrupted_stream_partial,
+)
+from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call, stop_thinking_spinner
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_failure_copy import failed_turn_notice, site_copy
@@ -328,6 +333,41 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._stream_needs_break = True
 
 
+def _is_xai_bad_credentials_403(
+    provider: str,
+    status_code: Any,
+    api_error: Any,
+    error_context: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """xAI reports an expired or invalid OAuth access token as HTTP 403 with
+    body code ``unauthenticated:bad-credentials`` rather than 401, so the
+    401-only refresh trigger never fires and a long-lived worker keeps its
+    dead in-memory token (#82052). Scoped to xai-oauth: other providers'
+    403s remain non-retryable authorization failures.
+    """
+    if provider != "xai-oauth" or status_code != 403:
+        return False
+    if error_context is None:
+        from agent.agent_runtime_helpers import extract_api_error_context
+
+        error_context = extract_api_error_context(api_error)
+    reason = str((error_context or {}).get("reason") or "").strip().casefold()
+    if reason == "unauthenticated:bad-credentials":
+        return True
+    exact_messages = {
+        "oauth2 access token could not be validated",
+        "the oauth2 access token could not be validated",
+    }
+    for value in (
+        (error_context or {}).get("message"),
+        getattr(api_error, "message", None),
+    ):
+        message = str(value or "").strip().casefold().removesuffix(".")
+        if message in exact_messages:
+            return True
+    return False
+
+
 def _is_copilot_provider(agent: Any) -> bool:
     """Delegate to ``AIAgent._is_copilot_provider``; the fallback keeps the ``github-copilot`` /
     ``github`` aliases so credential recovery is not skipped for them."""
@@ -490,6 +530,23 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     return (provider or "").strip().lower() == "nous" or base_url_host_matches(
         str(base_url or ""), "inference-api.nousresearch.com"
     )
+
+
+def _is_standard_profile_child(agent) -> bool:
+    return getattr(agent, "_delegate_model_profile", None) == "standard"
+
+
+def _standard_child_can_fallback(agent, *, reason=None) -> bool:
+    """Permit a standard child to advance after the current provider execution error.
+
+    Content-policy rejections are deliberate safety denials for this exact prompt, not
+    provider availability failures, so they remain terminal. Cancellation and shutdown
+    use ``BaseException`` and never reach this guard.
+    """
+    if not _is_standard_profile_child(agent):
+        return True
+    from agent.error_classifier import FailoverReason
+    return reason != FailoverReason.content_policy_blocked
 
 
 def _billing_or_entitlement_message(
@@ -1425,6 +1482,21 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
         except InterruptedError:
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
+        except StreamPayloadBoundExceeded as api_error:
+            s.thinking_spinner = stop_thinking_spinner(agent, s.thinking_spinner)
+            s.interrupted = True
+            s._turn_exit_reason = "stream_payload_bound_exceeded"
+            s.final_response = persist_interrupted_stream_partial(
+                agent,
+                s.messages,
+                elapsed=time.time() - (s.api_start_time or time.time()),
+                exceeded=True,
+                size=getattr(api_error, "size", 0),
+                bound=getattr(api_error, "bound", None) or DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+            )
+            agent._vprint(f"{agent.log_prefix}⚠ {s.final_response}", force=True)
+            agent._persist_session(s.messages, s.conversation_history)
+            return None
         except Exception as api_error:
             _ae = _run_phase(handle_api_error, agent, s, api_error=api_error)
             if _ae.action == "return":

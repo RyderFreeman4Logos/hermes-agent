@@ -10,7 +10,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
-from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE, _is_xai_bad_credentials_403
 
 
 @pytest.fixture(autouse=True)
@@ -259,6 +259,146 @@ class _FakeCreateStream:
 
     def close(self):
         self.closed = True
+
+
+def test_codex_stream_payload_overflow_wins_over_same_handoff_interrupt(monkeypatch):
+    """The recorder's terminal control signal must survive callback guards.
+
+    The display callback raises the user interrupt flag while the overflowing
+    delta is being delivered.  The already-observed payload overflow remains
+    authoritative and the provider stream is closed without consuming the
+    later completion frame.
+    """
+    from agent.stream_payload_bound import (
+        DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        StreamPayloadBoundExceeded,
+    )
+
+    agent = _build_agent(monkeypatch)
+    consumed: list[str] = []
+
+    def display(text: str) -> None:
+        consumed.append(text)
+        if text == "y":
+            agent._interrupt_requested = True
+
+    agent.stream_delta_callback = display
+    stream = _FakeCreateStream([
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            delta="x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="y"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed"),
+        ),
+    ])
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream)
+    )
+
+    with pytest.raises(StreamPayloadBoundExceeded):
+        agent._run_codex_stream(_codex_request_kwargs())
+
+    assert stream.closed is True
+    assert consumed == ["x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES, "y"]
+    assert agent._current_streamed_assistant_text == (
+        "x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+    )
+
+
+def test_codex_nonstream_owner_preserves_overflow_during_interrupt(monkeypatch):
+    from agent.stream_payload_bound import (
+        DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        StreamPayloadBoundExceeded,
+    )
+
+    agent = _build_agent(monkeypatch)
+
+    def display(text: str) -> None:
+        if text == "y":
+            agent._interrupt_requested = True
+
+    agent.stream_delta_callback = display
+    stream = _FakeCreateStream([
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            delta="x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="y"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed"),
+        ),
+    ])
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(StreamPayloadBoundExceeded):
+        agent._interruptible_api_call(_codex_request_kwargs())
+
+    assert stream.closed is True
+
+
+def test_run_conversation_persists_bounded_overflow_when_interrupt_races(monkeypatch):
+    from agent.stream_payload_bound import DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+
+    agent = _build_agent(monkeypatch)
+
+    def display(text: str) -> None:
+        if text == "y":
+            agent._interrupt_requested = True
+
+    agent.stream_delta_callback = display
+    stream = _FakeCreateStream([
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_text.delta",
+            delta="x" * DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+        ),
+        SimpleNamespace(type="response.output_text.delta", delta="y"),
+        SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed"),
+        ),
+    ])
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: stream),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_kwargs: client
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda *_args, **_kwargs: None
+    )
+
+    result = agent.run_conversation("overflow please")
+
+    assert result["completed"] is False
+    assert result["interrupted"] is True
+    assert "262145 bytes" in result["final_response"]
+    assert result["messages"][-1]["role"] == "assistant"
+    assert result["messages"][-1]["content"] == result["final_response"]
+    assert len(result["final_response"].encode("utf-8")) < 1024
+    assert stream.closed is True
 
 
 def _codex_request_kwargs():
@@ -3035,3 +3175,125 @@ def test_codex_text_only_max_output_incomplete_keeps_codex_continuation(monkeypa
     assert result["completed"] is True
     assert not any(m.get("_length_continuation_nudge") for m in result["messages"])
     assert any(m.get("finish_reason") == "incomplete" for m in result["messages"] if m["role"] == "assistant")
+
+
+class _XaiForbidden403(Exception):
+    status_code = 403
+
+    def __init__(self, body, text="Error code: 403"):
+        self.body = body
+        super().__init__(text)
+
+
+class _Unauthorized401(Exception):
+    status_code = 401
+
+
+@pytest.mark.parametrize(
+    ("body", "text", "expected"),
+    [
+        ({"code": "unauthenticated:bad-credentials"}, "Error code: 403", True),
+        (
+            {"error": "bad-credentials is not the cause"},
+            "HTTP 403: bad-credentials is not the cause",
+            False,
+        ),
+        ({"code": "unauthenticated:bad-credentials-extra"}, "Error code: 403", False),
+        (
+            {"code": "other", "message": "OAuth2 access token could not be validated"},
+            "Error code: 403",
+            True,
+        ),
+        (
+            {"code": "other", "message": "not OAuth2 access token could be validated"},
+            "Error code: 403",
+            False,
+        ),
+    ],
+)
+def test_xai_403_marker_matching_is_structured_and_exact(body, text, expected):
+    assert _is_xai_bad_credentials_403(
+        "xai-oauth", 403, _XaiForbidden403(body, text)
+    ) is expected
+
+
+def test_run_conversation_xai_403_body_only_refreshes_and_retries(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403(
+                {
+                    "code": "unauthenticated:bad-credentials",
+                    "message": "OAuth2 access token could not be validated",
+                }
+            )
+        return _codex_message_response("OK")
+
+    refreshes = {"count": 0}
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        assert force is True
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 1
+    assert calls["api"] == 2
+    assert result["completed"] is True
+    assert result["final_response"] == "OK"
+
+
+def test_run_conversation_xai_403_shares_one_shot_budget_with_401(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+    refreshes = {"count": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403({"code": "unauthenticated:bad-credentials"})
+        raise _Unauthorized401("HTTP 401: unauthorized")
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 1
+    assert result.get("completed") is not True
+
+
+@pytest.mark.parametrize(
+    ("builder", "body"),
+    [
+        (_build_xai_oauth_agent, {"code": "personal-team-blocked:spending-limit"}),
+        (_build_xai_oauth_agent, {"error": "forbidden by policy"}),
+        (_build_agent, {"code": "unauthenticated:bad-credentials"}),
+    ],
+)
+def test_run_conversation_unrelated_403_does_not_refresh(monkeypatch, builder, body):
+    agent = builder(monkeypatch)
+    refreshes = {"count": 0}
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    def _api_call(_api_kwargs):
+        raise _XaiForbidden403(body)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 0
+    assert result.get("completed") is not True

@@ -211,6 +211,42 @@ describe('applyDisplay', () => {
     applyDisplay({ config: { display: { tui_statusbar: 'top' } } }, setBell)
     expect($uiState.get().statusBar).toBe('top')
   })
+
+  it('hydrates the legacy ordered status-bar segments when modern fields are absent', () => {
+    applyDisplay(
+      {
+        config: {
+          display: { tui_statusbar_segments: [' MODEL ', 'context', 'cwd', 'model'] }
+        }
+      } as any,
+      vi.fn()
+    )
+
+    expect(($uiState.get() as any).statusBarSegments).toEqual([
+      'model',
+      'context_tokens',
+      'context_bar',
+      'context_percent',
+      'cwd'
+    ])
+  })
+
+  it('prefers modern status_bar.fields over the legacy segment list', () => {
+    applyDisplay(
+      {
+        config: {
+          display: {
+            status_bar: { fields: ['model'] },
+            tui_statusbar_segments: ['cwd']
+          }
+        }
+      } as any,
+      vi.fn()
+    )
+
+    expect($uiState.get().statusBarFields).toEqual(new Set(['model']))
+    expect(($uiState.get() as any).statusBarSegments).toBeNull()
+  })
 })
 
 describe('normalizeStatusBar', () => {

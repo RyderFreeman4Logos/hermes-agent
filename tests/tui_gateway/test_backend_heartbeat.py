@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import os
+import time
 
 import pytest
 
@@ -25,6 +26,17 @@ from hermes_cli import model_switch_providers
 
 
 IDLE_S = 6 * 3600
+
+
+def _rows(db, backend_id: str) -> list:
+    deadline = time.monotonic() + 2
+    found = []
+    while time.monotonic() < deadline:
+        found = [row for row in db.list_backend_heartbeats() if row["backend_id"] == backend_id]
+        if found:
+            return found
+        time.sleep(0.02)
+    return found
 
 
 @pytest.fixture
@@ -48,7 +60,7 @@ class TestBackendHeartbeatRefresher:
 
         server._start_backend_heartbeat_refresher()
 
-        rows = db.list_backend_heartbeats()
+        rows = _rows(db, "test-backend-A")
         assert len(rows) == 1
         assert rows[0]["backend_id"] == "test-backend-A"
         assert rows[0]["last_heartbeat"] > 0
@@ -68,7 +80,7 @@ class TestBackendHeartbeatRefresher:
         server._start_backend_heartbeat_refresher()
         server._start_backend_heartbeat_refresher()
 
-        rows = db.list_backend_heartbeats()
+        rows = _rows(db, "test-backend-A")
         assert len(rows) == 1
 
     def test_zero_refresh_disables_refresher(self, db, monkeypatch):

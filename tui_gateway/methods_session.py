@@ -224,14 +224,22 @@ def _billing_pending_change(result: dict) -> dict:
 # ── session.create / list / most_recent / facts ──────────────────────
 def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list, *, source, cwd, profile_name,
                     copy_fields=(), compensate: bool = False, title_source: str = "user",
-                    user_id: str | None = None) -> None:
+                    user_id: str | None = None, memory_provider_mode: str | None = None) -> str | None:
     """Branch child row + parent transcript (bounded-chunk transactions) + title. ``_branched_from`` keeps the
     row visible in list_sessions_rich() (the live parent never matches the legacy end_reason='branched'
     heuristic); NULL ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate``
     deletes a committed row whose transcript/title failed (a durable-but-empty row would defeat the INSERT OR
     IGNORE first-prompt seed) — except on disk-full, where the delete cannot land. ``user_id`` is the creating
     login: the child is a Desktop session too, and the row only records identity at insert."""
-    db.create_session(new_key, source=source, model=_resolve_model(), model_config={"_branched_from": parent_key},
+    parent_row = {}
+    with contextlib.suppress(Exception):
+        parent_row = db.get_session(parent_key) or {}
+    parent_config = _parse_model_config(parent_row.get("model_config"), quiet=True) if parent_row else {}
+    branch_config = {"_branched_from": parent_key}
+    mode = memory_provider_mode or parent_config.get("memory_provider_mode")
+    if mode in {"authoritative", "hybrid"}:
+        branch_config["memory_provider_mode"] = mode
+    db.create_session(new_key, source=source, model=_resolve_model(), model_config=branch_config,
                       parent_session_id=parent_key, cwd=cwd, profile_name=profile_name, user_id=user_id)
     try:
         # Compensation guard (#93959 review): if the transcript copy or title write fails AFTER the row
@@ -256,6 +264,7 @@ def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list
             except Exception:
                 logger.debug("branch seed compensation delete failed for %s", new_key, exc_info=True)
         raise
+    return mode if mode in {"authoritative", "hybrid"} else None
 
 
 def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: list, source: str, profile_home):
@@ -266,10 +275,12 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
         with _session_db(record) as db:
             if db is None:
                 return
-            _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
+            mode = _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
                             source=source, cwd=record["cwd"],
                             profile_name=profile_name_for_home(profile_home) or _current_profile_name(),
                             compensate=True, title_source="derived", user_id=_session_auth_user_id(record))
+            if mode is not None:
+                record["resume_runtime_overrides"] = {"memory_provider_mode_override": mode}
             record["pending_title"] = None
             # The first submit's _persist_branch_seed is the fallback for a failed seed, not a second copy.
             record["_branch_seed_persisted"] = True
@@ -537,6 +548,7 @@ class _Resume:
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
             close_on_disconnect=_flag(self.params, "close_on_disconnect"),
             profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd), **extra)
+        record["display_history_limit"] = self.display_limit()
         if follows_profile:
             record.update(
                 follow_profile_config=True,
@@ -544,6 +556,11 @@ class _Resume:
                                            if overrides and overrides.get("model_override") else None),
             )
         return record
+
+    @staticmethod
+    def display_limit() -> int | None:
+        from hermes_state import resolved_max_resume_messages
+        return resolved_max_resume_messages() or None
 
     def claim(self, sid: str, record: dict) -> dict | None:
         """Register ``record`` live under the resume lock, or reuse a concurrent winner's session."""
@@ -572,11 +589,20 @@ class _Resume:
         self.db.reopen_session(self.target)
         if self.omit_messages:
             return self.child_history(repair=True), []
-        return self.db.get_resume_conversations(self.target)
+        try:
+            return self.db.get_resume_conversations(self.target, max_display_messages=self.display_limit())
+        except TypeError as exc:
+            # Lightweight stores from older adapters expose the pre-bound method shape.
+            if "max_display_messages" not in str(exc):
+                raise
+            return self.db.get_resume_conversations(self.target)
 
-    def display_prefix(self) -> list:
-        """Ancestor display rows (model-fed history drops a dangling tool-call tail — display keeps it)."""
-        return [] if self.omit_messages else self.db.get_ancestor_display_prefix(self.target)
+    def display_prefix(self, display: list, raw: list) -> list:
+        """Display-only rows already present in the bounded resume read (no second lineage query)."""
+        if self.omit_messages:
+            return []
+        tip_row_ids = {m.get("_row_id") for m in raw if isinstance(m, dict) and m.get("_row_id") is not None}
+        return [m for m in display if m.get("_row_id") not in tip_row_ids]
 
 
 def _find_live_unpersisted(needle: str, home) -> str:
@@ -684,7 +710,8 @@ def _resume_guard(ctx: _Resume) -> dict | None:
     omit_messages / lazy paths load the TIP segment only and are guarded tip-only (a lineage count rejected
     exactly the well-compressed chats). Metadata fallback for lightweight adaptor DBs; fails OPEN on errors."""
     from hermes_state import SessionResumeTooLargeError, resolved_max_resume_messages
-    tip_only = ctx.lazy or ctx.omit_messages or (ctx.defer_history and not ctx.eager_build)
+    # Every path replays only the active tip. Full/eager display history is bounded independently in SQL.
+    tip_only = True
     try:
         if callable(safety_check := getattr(ctx.db, "assert_resume_safe", None)):
             safety_check(ctx.target, **({"tip_only": True} if tip_only else {}))
@@ -798,7 +825,7 @@ def _resume_cold(ctx: _Resume) -> dict:
         return _err(ctx.rid, 5000, resume_failed_message(e))
     with _profile_build_scope(ctx.profile_home):
         overrides = _stored_session_runtime_overrides(ctx.found)
-    record = ctx.record(source, cwd, history, overrides, display_history_prefix=ctx.display_prefix(),
+    record = ctx.record(source, cwd, history, overrides, display_history_prefix=ctx.display_prefix(display_history, raw_history),
                         todo_state=_todo_state_from_history(history))
     if (reused := ctx.claim(sid, record)) is not None:
         return reused
@@ -815,7 +842,7 @@ def _resume_eager(ctx: _Resume) -> dict:
     with _profile_build_scope(ctx.profile_home):
         try:
             history, display_history, raw_history = ctx.restore()
-            display_history_prefix = ctx.display_prefix()
+            display_history_prefix = ctx.display_prefix(display_history, raw_history)
             # Profile db so turns persist to the right state.db; stored runtime identity so switching chats does
             # not inherit another chat's global model.
             stored_runtime_overrides = _stored_session_runtime_overrides(ctx.found)
@@ -855,7 +882,8 @@ def _resume_eager(ctx: _Resume) -> dict:
                 # Each turn re-binds HERMES_HOME (mid-turn memory/skills reads); lease claimed lazily on turn 1.
                 if ctx.profile_home is not None:
                     session["profile_home"] = str(ctx.profile_home)
-                session.update(display_history_prefix=display_history_prefix, active_session_lease=None)
+                session.update(display_history_prefix=display_history_prefix,
+                               display_history_limit=ctx.display_limit(), active_session_lease=None)
         except Exception as e:
             # _init_session registers _sessions[sid] BEFORE its first db read; left in place the fast path
             # would serve that dead session forever.
@@ -1980,6 +2008,17 @@ def _visible_branch_history(messages) -> list:
             and _coerce_message_text(message.get("content")).strip()]
 
 
+def _session_frozen_memory_provider_mode(session: dict | None) -> str | None:
+    agent = (session or {}).get("agent")
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        mode = init_config.get("memory_provider_mode")
+        if mode in {"authoritative", "hybrid"}:
+            return mode
+    mode = getattr(agent, "_memory_provider_mode", None)
+    return mode if mode in {"authoritative", "hybrid"} else None
+
+
 def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list, source: str):
     """Build + register the branched agent in the parent's profile; the DEDICATED db handle is ours until
     ``_transfer_db_to_agent`` (released here on failure)."""
@@ -1988,10 +2027,12 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
     branch_db, branch_owns_db = _profile_session_db(parent_home) if parent_home else (None, False)
     try:
         with _profile_build_scope(parent_home):
-            agent = _make_agent_in_context(new_sid, new_key, session_db=branch_db, platform_override=source,
-                                           cwd_override=_session_cwd(session),
-                                           context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
-                                           auth_user_id=parent_user_id)
+            agent = _make_agent_in_context(
+                new_sid, new_key, session_db=branch_db, platform_override=source,
+                cwd_override=_session_cwd(session),
+                context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
+                auth_user_id=parent_user_id,
+                memory_provider_mode_override=_session_frozen_memory_provider_mode(session))
             _init_session(new_sid, new_key, agent, list(history), cols=session.get("cols", 80),
                           cwd=_session_cwd(session), session_db=branch_db, source=source, profile_home=parent_home,
                           explicit_cwd=bool(session.get("explicit_cwd")))
@@ -2052,7 +2093,8 @@ def _(rid, params: dict, session: dict) -> dict:
                             profile_name=profile_name_for_home(home) or _current_profile_name(),
                             copy_fields=_BRANCH_COPY_FIELDS,
                             title_source="user" if params.get("name") else "derived",
-                            user_id=_session_auth_user_id(session))
+                            user_id=_session_auth_user_id(session),
+                            memory_provider_mode=_session_frozen_memory_provider_mode(session))
         except Exception as e:
             return _err(rid, 5008, f"branch failed: {e}")
     try:

@@ -213,7 +213,7 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
         force=True, diagnostic=True,
     )
     agent._emit_diagnostic_status("Content filter terminated stream; switching to fallback...")
-    if agent._try_activate_fallback():
+    if agent._try_activate_fallback(FailoverReason.content_policy_blocked):
         # Roll partial content back to the last clean turn so the fallback gets a
         # coherent continuation point; unmark survivors (their text left the partial).
         if st.truncated_response_parts:
@@ -644,7 +644,7 @@ def handle_content_policy_refusal(
 
     if agent._has_pending_fallback():
         agent._buffer_diagnostic_status("⚠️ Model declined to respond (safety refusal) — trying fallback...")
-    if agent._try_activate_fallback():
+    if agent._try_activate_fallback(FailoverReason.content_policy_blocked):
         active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
         return RefusalVerdict("break", None, active_system_prompt)
 

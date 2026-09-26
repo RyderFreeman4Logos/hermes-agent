@@ -963,6 +963,64 @@ def recover_with_credential_pool(
     return False, has_retried_429
 
 
+_MISSING = object()
+
+
+def _copy_request_overrides(value: Any) -> Any:
+    """Structurally copy supported override containers without invoking value hooks.
+
+    Request overrides are plain configuration data.  Calling arbitrary ``__deepcopy__``
+    hooks while a switch snapshot is being made lets a rejected switch mutate the live
+    graph before there is anything safe to restore.  Copy only dict/list structure and
+    retain opaque leaves as values; route configuration does not promise to clone them.
+    """
+    memo: Dict[int, Any] = {}
+    active: set[int] = set()
+    remaining = 10_000
+
+    def copy_plain(item: Any, depth: int = 0) -> Any:
+        nonlocal remaining
+        if item is _MISSING:
+            return item
+        item_type = type(item)
+        if item_type is not dict and item_type is not list:
+            if issubclass(item_type, (dict, list)):
+                raise ValueError("request_overrides containers must be plain built-in dict/list values")
+            return item
+        if depth >= 100:
+            raise ValueError("request_overrides nesting exceeds 100 containers")
+        oid = id(item)
+        if oid in active:
+            raise ValueError("request_overrides contains a cyclic container graph")
+        if oid in memo:
+            return memo[oid]
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError("request_overrides exceeds 10000 containers")
+        active.add(oid)
+        try:
+            if item_type is dict:
+                copied: Any = {}
+                memo[oid] = copied
+                for key, child in dict.items(item):
+                    if type(key) is not str:
+                        raise ValueError("request_overrides mapping keys must be plain strings")
+                    copied[key] = copy_plain(child, depth + 1)
+            else:
+                copied = []
+                memo[oid] = copied
+                for child in list.__iter__(item):
+                    copied.append(copy_plain(child, depth + 1))
+            return copied
+        except Exception:
+            memo.pop(oid, None)
+            raise
+        finally:
+            active.remove(oid)
+
+    return copy_plain(value)
+
+
 def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
     """Copy the identity/transport fields of a ``_primary_runtime`` snapshot onto ``agent``
     (shared by transport recovery and turn-start restore; the caller rebuilds the client)."""
@@ -976,7 +1034,7 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]
     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
-    agent.request_overrides = dict(rt.get("request_overrides") or {})
+    agent.request_overrides = _copy_request_overrides(rt.get("request_overrides") or {})
     agent._client_kwargs = dict(rt["client_kwargs"])
 
 
@@ -1128,6 +1186,14 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
         primary_model = str(rt.get("model") or "").strip()
         next_at = getattr(pool, "next_available_at", lambda **_kwargs: None)(model=primary_model or None)
         if next_at is not None and next_at > time.time():
+            # next_available_at is read-only: it will not run the early Codex
+            # quota probe that select() uses. A weekly reset can reopen early;
+            # staying on fallback until that stamp is a multi-day cache break.
+            entry = pool.current() if pool is not None and hasattr(pool, "current") else None
+            if primary_provider == "openai-codex" and bool(
+                getattr(pool, "_codex_quota_restored_upstream", lambda _entry: False)(entry)
+            ):
+                return False, prefetched_pool, prefetched
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(
@@ -1221,6 +1287,7 @@ def _revert_credential_rotation(agent) -> None:
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
+    agent._runtime_failed_backend_identities = set()
     if not agent._fallback_activated:
         # Reset the index even without activation: a failed _try_activate_fallback() can strand
         # _fallback_index past the chain end and silently block future fallbacks.
@@ -1937,7 +2004,7 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     overrides = dict(getattr(agent, "request_overrides", {}) or {})
     overrides.pop("extra_body", None)  # always drop the previous provider's extra_body
     if new_extra_body:
-        overrides["extra_body"] = dict(new_extra_body)
+        overrides["extra_body"] = _copy_request_overrides(new_extra_body)
     agent.request_overrides = overrides
 
 
@@ -1948,7 +2015,6 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id",
 )
-_MISSING = object()
 
 
 def _snapshot_switch_state(agent) -> Dict[str, Any]:
@@ -1958,6 +2024,11 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
     snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
     # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
     snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    # Override provenance is not in _SWITCH_SNAPSHOT_FIELDS: official re-derives extra_body on
+    # success, but a failed swap must restore the original nested graph, not an aliased dict.
+    snapshot["request_overrides"] = _copy_request_overrides(
+        getattr(agent, "request_overrides", _MISSING)
+    )
     return snapshot
 
 
@@ -2218,8 +2289,10 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         # Overrides must travel with the switched-to identity or a later recovery/restore resurrects
         # PRE-switch overrides from the stale init snapshot.
-        # See #75091.
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        # See #75091. Deep-copy so later mutation of agent.request_overrides cannot poison restore.
+        "request_overrides": _copy_request_overrides(
+            getattr(agent, "request_overrides", {}) or {}
+        ),
         "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
         "compressor_model": getattr(cc, "model", agent.model),
         "compressor_base_url": getattr(cc, "base_url", agent.base_url),
@@ -3488,22 +3561,29 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()
-    if not steer_text:
+    ingest_completion = getattr(agent, "_completion_steer_ingest", None)
+    if not steer_text and not callable(ingest_completion):
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
     target = next((messages[j] for j in tail if isinstance(messages[j], dict) and messages[j].get("role") == "tool"), None)
     if target is None:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # requeue so the fallback path delivers it as a normal next-turn
-        # user message (which persists like any other user turn).
-        _requeue_pending_steer(agent, steer_text)
+        # No tool result in this batch (e.g. all skipped by interrupt); true user
+        # steer returns to its rail and a structured completion keeps its owner.
+        if steer_text:
+            _requeue_pending_steer(agent, steer_text)
+        return
+
+    def insert(completion_text: str, _events: list) -> str:
+        text = f"{completion_text}\n{steer_text}" if steer_text else completion_text
+        messages.append(steer_user_row(text))
+        return "inserted"
+
+    if callable(ingest_completion) and ingest_completion(insert):
+        return
+    if not steer_text:
         return
     messages.append(steer_user_row(steer_text))
-    _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
-        steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
-    )
 
 
 def _shutdown_socket(sock: Any) -> None:

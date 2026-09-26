@@ -15,6 +15,7 @@ fell through to "switch providers manually" advice and never called
   3. The one-shot guard flag exists on TurnRetryState.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
@@ -115,6 +116,58 @@ class TestAuthFailoverActivation:
             advanced = agent._try_activate_fallback(reason=classified.reason)
         assert advanced is True
         assert agent._fallback_index == 1
+
+    def test_503_auth_unavailable_real_error_handler_switches_without_retries(self):
+        """A provider's empty auth pool must not be replayed as ten overloads."""
+        import time
+        from agent.turn_api_error import handle_api_error
+
+        generic_overload = classify_api_error(_auth_error(503, "service overloaded"), provider="xai")
+        assert generic_overload.reason == FailoverReason.overloaded
+        assert generic_overload.is_auth is False
+        xai_billing = _auth_error(403, "spending limit")
+        setattr(xai_billing, "body", {
+            "error": {"code": "personal-team-blocked:spending-limit", "message": "spending limit"}
+        })
+        xai_billing = classify_api_error(xai_billing, provider="xai")
+        assert xai_billing.reason == FailoverReason.billing
+        assert xai_billing.is_auth is False
+
+        agent = _make_agent(fallback_model=[{"provider": "openai", "model": "gpt-4o"}])
+        agent.provider, agent.model = "xai", "grok-4.6"
+        agent._recover_with_credential_pool = MagicMock(return_value=(False, False))
+        retry = TurnRetryState()
+        attempted = []
+        fallback_client = _mock_client("https://api.openai.com/v1")
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "gpt-4o"),
+        ) as resolve:
+            error = _auth_error(503, "auth_unavailable: no auth available (providers=xai, model=grok-4.6)")
+            attempted.append((agent.provider, agent.model))
+            verdict = handle_api_error(
+                agent, api_error=error, _retry=retry, thinking_spinner=None,
+                messages=[{"role": "user", "content": "hello"}],
+                api_messages=[{"role": "user", "content": "hello"}], api_kwargs={},
+                system_message=None, active_system_prompt=None, conversation_history=[],
+                approx_tokens=10, retry_count=0, max_retries=10, compression_attempts=0,
+                max_compression_attempts=1, api_call_count=1, api_request_id="req",
+                api_start_time=time.time(), effective_task_id=None, turn_id="turn",
+            )
+            if verdict.action == "break":
+                attempted.append((agent.provider, agent.model))
+                fallback_client.chat.completions.create.return_value = SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="accepted"))]
+                )
+                reply = fallback_client.chat.completions.create(model=agent.model, messages=verdict.messages)
+
+        assert verdict.action == "break"
+        assert retry.restart_with_rebuilt_messages is True
+        assert verdict.retry_count == 0
+        assert attempted == [("xai", "grok-4.6"), ("openai", "gpt-4o")]
+        assert resolve.call_count == 1
+        assert reply.choices[0].message.content == "accepted"
+        assert fallback_client.chat.completions.create.call_args.kwargs["model"] == "gpt-4o"
 
     def test_no_failover_without_chain(self):
         """A user with no fallback configured (the common case for the

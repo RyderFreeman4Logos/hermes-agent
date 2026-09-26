@@ -2620,6 +2620,39 @@ class TestModelPoolRouting(unittest.TestCase):
             )
         self.assertEqual(MockAgent.call_args.kwargs["fallback_model"], profile_chain)
 
+    def test_unauthenticated_profile_fallback_is_not_constructed(self):
+        """A profile chain must not hand an unauthenticated hop to the child."""
+        cfg = {
+            "model_pool": {
+                "standard": {
+                    "provider": "custom",
+                    "model": "primary-model",
+                    "base_url": "https://primary.invalid/v1",
+                    "api_key": "primary-secret",
+                    "fallback_chain": [
+                        {"provider": "xai", "model": "grok-4"},
+                        {
+                            "provider": "custom",
+                            "model": "local-model",
+                            "base_url": "http://127.0.0.1:11434/v1",
+                        },
+                    ],
+                }
+            }
+        }
+        parent = _make_mock_parent(depth=0)
+        parent._session_db = None
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.delegate_tool._load_config", return_value=cfg
+        ), patch("tools.delegate_tool._run_batch", return_value="BATCH_OK"):
+            MockAgent.return_value = MagicMock(session_id="child")
+            result = delegate_task(tasks=[{"goal": "probe"}], parent_agent=parent)
+        self.assertEqual(result, "BATCH_OK")
+        self.assertEqual(MockAgent.call_count, 1)
+        chain = MockAgent.call_args.kwargs["fallback_model"]
+        self.assertEqual([entry["provider"] for entry in chain], ["custom"])
+        self.assertEqual(chain[0]["model"], "local-model")
+
     def test_non_pool_bare_model_keeps_parent_fallback_overrides_and_score(self):
         """A bare model override is not a pool tier and still inherits the parent route extras."""
         parent_chain = [{"provider": "openrouter", "model": "parent-fallback"}]

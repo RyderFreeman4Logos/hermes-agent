@@ -3,6 +3,8 @@
 A requested profile must pin the child to that profile's primary +
 fallback_chain. Global delegation.model must not win, and the child must
 not inherit an empty/parent chain that retries the same exhausted model.
+
+Regression coverage for #284 admits only fallback routes the runtime can authenticate.
 """
 
 from __future__ import annotations
@@ -28,10 +30,10 @@ STANDARD_POOL = {
         "base_url": "http://127.0.0.1:9/v1",
         "api_key": "profile-key",
         "fallback_chain": [
-            {"provider": "openrouter", "model": "fb-one"},
-            {"provider": "openrouter", "model": "fb-two"},
-            {"provider": "openrouter", "model": "fb-three"},
-            {"provider": "openrouter", "model": "fb-four"},
+            {"provider": "openrouter", "model": "fb-one", "api_key": "sk-or-test"},
+            {"provider": "openrouter", "model": "fb-two", "api_key": "sk-or-test"},
+            {"provider": "openrouter", "model": "fb-three", "api_key": "sk-or-test"},
+            {"provider": "openrouter", "model": "fb-four", "api_key": "sk-or-test"},
         ],
     },
     "test": {
@@ -134,6 +136,50 @@ class TestModelProfileResolution:
             "fb-four",
         ]
         assert all(e["model"] != "gpt-5.6-terra" for e in chain)
+
+    def test_profile_fallback_chain_drops_unauthenticated_xai_before_spawn(self):
+        """A profile chain must not hand an unauthenticated hop to the child."""
+        cfg = {
+            "model_pool": {
+                "standard": {
+                    "provider": "custom",
+                    "model": "primary-model",
+                    "base_url": "https://primary.invalid/v1",
+                    "api_key": "primary-secret",
+                    "fallback_chain": [
+                        {"provider": "xai", "model": "grok-4"},
+                        {
+                            "provider": "custom",
+                            "model": "local-model",
+                            "base_url": "http://127.0.0.1:11434/v1",
+                        },
+                    ],
+                }
+            }
+        }
+        parent = _parent()
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            child.close = MagicMock()
+            return child
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", side_effect=_capture
+        ):
+            raw = delegate_task(tasks=[{"goal": "probe"}], parent_agent=parent)
+        payload = json.loads(raw)
+        assert "error" not in payload
+        chain = captured["fallback_model"]
+        assert [entry["provider"] for entry in chain] == ["custom"]
+        assert chain[0]["model"] == "local-model"
 
     def test_unknown_profile_fails_closed(self):
         payload, kwargs = _child_kwargs(model_profile="does-not-exist")
@@ -469,7 +515,7 @@ class TestLiveConfigReread:
                         "base_url": "http://127.0.0.1:9/v1",
                         "api_key": "profile-key",
                         "fallback_chain": [
-                            {"provider": "openrouter", "model": "new-fb"}
+                            {"provider": "openrouter", "model": "new-fb", "api_key": "sk-or-test"}
                         ],
                     }
                 },

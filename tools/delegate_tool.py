@@ -398,8 +398,52 @@ def _normalize_profile_fallback_chain(raw: Any) -> List[Dict[str, Any]]:
         normalized = dict(entry)
         normalized["provider"] = provider
         normalized["model"] = model
+        if not _fallback_hop_admitted(normalized):
+            continue
         chain.append(normalized)
     return chain
+
+
+_KEYLESS_ENDPOINT = "no-key-required"
+
+
+def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
+    """False when the existing runtime resolver cannot authenticate this hop.
+
+    An endpoint-less ``custom`` hop is left in: the resolver refuses it for a
+    missing URL, which the child fallback rail still has to inherit. Every
+    other hop must resolve, and the resolved key must be usable, callable, or
+    the keyless-endpoint sentinel. An empty cloud key is not a usable credential.
+    """
+    from hermes_cli.auth import AuthError, has_usable_secret
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    base_url = str(entry.get("base_url") or "").strip() or None
+    api_key = str(entry.get("api_key") or "").strip() or None
+    provider = entry["provider"].strip().lower()
+    if provider == "custom" and base_url is None and api_key is None:
+        return True
+    try:
+        resolved = resolve_runtime_provider(
+            requested=entry["provider"],
+            target_model=entry["model"],
+            explicit_base_url=base_url,
+            explicit_api_key=api_key,
+        )
+    except AuthError as exc:
+        logger.info(
+            "delegate profile fallback skipped %s/%s: %s",
+            entry["provider"], entry["model"], exc,
+        )
+        return False
+    key = resolved.get("api_key")
+    if callable(key) or key == _KEYLESS_ENDPOINT or has_usable_secret(key):
+        return True
+    logger.info(
+        "delegate profile fallback skipped %s/%s: resolved without credentials",
+        entry["provider"], entry["model"],
+    )
+    return False
 
 
 def _credentials_for_model_profile(

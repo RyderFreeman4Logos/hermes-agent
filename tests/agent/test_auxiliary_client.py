@@ -3558,6 +3558,7 @@ class TestCodexAuxiliaryAdapterCompletedResponse:
         )
 
         assert response.choices[0].message.content == "completed response"
+        assert response.choices[0].finish_reason == "stop"
         assert response.usage.prompt_tokens == 11
         assert response.usage.completion_tokens == 3
         assert response.usage.total_tokens == 14

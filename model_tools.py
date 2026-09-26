@@ -1237,6 +1237,25 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+def _emit_checkpoint_receipt(
+    callback, *, tool_call_id: Optional[str], tool_name: str, status: str,
+    error_type: Optional[str] = None, source_event_ids: Tuple[int, ...] = (),
+) -> None:
+    """Send typed host authority to an optional checkpoint observer."""
+    if callback is None:
+        return
+    try:
+        from agent.checkpoint_engine import ToolExecutionReceipt
+
+        effect_class = "observation" if tool_name in _READ_SEARCH_TOOLS else "workspace_mutation"
+        callback(ToolExecutionReceipt(
+            tool_call_id or "", tool_name, effect_class, status, None,
+            error_type, (), tuple(source_event_ids),
+        ))
+    except Exception as exc:
+        logger.debug("checkpoint receipt callback error: %s", exc)
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1253,6 +1272,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    receipt_callback=None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1292,6 +1312,14 @@ def handle_function_call(
     _dispatch_start = time.monotonic()
 
     def _return_bridge_result(result: Any) -> Any:
+        observed_status, observed_error_type, _ = _tool_result_observer_fields(
+            function_name, result,
+        )
+        _emit_checkpoint_receipt(
+            receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+            status="failed" if observed_status == "error" else "succeeded",
+            error_type=observed_error_type,
+        )
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
@@ -1392,6 +1420,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                receipt_callback=receipt_callback,
             )
 
     _tool_original_args = dict(function_args)
@@ -1416,6 +1445,10 @@ def handle_function_call(
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
+            _emit_checkpoint_receipt(
+                receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+                status="skipped", error_type="agent_loop_owned",
+            )
             return tool_error(f"{function_name} must be handled by the agent loop")
 
         # Check plugin hooks for a block/approve/modify directive (unless caller
@@ -1450,6 +1483,10 @@ def handle_function_call(
 
             if block_message is not None:
                 result = tool_error(block_message)
+                _emit_checkpoint_receipt(
+                    receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+                    status="blocked", error_type="plugin_block",
+                )
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1474,6 +1511,10 @@ def handle_function_call(
 
             edit_block_message = maybe_require_edit_approval(function_name, function_args)
             if edit_block_message is not None:
+                _emit_checkpoint_receipt(
+                    receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+                    status="blocked", error_type="edit_approval_denied",
+                )
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1492,6 +1533,10 @@ def handle_function_call(
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
                 result = tool_error("Edit approval denied: approval guard failed")
+                _emit_checkpoint_receipt(
+                    receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+                    status="blocked", error_type="edit_approval_error",
+                )
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1581,6 +1626,15 @@ def handle_function_call(
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
+        observed_status, observed_error_type, _ = _tool_result_observer_fields(
+            function_name, result,
+        )
+        _emit_checkpoint_receipt(
+            receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+            status="failed" if observed_status == "error" else "succeeded",
+            error_type=observed_error_type,
+        )
+
         _emit_post_tool_call_hook(
             function_name=function_name,
             function_args=function_args,
@@ -1637,6 +1691,10 @@ def handle_function_call(
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         result = tool_error(_sanitize_tool_error(error_msg))
+        _emit_checkpoint_receipt(
+            receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+            status="failed", error_type=type(e).__name__,
+        )
         duration_ms = (
             int((time.monotonic() - _dispatch_start) * 1000)
             if _dispatch_start is not None

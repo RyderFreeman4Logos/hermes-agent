@@ -31,7 +31,8 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_child_runtime, _resolve_delegation_credentials, _credentials_for_model_profile,
+    _available_model_profile_names, _model_pool,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -176,6 +177,10 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[Dict[str, Any]] = None,
+    override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
+    # A selected model_pool tier owns every unset route field. A bare model
+    # override still inherits the parent provider and endpoint.
+    pool_route: bool = False,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -222,13 +227,15 @@ def _build_child_agent(
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
+        override_fallback_chain=override_fallback_chain,
+        pool_route=pool_route,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
         request_overrides = dict(override_request_overrides)
     else:
-        request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
+        request_overrides = {} if (pool_route or override_provider) else dict(getattr(parent_agent, "request_overrides", {}) or {})
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
@@ -276,7 +283,7 @@ def _build_child_agent(
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
     # Shared pool lets children rotate credentials on rate limits.
-    child_pool = _resolve_child_credential_pool(
+    child_pool = None if pool_route else _resolve_child_credential_pool(
         rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),
     )
     if child_pool is not None:
@@ -366,25 +373,43 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    top_profile: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = {
-        "override_provider": creds["provider"], "override_base_url": creds["base_url"],
-        "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
-        "override_request_overrides": creds.get("request_overrides"),
-        "override_acp_command": creds.get("command"),
-        "override_acp_args": creds.get("args"),
-        "routing_cfg": routing_cfg,
-    }
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
+        route_profile = str(t.get("model_profile") or "").strip() or top_profile
+        try:
+            task_creds = _credentials_for_model_profile(routing_cfg, parent_agent, route_profile)
+        except ValueError as exc:
+            return [], str(exc)
+        resolved_profile = route_profile or ("standard" if _model_pool(routing_cfg) else None)
+        logger.info(
+            "delegate_task: resolved profile=%s model=%s provider=%s fallback=%s",
+            resolved_profile, task_creds.get("model"), task_creds.get("provider"),
+            [
+                {"provider": e.get("provider"), "model": e.get("model")}
+                for e in (task_creds.get("fallback_chain") or []) if isinstance(e, dict)
+            ],
+        )
+        creds = task_creds
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        overrides = {
+            "override_provider": creds["provider"], "override_base_url": creds["base_url"],
+            "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
+            "override_request_overrides": creds.get("request_overrides"),
+            "override_acp_command": creds.get("command"),
+            "override_acp_args": creds.get("args"),
+            "routing_cfg": routing_cfg,
+            "override_fallback_chain": creds.get("fallback_chain"),
+            "pool_route": bool(resolved_profile),
+        }
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
@@ -394,6 +419,7 @@ def _build_children(
             )
         except ValueError as exc:
             return [], str(exc)
+        child._delegate_model_profile = resolved_profile
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -441,8 +467,8 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
-    credentials_cfg: Optional[Dict[str, Any]] = None,
+    subagent_id: Optional[str] = None, message: Optional[str] = None, model_profile: Optional[str] = None, parent_agent=None,
+ credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -491,11 +517,12 @@ def delegate_task(
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    top_profile = str(model_profile or "").strip() or None
     try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+        creds = _credentials_for_model_profile(routing_cfg, parent_agent, top_profile)
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
+        # spawn loudly (#80450). Unknown/missing-standard model_pool profiles fail closed here too.
         return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
@@ -522,6 +549,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        top_profile=top_profile,
     )
     if err:
         return tool_error(err)
@@ -590,7 +618,8 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Omitted model_profile uses standard. Unknown names and a pool without "
+    "standard fail closed."
 )
 
 def _build_tasks_param_description() -> str:
@@ -616,6 +645,30 @@ def _build_dynamic_schema_overrides() -> dict:
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    profile_names = _available_model_profile_names()
+    profile_prop = dict(overrides_params["properties"].get("model_profile") or {})
+    profile_prop["description"] = (
+        "Named pool tier. Omitted uses standard. Unknown names and a pool "
+        "without standard fail closed. Per-task value overrides this."
+    )
+    if profile_names:
+        profile_prop["enum"] = profile_names
+    else:
+        profile_prop.pop("enum", None)
+    overrides_params["properties"]["model_profile"] = profile_prop
+    tasks_prop = dict(overrides_params["properties"]["tasks"])
+    tasks_items = dict(tasks_prop.get("items") or {})
+    tasks_item_props = dict(tasks_items.get("properties") or {})
+    task_profile_prop = dict(tasks_item_props.get("model_profile") or {})
+    task_profile_prop["description"] = "Per-task pool tier. Overrides the top-level model_profile."
+    if profile_names:
+        task_profile_prop["enum"] = profile_names
+    else:
+        task_profile_prop.pop("enum", None)
+    tasks_item_props["model_profile"] = task_profile_prop
+    tasks_items["properties"] = tasks_item_props
+    tasks_prop["items"] = tasks_items
+    overrides_params["properties"]["tasks"] = tasks_prop
 
     if not independent_completions:
         tasks = overrides_params["properties"]["tasks"]
@@ -685,6 +738,10 @@ DELEGATE_TASK_SCHEMA = {
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
                         ),
+                        "model_profile": _p(
+                            "string",
+                            "Per-task pool tier. Overrides the top-level model_profile.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -707,6 +764,11 @@ DELEGATE_TASK_SCHEMA = {
                 "string",
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
+            ),
+            "model_profile": _p(
+                "string",
+                "Named pool tier. Omitted uses standard. Unknown names and a pool "
+                "without standard fail closed. Per-task value overrides this.",
             ),
         },
         "required": [],
@@ -743,7 +805,8 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        parent_agent=kw.get("parent_agent"),
+ model_profile=args.get("model_profile"),
+ parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

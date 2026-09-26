@@ -194,6 +194,36 @@ class TestUnknownTopLevelKeys:
         assert any("api_key" in i.message for i in misplaced)
 
 
+class TestModelPoolRequiresStandard:
+    def test_nonempty_pool_without_standard_is_error(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "model_pool": {
+                    "fast": {"provider": "custom", "model": "tiny"},
+                    "test": {"provider": "custom", "model": "other"},
+                }
+            }
+        })
+        assert any(i.severity == "error" and "standard" in i.message for i in issues)
+
+    def test_pool_with_standard_is_ok(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "model_pool": {
+                    "standard": {"provider": "custom", "model": "main"},
+                    "fast": {"provider": "custom", "model": "tiny"},
+                }
+            }
+        })
+        assert not any(i.severity == "error" and "standard" in i.message for i in issues)
+
+    def test_empty_or_absent_pool_is_ok(self):
+        for config in ({"delegation": {}}, {"delegation": {"model_pool": {}}}):
+            assert not any(
+                i.severity == "error" and "standard" in i.message
+                for i in validate_config_structure(config)
+            )
+
 
 class TestQuotedContainerValues:
     """A list/mapping slot holding one quoted string is ignored by every reader (#83308, #105706)."""

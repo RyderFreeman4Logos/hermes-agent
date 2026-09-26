@@ -1299,6 +1299,16 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                    f"Move '{key}' under the appropriate section")
 
     _validate_web_backends(config, issues)
+    delegation_cfg = config.get("delegation")
+    if isinstance(delegation_cfg, dict):
+        pool = delegation_cfg.get("model_pool")
+        if isinstance(pool, dict) and pool and "standard" not in {str(name) for name in pool}:
+            _issue(
+                issues, "error",
+                "delegation.model_pool is non-empty but has no 'standard' profile",
+                "Add an explicit standard profile, or remove model_pool. "
+                "YAML key order is not a routing default.",
+            )
     _validate_quoted_containers(config, issues)
     return issues
 

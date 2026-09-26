@@ -181,6 +181,68 @@ class TestModelProfileResolution:
         assert [entry["provider"] for entry in chain] == ["custom"]
         assert chain[0]["model"] == "local-model"
 
+    def test_profile_fallback_chain_admits_scoped_env_key_before_spawn(self):
+        """A scoped fallback key is resolved before the child is constructed."""
+        from hermes_cli.auth import AuthError
+
+        scoped_key = "k" * 32
+        cfg = {
+            "model_pool": {
+                "standard": {
+                    "provider": "custom",
+                    "model": "primary-model",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "api_key": "p" * 3,
+                    "fallback_chain": [
+                        {
+                            "provider": "openrouter",
+                            "model": "env-fallback",
+                            "key_env": "HERMES_TEST_SCOPED_FALLBACK",
+                        },
+                    ],
+                },
+            },
+        }
+        parent = _parent()
+        captured = {}
+
+        def _resolve(**kwargs):
+            if kwargs.get("requested") == "openrouter":
+                if kwargs.get("explicit_api_key") != scoped_key:
+                    raise AuthError("scoped fallback key was not resolved", provider="openrouter", code="missing_api_key")
+                return {
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": scoped_key,
+                }
+            return {"provider": "custom", "base_url": "http://127.0.0.1:11434/v1", "api_key": "p" * 3}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            child.close = MagicMock()
+            return child
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "tools.delegate_tool._run_batch", return_value="BATCH_OK"
+        ), patch("run_agent.AIAgent", side_effect=_capture), patch(
+            "agent.secret_scope.get_secret", return_value=scoped_key
+        ) as get_secret, patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=_resolve
+        ):
+            result = delegate_task(tasks=[{"goal": "probe"}], parent_agent=parent)
+
+        assert result == "BATCH_OK"
+        get_secret.assert_called_once_with("HERMES_TEST_SCOPED_FALLBACK")
+        chain = captured["fallback_model"]
+        assert [entry["model"] for entry in chain] == ["env-fallback"]
+        assert chain[0]["key_env"] == "HERMES_TEST_SCOPED_FALLBACK"
+
     def test_unknown_profile_fails_closed(self):
         payload, kwargs = _child_kwargs(model_profile="does-not-exist")
         assert "error" in payload

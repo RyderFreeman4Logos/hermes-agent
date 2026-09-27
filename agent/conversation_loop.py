@@ -370,7 +370,7 @@ def _is_xai_bad_credentials_403(
     provider: str,
     status_code: Any,
     api_error: Any,
-    error_context: Optional[Dict[str, Any]] = None,
+    error_context: Optional[dict[str, Any]] = None,
 ) -> bool:
     """xAI reports an expired or invalid OAuth access token as HTTP 403 with
     body code ``unauthenticated:bad-credentials`` rather than 401, so the
@@ -1694,6 +1694,7 @@ def _run_conversation_turn(
     agent._compression_adoption_failed = False
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
+    agent._codex_auth_retry_attempted = False
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,

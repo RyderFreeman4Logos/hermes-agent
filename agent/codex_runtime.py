@@ -1128,32 +1128,36 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         writer_token["value"] = claim_stream_writer(agent)
         writer_token["raw_stream"] = _raw_stream
 
-    def _drain_for_finalizer(event_stream: Any) -> None:
+    def _drain_for_finalizer(event_stream: Any) -> BaseException | None:
         # ``final`` is already assembled; draining only lets Relay run its finalizer. A transport error
-        # here must NOT discard the completed, already-billed response.
+        # here must NOT discard the completed, already-billed response, but it does belong in diagnostics.
         budget = _stream_drain_timeout()
         if budget <= 0:
             return  # the ``finally`` below closes the stream
         drained = threading.Event()
+        drain_error: BaseException | None = None
 
         def _drain() -> None:
+            nonlocal drain_error
             try:
                 for _ignored in event_stream:
                     pass
             except (*transport_errors, _APIConnectionError) as exc:
+                drain_error = exc
                 if not isinstance(exc, transport_errors):
                     _log_failure(exc)
                 logger.warning("Codex Responses stream transport finalization failed after a terminal response was already "
                                "received; returning the completed response instead of retrying. %s error=%s",
                                agent._client_log_context(), exc)
-            except Exception:
+            except BaseException as exc:
+                drain_error = exc
                 logger.debug("Codex Responses stream finalization failed after a terminal response", exc_info=True)
             finally:
                 drained.set()
 
         threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True).start()
         if drained.wait(budget):
-            return
+            return drain_error
         logger.warning(
             "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
             "closing it and returning the completed response instead of retrying. %s",
@@ -1165,6 +1169,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if raw_stream is not None and raw_stream is not event_stream:
             _close_event_stream(raw_stream)
         _close_event_stream(event_stream)
+        return TimeoutError("Codex Responses stream drain did not complete after a terminal response")
 
     def _close_event_stream(event_stream: Any) -> None:
         close_fn = getattr(event_stream, "close", None)  # None while connect never succeeded
@@ -1215,7 +1220,6 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_first_delta=_live(on_first_delta) if on_first_delta is not None else None,
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
-                _finish_diagnostic(response=final)
             except transport_errors as exc:
                 _finish_diagnostic(error=exc)
                 if attempt >= max_stream_retries:
@@ -1255,7 +1259,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 _finish_diagnostic(error=exc)
                 raise
             if not agent._interrupt_requested:
-                _drain_for_finalizer(event_stream)
+                drain_error = _drain_for_finalizer(event_stream)
+            else:
+                drain_error = None
+            _finish_diagnostic(response=final, error=drain_error)
             if final.status in {"incomplete", "failed"}:
                 logger.warning("Codex Responses stream terminal status=%s "
                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",

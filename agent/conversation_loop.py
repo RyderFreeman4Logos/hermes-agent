@@ -1581,6 +1581,7 @@ def _run_conversation_turn(
     agent._compression_adoption_failed = False
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
+    agent._codex_auth_retry_attempted = False
     agent._last_turn_usage = None
 
     s = _LoopState(

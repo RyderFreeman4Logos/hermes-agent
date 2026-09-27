@@ -3249,6 +3249,37 @@ def test_run_conversation_xai_403_body_only_refreshes_and_retries(monkeypatch):
     assert result["final_response"] == "OK"
 
 
+def test_run_conversation_xai_403_shares_one_shot_budget_across_api_iterations(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+    refreshes = {"count": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403({"code": "unauthenticated:bad-credentials"})
+        if calls["api"] == 2:
+            return _codex_tool_call_response()
+        raise _XaiForbidden403({"code": "unauthenticated:bad-credentials"})
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
+        for call in assistant_message.tool_calls:
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": "{}"})
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+    result = agent.run_conversation("Run a command")
+
+    assert refreshes["count"] == 1
+    assert calls["api"] == 3
+    assert result.get("completed") is not True
+
+
 def test_run_conversation_xai_403_shares_one_shot_budget_with_401(monkeypatch):
     agent = _build_xai_oauth_agent(monkeypatch)
     calls = {"api": 0}

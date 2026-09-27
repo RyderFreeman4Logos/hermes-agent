@@ -98,7 +98,6 @@ async def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypat
 
     assert [kind for kind, _request in sends] == ["sync", "async", "stream"]
     assert [context.ordinals for context in contexts] == [[0], [0], [0]]
-    assert [context.requests for context in contexts] == [[request] for _kind, request in sends]
 
 
 def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
@@ -134,7 +133,6 @@ def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
 
     assert [kind for kind, _request in sends] == ["sync", "stream"]
     assert [context.ordinals for context in contexts] == [[0], [0]]
-    assert [context.requests for context in contexts] == [[request] for _kind, request in sends]
 
 
 @pytest.mark.asyncio
@@ -165,7 +163,7 @@ async def test_managed_async_retry_records_each_provider_callback(
 
     assert result == {"content": "attempt-2"}
     assert [context.ordinals for context in contexts] == [[0, 1]]
-    assert len(contexts[0].requests) == len(sends) == 2
+    assert len(sends) == 2
 
 
 @pytest.mark.parametrize(

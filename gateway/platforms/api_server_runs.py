@@ -78,7 +78,7 @@ _ROOM_RETENTION_REQUEST_KEY = (
 # Forwarded subagent lifecycle fields; free-text ones are secret-redacted.
 _SUBAGENT_EVENT_KEYS = (
     "goal", "task_count", "task_index", "subagent_id", "child_session_id", "delegation_id", "parent_id",
-    "depth", "model", "tool_count", "status", "summary", "duration_seconds", "input_tokens",
+    "depth", "model", "provider", "tool_count", "status", "summary", "duration_seconds", "input_tokens",
     "output_tokens", "reasoning_tokens", "api_calls", "cost_usd", "files_read", "files_written",
     "output_tail")
 _SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
@@ -292,7 +292,12 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
                 event["preview"] = redact_sensitive_text(str(preview), force=True)
             for key in _SUBAGENT_EVENT_KEYS:
                 value = kwargs.get(key)
-                if value is not None:
+                terminal_identity_null = (
+                    event_type == "subagent.complete"
+                    and key in {"model", "provider"}
+                    and key in kwargs
+                )
+                if value is not None or terminal_identity_null:
                     # Free text may carry child tool output: force secret redaction on this public stream.
                     redact = key in _SUBAGENT_TEXT_KEYS and isinstance(value, str)
                     event[key] = redact_sensitive_text(value, force=True) if redact else value

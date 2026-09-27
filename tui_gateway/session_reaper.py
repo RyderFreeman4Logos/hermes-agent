@@ -419,21 +419,19 @@ def _refresh_backend_heartbeat() -> None:
 
 
 def _start_backend_heartbeat_refresher() -> None:
-    """Register this backend and start the refresher thread (once per process). The first refresh writes the row
-    synchronously so this process's own sweep sees itself in the heartbeat table. ``_HEARTBEAT_REFRESH_S <= 0``
-    means "register once, never refresh"."""
+    """Register this backend and start the refresher thread (once per process).
+
+    The first write runs on the refresher thread, never on the caller: it waits
+    out the shared 20s lock patience, and both entry points call this before
+    ``gateway.ready``. ``_HEARTBEAT_REFRESH_S <= 0`` means "register once".
+    """
     global _heartbeat_refresher_started
     with _heartbeat_refresher_lock:
         if _heartbeat_refresher_started:
             return
         _heartbeat_refresher_started = True
-    try:
-        _refresh_backend_heartbeat()
-    except Exception:
-        logger.debug("initial backend heartbeat write failed", exc_info=True)
-    if _HEARTBEAT_REFRESH_S <= 0:
-        return
     stop_event = threading.Event()
+    first_write = threading.Event()
 
     def _loop() -> None:
         while not stop_event.is_set():
@@ -441,16 +439,22 @@ def _start_backend_heartbeat_refresher() -> None:
                 _refresh_backend_heartbeat()
             except Exception:
                 logger.debug("heartbeat refresh loop iteration failed", exc_info=True)
-            stop_event.wait(_HEARTBEAT_REFRESH_S)
+            finally:
+                first_write.set()
+            if _HEARTBEAT_REFRESH_S <= 0 or stop_event.wait(_HEARTBEAT_REFRESH_S):
+                return
 
     def _atexit_clear():
         stop_event.set()
+        thread.join(timeout=1.0)
         with contextlib.suppress(Exception):
             if (db := _get_db()) is not None:
                 db.clear_backend_heartbeat(_backend_id_for_this_process())
 
     atexit.register(_atexit_clear)
-    threading.Thread(target=_loop, name="hermes-gateway-heartbeat", daemon=True).start()
+    thread = threading.Thread(target=_loop, name="hermes-gateway-heartbeat", daemon=True)
+    thread.start()
+    first_write.wait(timeout=0.05)
 
 
 def _schedule_startup_orphan_sweep() -> None:

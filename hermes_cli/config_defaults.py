@@ -61,6 +61,8 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Append current-start and the latest successful completed-loop stop to each loop input.
+        "loop_timing_context": True,
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
@@ -122,6 +124,8 @@ DEFAULT_CONFIG = {
         # otherwise wedge the turn until the idle watchdog discards the already-billed response
         # (#103864). 0 skips the drain. Well-behaved endpoints close immediately and never wait this long.
         "stream_drain_timeout": 2.0,
+        # Local-only, HMAC-redacted evidence at the final Codex Responses SDK boundary. Off by default.
+        "codex_cache_diagnostics": {"enabled": False},
         # Empty-response retry guard. Empty retries re-send the full input at full price; this stops
         # re-billing deterministic empties (unsignaled refusals, zero output tokens) while failing
         # open on ambiguous evidence (missing usage, any tokens, model/provider change).
@@ -292,6 +296,7 @@ DEFAULT_CONFIG = {
         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.
         "font_family": "",
         "timeout": 180,
+        "auto_background_timeout_threshold": 200,
         # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons). 0
         # = SIGTERM only.
         "daemon_term_grace_seconds": 2.0,

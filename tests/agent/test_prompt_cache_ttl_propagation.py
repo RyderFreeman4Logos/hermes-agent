@@ -226,9 +226,12 @@ class TestFailoverRestartsPreflight:
                 node
                 for node in ast.walk(tree)
                 if isinstance(node, ast.If)
-                and isinstance(node.test, ast.Call)
-                and isinstance(node.test.func, ast.Attribute)
-                and node.test.func.attr == "_try_activate_fallback"
+                and any(
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_try_activate_fallback"
+                    for call in ast.walk(node.test)
+                    if isinstance(call, ast.Call)
+                )
             ]
             all_refs = [
                 node
@@ -237,8 +240,8 @@ class TestFailoverRestartsPreflight:
                 and node.attr == "_try_activate_fallback"
             ]
             assert len(all_refs) == len(fallback_ifs), (
-                f"{mod.__name__}: every _try_activate_fallback reference must be a "
-                "direct `if agent._try_activate_fallback(...):` site (#84733)"
+                f"{mod.__name__}: every _try_activate_fallback reference must be guarded by "
+                "an `if` that returns the retry-loop break verdict (#84733)"
             )
             for node in fallback_ifs:
                 kinds = [_verdict_kind(stmt) for stmt in node.body]

@@ -76,6 +76,7 @@ def test_codex_success_flushes_and_reports_persisted():
     assert isinstance(result["messages"][-1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+    agent._reset_stream_delivery_tracking.assert_called_once_with()
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():

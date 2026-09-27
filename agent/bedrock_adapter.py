@@ -862,14 +862,22 @@ class _ResponseParts:
             reasoning_content="\n\n".join(self.reasoning_parts) if self.reasoning_parts else None,
             bedrock_content_blocks=ordered_blocks or None,
         )
+        def count(key: str) -> int:
+            value = usage_data.get(key, 0)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
         cache_read_tokens, cache_write_tokens, output_tokens = (
-            usage_data.get(k, 0) for k in ("cacheReadInputTokens", "cacheWriteInputTokens", "outputTokens")
+            count(k) for k in ("cacheReadInputTokens", "cacheWriteInputTokens", "outputTokens")
         )
         prompt_tokens = usage_data.get("inputTokens", 0) + cache_read_tokens + cache_write_tokens
-        usage = SimpleNamespace(
+        usage_fields = dict(
             prompt_tokens=prompt_tokens, completion_tokens=output_tokens, total_tokens=prompt_tokens + output_tokens,
-            cache_read_input_tokens=cache_read_tokens, cache_creation_input_tokens=cache_write_tokens,
         )
+        if "cacheReadInputTokens" in usage_data:
+            usage_fields["cache_read_input_tokens"] = usage_data["cacheReadInputTokens"]
+        if "cacheWriteInputTokens" in usage_data:
+            usage_fields["cache_creation_input_tokens"] = usage_data["cacheWriteInputTokens"]
+        usage = SimpleNamespace(**usage_fields)
         finish_reason = _STOP_REASON_TO_FINISH_REASON.get(stop_reason, "stop")
         if self.tool_calls and finish_reason == "stop":
             finish_reason = "tool_calls"
@@ -991,7 +999,11 @@ def stream_converse_with_callbacks(
             stop_reason = event["messageStop"].get("stopReason", "end_turn")
         elif "metadata" in event:
             meta_usage = event["metadata"].get("usage", {})
-            usage_data = {key: meta_usage.get(key, 0) for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheWriteInputTokens")}
+            usage_data = {
+                key: meta_usage[key]
+                for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheWriteInputTokens")
+                if key in meta_usage
+            }
     flush_text()
     return parts.build([stream_blocks[i] for i in sorted(stream_blocks)], usage_data, stop_reason, "")
 

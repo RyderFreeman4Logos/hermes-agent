@@ -364,9 +364,9 @@ class TestFallbackChainDedup:
                 ok = agent._try_activate_fallback()
 
         assert ok is True
-        # The first entry was skipped — only the second reached resolve.
+        # Exact raw provider/model identity is rejected before resolver/key selection.
         assert called == [("zai", "glm-4.7")], (
-            f"expected fallback to skip same-state entry, got call order: {called}"
+            f"expected raw self entry to be skipped, got call order: {called}"
         )
 
 
@@ -380,11 +380,18 @@ class TestFallbackChainDedup:
         agent.model = "z-ai/glm-4.7"
         agent.base_url = "https://openrouter.ai/api/v1"
 
-        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
-            ok = agent._try_activate_fallback()
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "z-ai/glm-4.7"),
+            ) as mock_resolve,
+            patch("hermes_cli.fallback_config.resolve_entry_api_key", return_value=None) as resolve_key,
+        ):
+            ok = agent._try_activate_fallback(FailoverReason.auth)
 
         assert ok is False
         mock_resolve.assert_not_called()
+        resolve_key.assert_not_called()
 
     def test_allows_xai_api_fallback_from_xai_oauth_same_host_model(self):
         """xai-oauth and xai share api.x.ai but use different credentials.
@@ -511,6 +518,284 @@ class TestFallbackExtraBodyReResolution:
         self._activate(agent)
         assert agent.request_overrides.get("temperature") == 0.2
 
+
+
+    def test_first_fallback_freezes_pre_rescope_primary_overrides(self):
+        """Live contract: failed/restored fallback keeps original nested overrides."""
+        agent = self._agent_with_custom_providers()
+        original = agent.request_overrides
+        original["extra_body"] = dict(original["extra_body"])
+        original["extra_body"]["nested"] = {"value": "primary"}
+        agent._primary_runtime = {
+            "provider": agent.provider,
+            "request_overrides": original,
+        }
+        self._activate(agent)
+        frozen = agent._primary_runtime["request_overrides"]
+        assert frozen["extra_body"]["nested"]["value"] == "primary"
+        assert "old_only" in frozen["extra_body"]
+        assert frozen is not original
+        frozen["extra_body"]["nested"]["value"] = "poison"
+        assert original["extra_body"]["nested"]["value"] == "primary"
+        live = agent.request_overrides.get("extra_body") or {}
+        assert "old_only" not in live
+
+    def test_late_b_failure_restores_a_before_real_c_rescope(self):
+        """A rejected B cannot make C retain A-only provider overrides.
+
+        B's extra-body derivation is intentionally real.  The only injected fault is
+        the later notice sink, after identity/client/override publication, so the next
+        chain entry exercises the public fallback loop rather than a rescope stub.
+        """
+        b_url = "https://b-llm.example.com/v1"
+        c_url = "https://c-llm.example.com/v1"
+        agent = _make_agent(fallback_model=[
+            {"provider": "custom:b", "model": "b-model", "base_url": b_url},
+            {"provider": "custom:c", "model": "c-model", "base_url": c_url},
+        ])
+        agent.provider = "custom"
+        agent.model = "a-model"
+        agent.base_url = self.OLD_URL
+        agent.requested_provider = "custom"
+        agent._custom_providers = [
+            {"name": "aprov", "base_url": self.OLD_URL, "extra_body": {"a_only": 1}},
+            {"provider_key": "b", "base_url": b_url, "extra_body": {"b_only": 2}},
+            {"provider_key": "c", "base_url": c_url, "extra_body": {"c_only": 3}},
+        ]
+        agent.request_overrides = {"extra_body": {"a_only": 1, "caller": "kept"}}
+        original_notice = chat_completion_helpers._buffer_fallback_notice
+
+        def fail_only_after_b_rescope(live_agent, notice):
+            if live_agent.model == "b-model":
+                raise RuntimeError("late B notice sink failure")
+            return original_notice(live_agent, notice)
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[
+                (_mock_client(base_url=b_url), "b-model"),
+                (_mock_client(base_url=c_url), "c-model"),
+            ],
+        ), patch(
+            "agent.model_metadata.get_model_context_length", return_value=128_000
+        ), patch(
+            "agent.chat_completion_helpers._buffer_fallback_notice",
+            side_effect=fail_only_after_b_rescope,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert (agent.model, agent.provider, agent.base_url) == (
+            "c-model", "custom:c", c_url
+        )
+        extra = agent.request_overrides["extra_body"]
+        assert extra == {"caller": "kept", "c_only": 3}
+        assert "a_only" not in extra
+        assert "b_only" not in extra
+        # Build the next request through the active transport path without a
+        # network call.  The captured kwargs are the actual C-route request
+        # projection, not only the mutable runtime dictionary above.
+        next_kwargs = chat_completion_helpers.build_api_kwargs(
+            agent, [{"role": "user", "content": "capture C route"}], tools_for_api=[]
+        )
+        assert next_kwargs["model"] == "c-model"
+        assert agent.client.base_url == c_url
+        assert next_kwargs["extra_body"] == {"caller": "kept", "c_only": 3}
+
+    def test_repeated_late_native_failures_leave_only_successful_d_runtime(self):
+        """Two rejected native candidates cannot leak into the later successful route."""
+        urls = {
+            name: f"https://{name.lower()}.example.com/anthropic"
+            for name in ("A", "B", "C", "D")
+        }
+        agent = _make_agent(fallback_model=[
+            {
+                "provider": f"custom:{name.lower()}",
+                "model": f"{name.lower()}-model",
+                "base_url": urls[name],
+                "api_mode": "anthropic_messages",
+            }
+            for name in ("B", "C", "D")
+        ])
+        agent.provider = agent.requested_provider = "custom:a"
+        agent.model = "a-model"
+        agent.base_url = urls["A"]
+        agent.api_mode = "anthropic_messages"
+        agent.api_key = agent._anthropic_api_key = "a-key"
+        agent._anthropic_base_url = urls["A"]
+        agent._anthropic_client = MagicMock(name="A-native-client")
+        agent._is_anthropic_oauth = False
+        agent.client = None
+        agent._client_kwargs = {}
+        agent._credential_pool = MagicMock(name="A-pool", provider="custom:a")
+        agent._credential_pool_entry_id = "a-entry"
+        agent.runtime_capabilities = {"route": "a"}
+        agent._cached_system_prompt = "Model: a-model\nProvider: custom:a"
+        agent._pending_fallback_notice = ["A notice"]
+        agent.request_overrides = {"extra_body": {"caller": "kept", "a_only": 1}}
+        agent._custom_providers = [
+            {
+                "provider_key": name.lower(),
+                "base_url": urls[name],
+                "extra_body": {f"{name.lower()}_only": index},
+            }
+            for index, name in enumerate(("A", "B", "C", "D"), 1)
+        ]
+        compressor = MagicMock()
+        compressor.model = "a-model"
+        compressor.provider = "custom:a"
+        compressor.base_url = urls["A"]
+        compressor.api_key = "a-key"
+        compressor.api_mode = "anthropic_messages"
+        compressor.context_length = 111
+        compressor.update_model.side_effect = lambda **kw: [setattr(compressor, k, v) for k, v in kw.items()]
+        agent.context_compressor = compressor
+
+        clients = {
+            name: _mock_client(base_url=urls[name], api_key=f"{name.lower()}-key")
+            for name in ("B", "C", "D")
+        }
+
+        def install_candidate(_agent, _client, provider, *_args):
+            name = provider.rsplit(":", 1)[-1].upper()
+            agent.api_key = agent._anthropic_api_key = f"{name.lower()}-key"
+            agent._anthropic_base_url = urls[name]
+            agent._anthropic_client = MagicMock(name=f"{name}-native-client")
+            pool = MagicMock(name=f"{name}-pool", provider=provider)
+            pool.entry_id_for_api_key.return_value = f"{name.lower()}-entry"
+            agent._credential_pool = pool
+            agent._credential_pool_entry_id = f"{name.lower()}-entry"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(clients[name], f"{name.lower()}-model") for name in ("B", "C", "D")],
+        ), patch(
+            "agent.client_lifecycle._swap_fallback_clients", side_effect=install_candidate
+        ), patch(
+            "agent.model_metadata.get_model_context_length", return_value=222
+        ), patch(
+            "agent.native_compaction.resolve_native_compaction_capabilities",
+            side_effect=[RuntimeError("late B"), RuntimeError("late C"), {"route": "d"}],
+        ):
+            assert agent._try_activate_fallback() is True
+
+        request_client = MagicMock(name="D-request-client")
+        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False), patch.object(
+            agent, "_checkout_request_slot", return_value=(None, None)
+        ), patch.object(
+            agent, "_build_anthropic_client_for_key", return_value=request_client
+        ) as build_client, patch.object(agent, "_store_request_slot"):
+            assert agent._create_request_anthropic_client(reason="post-repeated-fallback") is request_client
+
+        assert build_client.call_args.args[0][:3] == ("direct", "d-key", urls["D"])
+        assert (agent.model, agent.provider, agent.base_url, agent.api_mode) == (
+            "d-model", "custom:d", urls["D"], "anthropic_messages"
+        )
+        assert (agent._anthropic_api_key, agent._anthropic_base_url) == ("d-key", urls["D"])
+        assert agent._anthropic_client._mock_name == "D-native-client"
+        assert (agent._credential_pool.provider, agent._credential_pool_entry_id) == ("custom:d", "d-entry")
+        assert (compressor.model, compressor.provider, compressor.base_url, compressor.context_length) == (
+            "d-model", "custom:d", urls["D"], 222
+        )
+        assert agent.request_overrides == {"extra_body": {"caller": "kept", "d_only": 4}}
+        assert agent.runtime_capabilities == {"route": "d"}
+        assert agent._cached_system_prompt == "Model: d-model\nProvider: custom:d"
+        assert len(agent._pending_fallback_notice) == 2
+        assert "d-model via custom:d" in agent._pending_fallback_notice[-1]
+        assert "b-model" not in agent._pending_fallback_notice[-1]
+        assert "c-model" not in agent._pending_fallback_notice[-1]
+
+    def test_exhausted_late_native_failure_restores_complete_primary_runtime(self):
+        """A rejected native fallback cannot leave its transport or compressor on B."""
+        a_url = "https://a.example.com/anthropic"
+        b_url = "https://b.example.com/anthropic"
+        agent = _make_agent(fallback_model=[{
+            "provider": "custom:b", "model": "b-model", "base_url": b_url,
+            "api_mode": "anthropic_messages",
+        }])
+        agent.provider = agent.requested_provider = "custom:a"
+        agent.model = "a-model"
+        agent.base_url = a_url
+        agent.api_mode = "anthropic_messages"
+        agent.api_key = agent._anthropic_api_key = "a-key"
+        agent._anthropic_base_url = a_url
+        agent._anthropic_client = MagicMock(name="A-native-client")
+        agent._is_anthropic_oauth = False
+        agent.client = None
+        agent._client_kwargs = {}
+        agent._credential_pool = MagicMock(name="A-pool", provider="custom:a")
+        agent._credential_pool_entry_id = "a-entry"
+        agent._use_prompt_caching = True
+        agent._use_native_cache_layout = True
+        agent.reasoning_config = {"effort": "high"}
+        agent.runtime_capabilities = {"route": "a"}
+        agent._provider_fallback_active = False
+        agent._provider_fallback_route = None
+        agent._cached_system_prompt = "Model: a-model\nProvider: custom:a"
+        agent._pending_fallback_notice = ["A notice"]
+        agent._consecutive_stale_streams = 4
+        agent.request_overrides = {"extra_body": {"route": "a"}}
+        compressor = MagicMock()
+        compressor.model = "a-model"
+        compressor.provider = "custom:a"
+        compressor.base_url = a_url
+        compressor.api_key = "a-key"
+        compressor.api_mode = "anthropic_messages"
+        compressor.context_length = 111
+        agent.context_compressor = compressor
+
+        def mutate_compressor(**kwargs):
+            for key, value in kwargs.items():
+                setattr(compressor, key, value)
+
+        compressor.update_model.side_effect = mutate_compressor
+        fb_client = _mock_client(base_url=b_url, api_key="b-key")
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client", return_value=(fb_client, "b-model")
+        ), patch(
+            "agent.client_lifecycle._swap_fallback_clients"
+        ) as swap, patch(
+            "agent.model_metadata.get_model_context_length", return_value=222
+        ), patch(
+            "agent.native_compaction.resolve_native_compaction_capabilities",
+            side_effect=RuntimeError("late capability failure"),
+        ):
+            def install_b(*_args):
+                agent.api_key = agent._anthropic_api_key = "b-key"
+                agent._anthropic_base_url = b_url
+                agent._anthropic_client = MagicMock(name="B-native-client")
+                agent._credential_pool = MagicMock(name="B-pool", provider="custom:b")
+                agent._credential_pool_entry_id = "b-entry"
+            swap.side_effect = install_b
+            assert agent._try_activate_fallback() is False
+
+        # Exercise the request-local physical transport key without opening a
+        # socket.  The next native request must be constructed from A's restored
+        # credential and endpoint rather than B's rejected client state.
+        request_client = MagicMock(name="A-request-client")
+        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False), patch.object(
+            agent, "_checkout_request_slot", return_value=(None, None)
+        ), patch.object(
+            agent, "_build_anthropic_client_for_key", return_value=request_client
+        ) as build_client, patch.object(agent, "_store_request_slot"):
+            assert agent._create_request_anthropic_client(reason="post-rejected-fallback") is request_client
+        built_key = build_client.call_args.args[0]
+        assert built_key[:3] == ("direct", "a-key", a_url)
+
+        assert (agent.model, agent.provider, agent.base_url, agent.api_mode) == (
+            "a-model", "custom:a", a_url, "anthropic_messages"
+        )
+        assert (agent._anthropic_api_key, agent._anthropic_base_url) == ("a-key", a_url)
+        assert agent._anthropic_client._mock_name == "A-native-client"
+        assert (agent._credential_pool.provider, agent._credential_pool_entry_id) == ("custom:a", "a-entry")
+        assert (compressor.model, compressor.provider, compressor.base_url, compressor.context_length) == (
+            "a-model", "custom:a", a_url, 111
+        )
+        assert agent.request_overrides == {"extra_body": {"route": "a"}}
+        assert agent.runtime_capabilities == {"route": "a"}
+        assert agent._cached_system_prompt == "Model: a-model\nProvider: custom:a"
+        assert agent._pending_fallback_notice == ["A notice"]
+        assert agent._consecutive_stale_streams == 4
 
 # ── MoA preset as a fallback entry (#112525, #112623) ─────────────────────
 

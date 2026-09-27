@@ -138,7 +138,8 @@ class TestBuiltinMemoryToolAvailability:
         with pytest.raises(RuntimeError, match="config read failed"):
             memory_tool_module.check_memory_requirements()
 
-        assert memory_tool_module._memory_surface_flags.get() is None
+        assert memory_tool_module._memory_surface_snapshot.get() is None
+        assert memory_tool_module._memory_surface_bound.get() is False
 
     def test_config_flip_updates_tool_without_manual_cache_clear(self, hermes_home):
         _write_memory_config(

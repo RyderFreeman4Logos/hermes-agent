@@ -360,6 +360,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "reasoning_config": g("reasoning_config") or _load_reasoning_config(str(g("model", "") or "")),
         "service_tier": g("service_tier") or _load_service_tier(),
         "request_overrides": dict(g("request_overrides", {}) or {}),
+        "memory_provider_mode_override": g("_memory_provider_mode"),
         # The side agent persists into the PARENT's store: a named-profile chat's ``bg_*`` rows
         # belong to that profile's state.db, not the launch handle.
         "platform": "tui", "session_db": getattr(agent, "_session_db", None) or _get_db(), "fallback_model": fallback,
@@ -517,6 +518,8 @@ def _rebuild_session_agent(sid: str, session: dict, **kwargs):
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
+    with session["history_lock"]:
+        _reclaim_queued_completion_receipts(session)
     updates = dict(
         attached_images=[], queued_prompt=None,
         _queued_prompt_generation=int(session.get("_queued_prompt_generation", 0)) + 1,
@@ -535,6 +538,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session))
     finally:
         _clear_session_context(tokens)
+    session["agent"] = new_agent
+    _persist_live_session_runtime(session)
     session.update(updates)
     session.pop("queued_prompts", None)
     with session["history_lock"]:

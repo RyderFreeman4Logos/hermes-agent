@@ -259,7 +259,8 @@ def settle_unrecovered_error(
     result), else the interruptible error backoff. ``FailoverReason.billing`` (402) is deliberately
     treated as non-retryable (#31273)."""
     from agent.conversation_loop import (
-        _arm_fallback_restart, _is_copilot_provider, _is_stale_copilot_credential_error
+        _arm_fallback_restart, _is_copilot_provider, _is_standard_profile_child,
+        _is_stale_copilot_credential_error, _standard_child_can_fallback,
     )
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> UnrecoveredErrorVerdict:
@@ -325,8 +326,13 @@ def settle_unrecovered_error(
         # model's own malformed tool-call JSON, #12770; MoA preset/adapter faults, #55933): skip
         # the cascade. An UNCLASSIFIED local ValueError/TypeError keeps its historical fallback;
         # a recognised verdict that opts out wins even when the exception is a ValueError subclass.
+        # A standard child still refuses content-policy denials.
         _unclassified_local = is_local_validation_error and classified.reason == FailoverReason.unknown
-        if classified.should_fallback or _unclassified_local or shrink_spent or reasoning_spent:
+        _may_fallback = (
+            (classified.should_fallback or _unclassified_local or shrink_spent or reasoning_spent)
+            and _standard_child_can_fallback(agent, reason=classified.reason)
+        )
+        if _may_fallback:
             # Announce the fallback only when a chain exists, else "trying fallback..." lies
             # before a silent abort.
             if agent._has_pending_fallback():
@@ -360,6 +366,16 @@ def settle_unrecovered_error(
             agent._fallback_index = 0
             agent._fallback_activated = False
             return _verdict("continue")
+        if _is_standard_profile_child(agent) and not _standard_child_can_fallback(
+            agent, reason=classified.reason,
+        ):
+            return _verdict("return", max_retries_exhausted_result(
+                agent, api_error, classified, max_retries=max_retries, is_rate_limited=is_rate_limited,
+                error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
+                messages=messages, conversation_history=conversation_history,
+                api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
+                base_url=_base, model=_model,
+            ))
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
         reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None

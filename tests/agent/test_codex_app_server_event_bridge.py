@@ -308,6 +308,22 @@ class TestBridgeRobustness:
             "type": "agentMessage", "id": "am-x", "text": "hi",
         }))
 
+    def test_payload_overflow_propagates_and_resets_request_accounting(self):
+        from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+        agent = _make_stub_agent()
+        agent._current_streamed_assistant_text = "accepted prefix"
+        agent._fire_stream_delta.side_effect = StreamPayloadBoundExceeded(262_145)
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        with pytest.raises(StreamPayloadBoundExceeded):
+            bridge({
+                "method": "item/agentMessage/delta",
+                "params": {"delta": "overflow"},
+            })
+
+        assert agent._current_streamed_assistant_text == ""
+
 
 
 

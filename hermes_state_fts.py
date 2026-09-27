@@ -358,34 +358,35 @@ class SessionFtsSetupMixin:
             return False
         self._raise_if_db_corrupt()
         try:
-            with self._lock:
-                self._raise_if_db_replaced()
-                if self._conn is None:
-                    self._reopen_after_close_locked(context="write")
-                self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    self._conn.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        (FTS_STALE_KEY,),
-                    )
-                    cjk_triggers_present = self._conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
-                        "LIMIT 1",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchone()
-                    if cjk_triggers_present:
+            with self._advisory_write_lock():
+                with self._lock:
+                    self._raise_if_db_replaced()
+                    if self._conn is None:
+                        self._reopen_after_close_locked(context="write")
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    try:
                         self._conn.execute(
                             "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (FTS_CJK_STALE_KEY,),
+                            (FTS_STALE_KEY,),
                         )
-                    self._drop_all_fts_triggers(self._conn.cursor())
-                    self._conn.commit()
-                except BaseException:
-                    self._conn.rollback()
-                    raise
+                        cjk_triggers_present = self._conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                            f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
+                            "LIMIT 1",
+                            _FTS_CJK_TRIGGERS,
+                        ).fetchone()
+                        if cjk_triggers_present:
+                            self._conn.execute(
+                                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                (FTS_CJK_STALE_KEY,),
+                            )
+                        self._drop_all_fts_triggers(self._conn.cursor())
+                        self._conn.commit()
+                    except BaseException:
+                        self._conn.rollback()
+                        raise
         except sqlite3.Error as detach_exc:
             logger.error(
                 "Could not detach corrupt FTS indexes; canonical write still cannot proceed: %s",

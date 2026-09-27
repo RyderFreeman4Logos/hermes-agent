@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from agent.transports.codex_app_server_session import (
     _approval_choice_to_codex_decision,
     _build_turn_input,
 )
+from agent.codex_runtime import make_codex_app_server_event_bridge
 
 
 class FakeClient:
@@ -128,6 +130,78 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
         client_factory=lambda **kw: client,
         **kwargs,
     )
+
+
+def test_first_usage_is_published_before_held_tool_phase_and_turn_completion():
+    client = FakeClient()
+    events = []
+    tool_phase = threading.Event()
+    release_tool = threading.Event()
+    agent = SimpleNamespace(
+        provider="openai-codex",
+        api_mode="codex_app_server",
+        _first_turn_usage=None,
+        _tui_cache_callback=lambda *args: events.append(args),
+        show_commentary=True,
+    )
+    bridge = make_codex_app_server_event_bridge(agent)
+
+    def on_event(note):
+        bridge(note)
+        if note.get("method") == "item/started":
+            tool_phase.set()
+            assert release_tool.wait(timeout=2)
+
+    client.queue_notification(
+        "thread/tokenUsage/updated",
+        tokenUsage={"last": {
+            "inputTokens": 100,
+            "cachedInputTokens": 90,
+            "outputTokens": 10,
+            "totalTokens": 110,
+        }},
+    )
+    client.queue_notification(
+        "item/started",
+        item={"id": "tool-1", "type": "commandExecution", "command": "synthetic"},
+    )
+    client.queue_notification(
+        "thread/tokenUsage/updated",
+        tokenUsage={"last": {
+            "inputTokens": 200,
+            "cachedInputTokens": 0,
+            "outputTokens": 20,
+            "totalTokens": 220,
+        }},
+    )
+    client.queue_notification(
+        "item/completed",
+        item={"id": "message-1", "type": "agentMessage", "text": "done"},
+    )
+    client.queue_notification(
+        "turn/completed",
+        turn={"id": "turn-fake-001", "status": "completed", "error": None},
+    )
+    result = []
+    runner = threading.Thread(target=lambda: result.append(
+        make_session(client, on_event=on_event).run_turn("hello", turn_timeout=2)
+    ))
+    runner.start()
+    try:
+        assert tool_phase.wait(timeout=2)
+        assert len(events) == 1
+        assert events[0][0] == "hit"
+        assert events[0][2] == 90
+        assert result == []
+    finally:
+        release_tool.set()
+        runner.join(timeout=2)
+
+    assert not runner.is_alive()
+    assert result[0].final_text == "done"
+    assert result[0].token_usage_first["cachedInputTokens"] == 90
+    assert result[0].token_usage_last["cachedInputTokens"] == 0
+    assert len(events) == 1
 
 
 # ---- choice mapping ----
@@ -267,6 +341,52 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    @pytest.mark.parametrize("during_server_request", [False, True])
+    def test_stream_payload_overflow_is_terminal_before_later_work(
+        self, during_server_request
+    ):
+        from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+        client = FakeClient()
+        if during_server_request:
+            client.queue_server_request(
+                "item/commandExecution/requestApproval",
+                request_id="approval-after-overflow",
+                command="pwd",
+                cwd="/tmp",
+            )
+        client.queue_notification(
+            "item/agentMessage/delta",
+            delta="overflowing delta",
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        def on_event(note):
+            if note.get("method") == "item/agentMessage/delta":
+                raise StreamPayloadBoundExceeded(262_145)
+
+        result = make_session(client, on_event=on_event).run_turn(
+            "hi", turn_timeout=2.0
+        )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert "262145 bytes" in (result.error or "")
+        assert result.final_text == result.error
+        assert result.projected_messages == [
+            {"role": "assistant", "content": result.error}
+        ]
+        assert [method for method, _params in client.requests].count(
+            "turn/interrupt"
+        ) == 1
+        assert client.responses == []
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})

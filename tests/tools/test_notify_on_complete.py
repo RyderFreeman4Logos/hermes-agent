@@ -18,6 +18,7 @@ from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
 )
+from tools.process_registry_notifications import format_process_notification
 
 
 @pytest.fixture()
@@ -166,6 +167,41 @@ class TestCompletionQueue:
         assert len(completions) == 3
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
+
+
+    @pytest.mark.parametrize(
+        ("changes", "missing"),
+        (
+            pytest.param({"exit_code": True}, (), id="boolean-exit-code"),
+            pytest.param({"completion_reason": "lost"}, (), id="mismatched-reason-source"),
+            pytest.param({"started_at": True}, (), id="boolean-start-time"),
+            pytest.param({"handoff_note": "parent requested this process"}, (), id="handed-off"),
+            pytest.param({}, ("session_id",), id="missing-session-id"),
+        ),
+    )
+    def test_malformed_child_completion_is_not_silently_dropped(self, registry, changes, missing):
+        evt = {
+            "type": "completion",
+            "session_id": "proc_child_malformed",
+            "task_id": "container-child",
+            "owner_task_id": "sa-child-owner",
+            "command": "echo child",
+            "started_at": 1.0,
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "output": "child output",
+        }
+        for key in missing:
+            evt.pop(key)
+        evt.update(changes)
+        registry.completion_queue.put(evt)
+
+        delivered = registry.drain_notifications()
+
+        assert len(delivered) == 1
+        assert delivered[0][0] == evt
+        assert delivered[0][1]
 
 
 # =========================================================================
@@ -399,6 +435,21 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
     assert "silent" in hint.lower() or "no way to learn" in hint.lower(), (
         "Hint must explain the failure mode, not just suggest the fix"
     )
+
+
+def test_routine_delegated_child_completion_is_silent():
+    """A child's ordinary exit-0 completion must not become a parent turn."""
+    event = {
+        "type": "completion",
+        "session_id": "proc_child",
+        "command": "echo child",
+        "started_at": 1.0,
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "delegated_child": True,
+    }
+    assert format_process_notification(event) is None
 
 
 def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):

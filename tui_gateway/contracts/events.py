@@ -180,6 +180,16 @@ class PersistedTurn(Payload):
     final_assistant_row_id: int | None = None
 
 
+class CacheInfo(Payload):
+    """First-response cache observation on ``message.complete``."""
+
+    state: str
+    pct: int = 0
+    read_tokens: int | None = None
+    prompt_tokens: int | None = None
+    compression_bound: bool | None = None
+
+
 class MessageCompletePayload(Payload):
     """``prompt_turn._complete_turn_payload`` / ``session_auto_continue._emit_terminal_turn_error`` /
     ``agent_callbacks._mirror_subagent_to_child`` (child watch mirror: ``text`` only) /
@@ -199,6 +209,8 @@ class MessageCompletePayload(Payload):
     error_surface: ErrorSurface | None = None
     partial: bool | None = None
     persisted_turn: PersistedTurn | None = None
+    cache_info: CacheInfo | None = None
+    completed_at: float | None = None
 
 
 event("message.complete", MessageCompletePayload, doc="The turn ended: final text, usage and outcome.")
@@ -209,6 +221,7 @@ class StatusUpdatePayload(Payload):
 
     kind: str
     text: str
+    cache_record: dict[str, JsonValue] | None = None
 
 
 event("status.update", StatusUpdatePayload, doc="Transient status line (kind: status, lifecycle, compacting, goal, loop, heartbeat, process, …).")

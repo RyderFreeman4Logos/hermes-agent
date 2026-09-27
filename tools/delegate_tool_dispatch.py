@@ -385,6 +385,15 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
     child_agents = [c for (_, _, c) in unit.children]
+    child_models = [getattr(c, "model", None) for c in child_agents]
+    if child_models and all(isinstance(model, str) and model for model in child_models):
+        unit_models = set(child_models)
+        unit_model = next(iter(unit_models)) if len(unit_models) == 1 else None
+    else:
+        # Compatibility for construction doubles and legacy callers whose
+        # children do not expose runtime metadata.
+        fallback_model = unit.creds.get("model") if isinstance(unit.creds, dict) else None
+        unit_model = fallback_model if isinstance(fallback_model, str) else None
 
     def _interrupt():
         for c in child_agents:
@@ -394,7 +403,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         # Call-wide goals: completion formatting indexes them by task_index.
         goals=[t["goal"] for t in unit.task_list], context=unit.context,
         toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
-        role=unit.top_role, model=unit.creds["model"],
+        role=unit.top_role, model=unit_model,
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,

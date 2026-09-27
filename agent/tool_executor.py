@@ -1072,10 +1072,13 @@ def _commit_tool_result(
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
     persisted_result = function_result
+    subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
     if _is_multimodal_tool_result(persisted_result):
         persisted_result = _persist_multimodal_text_parts(
             persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
         )
+        if subdir_hints:
+            _append_subdir_hint_to_multimodal(persisted_result, subdir_hints)
     else:
         persisted_result = maybe_persist_tool_result(
             content=persisted_result,
@@ -1083,16 +1086,9 @@ def _commit_tool_result(
             tool_use_id=tool_call_id,
             env=get_active_env(effective_task_id),
             config=budget,
+            history_suffix=subdir_hints or "",
         )
     _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
-
-    subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
-    if subdir_hints:
-        if _is_multimodal_tool_result(persisted_result):
-            # Hint goes on the text summary part so the model still sees it; image blocks untouched.
-            _append_subdir_hint_to_multimodal(persisted_result, subdir_hints)
-        else:
-            persisted_result += subdir_hints
 
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.

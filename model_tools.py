@@ -270,11 +270,16 @@ def _tool_defs_cache_key(
         cfg_fp = file_signature(cfg_stat)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
+    try:
+        from tools.memory_tool import memory_surface_cache_key
+        memory_surface = memory_surface_cache_key()
+    except Exception:
+        memory_surface = None
     return (
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
-        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope, memory_surface,
     )
 
 

@@ -1309,13 +1309,21 @@ class CLICommandsMixin:
         target_id, session_meta = resolved
         if target_id == self.session_id:
             return _cp("  Already on that session.")
+        try:
+            self._session_db.assert_resume_safe(target_id, tip_only=True)
+        except Exception as exc:
+            from hermes_state import SessionResumeTooLargeError
+            if isinstance(exc, SessionResumeTooLargeError):
+                return _cp(f"  Cannot resume session: {exc}")
         old_session_id = self.session_id
         _end_current_session(self, "resumed_other")
         self.session_id, self._resumed, self._pending_title = target_id, True, None
         _sync_process_session_id(target_id)
         # One lineage SELECT, two projections: model_history is alternation-repaired for live
         # replay (heals a durable user;user once); display_history is verbatim (as startup --resume).
-        model_history, display_history = self._session_db.get_resume_conversations(target_id)
+        from hermes_state import resolved_max_resume_messages
+        model_history, display_history = self._session_db.get_resume_conversations(
+            target_id, max_display_messages=resolved_max_resume_messages() or None)
         self.conversation_history = _without_session_meta(model_history)
         self._resume_display_history = _without_session_meta(display_history)
         with suppress(Exception):  # re-open the target session so it's not marked as ended
@@ -1339,9 +1347,7 @@ class CLICommandsMixin:
         # -c`/`--resume`. The startup resume paths already call this; without it, the terminal/code-exec
         # tools and relative-path resolution keep operating in the wrong repo. Idempotent and a no-op when
         # the session recorded no cwd. See #38562.
-        self._restore_session_cwd(session_meta)
-        self._restore_session_yolo(session_meta)
-        self._restore_session_model(session_meta)
+        self._restore_session_state(session_meta)
 
     def _resolve_resume_target(self, target: str):
         """``(session_id, meta)`` for a numbered selection, title, or id; None after printing why
@@ -1410,11 +1416,18 @@ class CLICommandsMixin:
         # user is still on open, not ended with end_reason="branched" and no branch (#11030).
         # The stable ``_branched_from`` marker keeps the branch visible in /resume + /sessions
         # even after the parent is re-ended with a different end_reason.
+        init_config = getattr(self.agent, "_session_init_model_config", None)
+        memory_provider_mode = (
+            init_config.get("memory_provider_mode") if isinstance(init_config, dict) else None
+        ) or getattr(self.agent, "_memory_provider_mode", None)
+        if not isinstance(memory_provider_mode, (str, type(None))):
+            memory_provider_mode = None
         try:
             self._session_db.create_session(
                 session_id=new_session_id, source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model, parent_session_id=parent_session_id,
                 model_config={"max_iterations": self.max_turns, "reasoning_config": self.reasoning_config,
+                              "memory_provider_mode": memory_provider_mode,
                               "_branched_from": parent_session_id})
         except Exception as e:
             return _cp(f"  Failed to create branch session: {e}")
@@ -1883,7 +1896,9 @@ class CLICommandsMixin:
 
     def _handle_memory_command(self, cmd: str):
         """Handle /memory slash command — pending review + approval-gate toggle."""
-        from hermes_cli.write_approval_commands import handle_pending_subcommand
+        from hermes_cli.write_approval_commands import (
+            handle_pending_subcommand, load_authoritative_memory_manager,
+        )
         from tools import write_approval as wa
         args = cmd.strip().split()[1:]
         store = getattr(self.agent, "_memory_store", None) if getattr(self, "agent", None) else None
@@ -1898,6 +1913,10 @@ class CLICommandsMixin:
             store = load_on_disk_store()
         out = handle_pending_subcommand(
             wa.MEMORY, args, memory_store=store,
+            memory_manager=getattr(self.agent, "_memory_manager", None) if getattr(self, "agent", None) else None,
+            memory_manager_factory=lambda: load_authoritative_memory_manager(
+                session_id=str(getattr(self, "session_id", "") or ""), platform="cli",
+            ),
             set_mode_fn=lambda enabled: self._save_write_approval("memory", enabled))
         print(out if out is not None else
               "Unknown /memory subcommand. Use: pending, approve <id>, reject <id>, approval <on|off>.")

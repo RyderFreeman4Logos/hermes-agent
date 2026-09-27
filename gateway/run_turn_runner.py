@@ -1036,6 +1036,24 @@ class TurnRunner:
                 count = row.get("message_count", 0)
         return count
 
+    def _stored_memory_provider_mode(self):
+        """Frozen memory route for a fresh/cache-miss agent, if the row has one."""
+        ctx = self._ctx
+        if self._runner._session_db is None or not ctx.session_id:
+            return None
+        mode = None
+        with suppress(Exception):
+            db = getattr(self._runner._session_db, "_db", self._runner._session_db)
+            row = db.get_session(ctx.session_id) or {}
+            model_config = row.get("model_config") or {}
+            if isinstance(model_config, str):
+                model_config = json.loads(model_config)
+            if isinstance(model_config, dict):
+                candidate = model_config.get("memory_provider_mode")
+                if candidate in {"authoritative", "hybrid"}:
+                    mode = candidate
+        return mode
+
     def _pop_cached_agent_for_eviction(self):
         """Evict under the lock but DEFER release (release_clients can block on memory-provider /
         socket teardown while the idle sweeper waits on this lock). The turn rebuilds a fresh agent, so
@@ -1127,6 +1145,7 @@ class TurnRunner:
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=True,
+            memory_provider_mode_override=self._stored_memory_provider_mode(),
         )
 
     def _resolve_turn_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr):

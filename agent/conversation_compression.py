@@ -759,25 +759,74 @@ def _get_compress_timeout_executor():
 def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None) -> Tuple[float, float]:
     """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
     ``idle_timeout_seconds <= 0`` disables the progress-aware wrapper. The ceiling is clamped to at least one
-    idle window when the idle budget is positive."""
+    idle window when the idle budget is positive. Configured auxiliary compression / fallback-chain
+    timeouts expand the host ceiling so the host does not preempt a longer candidate request.
+    Unrepresentable (non-finite / overflow) values are ignored."""
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+    aux_timeout = None
+    config_root = compression_cfg
     cfg = compression_cfg
     if cfg is None:
-        cfg = {}
+        config_root = {}
         with contextlib.suppress(Exception):
             from hermes_cli.config import load_config
             raw = load_config()
-            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
-            cfg = maybe if isinstance(maybe, dict) else {}
+            config_root = raw if isinstance(raw, dict) else {}
+    if isinstance(config_root, dict):
+        maybe = config_root.get("compression")
+        cfg = maybe if isinstance(maybe, dict) else config_root
+        auxiliary = config_root.get("auxiliary", {})
+        auxiliary_compression = (
+            auxiliary.get("compression", {}) if isinstance(auxiliary, dict) else {}
+        )
+        raw_aux_timeout = (
+            auxiliary_compression.get("timeout")
+            if isinstance(auxiliary_compression, dict)
+            else None
+        )
+        if raw_aux_timeout is not None:
+            with contextlib.suppress(TypeError, ValueError, OverflowError):
+                parsed = float(raw_aux_timeout)
+                if math.isfinite(parsed) and parsed > 0:
+                    aux_timeout = parsed
+        fallback_chain = (
+            auxiliary_compression.get("fallback_chain")
+            if isinstance(auxiliary_compression, dict)
+            else None
+        )
+        if isinstance(fallback_chain, list):
+            for entry in fallback_chain:
+                if not isinstance(entry, dict):
+                    continue
+                if not str(entry.get("provider") or "").strip():
+                    continue
+                if not str(entry.get("model") or "").strip():
+                    continue
+                raw_timeout = entry.get("timeout")
+                if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
+                    with contextlib.suppress(TypeError, ValueError, OverflowError):
+                        parsed = float(raw_timeout)
+                        if math.isfinite(parsed) and parsed > 0:
+                            aux_timeout = max(aux_timeout or 0.0, parsed)
+    else:
+        cfg = {}
     if isinstance(cfg, dict):
         # Explicit 0/negative idle disables; a non-positive ceiling is ignored.
-        with contextlib.suppress(TypeError, ValueError):
+        with contextlib.suppress(TypeError, ValueError, OverflowError):
             if cfg.get("context_timeout_seconds") is not None:
-                idle = float(cfg["context_timeout_seconds"])
-        with contextlib.suppress(TypeError, ValueError):
-            if cfg.get("context_total_ceiling_seconds") is not None and float(cfg["context_total_ceiling_seconds"]) > 0:
-                ceiling = float(cfg["context_total_ceiling_seconds"])
+                parsed = float(cfg["context_timeout_seconds"])
+                if math.isfinite(parsed):
+                    idle = parsed
+        with contextlib.suppress(TypeError, ValueError, OverflowError):
+            if cfg.get("context_total_ceiling_seconds") is not None:
+                parsed = float(cfg["context_total_ceiling_seconds"])
+                if math.isfinite(parsed) and parsed > 0:
+                    ceiling = parsed
+    if aux_timeout is not None:
+        # The host must not preempt a longer configured compression request.
+        # Its own idle budget still detects a silent provider.
+        ceiling = max(ceiling, aux_timeout)
     if idle > 0:
         ceiling = max(ceiling, idle)
         # #114594: the aux summary attempt legitimately needs up to its own budget (floor 300s), while the
@@ -2599,6 +2648,7 @@ class _CompressionLease:
         self._lifecycle = lifecycle
         self.holder: Optional[str] = None
         self.watermark: Optional[int] = None
+        self.source_signature: Optional[str] = None
         self._refresher: Optional[_CompressionLockLeaseRefresher] = None
         self._released = False
         self._release_guard = threading.Lock()
@@ -2704,7 +2754,12 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
         acquired = try_acquire(lease.sid, lease.holder, ttl_seconds=lease.ttl)
         if acquired:
             try:
-                lease.watermark = lease.db.get_active_message_watermark(lease.sid)
+                snapshot = getattr(lease.db, "get_active_message_source_snapshot", None)
+                if callable(snapshot):
+                    lease.watermark, lease.source_signature = snapshot(lease.sid)
+                else:
+                    lease.watermark = lease.db.get_active_message_watermark(lease.sid)
+                    lease.source_signature = None
                 # A captured watermark makes the commit safe against later rows on BOTH commit
                 # paths; tell the fence so a host may keep this attempt's admission.
                 if commit_fence is not None:
@@ -2716,6 +2771,7 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
                     "will be archived with the snapshot", lease.sid, _wm_err,
                 )
                 lease.watermark = None
+                lease.source_signature = None
         return acquired
     except Exception as _lock_err:
         with _swallow('compression lock cleanup after failed acquire failed: %s'):
@@ -3311,15 +3367,18 @@ def _publish_rotated_compaction(
     old_title = agent._session_db.get_session_title(agent.session_id)
     new_session_id = mint_session_id()
     from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.loop_timing import model_config_for_compression_child
     agent._session_db.publish_compression_child(
         parent_session_id=old_session_id, child_session_id=new_session_id,
         source=_compression_child_source(agent, old_session_id), model=agent.model,
-        model_config=agent._session_init_model_config, system_prompt=new_system_prompt, messages=compressed,
+        model_config=model_config_for_compression_child(agent, agent._session_init_model_config),
+        system_prompt=new_system_prompt, messages=compressed,
         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,
         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
         watermark=(lease.watermark if _foreign_tail_ceiling is not None else None),
         watermark_ceiling=_foreign_tail_ceiling,
+        source_signature=lease.source_signature,
     )
     # `already_present` stamping is done by run_agent's _sync_persisted_markers;
     # this branch covers inserted/merged only; direct callers must use that wrapper.
@@ -3633,6 +3692,7 @@ def _commit_compaction(
                 agent._session_db.archive_and_compact(
                     agent.session_id, persisted, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=lease.watermark, lock_holder=lease.holder, tail_count=tail_count,
+                    source_signature=lease.source_signature,
                 )
                 compressed = persisted
                 split_status = "in_place_committed"

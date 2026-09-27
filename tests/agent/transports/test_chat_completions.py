@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -202,6 +203,43 @@ class TestChatCompletionsBasic:
         returned by identity (preserves the deepcopy-on-demand contract)."""
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
+
+    def test_convert_messages_strips_persistence_only_display_fields(self, transport):
+        message = {
+            "role": "user",
+            "content": "ordinary decorated input",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "background"},
+        }
+
+        converted = transport.convert_messages([message])
+
+        assert converted == [{"role": "user", "content": "ordinary decorated input"}]
+        assert message["display_kind"] == "internal_notification"
+        assert message["display_metadata"] == {"source": "background"}
+
+    def test_iteration_summary_uses_the_same_display_field_sanitizer(self):
+        from agent.chat_completion_helpers import _chat_summary_attempt
+
+        message = {
+            "role": "user",
+            "content": "decorated input",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "background"},
+        }
+        agent = SimpleNamespace(
+            model="test/model",
+            _force_ascii_payload=False,
+            _build_api_kwargs=lambda messages, tools_for_api=None: {},
+        )
+
+        with patch.object(agent, "_build_api_kwargs", return_value={}) as build_kwargs:
+            _chat_summary_attempt(agent, [message], "request-id")
+
+        build_kwargs.assert_called_once_with(
+            [{"role": "user", "content": "decorated input"}],
+        )
+        assert message["display_kind"] == "internal_notification"
 
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
@@ -830,6 +868,41 @@ class TestPromptCacheKeyCapability:
                 list(result)
         return captured
 
+    def test_post_compress_request_reuses_unchanged_stable_prefix_key(self, transport):
+        """Compression may rebuild only the volatile system-prompt suffix."""
+        marker = {"type": "ephemeral"}
+
+        def key(volatile_suffix):
+            return transport.build_kwargs(
+                model="cache-model",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "stable prefix",
+                                "cache_control": marker,
+                            },
+                            {
+                                "type": "text",
+                                "text": volatile_suffix,
+                                "cache_control": marker,
+                            },
+                        ],
+                    },
+                    {"role": "user", "content": "next request"},
+                ],
+                tools=[],
+                session_id="session-after-compress",
+                supports_prompt_cache_key=True,
+            )["prompt_cache_key"]
+
+        before_compress = key("volatile before compression")
+        first_after_compress = key("rebuilt volatile suffix")
+
+        assert first_after_compress == before_compress
+
     def test_profile_capability_emits_content_key_in_nonstream_request_body(self, transport):
         from providers.base import ProviderProfile
 
@@ -908,6 +981,36 @@ class TestPromptCacheKeyCapability:
 
         assert "prompt_cache_key" not in kwargs
         assert "prompt_cache_key" not in body
+
+    def test_named_custom_same_route_reuses_stable_prefix_key(self, transport):
+        """Short-gap main requests keep one cache bucket for a stable prefix."""
+        stable = {
+            "type": "text",
+            "text": "stable prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+
+        def key(user_text):
+            return transport.build_kwargs(
+                model="grok-4.6",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [stable, {"type": "text", "text": "volatile"}],
+                    },
+                    {"role": "user", "content": user_text},
+                ],
+                tools=self._tools(),
+                session_id="same-route-session",
+                provider_name="custom:localrouter",
+                base_url="https://localrouter.invalid/v1",
+            )["prompt_cache_key"]
+
+        first = key("first request")
+        second = key("second request")
+
+        assert first.startswith("pck_")
+        assert second == first
 
     def test_explicit_top_level_and_extra_body_overrides_are_preserved(self, transport):
         from providers.base import ProviderProfile

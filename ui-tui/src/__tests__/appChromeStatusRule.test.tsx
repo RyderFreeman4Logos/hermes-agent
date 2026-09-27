@@ -223,10 +223,7 @@ describe('StatusRule background-subagent indicator', () => {
     expect(textContent(element)).not.toContain('resumes when')
   })
 
-  it('drops the subagent segment before the bg segment on a narrow terminal', () => {
-    // cols=44 is below the subagents breakpoint (92) but the bg breakpoint
-    // (88) too — both gone. Assert the lower-priority subagent indicator is
-    // not shown when space is tight even with a live count.
+  it('retains the subagent segment on a narrow terminal', () => {
     const element = StatusRule({
       ...baseProps,
       cols: 44,
@@ -234,7 +231,7 @@ describe('StatusRule background-subagent indicator', () => {
       usage: { ...baseProps.usage, active_subagents: 2 }
     })
 
-    expect(textContent(element)).not.toContain('⛓')
+    expect(textContent(element)).toContain('⛓ 2')
   })
 })
 
@@ -266,7 +263,7 @@ describe('StatusRule session count click target', () => {
     expect(openSwitcher).toHaveBeenCalledOnce()
   })
 
-  it('keeps status + model and drops the low-value tail on a narrow terminal', () => {
+  it('keeps status, model, and the present tail when a narrow terminal reflows', () => {
     const element = StatusRule({
       bgCount: 0,
       busy: false,
@@ -297,8 +294,8 @@ describe('StatusRule session count click target', () => {
     // Must-keep essentials survive intact …
     expect(rendered).toContain('ready')
     expect(rendered).toContain('opus 4.8')
-    // … while the low-value tail (session count) is dropped, not truncated.
-    expect(rendered).not.toContain('3 sessions')
+    // The complete tail moves to another row instead of disappearing.
+    expect(rendered).toContain('3 sessions')
   })
 })
 
@@ -580,5 +577,21 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     })
 
     expect(textContent(element)).not.toContain('weekly-digest')
+  })
+
+  it('uses the legacy segment list as an ordered visibility contract', () => {
+    const rendered = textContent(
+      StatusRule({
+        ...baseProps,
+        cols: 160,
+        statusBarSegments: ['cwd', 'model']
+      })
+    )
+
+    expect(rendered).toContain('~/repo')
+    expect(rendered).toContain('opus 4.8')
+    expect(rendered.indexOf('~/repo')).toBeLessThan(rendered.indexOf('opus 4.8'))
+    expect(rendered).not.toContain('ready')
+    expect(rendered).not.toContain('50k')
   })
 })

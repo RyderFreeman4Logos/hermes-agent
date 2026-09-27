@@ -137,6 +137,8 @@ def perform_api_call(
             provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
             api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
         )
+        from agent.turn_usage import observe_response_usage
+        observe_response_usage(agent, response)
     finally:
         with _bracket:
             if _model_request_active is not None:
@@ -175,8 +177,6 @@ def handle_api_interrupt(
     """``InterruptedError`` during the provider call: a pending redirect keeps its correction
     queued for the outer-loop rebuild; otherwise keep any streamed partial text so the next
     turn has a record of the half-finished reply."""
-    from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
     # redirect() cancelled only this request: keep the correction queued, clear the
     # cancellation bit, let the outer loop rebuild. Never materialize incomplete
@@ -199,11 +199,10 @@ def handle_api_interrupt(
             "api_content": _INTERRUPTED_PLACEHOLDER,
         })
         final_response = REPETITION_LOOP_INTERRUPTED
-    elif _partial:
-        append_message(messages, {"role": "assistant", "content": _partial})
-        final_response = _partial
     else:
-        final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
+        from agent.stream_payload_bound import persist_interrupted_stream_partial
+
+        final_response = persist_interrupted_stream_partial(agent, messages, elapsed=api_elapsed)
     agent._persist_session(messages, conversation_history)
     return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
 
@@ -258,7 +257,7 @@ def nous_rate_limit_guard(
                     _nous_msg = f"Your Nous account has hit its rate limit; it resets in {reset}."
                 agent._buffer_vprint(f"⏳ {_nous_msg} Trying fallback...")
                 agent._buffer_diagnostic_status(f"⏳ {_nous_msg}")
-                if agent._try_activate_fallback():
+                if agent._try_activate_fallback(reason=FailoverReason.rate_limit):
                     active_system_prompt = _arm_fallback_restart(
                         agent, api_messages, active_system_prompt, _retry)
                     retry_count = 0

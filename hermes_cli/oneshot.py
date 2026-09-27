@@ -463,7 +463,8 @@ def _load_resume_target(session_db, resume: Optional[str]) -> tuple[Optional[str
     if not session_meta:
         raise RuntimeError(f"session not found: {resume}")
     session_db.assert_resume_safe(resolved, tip_only=True)
-    restored, _display = session_db.get_resume_conversations(resolved)
+    restored = session_db.get_messages_as_conversation(
+        resolved, repair_alternation=True, include_row_ids=True)
     history = [m for m in restored if m.get("role") != "session_meta"]
     try:
         session_db.reopen_session(resolved)

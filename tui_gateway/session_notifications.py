@@ -158,18 +158,310 @@ def _notif_log_failure(what: str, exc: BaseException) -> None:
     print(f"[tui_gateway] {what}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> None:
+def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwargs) -> bool:
     """message.start + _run_prompt_submit for a claimed (running=True) turn; releases on failure."""
     try:
         from gateway.warning_notifications import render_notification
         with _session_profile_runtime_scope(session):
             render_notification(lambda: _emit("message.start", sid), platform="tui",
                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        return _run_prompt_submit(rid, sid, session, text, **kwargs)
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
         raise
+
+
+def _mark_completion_events_consumed(events: list) -> None:
+    from tools.process_registry import process_registry
+
+    for evt in events:
+        if evt.get("type") != "completion":
+            continue
+        sid = evt.get("session_id")
+        if sid:
+            process_registry._completion_consumed.add(sid)
+
+
+def _completion_ownership_lock(session: dict):
+    """Serialize the completion-specific transitions layered onto AIAgent's steer rail."""
+    return session.setdefault("_completion_ownership_lock", threading.RLock())
+
+
+def _ingest_completion_transfer(session: dict, insert) -> bool:
+    """Render, insert, and settle one accepted structured transfer atomically."""
+    from tools.process_registry import process_registry
+
+    with _completion_ownership_lock(session):
+        if session.get("_closing") or session.get("_finalized"):
+            return False
+        transfer = list(session.get("_completion_transfer") or [])
+        if not transfer:
+            return False
+        surviving = [
+            evt for evt in transfer
+            if not process_registry.is_completion_consumed(evt.get("session_id") or "")
+        ]
+        if not surviving:
+            session["_completion_transfer"] = []
+            return False
+        text = _format_completion_batch(surviving)
+        if not text:
+            return False
+        try:
+            outcome = insert(text, surviving)
+        except TypeError:
+            # Existing core adapters expose the original one-argument callback
+            # shape.  They always mean an actual row insertion, never queue
+            # reservation; the two-argument form is only needed by the queue
+            # boundary below.
+            outcome = "inserted" if insert(text) else False
+        if not outcome:
+            return False
+        session["_completion_transfer"] = []
+        if outcome == "inserted":
+            _mark_completion_events_consumed(surviving)
+        return True
+
+
+def _bind_completion_ingest(session: dict, agent) -> None:
+    """Expose the session's short ingestion transaction to core turn consumers."""
+    if agent is not None:
+        agent._completion_steer_ingest = lambda insert: _ingest_completion_transfer(session, insert)
+
+
+def _format_completion_batch(events: list) -> str | None:
+    """Reuse official ProcessNotificationBatch text for one idle/steer ingest."""
+    from tools.process_registry import process_registry
+    from tools.process_registry_notifications import ProcessNotificationBatch, format_process_notification
+
+    notifications = []
+    for evt in events:
+        text = format_process_notification(evt)
+        if text:
+            notifications.append((evt, text))
+    if not notifications:
+        return None
+    return ProcessNotificationBatch(tuple(notifications)).render(process_registry)
+
+
+def _session_can_steer_completions(session: dict) -> bool:
+    """True when the live turn can ingest via AIAgent.steer (never a drop path)."""
+    if not session.get("running"):
+        return False
+    return callable(getattr(session.get("agent"), "steer", None))
+
+
+def _deliver_completions_via_steer(sid: str, session: dict, events: list, emitted: set) -> bool:
+    """Stage one structured completion batch for the current busy turn."""
+    if not events or not _session_can_steer_completions(session):
+        return False
+    text = _format_completion_batch(events)
+    if not text:
+        return False
+    if len(events) == 1:
+        batch_key = _notification_event_dedup_key(events[0])
+    else:
+        batch_key = ("completion-batch",) + tuple(
+            _notification_event_dedup_key(evt) for evt in events
+        )
+    if batch_key not in emitted:
+        _emit("status.update", sid, {"kind": "process", "text": text})
+        emitted.add(batch_key)
+    with _completion_ownership_lock(session):
+        if session.get("_closing") or session.get("_finalized"):
+            return False
+        # A noncompletion was observed after the current transfer.  Keep its
+        # suffix pending until that boundary gets a turn; appending here would
+        # silently coalesce C1/W/C2 into one insertion batch.
+        if session.get("_completion_transfer_barrier"):
+            return False
+        _bind_completion_ingest(session, session.get("agent"))
+        transfer = session.setdefault("_completion_transfer", [])
+        have = {evt.get("session_id") for evt in transfer}
+        for evt in events:
+            if evt.get("session_id") not in have:
+                transfer.append(dict(evt))
+    return True
+
+
+def _idle_completion_turn(
+    sid: str, session: dict, claim_evt: dict, text: str, events: list | None = None,
+) -> bool:
+    """Claim + one agent turn for a process notification (single or batch text)."""
+    from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
+
+    claim = claim_event_delivery(claim_evt, "tui-poller")
+    if claim is None:
+        _notif_release_turn(session)
+        return False
+    try:
+        receipt_kwargs = {}
+        if events and (receipt := session.get("_completion_active_receipt")) is not None:
+            receipt_kwargs["completion_receipt"] = receipt
+        accepted = _notif_submit(
+            f"__notif__{int(time.time() * 1000)}", sid, session, text,
+            "notification poller dispatch failed", **receipt_kwargs,
+        )
+    except Exception:
+        release_event_delivery(claim_evt, claim)
+        return False
+    if accepted is False:
+        release_event_delivery(claim_evt, claim)
+        return False
+    complete_event_delivery(claim_evt, claim)
+    return True
+
+
+def _deliver_completion_notifications(sid: str, session: dict, events: list, emitted: set) -> None:
+    """Start one idle completion turn; only its later core insertion settles it."""
+    if not events:
+        return
+    text = _format_completion_batch(events)
+    if not text:
+        return
+    with session["history_lock"]:
+        if session.get("running"):
+            pending = session.setdefault("_completion_pending", [])
+            session["_completion_pending"] = list(events) + list(pending)
+            return
+    if len(events) == 1:
+        batch_key = _notification_event_dedup_key(events[0])
+    else:
+        batch_key = ("completion-batch",) + tuple(
+            _notification_event_dedup_key(evt) for evt in events
+        )
+    if batch_key not in emitted:
+        _emit("status.update", sid, {"kind": "process", "text": text})
+        emitted.add(batch_key)
+    receipt = None
+    with _completion_ownership_lock(session):
+        with session["history_lock"]:
+            # Status output is deliberately outside the claim so a slow client
+            # cannot hold history.  A user may have claimed the idle turn while
+            # it was emitted; make the final check and receipt creation one
+            # transaction so that user row can never acknowledge these events.
+            if session.get("running") or session.get("_closing") or session.get("_finalized"):
+                pending = session.setdefault("_completion_pending", [])
+                session["_completion_pending"] = list(events) + list(pending)
+                return
+            session["running"] = True
+            receipt = {"events": [dict(event) for event in events], "generation": int(
+                session.get("_queued_prompt_generation", 0))}
+            session["_completion_active_receipt"] = receipt
+    if not _idle_completion_turn(sid, session, events[0], text, events):
+        with _completion_ownership_lock(session):
+            if session.get("_completion_active_receipt") is receipt:
+                session.pop("_completion_active_receipt", None)
+                with session["history_lock"]:
+                    pending = session.setdefault("_completion_pending", [])
+                    session["_completion_pending"] = list(events) + list(pending)
+
+
+def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) -> None:
+    with session["history_lock"]:
+        pending = list(session.get("_completion_pending") or [])
+        if session.get("_closing") or session.get("_finalized"):
+            return
+        running = bool(session.get("running"))
+    if not running:
+        with _completion_ownership_lock(session):
+            barrier = session.get("_completion_transfer_barrier")
+            if isinstance(barrier, dict) and barrier.get("started") and not session.get("_completion_transfer"):
+                session.pop("_completion_transfer_barrier", None)
+    if pending and running:
+        if not _session_can_steer_completions(session):
+            return
+        with session["history_lock"]:
+            session["_completion_pending"] = []
+    if pending and running:
+        try:
+            staged = _deliver_completions_via_steer(sid, session, pending, emitted)
+        except Exception as exc:
+            _notif_log_failure("completion staging failed", exc)
+            staged = False
+        if not staged:
+            with session["history_lock"]:
+                session["_completion_pending"] = list(pending) + list(
+                    session.get("_completion_pending") or []
+                )
+        return
+
+    def insert(text: str, events: list) -> str | bool:
+        with session["history_lock"]:
+            if session.get("running") or session.get("_closing") or session.get("_finalized"):
+                return False
+            _enqueue_prompt(
+                session, text, session.get("transport"), structured_completion=True,
+                completion_events=events,
+            )
+            return "reserved"
+
+    if not pending:
+        if _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session):
+            return
+        if _ingest_completion_transfer(session, insert):
+            _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
+        return
+
+    # A noncompletion observed after a prior transfer is an ordering boundary,
+    # not merely a busy-turn detail.  First let the older transfer reserve its
+    # own turn; leave the later pending suffix with P until the boundary route
+    # has actually started.  This prevents C1/W/C2 from becoming C1+C2/W when
+    # the session becomes idle between poller snapshots.
+    with _completion_ownership_lock(session):
+        barrier = session.get("_completion_transfer_barrier")
+        transfer_waiting_for_barrier = isinstance(barrier, dict) and not barrier.get("started")
+    if transfer_waiting_for_barrier:
+        if _ingest_completion_transfer(session, insert):
+            _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
+        return
+
+    pending_only = False
+    with _completion_ownership_lock(session):
+        with session["history_lock"]:
+            if session.get("running") or session.get("_closing") or session.get("_finalized"):
+                return
+            pending = list(session.get("_completion_pending") or [])
+            if not pending:
+                return
+            transfer = list(session.get("_completion_transfer") or [])
+            session["_completion_pending"] = []
+            if not transfer:
+                pending_only = True
+            else:
+                have = {evt.get("session_id") for evt in transfer}
+                for evt in pending:
+                    event_id = evt.get("session_id")
+                    if event_id not in have:
+                        transfer.append(dict(evt))
+                        have.add(event_id)
+                session["_completion_transfer"] = transfer
+        # The user drain has priority only over work it atomically observed.
+        # Keep detached pending events in their authoritative owner until that
+        # decision is complete; an early return must never abandon them.
+        if _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session):
+            if pending_only:
+                with session["history_lock"]:
+                    session["_completion_pending"] = list(pending) + list(
+                        session.get("_completion_pending") or [])
+            return
+        inserted = not pending_only and _ingest_completion_transfer(session, insert)
+
+    if pending_only:
+        _deliver_completion_notifications(sid, session, pending, emitted)
+        return
+
+    text = _format_completion_batch(pending)
+    if text:
+        batch_key = (("completion-batch",) + tuple(
+            _notification_event_dedup_key(evt) for evt in pending
+        ) if len(pending) > 1 else _notification_event_dedup_key(pending[0]))
+        if batch_key not in emitted:
+            _emit("status.update", sid, {"kind": "process", "text": text})
+            emitted.add(batch_key)
+    if inserted:
+        _drain_queued_prompt(f"__notif__{int(time.time() * 1000)}", sid, session)
 
 
 def _notif_loop_status(sid: str, text: str) -> None:
@@ -456,7 +748,7 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
                       **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
 
 
-def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
+def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool:
     """Run the claimed (running=True) agent turn for one notification event."""
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
     try:
@@ -469,18 +761,22 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None
         # the target. No turn will run, and nothing else clears ``running``: a busy session is exempt
         # from the reaper, keeps its lease, and never reaches its bot mailbox again.
         _notif_release_turn(session)
-        return
+        return False
     kwargs = ({"display_kind": "async_delegation_complete", "display_metadata": _async_delegation_display_metadata(evt)}
               if evt.get("type") == "async_delegation" else {})
     from agent.notification_presentation import diagnostic_process_event
     if diagnostic_process_event(evt):
         kwargs.setdefault("display_metadata", {})["notification_category"] = "diagnostic"
     try:
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
+        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text, "notification poller dispatch failed", **kwargs)
     except Exception:
         release_event_delivery(evt, claim)
-        return
+        return False
+    if accepted is False:
+        release_event_delivery(evt, claim)
+        return False
     complete_event_delivery(evt, claim)
+    return True
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
@@ -511,6 +807,17 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
+    if evt_type == "completion":
+        with session["history_lock"]:
+            if deferred is None:
+                # Live poller: buffer off the shared queue; flush coalesces.
+                session.setdefault("_completion_pending", []).append(evt)
+                return True
+            if session.get("running"):
+                # Official drain (post-turn/shutdown deferred=[]) while busy:
+                # requeue, do not emit. Post-turn has no leftover pending drain.
+                deferred.append(evt)
+                return True
     text = fmt(evt)
     if not text:
         return True
@@ -529,13 +836,22 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
         return True
+    if evt_type != "completion" and deferred is None:
+        with _completion_ownership_lock(session):
+            if session.get("_completion_transfer"):
+                session["_completion_transfer_barrier"] = dict(evt)
     if not _notif_claim_turn(session):
         queue.put(evt)
         if deferred is not None:
             return False
         time.sleep(0.25)  # back off: the re-queued event keeps the queue non-empty, else this loop spins at 100% CPU
         return True
-    _notif_dispatch_event(sid, session, evt, text)
+    dispatched = _notif_dispatch_event(sid, session, evt, text)
+    if dispatched:
+        with _completion_ownership_lock(session):
+            barrier = session.get("_completion_transfer_barrier")
+            if isinstance(barrier, dict) and barrier.get("session_id") == evt.get("session_id"):
+                barrier["started"] = True
     return True
 
 
@@ -566,12 +882,16 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         return
     if text is None:
         _notif_release_turn(session)
+        return
     try:
-        if text is not None:
-            _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
-                          "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
-                          display_metadata={"display_text": batch.display_text(registry)})
+        accepted = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, text,
+                                 "completion batch dispatch failed", display_kind=PROCESS_COMPLETE_DISPLAY_KIND,
+                                 display_metadata={"display_text": batch.display_text(registry)})
     except Exception:
+        for event, _text, claim in claimed:
+            release_event_delivery(event, claim)
+        return
+    if accepted is False:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
         return
@@ -586,6 +906,8 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
         if event.get("type", "completion") != "completion":
             _notif_dispatch_completions(sid, session, completions, registry, deferred)
             completions = []
+            if deferred is None:
+                _flush_pending_completions_if_idle(sid, session, emitted)
         if not _notif_handle_event(sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned):
             for remaining in events[index + 1:]:
                 (deferred.append if deferred is not None else registry.completion_queue.put)(remaining)
@@ -714,9 +1036,22 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
             last_kanban_poll = now
             _notif_poll_kanban(sid, session)
+        with session["history_lock"]:
+            pending = list(session.get("_completion_pending") or [])
+        has_completion_owner = pending or session.get("_completion_transfer")
+        timeout = 0.5
+        if has_completion_owner:
+            timeout = 0.1
+            _active = getattr(session.get("agent"), "_model_request_active", None)
+            if _session_can_steer_completions(session) and _active is not None and getattr(
+                    _active, "is_set", lambda: False)():
+                timeout = 2.0
         try:
-            evt = queue.get(timeout=0.5)
+            evt = queue.get(timeout=timeout)
         except Exception:
+            if stop_event.is_set() or session.get("_finalized"):
+                break
+            _flush_pending_completions_if_idle(sid, session, emitted)
             continue
         ready = [evt]
         for _ in range(queue.qsize()):
@@ -730,6 +1065,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
             # This thread is the session's only path to notifications, /loop, /heartbeat and its
             # bot mailbox; one bad event must not end all four.
             _notif_log_failure("notification dispatch failed", exc)
+        _flush_pending_completions_if_idle(sid, session, emitted)
     # Drain remaining events after the stop signal so nothing is lost on shutdown; foreign and orphaned-delegation
     # events are handed back to the shared queue afterwards.
     deferred: list = []
@@ -740,6 +1076,24 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         except Exception:
             break
     handle(ready, deferred)
+    _flush_pending_completions_if_idle(sid, session, emitted)
+    # A live poller stop retains the accepted transfer on its session. A dying
+    # session atomically kills that authority before returning exact events.
+    with _completion_ownership_lock(session):
+        dying = bool(session.get("_finalized") or session.get("_closing"))
+        with session["history_lock"]:
+            if dying:
+                _reclaim_queued_completion_receipts(session)
+            pending = list(session.get("_completion_pending") or [])
+            session["_completion_pending"] = []
+        transfer = list(session.get("_completion_transfer") or []) if dying else []
+        if dying:
+            session["_completion_transfer"] = []
+    for evt in transfer + pending:
+        if evt.get("type") == "completion" and process_registry.is_completion_consumed(
+                evt.get("session_id") or ""):
+            continue
+        queue.put(evt)
     for evt in deferred:
         queue.put(evt)
 

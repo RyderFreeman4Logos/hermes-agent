@@ -76,6 +76,11 @@ class _NonStreamRequest:
             self.result["response"] = h._dispatch_nonstreaming_api_request(
                 self.agent, self.api_kwargs, make_client=self._make_client)
         except Exception as e:
+            from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+            if isinstance(e, StreamPayloadBoundExceeded):
+                self.result["error"] = e
+                return
             # Our own force-close caused this error: swallow it, the main
             # thread raises InterruptedError (#6600). Retirement logs at info
             # (a watchdog discarded output the provider already sent — what an
@@ -226,6 +231,10 @@ class _NonStreamRequest:
 
     def _interrupt(self, elapsed: float) -> None:
         agent = self.agent
+        from agent.stream_payload_bound import StreamPayloadBoundExceeded
+
+        if isinstance(self.result.get("error"), StreamPayloadBoundExceeded):
+            raise self.result["error"]
         last_event_ts, _, _ = self._codex_watchdog_snapshot()
         h._record_interrupted_provider_wait(agent, elapsed,
             response_started=self.wd.codex and last_event_ts is not None

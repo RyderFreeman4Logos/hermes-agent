@@ -18,6 +18,7 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _FTS_CJK_TRIGGERS,
     escape_like as _escape_like, fts_rebuild_admission, fts_trigram_session_sql, routed_sessions_setting,
 )
+from hermes_state_errors import is_transient_sqlite_error
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -339,8 +340,7 @@ class SessionSearchMixin:
         try:
             more = self._execute_write(_do)
         except sqlite3.OperationalError as exc:
-            logger.debug(fail_msg, exc)
-            return True  # transient (lock contention) — caller retries
+            return self._fts_chunk_error(exc, fail_msg)
         if more is False:
             status = self._rebuild_status(prefix)
             if (finish_when_empty and high_water <= 0) or (
@@ -349,6 +349,14 @@ class SessionSearchMixin:
                 finish()
             return False
         return bool(more)
+
+    def _fts_chunk_error(self, exc: sqlite3.OperationalError, fail_msg: str) -> bool:
+        """True only for lock/busy (the driver bounds those). Anything else stops the phase."""
+        if is_transient_sqlite_error(exc) and "disk i/o error" not in str(exc).lower():
+            logger.debug(fail_msg, exc)
+            return True
+        logger.warning(fail_msg, exc)
+        raise exc
 
     def _fts_teardown_trash_step(self) -> bool:
         """Tear down one chunk of a demoted v22 FTS shadow table (a PLAIN table now); True while
@@ -411,8 +419,7 @@ class SessionSearchMixin:
         try:
             return bool(self._execute_write(_do))
         except sqlite3.OperationalError as exc:
-            logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
-            return True
+            return self._fts_chunk_error(exc, "FTS trash teardown chunk failed (will retry): %s")
 
     def _fts_cjk_reset_if_stale(self) -> None:
         """From-scratch rebuild of a stale cjk index (triggers were dropped, gap extent unknown):
@@ -660,25 +667,44 @@ class SessionSearchMixin:
             progress_cb({"phase": phase, "percent": st["percent"] if st else 100,
                          "indexed": st["indexed"] if st else 0, "total": st["total"] if st else 0})
 
-        def _drive(phase: str, step) -> None:
-            """Run *step* to completion; the inter-chunk sleep is the single place the duty
-            cycle is enforced — back-to-back BEGIN IMMEDIATE chunks starve a live
-            gateway/CLI out of its lock retries."""
+        def _drive(phase: str, step) -> Optional[str]:
+            """Run *step* until it finishes or the shared write patience is exhausted.
+
+            The inter-chunk sleep is the single place the duty cycle is enforced —
+            back-to-back BEGIN IMMEDIATE chunks starve a live gateway/CLI out of its
+            lock retries. A non-lock OperationalError stops immediately; repeated
+            lock/busy retries share ``_WRITE_PATIENCE_S`` (the same monotonic budget
+            ``_execute_write`` uses for one write).
+            """
+            deadline = time.monotonic() + self._WRITE_PATIENCE_S
             while True:
                 _t0 = time.monotonic()
-                if not step():
-                    break
+                try:
+                    if not step():
+                        return None
+                except sqlite3.OperationalError:
+                    return "fts_error"
+                if time.monotonic() >= deadline:
+                    return "fts_error"
                 _emit(phase)
-                time.sleep(max(self._FTS_REBUILD_MIN_PAUSE, (time.monotonic() - _t0) * self._FTS_REBUILD_DUTY_FACTOR))
+                pause = max(
+                    self._FTS_REBUILD_MIN_PAUSE,
+                    (time.monotonic() - _t0) * self._FTS_REBUILD_DUTY_FACTOR,
+                )
+                time.sleep(min(pause, max(0.0, deadline - time.monotonic())))
 
         # Phase 1: base backfill; 1b: CJK-bigram backfill (own marker pair).
         _emit("backfill")
-        _drive("backfill", self.fts_rebuild_step)
-        _emit("backfill")
-        _drive("backfill", self.fts_cjk_rebuild_step)
-        # Phase 2: tear down the demoted legacy shadow tables in chunks.
-        _emit("teardown")
-        _drive("teardown", self._fts_teardown_trash_step)
+        for phase, step in (
+            ("backfill", self.fts_rebuild_step),
+            ("backfill", self.fts_cjk_rebuild_step),
+            ("teardown", self._fts_teardown_trash_step),
+        ):
+            reason = _drive(phase, step)
+            if reason is not None:
+                logger.warning("FTS storage optimization stopped (%s)", reason)
+                return {"ok": False, "reason": reason, "vacuumed": None}
+            _emit(phase)
         with self._read_ctx() as conn:
             still_pending = _meta_row(conn, "fts_rebuild_high_water") is not None
             still_trash = self._has_fts_trash(conn)

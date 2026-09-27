@@ -317,22 +317,28 @@ export class GatewayClient extends EventEmitter {
 
   private startReadyTimer(python: string, cwd: string) {
     this.readyTimer = setTimeout(() => {
-      if (this.ready) {
+      if (this.ready || this.disposed) {
         return
       }
 
-      // Append the most recent gateway stderr/log lines to the timeout
-      // event so users can tell apart "wrong python", "missing dep",
-      // and "config parse failure" from one glance instead of having
-      // to dig through `/logs`.  Capped to keep the activity feed
-      // readable on slow boots.
       const stderrTail = this.getLogTail(20)
+      const proc = this.proc
 
       this.lifecycle(`[startup] timed out waiting for gateway.ready (python=${python}, cwd=${cwd})`)
       this.publish({
         type: 'gateway.start_timeout',
         payload: { cwd, python, stderr_tail: stderrTail }
       })
+
+      // Spawn mode owns this child. A warning leaves it running after the
+      // parent is killed (issue #352). Attached sockets belong to another
+      // process, so this path must not signal them.
+      if (proc && this.proc === proc && proc.exitCode === null && !proc.killed) {
+        this.disposed = true
+        this.proc = null
+        proc.kill()
+        this.handleTransportExit(null, 'gateway startup timeout')
+      }
     }, STARTUP_TIMEOUT_MS)
   }
 

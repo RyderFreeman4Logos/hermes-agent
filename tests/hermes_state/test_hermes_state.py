@@ -5617,6 +5617,46 @@ class TestGetMessagesPagination:
         assert tip.value.message_count == 4
         assert tip.value.scope == "in its tip segment"
 
+    def test_resume_display_tail_is_bounded_without_truncating_tip_or_replaying_generations(self, db):
+        """A long display lineage stays a SQL-bounded UI tail while the model gets the complete tip."""
+        db.create_session(session_id="root", source="cli")
+        db.append_messages_batch("root", [
+            {"role": "user", "content": "old-0", "timestamp": 1.0},
+            {"role": "assistant", "content": "old-1", "timestamp": 2.0},
+            {"role": "user", "content": "carried", "timestamp": 3.0},
+        ])
+        db.create_session(session_id="tip", source="compression", parent_session_id="root")
+        db.append_messages_batch("tip", [
+            # Compaction copied this logical row into the tip; display must still show it once.
+            {"role": "user", "content": "carried", "timestamp": 3.0},
+            {"role": "assistant", "content": "tip-answer", "timestamp": 4.0},
+        ])
+        # A pre-display-index database must stay bounded too; resume may not backfill every segment first.
+        db._conn.execute("UPDATE messages SET display_identity = NULL, display_order = NULL")
+        db._conn.commit()
+
+        reads = []
+        original_read_all = db._read_all
+
+        def record_read(sql, params=()):
+            rows = original_read_all(sql, params)
+            reads.append((sql, len(rows)))
+            return rows
+
+        db._read_all = record_read
+        assert db.assert_resume_safe("tip", max_messages=2, tip_only=True) == 2
+        with pytest.raises(hermes_state.SessionResumeTooLargeError):
+            db.assert_resume_safe("tip", max_messages=1, tip_only=True)
+        model, display = db.get_resume_conversations("tip", max_display_messages=2)
+
+        assert [message["content"] for message in model] == ["carried", "tip-answer"]
+        assert [message["content"] for message in display] == ["carried", "tip-answer"]
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE display_identity IS NOT NULL OR display_order IS NOT NULL"
+        ).fetchone()[0] == 0
+        assert all(row_count <= 2 for _sql, row_count in reads)
+        assert any("LIMIT" in sql.upper() for sql, _row_count in reads)
+
     def test_resume_guard_counts_exactly_what_a_branch_resume_loads(self, db):
         """An explicit /branch copy owns its transcript: the guard and the
         resume readers must agree that its lineage is itself alone."""

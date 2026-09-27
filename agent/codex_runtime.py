@@ -1022,6 +1022,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # claims the sink supersedes this token; that only silences OUR live callbacks — consumption continues,
     # because stopping here handed the gateway a "completed" response missing its tail (#69486).
     writer_token = {"value": None, "raw_stream": None, "superseded_logged": False}
+    diagnostic_token = None
+
+    def _finish_diagnostic(response=None, error=None):
+        nonlocal diagnostic_token
+        if diagnostic_token is not None:
+            from agent.cache_prefix_diagnostics import finish_attempt
+            finish_attempt(diagnostic_token, response=response, error=error)
+            diagnostic_token = None
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -1076,6 +1084,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         return bool(agent._interrupt_requested)
 
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+        nonlocal diagnostic_token
         from hermes_cli.providers import is_actual_route
 
         if is_actual_route(
@@ -1087,14 +1096,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        from agent.cache_prefix_diagnostics import call_final_codex_create
-
-        return call_final_codex_create(
-            active_client.responses.create,
-            bypass_sdk_request_transform(stream_kwargs),
-            correlation=str(getattr(agent, "_current_api_request_id", "") or ""),
-            attempt=attempt,
+        from agent.cache_prefix_diagnostics import begin_attempt
+        final_kwargs = bypass_sdk_request_transform(stream_kwargs)
+        api_id = str(getattr(agent, "_current_api_request_id", "") or "")
+        ordinal_text = api_id.rsplit(":api:", 1)[-1] if ":api:" in api_id else ""
+        diagnostic_token = begin_attempt(
+            final_kwargs,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            turn_id=api_id.rsplit(":api:", 1)[0] if ordinal_text else "",
+            api_id=api_id,
+            ordinal=int(ordinal_text) if ordinal_text.isdecimal() else -1,
+            retry=attempt,
+            role=call_role,
         )
+        return active_client.responses.create(**final_kwargs)
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
@@ -1200,7 +1215,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_first_delta=_live(on_first_delta) if on_first_delta is not None else None,
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
+                _finish_diagnostic(response=final)
             except transport_errors as exc:
+                _finish_diagnostic(error=exc)
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1215,9 +1232,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             except RuntimeError:
                 # "No terminal response"; Relay may still hold a finalizer-assembled response.
                 if event_stream is not None and event_stream.final_response is not None:
+                    _finish_diagnostic(response=event_stream.final_response)
                     return event_stream.final_response
+                _finish_diagnostic(error=RuntimeError("stream did not produce a terminal response"))
                 raise
             except _APIConnectionError as exc:
+                _finish_diagnostic(error=exc)
                 # The SDK wraps every connect/receive failure (``raise APIConnectionError from err``), so the
                 # raw ``transport_errors`` branch above never sees a pre-stream failure. Before the stream
                 # opened nothing is billed, so one fresh physical request is safe (#103673); once the writer
@@ -1230,6 +1250,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     )
                     continue
                 _log_failure(exc)
+                raise
+            except BaseException as exc:
+                _finish_diagnostic(error=exc)
                 raise
             if not agent._interrupt_requested:
                 _drain_for_finalizer(event_stream)

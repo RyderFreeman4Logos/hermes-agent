@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import threading
 from types import SimpleNamespace
 
 from agent import cache_prefix_diagnostics as diagnostics
@@ -112,6 +113,87 @@ def test_real_sdk_boundary_stream_terminal_and_error(tmp_path, monkeypatch):
     assert seen and rows(tmp_path)[0]["ordinal"] == 2
     assert rows(tmp_path)[0]["usage"] == {"cache_read": 0, "uncached_input": 4}
     assert "raw sentinel" not in json.dumps(rows(tmp_path))
+
+
+def test_delayed_trailing_drain_error_is_recorded_after_iterator_error(tmp_path, monkeypatch):
+    from agent.codex_runtime import run_codex_stream
+    import httpx
+
+    enable(tmp_path, monkeypatch)
+    phases = []
+    drain_started = threading.Event()
+    drain_release = threading.Event()
+    append = diagnostics._append
+
+    def release_drain():
+        if drain_started.wait(2):
+            drain_release.set()
+
+    release_thread = threading.Thread(target=release_drain, daemon=True)
+    release_thread.start()
+
+    def record_append(row):
+        phases.append(f"diagnostic:{row['kind']}")
+        return append(row)
+
+    monkeypatch.setattr(diagnostics, "_append", record_append)
+
+    class DelayedTrailingFailure:
+        def __init__(self):
+            self._terminal = True
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._terminal:
+                self._terminal = False
+                phases.append("terminal")
+                return {
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "usage": {"input_tokens": 4, "input_tokens_details": {"cached_tokens": 0}},
+                    },
+                }
+            phases.append("drain_started")
+            drain_started.set()
+            assert drain_release.wait(2)
+            phases.append("drain_error")
+            raise httpx.ReadError("late trailing read")
+
+    class Agent:
+        provider = "openai-codex"
+        session_id = "session"
+        _current_api_request_id = "session:task:turn:api:2"
+        _interrupt_requested = False
+        _fallback_index = 0
+        model = "model"
+
+        def _is_codex_backend(self): return True
+        def _fire_stream_delta(self, text): pass
+        def _fire_reasoning_delta(self, text): pass
+        def _touch_activity(self, text): pass
+        def _client_log_context(self): return "test"
+
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return DelayedTrailingFailure()
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create), base_url="https://chatgpt.com/backend-api/codex")
+    result = run_codex_stream(Agent(), request(), client=client)
+    release_thread.join(2)
+
+    assert result is not None
+    assert result.status == "completed"
+    assert len(calls) == 1
+    assert phases == ["terminal", "drain_started", "drain_error", "diagnostic:error"]
+    row = rows(tmp_path)[0]
+    assert row["kind"] == "error"
+    assert row["usage"] == {"cache_read": None, "uncached_input": None}
+    assert "late trailing read" not in json.dumps(row)
 
 
 def test_unsafe_ancestor_output_key_and_permissions_fail_closed(tmp_path, monkeypatch):

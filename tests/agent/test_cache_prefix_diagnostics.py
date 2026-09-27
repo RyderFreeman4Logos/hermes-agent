@@ -1,79 +1,159 @@
 from __future__ import annotations
 
 import json
-import os
-import threading
+import multiprocessing
 from types import SimpleNamespace
 
 from agent import cache_prefix_diagnostics as diagnostics
 
 
-def _request():
+def request():
     return {
-        "model": "model",
+        "model": "model-secret",
         "instructions": "system secret",
-        "input": [{"role": "user", "content": "prompt secret"}],
+        "input": [{"role": "user", "content": "old secret"}, {"role": "assistant", "content": "later secret"}],
         "tools": [{"type": "function", "name": "tool secret"}],
         "prompt_cache_key": "scope secret",
     }
 
 
+def enable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(diagnostics, "_enabled", lambda: True)
+
+
+def rows(tmp_path):
+    return [json.loads(x) for x in (tmp_path / "cache" / "codex-cache-prefix.jsonl").read_text().splitlines()]
+
+
+def _process_record(home):
+    import os
+    os.environ["HERMES_HOME"] = str(home)
+    diagnostics._enabled = lambda: True
+    token = diagnostics.begin_attempt(request(), session_id="process", turn_id="turn", api_id="api", ordinal=0, retry=0)
+    diagnostics.finish_attempt(token)
+
+
 def test_disabled_does_not_create_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(diagnostics, "_enabled", lambda: False)
-    diagnostics.record_attempt_start(_request(), correlation="raw-id", attempt=0)
+    assert diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0) is None
     assert not (tmp_path / "cache").exists()
 
 
-def test_records_only_digests_lengths_and_usage(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(diagnostics, "_enabled", lambda: True)
-    token = diagnostics.record_attempt_start(_request(), correlation="raw-id", attempt=0)
-    diagnostics.record_attempt_terminal(token, SimpleNamespace(usage=SimpleNamespace(input_tokens_details=SimpleNamespace(cached_tokens=7))))
-    path = tmp_path / "cache" / "codex-cache-prefix.jsonl"
-    rows = [json.loads(line) for line in path.read_text().splitlines()]
-    assert len(rows) == 2
-    text = path.read_text()
-    for sentinel in ("system secret", "prompt secret", "tool secret", "scope secret", "raw-id"):
-        assert sentinel not in text
-    assert rows[0]["kind"] == "start"
-    assert rows[0]["segments"]["messages"]["bytes"] > 0
-    assert rows[1]["kind"] == "terminal"
-    assert rows[1]["cache_tokens"] == 7
+def test_terminal_row_is_after_consumption_and_redacted(tmp_path, monkeypatch):
+    enable(tmp_path, monkeypatch)
+    token = diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=2, retry=1, role="primary")
+    assert token is not None
+    diagnostics.finish_attempt(token, SimpleNamespace(usage=SimpleNamespace(input_tokens=10, input_tokens_details=SimpleNamespace(cached_tokens=7))))
+    data = rows(tmp_path)
+    assert len(data) == 1 and data[0]["kind"] == "terminal"
+    assert data[0]["ordinal"] == 2 and data[0]["retry"] == 1
+    assert data[0]["usage"] == {"cache_read": 7, "uncached_input": 3}
+    assert [x["key"] for x in data[0]["components"]] == ["system", "tools", "scope", "history:0", "history:1"]
+    text = (tmp_path / "cache" / "codex-cache-prefix.jsonl").read_text()
+    for secret in ("system secret", "old secret", "later secret", "tool secret", "scope secret", "model-secret"):
+        assert secret not in text
+    assert '"session":"s"' not in text and '"turn":"t"' not in text
 
 
-def test_symlink_is_refused(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(diagnostics, "_enabled", lambda: True)
-    (tmp_path / "cache").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
-    diagnostics.record_attempt_start(_request(), correlation="id", attempt=0)
-    assert not (tmp_path / "elsewhere").exists()
+def test_exception_is_one_error_row_without_exception_text(tmp_path, monkeypatch):
+    enable(tmp_path, monkeypatch)
+    token = diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+    diagnostics.finish_attempt(token, error=ValueError("sentinel exception"))
+    row = rows(tmp_path)[0]
+    assert row["kind"] == "error" and "sentinel" not in json.dumps(row)
 
 
-def test_concurrent_records_are_complete_json_lines(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(diagnostics, "_enabled", lambda: True)
-    threads = [threading.Thread(target=diagnostics.record_attempt_start, args=(_request(),), kwargs={"correlation": str(i), "attempt": i}) for i in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    path = tmp_path / "cache" / "codex-cache-prefix.jsonl"
-    assert len(path.read_text().splitlines()) == 8
-    for line in path.read_text().splitlines():
-        json.loads(line)
+def test_usage_zero_and_unknown_are_distinct(tmp_path, monkeypatch):
+    enable(tmp_path, monkeypatch)
+    for usage in (SimpleNamespace(input_tokens=0, input_tokens_details=SimpleNamespace(cached_tokens=0)), None):
+        token = diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+        diagnostics.finish_attempt(token, SimpleNamespace(usage=usage))
+    assert rows(tmp_path)[0]["usage"] == {"cache_read": 0, "uncached_input": 0}
+    assert rows(tmp_path)[1]["usage"] == {"cache_read": None, "uncached_input": None}
 
 
-def test_real_final_kwargs_boundary(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(diagnostics, "_enabled", lambda: True)
-    seen = {}
-    request = _request()
+def test_component_change_changes_only_component_digest(tmp_path, monkeypatch):
+    enable(tmp_path, monkeypatch)
+    a = request(); b = request(); b["tools"][0]["name"] = "changed"
+    for req in (a, b):
+        token = diagnostics.begin_attempt(req, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+        diagnostics.finish_attempt(token)
+    first, second = rows(tmp_path)
+    assert first["components"][1]["hmac"] != second["components"][1]["hmac"]
+    assert first["components"][0] == second["components"][0]
 
+
+def test_real_sdk_boundary_stream_terminal_and_error(tmp_path, monkeypatch):
+    from agent.codex_runtime import run_codex_stream
+    enable(tmp_path, monkeypatch)
+    seen = []
+    class Agent:
+        provider = "openai-codex"
+        session_id = "session raw sentinel"
+        _current_api_request_id = "session raw sentinel:task:turn raw sentinel:api:2"
+        _interrupt_requested = False
+        _fallback_index = 0
+        model = "model"
+        def _is_codex_backend(self): return True
+        def _fire_stream_delta(self, text): pass
+        def _fire_reasoning_delta(self, text): pass
+        def _touch_activity(self, text): pass
+    agent = Agent()
     def create(**kwargs):
-        seen.update(kwargs)
-        return object()
+        seen.append(kwargs)
+        assert len(rows(tmp_path)) == 0 if (tmp_path / "cache" / "codex-cache-prefix.jsonl").exists() else True
+        return iter([{"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 4, "input_tokens_details": {"cached_tokens": 0}}}}])
+    client = SimpleNamespace(responses=SimpleNamespace(create=create), base_url="https://chatgpt.com/backend-api/codex")
+    result = run_codex_stream(agent, request(), client=client)
+    assert result.status == "completed"
+    assert seen and rows(tmp_path)[0]["ordinal"] == 2
+    assert rows(tmp_path)[0]["usage"] == {"cache_read": 0, "uncached_input": 4}
+    assert "raw sentinel" not in json.dumps(rows(tmp_path))
 
-    diagnostics.call_final_codex_create(create, request, correlation="id", attempt=1)
-    assert seen == request
-    assert "input" not in (tmp_path / "cache" / "codex-cache-prefix.jsonl").read_text()
+
+def test_unsafe_ancestor_output_key_and_permissions_fail_closed(tmp_path, monkeypatch):
+    enable(tmp_path, monkeypatch)
+    parent = tmp_path / "link"
+    parent.symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(parent))
+    assert diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0) is None
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    directory = tmp_path / "cache"
+    directory.mkdir(mode=0o700)
+    key = directory / "codex-cache-prefix.key"
+    key.symlink_to(tmp_path / "victim")
+    assert diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0) is None
+    key.unlink()
+    token = diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+    output = directory / "codex-cache-prefix.jsonl"
+    output.symlink_to(tmp_path / "victim")
+    diagnostics.finish_attempt(token)
+    assert not (tmp_path / "victim").exists()
+    output.unlink()
+    key.chmod(0o644)
+    assert diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0) is None
+
+
+def test_file_sequence_and_rotation_continue(tmp_path, monkeypatch):
+    enable(tmp_path, monkeypatch)
+    monkeypatch.setattr(diagnostics, "_MAX_BYTES", 1700)
+    for number in range(5):
+        token = diagnostics.begin_attempt(request(), session_id="session", turn_id=f"turn-{number}", api_id=f"api-{number}", ordinal=number, retry=0)
+        diagnostics.finish_attempt(token)
+    directory = tmp_path / "cache"
+    older = [json.loads(line) for line in (directory / "codex-cache-prefix.jsonl.1").read_text().splitlines()]
+    latest = rows(tmp_path)
+    assert [r["sequence"] for r in older + latest] == sorted(r["sequence"] for r in older + latest)
+    assert latest[-1]["sequence"] == 4
+
+
+def test_multiprocess_append_is_lossless(tmp_path, monkeypatch):
+    enable(tmp_path, monkeypatch)
+    context = multiprocessing.get_context("fork")
+    processes = [context.Process(target=_process_record, args=(tmp_path,)) for _ in range(4)]
+    for process in processes: process.start()
+    for process in processes: process.join()
+    assert all(process.exitcode == 0 for process in processes)
+    assert len(rows(tmp_path)) == 4

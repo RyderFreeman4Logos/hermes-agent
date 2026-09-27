@@ -37,7 +37,6 @@ class _PhysicalDiagnosticContext:
     scope: dict[str, str] | None = None
     latest_event: Any = None
     ordinals: list[int] = field(default_factory=list)
-    requests: list[dict[str, Any]] = field(default_factory=list)
 
 
 _PHYSICAL_DIAGNOSTICS: contextvars.ContextVar[_PhysicalDiagnosticContext | None] = (
@@ -90,7 +89,6 @@ def _record_attempt(
     context = _PHYSICAL_DIAGNOSTICS.get()
     if context is not None:
         context.ordinals.append(physical_send_ordinal)
-        context.requests.append(dict(request))
     return None
 
 

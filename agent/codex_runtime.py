@@ -1087,7 +1087,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        from agent.cache_prefix_diagnostics import call_final_codex_create
+
+        return call_final_codex_create(
+            active_client.responses.create,
+            bypass_sdk_request_transform(stream_kwargs),
+            correlation=str(getattr(agent, "_current_api_request_id", "") or ""),
+            attempt=attempt,
+        )
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)

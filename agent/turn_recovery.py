@@ -404,9 +404,13 @@ def _refresh_credentials_after_401(
         agent.api_mode == "codex_responses"
         and agent.provider in {"openai-codex", "xai-oauth"}
         and (status_code == 401 or xai_bad_403)
-        and not _retry.codex_auth_retry_attempted
+        and not (
+            getattr(agent, "_codex_auth_retry_attempted", False)
+            or _retry.codex_auth_retry_attempted
+        )
     ):
         _retry.codex_auth_retry_attempted = True
+        agent._codex_auth_retry_attempted = True
         if agent._try_refresh_codex_client_credentials(force=True):
             _label = "xAI OAuth" if agent.provider == "xai-oauth" else "Codex"
             agent._buffer_vprint(f"🔐 {_label} auth refreshed after {status_code}. Retrying request...")

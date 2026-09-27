@@ -15,6 +15,7 @@ from typing import Any
 _MAX_BYTES = 4 * 1024 * 1024
 _MAX_HISTORY = 64
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _key_lock = threading.Lock()
 
 
@@ -33,19 +34,55 @@ def _paths() -> tuple[Path, Path, Path, Path]:
 
 
 def _private_dir(path: Path) -> None:
-    for ancestor in (*reversed(path.parents), path):
-        if ancestor.is_symlink():
-            raise OSError("diagnostic ancestor is unsafe")
-    try:
-        mode = path.lstat().st_mode
-    except FileNotFoundError:
+    if not _NOFOLLOW:
+        raise OSError("diagnostic directory requires nofollow support")
+
+    home = Path(os.path.abspath(path.parent))
+    flags = os.O_RDONLY | _DIRECTORY | _NOFOLLOW
+    uid_getter = getattr(os, "getuid", None)
+
+    def validate(fd: int, *, private: bool) -> None:
+        info = os.fstat(fd)
+        mode = stat.S_IMODE(info.st_mode)
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError("diagnostic ancestor is not a directory")
+        if private:
+            if uid_getter is not None and info.st_uid != uid_getter():
+                raise OSError("diagnostic directory has the wrong owner")
+            if mode != 0o700:
+                raise OSError("diagnostic directory is not private")
+        elif mode & 0o022 and not (mode & stat.S_ISVTX):
+            raise OSError("diagnostic ancestor is writable")
+
+    def open_child(parent_fd: int, name: str) -> int:
         try:
-            path.mkdir(mode=0o700, parents=True, exist_ok=False)
-        except FileExistsError:
-            pass
-        mode = path.lstat().st_mode
-    if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode) or stat.S_IMODE(mode) != 0o700:
-        raise OSError("diagnostic directory is unsafe")
+            return os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            return os.open(name, flags, dir_fd=parent_fd)
+
+    # ponytail: ancestors above HERMES_HOME are only checked for symlink traversal and writeability;
+    # descriptor ownership hardening starts at the configured private root.
+    fd = os.open(os.sep, flags)
+    try:
+        parts = home.parts[1:]
+        for index, name in enumerate(parts):
+            child_fd = open_child(fd, name)
+            os.close(fd)
+            fd = child_fd
+            validate(fd, private=index == len(parts) - 1)
+        if not parts:
+            validate(fd, private=True)
+        child_fd = open_child(fd, path.name)
+        try:
+            validate(child_fd, private=True)
+        finally:
+            os.close(child_fd)
+    finally:
+        os.close(fd)
 
 
 def _key(directory: Path) -> bytes:
@@ -108,7 +145,7 @@ def _components(request: dict[str, Any], key: bytes) -> list[dict[str, Any]]:
     for index, item in enumerate(history[:_MAX_HISTORY]):
         result.append(_component(key, f"history:{index}", item))
     if len(history) > _MAX_HISTORY:
-        result.append(_component(key, "history:overflow", len(history) - _MAX_HISTORY))
+        result.append(_component(key, "history:overflow", history[_MAX_HISTORY:]))
     return result
 
 

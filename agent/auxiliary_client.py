@@ -2777,13 +2777,13 @@ def reset_runtime_main(token: contextvars.Token) -> None:
 @contextlib.contextmanager
 def scoped_runtime_main(main_runtime: Optional[Dict[str, Any]]):
     """Temporarily bind an explicit runtime without touching legacy mirrors."""
-    # Partial snapshots (e.g. _current_main_runtime) omit session identity.
+    # Partial snapshots (e.g. _current_main_runtime) omit requested-provider/session identity.
     # Inherit only omitted fields; {} isolates, and explicit ""/override win.
     if isinstance(main_runtime, dict) and main_runtime:
         current = _RUNTIME_MAIN_CONTEXT.get()
         if isinstance(current, dict):
             merged = dict(main_runtime)
-            for field in ("session_id", "cache_scope"):
+            for field in ("requested_provider", "session_id", "cache_scope"):
                 if field not in main_runtime:
                     inherited = current.get(field)
                     if isinstance(inherited, str) and inherited.strip():

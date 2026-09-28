@@ -993,6 +993,94 @@ class TestConfiguredAuxiliarySessionId:
 
         assert kwargs["extra_headers"]["session_id"] == "root-session"
 
+    def test_production_snapshot_uses_requested_provider_over_real_transport(self, tmp_path, monkeypatch):
+        """The production-shaped snapshot must retain named-custom session opt-in on the wire."""
+        import http.server
+        import threading
+        import hermes_yaml as yaml
+        import agent.auxiliary_client as aux
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            seen = []
+
+            def do_POST(self):
+                type(self).seen.append({key.lower(): value for key, value in self.headers.items()})
+                length = int(self.headers.get("content-length", "0"))
+                self.rfile.read(length)
+                body = json.dumps({
+                    "choices": [{"message": {"content": "ok"}}],
+                    "model": "gpt-5.6-luna",
+                }).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump({
+            "providers": {
+                "pm": {
+                    "name": "PhotonMark",
+                    "api": base_url,
+                    "api_key": "pm-config-key",
+                    "send_session_id": True,
+                },
+                "off": {
+                    "name": "OptOut",
+                    "api": base_url,
+                    "api_key": "off-config-key",
+                    "send_session_id": False,
+                },
+            },
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        production_snapshot = {
+            "model": "gpt-5.6-luna",
+            "provider": "custom",
+            "base_url": base_url,
+            "api_key": "loopback-key",
+            "api_mode": "chat_completions",
+        }
+        isolated_snapshot = dict(production_snapshot, requested_provider="", session_id="", cache_scope="")
+        token = aux.set_runtime_main(
+            "custom", "gpt-5.6-luna", requested_provider="pm",
+            session_id="physical-session", cache_scope="root-session",
+        )
+        try:
+            def _call(provider, runtime=production_snapshot):
+                aux.call_llm(
+                    task="compression", provider=provider, model="gpt-5.6-luna",
+                    base_url=base_url, api_key="loopback-key", api_mode="chat_completions",
+                    main_runtime=runtime, messages=[{"role": "user", "content": "summarize"}], timeout=10,
+                )
+                return _Handler.seen[-1]
+
+            resolved_custom = _call("custom")
+            named_custom = _call("pm")
+            standard = _call("openai", isolated_snapshot)
+            default_off = _call("off", isolated_snapshot)
+        finally:
+            aux.reset_runtime_main(token)
+            aux.shutdown_cached_clients()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert len(_Handler.seen) == 4
+        assert resolved_custom.get("session_id") == "root-session"
+        assert named_custom.get("session_id") == "root-session"
+        assert "session_id" not in standard
+        assert "session_id" not in default_off
+
     def test_resolved_custom_default_off_sends_no_session_id(self, tmp_path, monkeypatch):
         import hermes_yaml as yaml
         import agent.auxiliary_client as aux

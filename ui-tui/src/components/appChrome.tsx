@@ -796,7 +796,7 @@ export function StatusRule({
     }
 
     const configured = configuredStatusBarSegments === null ? null : new Set(configuredStatusBarSegments)
-    const legacy = (name: string) => configured === null || configured.has(name)
+    const visible = (name: string, modernName = name) => (configured === null ? ok(modernName) : configured.has(name))
 
     const contextTokens = usage.context_max
       ? `${contextMark}${compactNumber(usage.context_used ?? 0)} tok`
@@ -806,7 +806,9 @@ export function StatusRule({
 
     const contextBar = usage.context_max ? `[${ctxBar(pct)}]` : ''
     const contextPercent = pct == null ? '' : `${contextMark}${pct}%`
-    const narrowRightLabel = sessionTitle && ok('title') ? ` ${sessionTitle} ` : cwdLabel
+
+    const narrowRightLabel =
+      sessionTitle && (configured !== null || ok('title')) ? ` ${sessionTitle} ` : visible('cwd') ? cwdLabel : ''
 
     const customSessionCountNode = onSessionCountClick ? (
       <Box flexShrink={0} onClick={handleSessionCountClick}>
@@ -824,11 +826,11 @@ export function StatusRule({
 
     const available: Record<string, StatusRenderItem | null> = {
       battery:
-        legacy('battery') && showBattery
+        visible('battery') && showBattery
           ? item('battery', <Text color={batteryColorVal}>{batteryText}</Text>, batteryText)
           : null,
       indicator:
-        legacy('indicator') && (busy || showNotice || status)
+        visible('indicator') && (busy || showNotice || status)
           ? item(
               'indicator',
               busy ? (
@@ -849,22 +851,22 @@ export function StatusRule({
             )
           : null,
       model:
-        legacy('model') && modelText ? item('model', <Text color={t.color.muted}>{modelText}</Text>, modelText) : null,
+        visible('model') && modelText ? item('model', <Text color={t.color.muted}>{modelText}</Text>, modelText) : null,
       context_tokens:
-        legacy('context_tokens') && contextTokens && (configured !== null || ok('context_detail') || ok('context_pct'))
+        (visible('context_tokens', 'context_detail') || (configured === null && ok('context_pct'))) && contextTokens
           ? item('context_tokens', <Text color={t.color.muted}>{contextTokens}</Text>, contextTokens)
           : null,
       context_bar:
-        legacy('context_bar') && contextBar && (configured !== null || ok('context_pct'))
+        visible('context_bar', 'context_pct') && contextBar
           ? item('context_bar', <Text color={barColor}>{contextBar}</Text>, contextBar)
           : null,
       context_percent:
-        legacy('context_percent') && contextPercent && (configured !== null || ok('context_pct'))
+        visible('context_percent', 'context_pct') && contextPercent
           ? item('context_percent', <Text color={barColor}>{contextPercent}</Text>, contextPercent)
           : null,
-      focus: legacy('focus') && showFocus ? item('focus', <Text color={t.color.warn}>◉ focus</Text>, '◉ focus') : null,
+      focus: visible('focus') && showFocus ? item('focus', <Text color={t.color.warn}>◉ focus</Text>, '◉ focus') : null,
       session_duration:
-        legacy('session_duration') && ok('duration') && sessionStartedAt
+        visible('session_duration', 'duration') && sessionStartedAt
           ? {
               id: 'session_duration',
               node: (
@@ -876,7 +878,7 @@ export function StatusRule({
             }
           : null,
       idle:
-        legacy('idle') && !busy && lastTurnEndedAt != null
+        visible('idle', 'idle_since') && !busy && lastTurnEndedAt != null
           ? {
               id: 'idle',
               node: (
@@ -888,7 +890,7 @@ export function StatusRule({
             }
           : null,
       compressions:
-        legacy('compressions') && ok('compressions') && compressions > 0
+        visible('compressions') && compressions > 0
           ? item(
               'compressions',
               <Text color={compressions >= 10 ? t.color.error : compressions >= 5 ? t.color.warn : t.color.muted}>
@@ -910,38 +912,37 @@ export function StatusRule({
           ? item('tps', <Text color={t.color.muted}>{tpsText}</Text>, tpsText)
           : null,
       voice:
-        legacy('voice') && ok('voice') && voiceLabel
+        visible('voice') && voiceLabel
           ? item('voice', <Text color={t.color.muted}>{voiceLabel}</Text>, voiceLabel)
           : null,
       sessions:
-        legacy('sessions') && sessionCountText ? item('sessions', customSessionCountNode, sessionCountText) : null,
+        visible('sessions') && sessionCountText ? item('sessions', customSessionCountNode, sessionCountText) : null,
       bg_tasks:
-        legacy('bg_tasks') && ok('bg_tasks') && bgCount > 0
+        visible('bg_tasks') && bgCount > 0
           ? item('bg_tasks', <Text color={t.color.muted}>{bgCount} bg</Text>, `${bgCount} bg`)
           : null,
       subagents:
-        legacy('subagents') && ok('bg_subagents') && subagentCount > 0
+        visible('subagents', 'bg_subagents') && subagentCount > 0
           ? item('subagents', <Text color={t.color.muted}>⛓ {subagentCount}</Text>, `⛓ ${subagentCount}`)
           : null,
       resume:
-        legacy('resume') && !busy && subagentCount > 0
+        visible('resume') && !busy && subagentCount > 0
           ? item('resume', <Text color={t.color.muted}>{resumeHintText}</Text>, resumeHintText)
           : null,
       dev_credits:
-        legacy('dev_credits') && devCreditsText
+        visible('dev_credits') && devCreditsText
           ? item('dev_credits', <Text color={t.color.accent}>{devCreditsText}</Text>, devCreditsText)
           : null,
-      cwd:
-        legacy('cwd') && narrowRightLabel
-          ? item(
-              'cwd',
-              <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
-                {narrowRightLabel}
-              </Text>,
-              narrowRightLabel
-            )
-          : null,
-      spawn_hud: legacy('spawn_hud')
+      cwd: narrowRightLabel
+        ? item(
+            'cwd',
+            <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
+              {narrowRightLabel}
+            </Text>,
+            narrowRightLabel
+          )
+        : null,
+      spawn_hud: visible('spawn_hud')
         ? {
             id: 'spawn_hud',
             node: null,

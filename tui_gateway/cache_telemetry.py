@@ -13,6 +13,8 @@ from .method_ctx import bind_module
 
 def _attach_tui_cache_callback(agent, sid: str):
     """Publish the first provider cache response for each TUI wake."""
+    from agent.usage_pricing import format_cache_hit_pct
+
     agent._tui_cache_owner_session = sid
 
     def emit_cache_state(
@@ -24,7 +26,7 @@ def _attach_tui_cache_callback(agent, sid: str):
             return
         agent._tui_first_provider_response_recorded = True
         text = (
-            f"cache {pct}%"
+            f"cache {format_cache_hit_pct(_read, _prompt)}%"
             if state == "hit"
             else "cache unavailable"
             if state == "no_field"

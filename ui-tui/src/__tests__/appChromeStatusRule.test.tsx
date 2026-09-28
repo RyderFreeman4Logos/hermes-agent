@@ -442,6 +442,16 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     expect(rendered).toContain('↑ 50 t/s')
   })
 
+  it('renders a positive cache-hit ratio rounded to zero as <1%', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 160,
+      usage: { ...perfUsage, cache_hit_pct: 0 }
+    })
+
+    expect(textContent(element)).toContain('◎ <1%')
+  })
+
   it('self-hides when the server omits the keys', () => {
     const element = StatusRule({ ...baseProps, cols: 160 })
     const rendered = textContent(element)

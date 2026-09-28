@@ -6728,7 +6728,12 @@ def _configured_auxiliary_session_id(provider: str) -> str:
     try:
         from hermes_cli.runtime_provider import _get_named_custom_provider
 
-        entry = _get_named_custom_provider(str(provider or "").strip())
+        name = str(provider or "").strip()
+        # Resolved wire provider is the billing class "custom"; the configured
+        # entry key is the requested name (custom:pm, pm, ...).
+        if name.lower() == "custom":
+            name = str(_runtime_main_value("requested_provider") or "").strip() or name
+        entry = _get_named_custom_provider(name)
     except Exception:
         return ""
     if not isinstance(entry, dict) or entry.get("send_session_id") is not True:

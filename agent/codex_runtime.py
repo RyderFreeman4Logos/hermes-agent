@@ -149,9 +149,11 @@ def _queue_token_counts(agent, fail_msg: str, *fail_extra: Any, counts: Callable
 def _canonical_codex_app_server_usage(raw: dict):
     from agent.usage_pricing import CanonicalUsage, _cache_evidence
 
+    # inputTokens includes cachedInputTokens. CanonicalUsage.prompt_tokens adds
+    # cache_read back, so the input bucket is the uncached remainder.
     cache_read_tokens, cache_valid = _cache_evidence(raw, ("cachedInputTokens",))
     return CanonicalUsage(
-        input_tokens=_coerce_usage_int(raw.get("inputTokens")),
+        input_tokens=max(0, _coerce_usage_int(raw.get("inputTokens")) - cache_read_tokens),
         output_tokens=_coerce_usage_int(raw.get("outputTokens")),
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=0,

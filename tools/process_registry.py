@@ -2035,6 +2035,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "Reconciled session %s: direct child exited with code %s; "
                 "reader will publish the owned completion after its final drain.",
                 session.id, rc)
+            self._move_to_finished(session)
             return
         # Best-effort non-blocking drain of whatever the reader hasn't consumed.
         stdout = getattr(proc, "stdout", None)
@@ -2122,7 +2123,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Block until the process exits, the timeout elapses, the user interrupts, or a
         mid-turn user message (steer/redirect → ``request_yield``) releases the wait.
         ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
-        with status exited|timeout|interrupted|not_found|error and an output snapshot."""
+        with status exited|running|timeout|interrupted|not_found|error and an output
+        snapshot. A running notified session returns immediately; its completion is
+        delivered through the existing notification queue. A mid-turn steer/redirect
+        (``request_yield``) still releases a blocking wait."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
 
         try:
@@ -2141,6 +2145,26 @@ class ProcessRegistry(ProcessCheckpointMixin):
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
+        self._reconcile_local_exit(session)  # orphaned-pipe reader guard
+        if session.notify_on_complete and not session.exited:
+            from agent.delegation_context import is_delegated_child_context
+
+            # A native child has no parent notification drain. Deferring its
+            # wait leaves the child looping on wait_deferred until interrupt.
+            if not is_delegated_child_context():
+                return {
+                    "status": "running",
+                    "session_id": session.id,
+                    "command": session.command,
+                    "process_running": True,
+                    "wait_deferred": True,
+                    "notify_on_complete": True,
+                    "note": (
+                        "process.wait was auto-backgrounded because notify_on_complete "
+                        "is set; continue other work and you will be notified exactly "
+                        "once when the process exits."
+                    ),
+                }
         deadline = time.monotonic() + effective_timeout
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
@@ -2615,8 +2639,9 @@ PROCESS_SCHEMA = {
         "terminal(background=true)). "
         "Completed results remain retrievable by session_id when resuming their owning conversation "
         "(up to 7 days, newest 64 results per profile; rolling output tail). "
-        "poll: status + new output. log: full output, paged. wait: block "
-        "until exit or timeout (partial output on timeout). write vs "
+        "poll: status + new output. log: full output, paged. wait: return "
+        "immediately for notify_on_complete targets; otherwise block until "
+        "exit or timeout (partial output on timeout). write vs "
         "submit: submit appends Enter — use it to answer prompts; write "
         "sends raw bytes, no newline. close: EOF stdin. kill: terminate. "
         "handoff (subagents only): transfer a running process you started to your parent agent, which then "
@@ -2640,7 +2665,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait'.",
+                "description": "Max seconds for 'wait' when the target is not already configured for completion notification.",
                 "minimum": 1
             },
             "offset": {

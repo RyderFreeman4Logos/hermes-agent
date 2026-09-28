@@ -40,15 +40,13 @@ def test_list_leaves_live_reader_as_completion_owner():
 
     assert listed[0]["status"] == "exited"
     assert session._reader_finish_requested.is_set()
-    assert session.id in registry._running
-    assert registry.completion_queue.empty()
+    assert session.id in registry._finished
+    event = registry.completion_queue.get_nowait()
+    assert (event["owner_task_id"], event["output"]) == ("owner-owner", "")
 
     session.append_output("owner-output")
     registry._move_to_finished(session)
-    event = registry.completion_queue.get_nowait()
-    assert (event["owner_task_id"], event["output"]) == (
-        "owner-owner", "owner-output",
-    )
+    assert registry.completion_queue.empty()
 
 
 @pytest.mark.platforms("linux")
@@ -137,6 +135,77 @@ def _probe(root):
                 break
 
 
+@pytest.mark.platforms("linux")
+def test_notified_wait_reconciles_descendant_held_pipe(tmp_path):
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "wait-probe", str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _wait_probe(root):
+    import tools.process_registry as module
+
+    assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+    module._SYSTEMD_SCOPE_AVAILABLE = False
+    registry = module.ProcessRegistry()
+    command = f"exec {shlex.quote(sys.executable)} {shlex.quote(__file__)}"
+    session = None
+    try:
+        session = registry.spawn_local(
+            f"{command} child {shlex.quote(str(root / 'wait'))}",
+            cwd=str(root), task_id="wait-task", owner_task_id="wait-owner",
+            session_key="wait-session",
+        )
+        session.notify_on_complete = True
+        deadline = time.monotonic() + 5
+        while "wait-output" not in session.output_buffer:
+            assert time.monotonic() < deadline, "writer did not become ready"
+            time.sleep(0.01)
+        assert session.process.poll() is None
+        (root / "wait-exit").touch()
+        assert session.process.wait(timeout=5) == 0
+        assert session._reader_thread.is_alive()
+        started = time.monotonic()
+        result = registry.wait(session.id, timeout=5)
+        elapsed = time.monotonic() - started
+        print(json.dumps({"wait": result, "elapsed": elapsed,
+                          "queue": registry.completion_queue.qsize()}), flush=True)
+        assert elapsed < 2, "notified wait blocked for the descendant's pipe lifetime"
+        assert result["status"] == "exited" and result["exit_code"] == 0
+        assert "wait-output" in result["output"]
+        event = registry.completion_queue.get(timeout=2)
+        assert (event["session_id"], event["owner_task_id"], event["exit_code"]) == (
+            session.id, "wait-owner", 0)
+        assert "wait-output" in event["output"]
+        assert registry.completion_queue.empty()
+        (root / "wait-stop").touch()
+        session._reader_thread.join(timeout=5)
+        assert not session._reader_thread.is_alive()
+        assert registry.completion_queue.empty()
+        assert registry.is_completion_consumed(session.id)
+        assert "wait-output" in registry.read_log(session.id)["output"]
+        print("PASS: notified wait reconciled the exited child and published once", flush=True)
+    finally:
+        (root / "wait-stop").touch()
+        (root / "wait-exit").touch()
+        if session is not None:
+            try:
+                os.killpg(session.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            session.process.wait(timeout=5)
+            session._reader_thread.join(timeout=5)
+        while True:
+            try:
+                os.waitpid(-1, 0)
+            except ChildProcessError:
+                break
+
+
 def _child(gate):
     subprocess.Popen(
         [sys.executable, __file__, "writer", str(gate)], stdin=subprocess.DEVNULL,
@@ -154,4 +223,4 @@ def _writer(gate):
 
 
 if __name__ == "__main__":
-    {"probe": _probe, "child": _child, "writer": _writer}[sys.argv[1]](Path(sys.argv[2]))
+    {"probe": _probe, "wait-probe": _wait_probe, "child": _child, "writer": _writer}[sys.argv[1]](Path(sys.argv[2]))

@@ -955,6 +955,79 @@ class TestConfiguredAuxiliarySessionId:
             aux.reset_runtime_main(token)
 
         assert "session_id" not in (kwargs.get("extra_headers") or {})
+
+    def test_resolved_custom_uses_configured_requested_provider(self, tmp_path, monkeypatch):
+        """Resolved provider stays 'custom'; the configured entry is still requested_provider."""
+        import hermes_yaml as yaml
+        import agent.auxiliary_client as aux
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump({
+            "providers": {
+                "pm": {
+                    "name": "PhotonMark",
+                    "api": "https://codex.photonmark.com/openai/v1",
+                    "api_key": "pm-key",
+                    "send_session_id": True,
+                },
+            },
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        token = aux.set_runtime_main(
+            "custom",
+            "gpt-5.6-luna",
+            requested_provider="pm",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            kwargs = _build_call_kwargs(
+                "custom",
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "summarize"}],
+                task="compression",
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert kwargs["extra_headers"]["session_id"] == "root-session"
+
+    def test_resolved_custom_default_off_sends_no_session_id(self, tmp_path, monkeypatch):
+        import hermes_yaml as yaml
+        import agent.auxiliary_client as aux
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump({
+            "providers": {
+                "pm": {
+                    "name": "PhotonMark",
+                    "api": "https://codex.photonmark.com/openai/v1",
+                    "api_key": "pm-key",
+                },
+            },
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        token = aux.set_runtime_main(
+            "custom",
+            "gpt-5.6-luna",
+            requested_provider="pm",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            kwargs = _build_call_kwargs(
+                "custom",
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "summarize"}],
+                task="compression",
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert "session_id" not in (kwargs.get("extra_headers") or {})
+
 class TestNousTagsScoping:
     def test_tags_injected_when_provider_is_nous(self, monkeypatch):
         import agent.auxiliary_client as aux

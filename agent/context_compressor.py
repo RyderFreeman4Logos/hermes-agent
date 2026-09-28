@@ -5063,12 +5063,12 @@ Write only the summary body. Do not include any preamble or prefix."""
 
         # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
         # the assistant anchor could re-trigger its forward turn-pair push. The N-user promise
-        # (#70250) outranks the single-user budget exception, so it does not run under the split.
+        # (#70250) is a user-facing setting and must outrank the single-user budget exception,
+        # so it also runs under the split.
         # getattr: plugin engines and __new__ doubles skip __init__.
         _min_tail_users = getattr(self, "min_tail_user_messages", 1)
         if (
-            not split_oversized_turn
-            and isinstance(_min_tail_users, int)
+            isinstance(_min_tail_users, int)
             and not isinstance(_min_tail_users, bool)
             and _min_tail_users > 1
         ):

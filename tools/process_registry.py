@@ -2035,6 +2035,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "Reconciled session %s: direct child exited with code %s; "
                 "reader will publish the owned completion after its final drain.",
                 session.id, rc)
+            self._move_to_finished(session)
             return
         # Best-effort non-blocking drain of whatever the reader hasn't consumed.
         stdout = getattr(proc, "stdout", None)
@@ -2144,9 +2145,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
-        # A notified process already has an autonomous completion path. Do not
-        # hold the parent agent turn on a redundant foreground wait: yielding
-        # here lets unrelated prompts/completions arrive while this process runs.
+        self._reconcile_local_exit(session)  # orphaned-pipe reader guard
         if session.notify_on_complete and not session.exited:
             from agent.delegation_context import is_delegated_child_context
 

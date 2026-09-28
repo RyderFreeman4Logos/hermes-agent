@@ -1413,10 +1413,18 @@ class CLICommandsMixin:
             with suppress(Exception):
                 parent_prompt = (self._session_db.get_session(parent_session_id) or {}).get("system_prompt")
         try:
+            live_agent = getattr(self, "agent", None)
+            init_config = getattr(live_agent, "_session_init_model_config", None)
+            memory_provider_mode = (
+                init_config.get("memory_provider_mode") if isinstance(init_config, dict) else None
+            ) or getattr(live_agent, "_memory_provider_mode", None)
+            if memory_provider_mode not in {"authoritative", "hybrid"}:
+                memory_provider_mode = None
             self._session_db.create_session(
                 session_id=new_session_id, source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model, parent_session_id=parent_session_id, system_prompt=parent_prompt or None,
                 model_config={"max_iterations": self.max_turns, "reasoning_config": self.reasoning_config,
+                              "memory_provider_mode": memory_provider_mode,
                               "_branched_from": parent_session_id})
         except Exception as e:
             return _cp(f"  Failed to create branch session: {e}")
@@ -1885,10 +1893,13 @@ class CLICommandsMixin:
 
     def _handle_memory_command(self, cmd: str):
         """Handle /memory slash command — pending review + approval-gate toggle."""
-        from hermes_cli.write_approval_commands import handle_pending_subcommand
+        from hermes_cli.write_approval_commands import (
+            handle_pending_subcommand, load_authoritative_memory_manager,
+        )
         from tools import write_approval as wa
         args = cmd.strip().split()[1:]
-        store = getattr(self.agent, "_memory_store", None) if getattr(self, "agent", None) else None
+        live_agent = getattr(self, "agent", None)
+        store = getattr(live_agent, "_memory_store", None) if live_agent else None
         if store is None:
             # No live agent store (e.g. Desktop GUI): use a fresh on-disk store, as the gateway
             # does — same MEMORY/USER.md, same configured char limits.
@@ -1900,6 +1911,10 @@ class CLICommandsMixin:
             store = load_on_disk_store()
         out = handle_pending_subcommand(
             wa.MEMORY, args, memory_store=store,
+            memory_manager=getattr(live_agent, "_memory_manager", None) if live_agent else None,
+            memory_manager_factory=lambda: load_authoritative_memory_manager(
+                session_id=str(getattr(self, "session_id", "") or ""), platform="cli",
+            ),
             set_mode_fn=lambda enabled: self._save_write_approval("memory", enabled))
         print(out if out is not None else
               "Unknown /memory subcommand. Use: pending, approve <id>, reject <id>, approval <on|off>.")

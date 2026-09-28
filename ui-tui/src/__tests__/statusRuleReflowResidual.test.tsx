@@ -12,7 +12,7 @@ import { DEFAULT_THEME } from '../theme.js'
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 20))
 
-const renderSegments = async (segments: readonly string[]) => {
+const renderSegments = async (segments: readonly string[] | null) => {
   const stdout = new PassThrough()
   const stdin = new PassThrough()
   const stderr = new PassThrough()
@@ -35,7 +35,7 @@ const renderSegments = async (segments: readonly string[]) => {
       model="qwen"
       sessionStartedAt={null}
       status="ready"
-      statusBarSegments={[...segments]}
+      statusBarSegments={segments === null ? null : [...segments]}
       statusColor={DEFAULT_THEME.color.ok}
       t={DEFAULT_THEME}
       turnStartedAt={null}
@@ -59,6 +59,73 @@ const renderSegments = async (segments: readonly string[]) => {
     instance.cleanup()
   }
 }
+
+describe('status-rule narrow visibility', () => {
+  it('hides ready and cwd when modern fields request model only', async () => {
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+    let output = ''
+
+    Object.assign(stdout, { columns: 44, isTTY: false, rows: 24 })
+    Object.assign(stdin, { isTTY: false })
+    Object.assign(stderr, { isTTY: false })
+    stdout.on('data', chunk => {
+      output += chunk.toString()
+    })
+
+    const instance = renderSync(
+      <StatusRule
+        bgCount={0}
+        busy={false}
+        cols={44}
+        cwdLabel="~/repo"
+        liveSessionCount={0}
+        model="qwen"
+        sessionStartedAt={null}
+        status="ready"
+        statusBarFields={new Set(['model'])}
+        statusBarSegments={null}
+        statusColor={DEFAULT_THEME.color.ok}
+        t={DEFAULT_THEME}
+        turnStartedAt={null}
+        usage={{ context_max: 0, context_percent: 0, context_used: 0, total: 0 }}
+        voiceLabel=""
+      />,
+      {
+        patchConsole: false,
+        stderr: stderr as NodeJS.WriteStream,
+        stdin: stdin as NodeJS.ReadStream,
+        stdout: stdout as NodeJS.WriteStream
+      }
+    )
+
+    try {
+      await flush()
+      const rendered = stripAnsi(output)
+      expect(rendered).toContain('qwen')
+      expect(rendered).not.toContain('ready')
+      expect(rendered).not.toContain('~/repo')
+    } finally {
+      instance.unmount()
+      instance.cleanup()
+    }
+  })
+
+  it('keeps the default narrow bar when legacy segments are unset', async () => {
+    const rendered = await renderSegments(null)
+    expect(rendered).toContain('ready')
+    expect(rendered).toContain('qwen')
+    expect(rendered).toContain('~/repo')
+  })
+
+  it('honors an explicit narrow legacy model-only selection', async () => {
+    const rendered = await renderSegments(['model'])
+    expect(rendered).toContain('qwen')
+    expect(rendered).not.toContain('ready')
+    expect(rendered).not.toContain('~/repo')
+  })
+})
 
 describe('status-rule narrow reflow', () => {
   it('does not reserve a physical row for an inactive spawn HUD', async () => {

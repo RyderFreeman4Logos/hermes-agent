@@ -815,6 +815,7 @@ class TurnController {
     })
 
     const hasTime = Number.isFinite(payload.completed_at)
+
     if (footnote && (hasTime || finalMessages.some(message => message.role === 'assistant'))) {
       finalMessages.push(footnote)
     }

@@ -795,6 +795,17 @@ def format_token_count_compact(value: int) -> str:
     return f"{sign}{text}{suffix}"
 
 
+def format_cache_hit_pct(read_tokens: int, prompt_tokens: int) -> str:
+    """Rounded hit percent. A positive read below 0.5% stays '<1', not '0'."""
+    read = max(0, int(read_tokens or 0))
+    prompt = max(0, int(prompt_tokens or 0))
+    if read <= 0 or prompt <= 0:
+        return "0"
+    if read * 100 < prompt:
+        return "<1"
+    return str(round(100 * read / prompt))
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).

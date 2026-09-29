@@ -32,11 +32,24 @@ def _num(value: Any, default: int = 0) -> int:
 def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
+
+def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return the accepted route, or the route selected before the child ran."""
+    route = getattr(child, "_delegate_successful_llm_route", None)
+    if isinstance(route, tuple) and len(route) == 2:
+        model, provider = map(_str_or_none, route)
+        if model is not None or provider is not None:
+            return model, provider
+    return _str_or_none(getattr(child, "model", None)), _str_or_none(getattr(child, "provider", None))
+
+
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
+    model, provider = _accepted_route_identity(child)
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
-        "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
+        "duration_seconds": duration, "model": model, "provider": provider,
+        "_child_role": getattr(child, "_delegate_role", None),
     }
 
 def _append_missed_steer(entry: Dict[str, Any], late_steer: Optional[str]) -> None:
@@ -587,14 +600,16 @@ def _build_result_entry(
 
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
-    # Result entry contract: see the _run_single_child docstring.
+    # Result entry contract: see the ``_run_single_child`` docstring.
+    accepted_model, accepted_provider = _accepted_route_identity(child)
     entry: Dict[str, Any] = {
         "task_index": task_index,
         "status": status,
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
-        "model": _str_or_none(getattr(child, "model", None)),
+        "model": accepted_model,
+        "provider": accepted_provider,
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -922,9 +937,11 @@ class _ChildRun:
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
         status = "timeout" if is_timeout else "error"
+        accepted_model, accepted_provider = _accepted_route_identity(child)
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
+            "model": accepted_model, "provider": accepted_provider,
             "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,

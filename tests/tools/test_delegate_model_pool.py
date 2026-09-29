@@ -1,8 +1,8 @@
 """delegate_task model_profile / delegation.model_pool (issue #117).
 
-A requested profile must pin the child to that profile's primary +
-fallback_chain. Global delegation.model must not win, and the child must
-not inherit an empty/parent chain that retries the same exhausted model.
+A requested profile pins the child's primary route and may override the
+routing owner's fallback policy. Global delegation.model must not win, and a
+pinned child must never borrow the parent's fallback chain.
 """
 
 from __future__ import annotations
@@ -134,6 +134,36 @@ class TestModelProfileResolution:
             "fb-four",
         ]
         assert all(e["model"] != "gpt-5.6-terra" for e in chain)
+
+    def test_profile_fallback_presence_keeps_owner_policy_without_parent_inheritance(self):
+        route = {key: value for key, value in STANDARD_POOL["standard"].items()
+                 if key != "fallback_chain"}
+        declared = [{"provider": "openrouter", "model": "owner-backup"}]
+        for profile_chain, owner_chain, expected in (
+            (None, declared, ["owner-backup"]),
+            (None, None, []),
+            ([], declared, []),
+            ([{"provider": "openrouter", "model": "profile-backup"}], declared, ["profile-backup"]),
+        ):
+            profile = dict(route)
+            if profile_chain is not None:
+                profile["fallback_chain"] = profile_chain
+            cfg = {"model_pool": {"standard": profile}, "fallback_providers": owner_chain}
+            captured = {}
+
+            def capture(**kwargs):
+                captured.update(kwargs)
+                child = MagicMock()
+                child.run_conversation.return_value = {"final_response": "ok", "completed": True, "api_calls": 1}
+                return child
+
+            with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+                "run_agent.AIAgent", side_effect=capture
+            ):
+                payload = json.loads(delegate_task(goal="verify fallback policy", parent_agent=_parent()))
+            assert "error" not in payload
+            assert (captured["model"], captured["api_key"]) == ("deepseek-v4-flash", "profile-key")
+            assert [entry["model"] for entry in captured["fallback_model"] or []] == expected
 
     def test_unknown_profile_fails_closed(self):
         payload, kwargs = _child_kwargs(model_profile="does-not-exist")

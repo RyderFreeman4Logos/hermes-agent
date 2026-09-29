@@ -1161,7 +1161,7 @@ def _plan_execution(
                     f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true for long-running commands."
                 ))
             promoted = timeout
-        elif background_was_omitted and timeout is not None and timeout > auto_background_threshold:
+        elif background_was_omitted and effective_timeout > auto_background_threshold:
             auto_promoted = True
 
     return _ExecPlan(

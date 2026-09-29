@@ -248,10 +248,10 @@ describe('status-chrome timers under an occluding overlay', () => {
     expect(oneSecondTimers(intervalSpy)).toBeGreaterThan(0)
   })
 
-  it('freezes the FaceTicker verb on compacting and skips verb rotation (#97239)', () => {
+  it('freezes the FaceTicker verb on compacting and skips verb rotation (#97239)', async () => {
     const { output } = mount({ ...busyProps, compacting: true })
 
-    expect(output()).toContain('compacting')
+    await vi.waitFor(() => expect(output()).toContain('compacting'), { interval: 10, timeout: 5_000 })
     // Glyph still ticks at the kaomoji cadence; the rotating-verb timer does not.
     expect(armedDelays(intervalSpy).filter(delay => delay === 2500)).toHaveLength(1)
     expect(oneSecondTimers(intervalSpy)).toBeGreaterThan(0)
@@ -297,8 +297,14 @@ describe('status-chrome timers under an occluding overlay', () => {
 
     const rule = mount(idleProps)
 
-    expect(rule.output()).toContain('1m 0s')
-    expect(rule.output()).toContain('✓ 5s')
+    await vi.waitFor(
+      () => {
+        const initial = rule.output()
+        expect(initial).toContain('1m 0s')
+        expect(initial).toContain('✓ 5s')
+      },
+      { interval: 10, timeout: 5_000 }
+    )
 
     // Five minutes of wall clock elapse while the overlay covers the rule.
     nowSpy.mockReturnValue(T0 + 300_000)

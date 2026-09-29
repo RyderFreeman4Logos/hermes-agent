@@ -473,8 +473,9 @@ def _credentials_for_model_profile(
         raise ValueError(f"{name!r} requires an api_key for its route.")
     if overlay["model"]:
         creds["model"] = overlay["model"]
-    creds["fallback_chain"] = _normalize_profile_fallback_chain(
-        profile.get("fallback_chain")
+    creds["fallback_chain"] = (
+        _normalize_profile_fallback_chain(profile["fallback_chain"])
+        if "fallback_chain" in profile else None
     )
     return creds
 

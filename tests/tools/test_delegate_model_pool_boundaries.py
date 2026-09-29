@@ -87,6 +87,57 @@ def _fake_child(parent, captured):
 def _sync_result(_batch, _background):
     return json.dumps({"ok": True})
 
+@pytest.mark.parametrize("pool,expected", [
+    ("oops", "mapping"), ([], "mapping"), (["standard"], "mapping"),
+    (0, "mapping"), (False, "mapping"), ("", "mapping"),
+    ({" ": _route("x"), "standard": _route("s")}, "name"),
+    ({1: _route("x"), "standard": _route("s")}, "name"),
+    ({" standard ": _route("s")}, "name"),
+    ({"standard": ["model"]}, "mapping"),
+    ({"standard": {**_route("s"), "model": ["s"]}}, "model"),
+    ({"standard": {**_route("s"), "provider": ["custom"]}}, "provider"),
+    ({"standard": {**_route("s"), "base_url": ["url"]}}, "base_url"),
+    ({"standard": {**_route("s"), "api_key": True}}, "api_key"),
+    ({"standard": {**_route("s"), "fallback_chain": "backup"}}, "fallback_chain"),
+    ({"standard": {**_route("s"), "fallback_chain": [{"provider": "custom"}]}}, "fallback_chain"),
+    ({"standard": _route("s"), "fast": {"provider": "custom"}}, "model"),
+    ({"fast": _route("f")}, "standard"),
+])
+def test_malformed_pool_class_refused_before_child_or_transcript(pool, expected):
+    cfg = {"model": "global-model", "provider": "openrouter", "model_pool": pool}
+    with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+        "tools.delegate_tool._build_child_preserving_parent_tools"
+    ) as build, patch("tools.delegation_live_log.create_live_transcripts") as live:
+        result = json.loads(delegate_task(goal="check route", parent_agent=_parent()))
+    assert expected in result["error"], result
+    build.assert_not_called()
+    live.assert_not_called()
+    assert any(
+        issue.severity == "error" and expected in issue.message
+        for issue in validate_config_structure({"delegation": cfg})
+    )
+
+@pytest.mark.parametrize("pool", [None, {}])
+def test_absent_or_empty_pool_keeps_legacy_route(pool):
+    cfg = {"model": "legacy-model", "model_pool": pool}
+    captured = []
+    with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+        "tools.delegate_tool._build_child_preserving_parent_tools",
+        side_effect=_fake_child(_parent(), captured),
+    ), patch("tools.delegate_tool._run_batch", side_effect=_sync_result):
+        result = json.loads(delegate_task(goal="legacy", parent_agent=_parent()))
+    assert result == {"ok": True}
+    assert captured[0]["model"] == "legacy-model"
+    assert not [i for i in validate_config_structure({"delegation": cfg}) if i.severity == "error"]
+
+def test_malformed_pool_does_not_advertise_partial_tier_schema():
+    from tools.delegate_tool import _build_dynamic_schema_overrides
+    cfg = {"model_pool": {"standard": _route("s"), "fast": {"model": "oops"}}}
+    with patch("tools.delegate_tool._load_config", return_value=cfg):
+        props = _build_dynamic_schema_overrides()["parameters"]["properties"]
+    assert "enum" not in props["model_profile"]
+    assert "enum" not in props["tasks"]["items"]["properties"]["model_profile"]
+
 
 @pytest.mark.parametrize("missing", ["model", "api_key"])
 def test_incomplete_pool_route_refused_before_children_and_config_reports_it(missing):

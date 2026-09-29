@@ -365,14 +365,17 @@ def _run_single_child(
 
 
 def _model_pool(cfg: dict) -> dict:
-    pool = cfg.get("model_pool") or {}
+    pool = cfg.get("model_pool")
     return pool if isinstance(pool, dict) else {}
 
 
 def _available_model_profile_names(cfg: Optional[dict] = None) -> List[str]:
     if cfg is None:
         cfg = _load_config()
-    return [str(name) for name in _model_pool(cfg) if str(name).strip()]
+    from tools.delegate_tool_config import _model_pool_errors
+    if _model_pool_errors(cfg.get("model_pool")):
+        return []
+    return [name for name in _model_pool(cfg) if isinstance(name, str) and name and name == name.strip()]
 
 
 def _default_model_profile_name(cfg: dict) -> Optional[str]:
@@ -471,6 +474,10 @@ def _resolve_task_routes(
     top_profile: Optional[str],
 ) -> List[tuple[Optional[str], Dict[str, Any]]]:
     """Resolve every effective task route before child-owned resources exist."""
+    from tools.delegate_tool_config import _model_pool_errors
+    errors = _model_pool_errors(cfg.get("model_pool"))
+    if errors:
+        raise ValueError(errors[0])
     routes: List[tuple[Optional[str], Dict[str, Any]]] = []
     by_profile: Dict[Optional[str], tuple[Optional[str], Dict[str, Any]]] = {}
     has_pool = bool(_model_pool(cfg))

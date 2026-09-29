@@ -1700,19 +1700,23 @@ class SessionMessagesMixin:
         if max_display_messages is None:
             rows = self._fetch_conversation_rows(session_ids, _DISPLAY_ACTIVE_CLAUSE, with_session_id=True)
             tip_rows = [r for r in rows if r["session_id"] == session_id and r["active"]]
+            rows = self._dedupe_display_generations(rows)
         else:
             tip_rows = self._fetch_conversation_rows([session_id], " AND active = 1", with_session_id=True)
             if max_display_messages == 0:
                 rows = []
             else:
                 placeholders = _placeholders(session_ids)
-                missing_display_identity = self._read_one(
+                # Read-only stores may predate either display-index column.
+                with self._read_ctx() as conn:
+                    columns = set(self._message_column_names(conn))
+                indexed = {"display_identity", "display_order"} <= columns and self._read_one(
                     f"""SELECT 1 FROM messages
                         WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
                           AND (display_identity IS NULL OR display_order IS NULL) LIMIT 1""",
                     tuple(session_ids),
-                )
-            if max_display_messages and missing_display_identity is None:
+                ) is None
+            if max_display_messages and indexed:
                 # The window retains the existing display-generation contract: active wins, then the newest
                 # representative, while MIN(id) keeps the logical message's original order. Only the bounded
                 # page crosses the SQLite/Python boundary.
@@ -1739,8 +1743,9 @@ class SessionMessagesMixin:
         model_history = self._rows_to_conversation(
             tip_rows, session_id=session_id,
             include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
+        # Bounded selectors already dedupe and order by the logical origin, not the representative id.
         display_history = self._rows_to_conversation(
-            self._dedupe_display_generations(rows), session_id=session_id,
+            rows, session_id=session_id,
             include_ancestors=True, repair_alternation=False, include_row_ids=True)
         return model_history, display_history
 

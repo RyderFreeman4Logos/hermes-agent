@@ -455,10 +455,19 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
             f"Refusing to build a subagent with an incomplete credential bundle — check the provider's "
             f"configuration / auth, or set delegation.base_url for a direct endpoint."
         )
+    from hermes_cli.runtime_provider import _parse_api_mode
+    api_mode = runtime.get("api_mode")
+    explicit_mode = _parse_api_mode(v["api_mode"])
+    # Tier overrides reach the wire, but cannot replace SDK/process transports.
+    if (explicit_mode and configured_provider.strip().lower() not in _NATIVE_SDK_PROVIDERS
+            and str(runtime.get("provider") or "").lower() not in _NATIVE_SDK_PROVIDERS
+            and not pinned_command):
+        from hermes_cli.providers import host_mandated_api_mode
+        api_mode = host_mandated_api_mode(runtime.get("base_url") or "") or explicit_mode
     return _credential_bundle(
         v["model"] or runtime.get("model") or None,
         configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
-        runtime.get("base_url"), api_key, runtime.get("api_mode"),
+        runtime.get("base_url"), api_key, api_mode,
         _merge_request_overrides(runtime.get("request_overrides"), explicit_request_overrides) or {},
         command=pinned_command, args=list(runtime.get("args") or []),
     )

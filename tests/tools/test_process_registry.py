@@ -71,6 +71,23 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     )
 
 
+def test_reader_start_failure_rolls_back_exact_registration(registry, monkeypatch):
+    session = _make_session(sid="failed-reader")
+    other = _make_session(sid="unrelated")
+    registry._running[other.id] = other
+
+    def fail_start(_thread):
+        assert registry._running[session.id] is session
+        raise RuntimeError("thread capacity")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread capacity"):
+        registry._track_started(session, lambda _session: None, "reader")
+    assert session.id not in registry._running
+    assert registry._running[other.id] is other
+    assert session._reader_thread is None
+
+
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
     old = _make_session(sid="proc_old", task_id="session-a")
     finished = _make_session(

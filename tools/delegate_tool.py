@@ -177,6 +177,8 @@ def _build_child_agent(
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[Dict[str, Any]] = None,
     override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
+    override_requested_provider: Optional[str] = None,
+    override_fixed_api_key: bool = False,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -224,6 +226,7 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
         override_fallback_chain=override_fallback_chain,
+        override_requested_provider=override_requested_provider,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -278,7 +281,9 @@ def _build_child_agent(
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
     # Shared pool lets children rotate credentials on rate limits.
-    child_pool = _resolve_child_credential_pool(
+    if override_fixed_api_key:
+        child._credential_pool = None
+    child_pool = None if override_fixed_api_key else _resolve_child_credential_pool(
         rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),
     )
     if child_pool is not None:
@@ -432,12 +437,13 @@ def _credentials_for_model_profile(
     if error:
         raise ValueError(error)
 
+    from hermes_cli.runtime_provider import _parse_api_mode
     overlay = {
         "model": str(profile.get("model") or "").strip() or None,
         "provider": str(profile.get("provider") or "").strip() or None,
         "base_url": str(profile.get("base_url") or "").strip() or None,
         "api_key": str(profile.get("api_key") or "").strip() or None,
-        "api_mode": str(profile.get("api_mode") or "").strip().lower() or None,
+        "api_mode": _parse_api_mode(profile.get("api_mode")),
     }
     # A non-empty pool is the only routing source; ignore global delegation
     # route keys so a global pin cannot override a selected tier.
@@ -459,6 +465,9 @@ def _credentials_for_model_profile(
             raise ValueError(f"{name!r} requires an api_key for its endpoint.")
         merged["api_key"] = runtime["api_key"]
     creds = _resolve_delegation_credentials(merged, parent_agent)
+    creds["fixed_api_key"] = bool(overlay["api_key"])
+    if overlay["provider"] and overlay["base_url"]:
+        creds["requested_provider"] = overlay["provider"]
     if not creds.get("api_key"):
         raise ValueError(f"{name!r} requires an api_key for its route.")
     if overlay["model"]:
@@ -529,6 +538,8 @@ def _build_children(
             "override_acp_args": creds.get("args"),
             "routing_cfg": routing_cfg,
             "override_fallback_chain": creds.get("fallback_chain"),
+            "override_requested_provider": creds.get("requested_provider"),
+            "override_fixed_api_key": creds.get("fixed_api_key", False),
         }
         try:
             child = _build_child_preserving_parent_tools(

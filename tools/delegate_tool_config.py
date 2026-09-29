@@ -333,6 +333,11 @@ def _pool_route_error(name: str, profile: Any) -> Optional[str]:
         value = profile.get(field)
         if value is not None and (not isinstance(value, str) or (value and not value.strip())):
             return f"{name!r} has an invalid {field}; expected a string."
+    mode = profile.get("api_mode")
+    if mode is not None and mode != "":
+        from hermes_cli.runtime_provider import _parse_api_mode
+        if not isinstance(mode, str) or _parse_api_mode(mode) is None:
+            return f"{name!r} has an invalid api_mode; expected a supported transport."
     if not (profile.get("model") or "").strip():
         return f"{name!r} requires a model."
     provider = (profile.get("provider") or "").strip()
@@ -426,7 +431,7 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
             f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
         ) from exc
 
-    api_key = runtime.get("api_key", "")
+    api_key = v["api_key"] or runtime.get("api_key", "")
     if not api_key:
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
@@ -530,6 +535,7 @@ def _resolve_child_runtime(
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
     routing_cfg: Optional[Dict[str, Any]] = None,
     override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
+    override_requested_provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -599,7 +605,7 @@ def _resolve_child_runtime(
 
     # A named provider identity is endpoint-scoped. Preserve it only when the
     # child inherits the exact parent route; an override owns its final identity.
-    effective_requested_provider = effective_provider
+    effective_requested_provider = override_requested_provider or effective_provider
     if not override_provider and not override_base_url and not override_acp_command:
         effective_requested_provider = (
             getattr(parent_agent, "requested_provider", None) or effective_provider

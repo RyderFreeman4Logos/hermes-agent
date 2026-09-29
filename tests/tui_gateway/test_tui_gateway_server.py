@@ -7958,7 +7958,13 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path), "explicit_cwd": True})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": str(tmp_path),
+        }
     ]
 
 
@@ -7977,7 +7983,13 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     server._ensure_session_db_row({"session_key": "k1", "source": "tool"})
 
     assert created == [
-        {"key": "k1", "source": "tool", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "tool",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": None,
+        }
     ]
 
 
@@ -8004,7 +8016,13 @@ def test_ensure_session_db_row_records_a_terminal_workspace(monkeypatch, tmp_pat
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": str(tmp_path),
+        }
     ]
 
 
@@ -8025,7 +8043,13 @@ def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp
     server._ensure_session_db_row({"session_key": "k1", "source": "desktop", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "desktop", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "desktop",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": None,
+        }
     ]
 
 
@@ -8069,7 +8093,7 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
 
 def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
     """A chat that made no explicit pick falls back to the global model and
-    writes no model_config (so it tracks the profile default)."""
+    still stamps memory_provider_mode=hybrid (default provider mode)."""
     created = []
 
     class _FakeDB:
@@ -8081,7 +8105,9 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
 
     server._ensure_session_db_row({"session_key": "k1", "model_override": None})
 
-    assert created == [{"model": "global/default", "model_config": None}]
+    assert created == [
+        {"model": "global/default", "model_config": {"memory_provider_mode": "hybrid"}}
+    ]
 
 
 def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
@@ -17051,12 +17077,11 @@ def test_model_save_key_reconciles_the_launch_profiles_stale_setup_record(monkey
 
 
 def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_path):
-    """The post-turn heap trim must run after the turn's pre-turn history snapshots are dropped:
-    malloc_trim cannot return pages still referenced, so a retained snapshot of a large tool
-    result pins them for the life of the process. Observed through a weak reference to the old
-    message, not by reading the finisher's local variable names."""
+    """The post-turn heap trim follows cleared history snapshots: assert the finisher locals are empty,
+    and verify the old large message is reclaimable before trim."""
     import contextlib
     import gc
+    import inspect
     import weakref
 
     class _Msg(dict):
@@ -17067,10 +17092,20 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
 
     class _Agent:
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kw):
+            observed["persist_user_message"] = _kw.get("persist_user_message")
             return {"final_response": "reply", "messages": [{"role": "assistant", "content": "reply"}]}
 
     def _trim(**_kwargs):
         order.append("trim")
+        frame = inspect.currentframe()
+        assert frame is not None and frame.f_back is not None
+        caller_locals = frame.f_back.f_locals
+        assert "history" in caller_locals and "run_kwargs" in caller_locals, (
+            "expected locals not found in _run_prompt_submit's finally frame — "
+            "renamed? update this test"
+        )
+        observed["history"] = caller_locals["history"]
+        observed["run_kwargs"] = caller_locals["run_kwargs"]
         gc.collect()
         observed["alive_at_trim"] = old_ref() is not None
 
@@ -17098,7 +17133,10 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
             {"id": "1", "method": "prompt.submit", "params": {"session_id": "sid_trim", "text": "hi"}})
 
         assert resp is not None and resp.get("result")
-        assert order == ["trim", "reset_home"]
+        assert observed["persist_user_message"] == "hi"
+        assert not observed["history"]
+        assert not observed["run_kwargs"]
+        assert order[-2:] == ["trim", "reset_home"]
         assert observed["alive_at_trim"] is False, "a pre-turn history snapshot survived to the heap trim"
     finally:
         server._sessions.pop("sid_trim", None)

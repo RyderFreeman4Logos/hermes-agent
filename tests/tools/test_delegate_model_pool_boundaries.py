@@ -246,6 +246,14 @@ def test_public_named_shared_endpoint_keeps_explicit_owner_before_dispatch(monke
     assert _lease_child_credential(seen[0]) == (None, None)
     assert seen[0].api_key == "fixed-b"
     foreign_pool.acquire_lease.assert_not_called()
+    from agent.agent_runtime_helpers import _rebind_primary_credential_pool
+    seen[0]._credential_pool = foreign_pool  # a fallback's foreign pool before primary restore
+    _rebind_primary_credential_pool(
+        seen[0], "custom", "fixture-m", lambda _: True,
+        lambda: foreign_pool, foreign_pool, True,
+    )
+    assert seen[0]._credential_pool is None
+    seen[0]._swap_credential.assert_not_called()
 
 
 def test_provider_only_fixed_key_and_derived_named_pool_before_dispatch():

@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
@@ -1248,10 +1248,12 @@ class SessionMessagesMixin:
 
         return bool(self._execute_write(_do))
 
-    def _legacy_display_page(self, session_id: str, *, active_clause: str, limit: Optional[int], offset: int,
+    def _legacy_display_page(self, session_id: Union[str, List[str]], *, active_clause: str, limit: Optional[int], offset: int,
                              latest: bool) -> List[Any]:
         """Project a legacy read-only display page without retaining transcript payloads."""
         representatives: Dict[bytes, Tuple[int, int]] = {}
+        session_ids = [session_id] if isinstance(session_id, str) else session_id
+        placeholders = _placeholders(session_ids)
         with self._read_ctx() as conn:
             conn.execute("BEGIN")
             try:
@@ -1263,8 +1265,8 @@ class SessionMessagesMixin:
                 rows = conn.execute(
                     "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, active, "
                     f"display_kind, display_metadata FROM messages {index_hint} "
-                    f"WHERE session_id = ?{active_clause} ORDER BY id ASC",
-                    (session_id,))
+                    f"WHERE session_id IN ({placeholders}){active_clause} ORDER BY id ASC",
+                    tuple(session_ids))
                 for row in rows:
                     if self._is_model_only_row(row):
                         continue
@@ -1282,9 +1284,9 @@ class SessionMessagesMixin:
                 for start in range(0, len(selected_ids), 900):
                     chunk = selected_ids[start:start + 900]
                     selected.update({row["id"]: row for row in conn.execute(
-                        f"SELECT * FROM messages WHERE session_id = ?{active_clause} "
+                        f"SELECT * FROM messages WHERE session_id IN ({placeholders}){active_clause} "
                         f"AND id IN ({_placeholders(chunk)})",
-                        (session_id, *chunk))})
+                        (*session_ids, *chunk))})
                 return [selected[row_id] for row_id in selected_ids if row_id in selected]
             finally:
                 if conn.in_transaction:
@@ -1612,6 +1614,7 @@ class SessionMessagesMixin:
                                ) AS generation_rank
                         FROM messages
                         WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
+                          {DISPLAY_VISIBLE_SQL}
                     ), page AS (
                         SELECT * FROM ranked WHERE generation_rank = 1
                         ORDER BY logical_order DESC LIMIT ?
@@ -1619,13 +1622,9 @@ class SessionMessagesMixin:
                     SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}
                     FROM page ORDER BY logical_order ASC""", (*session_ids, max_display_messages))
             elif max_display_messages:
-                # Legacy stores stay read-only here: resume must not backfill each lineage segment before it
-                # can apply the bound. Duplicates in the bounded raw tail still collapse below.
-                rows = self._read_all(f"""SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM (
-                        SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM messages
-                        WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
-                        ORDER BY id DESC LIMIT ?
-                    ) ORDER BY id ASC""", (*session_ids, max_display_messages))
+                # Legacy stores stay read-only: stream identities, fetch only the selected payloads.
+                rows = self._legacy_display_page(session_ids, active_clause=_DISPLAY_ACTIVE_CLAUSE,
+                                                 limit=max_display_messages, offset=0, latest=True)
         # The model projection stays active-only: it is the compressed working context.
         model_history = self._rows_to_conversation(
             tip_rows, session_id=session_id,

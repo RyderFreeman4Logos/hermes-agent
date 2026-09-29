@@ -5623,6 +5623,15 @@ class TestGetMessagesPagination:
             return rows
 
         db._read_all = record_read
+        legacy_pages = []
+        original_legacy_page = db._legacy_display_page
+
+        def record_legacy_page(*args, **kwargs):
+            rows = original_legacy_page(*args, **kwargs)
+            legacy_pages.append((kwargs["limit"], len(rows)))
+            return rows
+
+        db._legacy_display_page = record_legacy_page
         assert db.assert_resume_safe("tip", max_messages=2, tip_only=True) == 2
         with pytest.raises(hermes_state.SessionResumeTooLargeError):
             db.assert_resume_safe("tip", max_messages=1, tip_only=True)
@@ -5634,7 +5643,29 @@ class TestGetMessagesPagination:
             "SELECT COUNT(*) FROM messages WHERE display_identity IS NOT NULL OR display_order IS NOT NULL"
         ).fetchone()[0] == 0
         assert all(row_count <= 2 for _sql, row_count in reads)
-        assert any("LIMIT" in sql.upper() for sql, _row_count in reads)
+        assert legacy_pages == [(2, 2)]
+
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_resume_display_limit_counts_visible_logical_messages(self, db, legacy):
+        db.create_session(session_id="root", source="cli")
+        db.append_messages_batch("root", [
+            {"role": "user", "content": "older", "timestamp": 1.0},
+            {"role": "assistant", "content": "carried", "timestamp": 2.0},
+        ])
+        db.create_session(session_id="tip", source="compression", parent_session_id="root")
+        db.append_messages_batch("tip", [
+            {"role": "assistant", "content": "carried", "timestamp": 2.0},
+            {"role": "user", "content": "hidden", "timestamp": 3.0,
+             "display_metadata": {"model_only": True}},
+        ])
+        if legacy:
+            db._conn.execute("UPDATE messages SET display_identity = NULL, display_order = NULL")
+            db._conn.commit()
+        model, display = db.get_resume_conversations("tip", max_display_messages=2)
+        assert [m["content"] for m in model] == ["carried", "hidden"]
+        assert [m["content"] for m in display] == ["older", "carried"]
+        if legacy:
+            assert db._conn.execute("SELECT COUNT(*) FROM messages WHERE display_identity IS NOT NULL").fetchone()[0] == 0
 
     def test_resume_guard_counts_exactly_what_a_branch_resume_loads(self, db):
         """An explicit /branch copy owns its transcript: the guard and the

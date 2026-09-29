@@ -1255,7 +1255,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
         with self._lock:
             self._prune_if_needed()
             self._running[session.id] = session
-        reader.start()
+        try:
+            reader.start()
+        except Exception:
+            with self._lock:
+                if self._running.get(session.id) is session:
+                    del self._running[session.id]
+            session._reader_thread = None
+            raise
         self._write_checkpoint()
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:

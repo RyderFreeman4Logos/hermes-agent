@@ -1267,6 +1267,12 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     if isinstance(delegation_cfg, dict):
         pool = delegation_cfg.get("model_pool")
         if isinstance(pool, dict) and pool:
+            from tools.delegate_tool_config import _pool_route_error
+            for name, profile in pool.items():
+                error = _pool_route_error(str(name), profile)
+                if error:
+                    _issue(issues, "error", f"delegation.model_pool.{name}: {error}",
+                           "Complete this tier's route without borrowing parent or global routing.")
             names = [str(name) for name in pool if str(name).strip()]
             if "standard" not in names:
                 _issue(

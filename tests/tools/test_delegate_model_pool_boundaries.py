@@ -17,6 +17,7 @@ from tools import async_delegation as ad
 from tools.delegate_tool import delegate_task
 from tools.delegate_tool_child_run import _lease_child_credential
 from tools.delegate_tool_config import _resolve_child_credential_pool
+from hermes_cli.config import validate_config_structure
 from tools.process_registry import process_registry
 from tools.process_registry_notifications import _format_batch_delegation, format_process_notification
 
@@ -85,6 +86,44 @@ def _fake_child(parent, captured):
 
 def _sync_result(_batch, _background):
     return json.dumps({"ok": True})
+
+
+@pytest.mark.parametrize("missing", ["model", "api_key"])
+def test_incomplete_pool_route_refused_before_children_and_config_reports_it(missing):
+    route = _route("pool-model")
+    del route[missing]
+    cfg = {"max_iterations": 4, "model_pool": {"standard": route}}
+    parent = _parent()
+    with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+        "tools.delegate_tool._build_child_preserving_parent_tools"
+    ) as build:
+        result = json.loads(delegate_task(goal="check route", parent_agent=parent))
+    assert missing in result["error"]
+    build.assert_not_called()
+    assert any(missing in i.message and i.severity == "error" for i in validate_config_structure({"delegation": cfg}))
+
+
+@pytest.mark.parametrize("same_endpoint", [True, False])
+def test_named_pool_provider_can_resolve_its_own_endpoint_credential(same_endpoint):
+    route = _route("pool-model", provider="named-provider")
+    del route["api_key"]
+    cfg = {"max_iterations": 4, "model_pool": {"standard": route}}
+    parent = _parent()
+    captured = []
+    with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value={"provider": "custom", "model": "pool-model", "base_url": route["base_url"] if same_endpoint else "http://127.0.0.1:8/v1", "api_key": "provider-key"},
+    ), patch("tools.delegate_tool._build_child_preserving_parent_tools", side_effect=_fake_child(parent, captured)), patch(
+        "tools.delegate_tool._run_batch", side_effect=_sync_result
+    ):
+        result = json.loads(delegate_task(goal="check route", parent_agent=parent))
+    if same_endpoint:
+        assert result == {"ok": True}
+        assert captured[0]["override_api_key"] == "provider-key"
+        assert captured[0]["override_api_key"] != parent.api_key
+    else:
+        assert "api_key" in result["error"]
+        assert captured == []
 
 
 def test_direct_endpoint_keeps_canonical_custom_identity_through_lease():

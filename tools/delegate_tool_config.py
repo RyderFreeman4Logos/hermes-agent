@@ -325,6 +325,20 @@ def _credential_bundle(model, provider, base_url, api_key, api_mode, request_ove
         "request_overrides": request_overrides, **extra,
     }
 
+def _pool_route_error(name: str, profile: Any) -> Optional[str]:
+    """Structural requirements of an exclusive named delegation route."""
+    if not isinstance(profile, dict):
+        return f"{name!r} is not a mapping."
+    if not str(profile.get("model") or "").strip():
+        return f"{name!r} requires a model."
+    provider = str(profile.get("provider") or "").strip()
+    endpoint = str(profile.get("base_url") or "").strip()
+    if not provider and not endpoint:
+        return f"{name!r} requires a provider or base_url."
+    if (not provider or provider == "custom") and not str(profile.get("api_key") or "").strip():
+        return f"{name!r} requires an api_key for its endpoint."
+    return None
+
 def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
     """``delegation.base_url`` branch: provider/api_mode from URL heuristics."""
     # Shared URL-based api_mode detector so Anthropic-compatible direct endpoints (/anthropic suffix: Azure AI

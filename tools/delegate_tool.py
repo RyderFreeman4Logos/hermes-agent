@@ -424,8 +424,10 @@ def _credentials_for_model_profile(
         available = ", ".join(_available_model_profile_names(cfg)) or "(none)"
         raise ValueError(f"Unknown {name!r}. Configured: {available}.")
     profile = pool[name]
-    if not isinstance(profile, dict):
-        raise ValueError(f"{name!r} is not a mapping.")
+    from tools.delegate_tool_config import _pool_route_error
+    error = _pool_route_error(name, profile)
+    if error:
+        raise ValueError(error)
 
     overlay = {
         "model": str(profile.get("model") or "").strip() or None,
@@ -441,7 +443,21 @@ def _credentials_for_model_profile(
     for key, value in overlay.items():
         if value:
             merged[key] = value
+    if overlay["base_url"] and not overlay["api_key"]:
+        # A named provider may own a credential for this exact endpoint; never borrow the parent's.
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        try:
+            runtime = resolve_runtime_provider(requested=overlay["provider"], target_model=overlay["model"])
+        except Exception as exc:
+            raise ValueError(f"{name!r} cannot resolve endpoint credentials: {exc}") from exc
+        from tools.delegate_tool_config import _normalized_runtime_url
+        if (_normalized_runtime_url(runtime.get("base_url")) != _normalized_runtime_url(overlay["base_url"])
+                or not runtime.get("api_key")):
+            raise ValueError(f"{name!r} requires an api_key for its endpoint.")
+        merged["api_key"] = runtime["api_key"]
     creds = _resolve_delegation_credentials(merged, parent_agent)
+    if not creds.get("api_key"):
+        raise ValueError(f"{name!r} requires an api_key for its route.")
     if overlay["model"]:
         creds["model"] = overlay["model"]
     creds["fallback_chain"] = _normalize_profile_fallback_chain(

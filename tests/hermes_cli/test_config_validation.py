@@ -212,8 +212,8 @@ class TestModelPoolRequiresStandard:
         issues = validate_config_structure({
             "delegation": {
                 "model_pool": {
-                    "standard": {"provider": "custom", "model": "main"},
-                    "fast": {"provider": "custom", "model": "tiny"},
+                    "standard": {"provider": "custom", "model": "main", "base_url": "http://127.0.0.1:9/v1", "api_key": "fixture-key"},
+                    "fast": {"provider": "custom", "model": "tiny", "base_url": "http://127.0.0.1:8/v1", "api_key": "fixture-key"},
                 }
             }
         })

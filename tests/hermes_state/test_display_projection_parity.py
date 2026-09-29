@@ -21,6 +21,8 @@ that must NOT grow with it: the model-fed projection stays compressed, and
 soft-deleted Undo/Rewind rows stay hidden.
 """
 
+import sqlite3
+
 import pytest
 
 from hermes_state import SessionDB
@@ -211,3 +213,122 @@ class TestResumeGuardBoundsWhatResumeLoads:
 
         assert tip_count < db.get_resume_message_count(sid)
         assert db.assert_resume_safe(sid, max_messages=tip_count, tip_only=True)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("scenario", ["interleaved", "hidden", "new_time", "compacted", "edited", "branch", "pagination"])
+def test_bounded_resume_preserves_display_projection(tmp_path, legacy, scenario):
+    """Selection must preserve logical order, not re-sort the chosen generation ids."""
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    try:
+        db.create_session("root", source="cli")
+        db.append_messages_batch("root", [
+            {"role": "user", "content": "question", "timestamp": 1.0},
+            {"role": "assistant", "content": "between", "timestamp": 2.0},
+        ])
+        if scenario == "new_time":
+            db.append_messages_batch("root", [{"role": "user", "content": "question", "timestamp": 4.0}])
+        if scenario in ("compacted", "pagination"):
+            db._conn.execute("UPDATE messages SET active=0, compacted=1 WHERE content='question'")
+            db._conn.commit()
+        content = "question"
+        if scenario == "edited":
+            row_id = db.get_messages("root")[0]["id"]
+            assert db.set_user_message_content("root", row_id, "edited") == 1
+            content = "edited"
+        target = "root" if scenario == "pagination" else "tip"
+        if target == "tip":
+            db.create_session("tip", source="compression", parent_session_id="root",
+                              model_config={"_branched_from": "root"} if scenario == "branch" else None)
+        if scenario not in ("new_time", "branch"):
+            db.append_messages_batch(target, [{"role": "user", "content": content, "timestamp": 1.0}])
+        if scenario in ("hidden", "pagination"):
+            db.append_messages_batch(target, [{
+                "role": "assistant", "content": "hidden", "timestamp": 5.0,
+                "display_metadata": {"model_only": True},
+            }])
+        db.append_messages_batch(target, [{"role": "assistant", "content": "end", "timestamp": 6.0}])
+        if legacy:
+            db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+            db._conn.commit()
+    finally:
+        db.close()
+
+    before = path.read_bytes()
+    ro = SessionDB(path, read_only=True)
+    try:
+        model, full = ro.get_resume_conversations(target)
+        for limit in range(len(full) + 3):
+            bounded_model, display = ro.get_resume_conversations(target, max_display_messages=limit)
+            assert bounded_model == model
+            assert display == (full[-limit:] if limit else [])
+        if scenario == "pagination":
+            full_page = ro.get_messages(target, include_compacted=True)
+            for latest in (False, True):
+                for offset in range(len(full_page) + 2):
+                    for limit in (0, 1, 2, len(full_page) + 2):
+                        expected = (full_page[::-1][offset:offset + limit][::-1] if latest
+                                    else full_page[offset:offset + limit])
+                        assert ro.get_messages(target, include_compacted=True, latest=latest,
+                                               offset=offset, limit=limit) == expected
+    finally:
+        ro.close()
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("shape", ["current", "null", "no-identity", "no-order", "no-both"])
+@pytest.mark.parametrize("session_index", [False, True])
+def test_bounded_resume_readonly_schema_capabilities(tmp_path, monkeypatch, shape, session_index):
+    """Legacy schema capability precedes index probing; no migration or full payload fetch."""
+    seed = tmp_path / "seed.db"
+    db = SessionDB(seed)
+    try:
+        db.create_session("root", source="cli")
+        db.append_messages_batch("root", [
+            {"role": "user" if i % 2 == 0 else "assistant",
+             "content": f"{i}:" + "x" * 4096, "timestamp": float(i + 1)}
+            for i in range(200)
+        ])
+        db.create_session("tip", source="compression", parent_session_id="root")
+        db.append_messages_batch("tip", [
+            {"role": "user", "content": "tip-user", "timestamp": 201.0},
+            {"role": "assistant", "content": "tip-answer", "timestamp": 202.0},
+        ])
+    finally:
+        db.close()
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("ATTACH DATABASE ? AS src", (str(seed),))
+        excluded = {"no-identity": {"display_identity"}, "no-order": {"display_order"},
+                    "no-both": {"display_identity", "display_order"}}.get(shape, set())
+        columns = [row[1] for row in conn.execute("PRAGMA src.table_info(messages)") if row[1] not in excluded]
+        quoted = ",".join(f'"{col}"' for col in columns)
+        conn.execute(f"CREATE TABLE messages AS SELECT {quoted} FROM src.messages")
+        conn.execute("CREATE TABLE sessions AS SELECT * FROM src.sessions")
+        if session_index:
+            conn.execute("CREATE INDEX idx_messages_session_id ON messages(session_id, id)")
+        if shape == "null":
+            conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+    before = path.read_bytes()
+    ro = SessionDB(path, read_only=True)
+    try:
+        model, full = ro.get_resume_conversations("tip")
+        assert [m["content"] for m in model] == ["tip-user", "tip-answer"]
+        root = ro.get_messages("root", include_compacted=True)
+        assert ro.get_messages("root", include_compacted=True, limit=4, latest=True) == root[-4:]
+        assert ro.get_resume_conversations("tip", max_display_messages=0) == (model, [])
+        sizes = []
+        original = ro._read_all
+
+        def observed(sql, params=()):
+            rows = original(sql, params)
+            sizes.append(len(rows))
+            return rows
+
+        monkeypatch.setattr(ro, "_read_all", observed)
+        assert ro.get_resume_conversations("tip", max_display_messages=4) == (model, full[-4:])
+        assert sizes and max(sizes) <= 4
+    finally:
+        ro.close()
+        assert path.read_bytes() == before

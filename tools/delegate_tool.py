@@ -282,6 +282,7 @@ def _build_child_agent(
         child._session_init_model_config["_delegate_from"] = parent_sid
     # Shared pool lets children rotate credentials on rate limits.
     if override_fixed_api_key:
+        child._delegation_fixed_api_key = True
         child._credential_pool = None
     child_pool = None if override_fixed_api_key else _resolve_child_credential_pool(
         rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),

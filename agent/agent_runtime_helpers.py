@@ -1181,6 +1181,10 @@ def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matc
     fallback attaches its own pool, which would trip the provider-mismatch guard on the next
     401/429: reload the primary pool, else clear it. The snapshot api_key may be stale after
     rotation; re-select the pool's best entry, keeping the snapshot key when none is usable."""
+    if getattr(agent, "_delegation_fixed_api_key", False):
+        agent._credential_pool = None
+        agent._credential_pool_entry_id = None
+        return  # The snapshot's pinned tier key owns the primary route.
     pool = getattr(agent, "_credential_pool", None)
     pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
     if pool is not None and pool_provider and not matches_primary(pool):

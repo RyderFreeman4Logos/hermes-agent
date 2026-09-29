@@ -210,6 +210,100 @@ def test_direct_endpoint_keeps_canonical_custom_identity_through_lease():
     assert captured[0]["override_api_key"] == "fixture-fixture-model-key"
 
 
+def test_public_named_shared_endpoint_keeps_explicit_owner_before_dispatch(monkeypatch):
+    url = "http://127.0.0.1:9/v1"
+    cfg = {"model_pool": {
+        "standard": {"provider": "named-a", "model": "fixture-m", "base_url": url, "api_key": "fixed-a"},
+        "other": {"provider": "named-b", "model": "fixture-m", "base_url": url, "api_key": "fixed-b"},
+    }}
+    parent = _parent()
+    foreign = SimpleNamespace(id="foreign", api_key="pool-a", base_url=url, last_status="ok")
+    foreign_pool = MagicMock()
+    foreign_pool.entries.return_value = [foreign]
+    foreign_pool.acquire_lease.return_value = "foreign"
+    monkeypatch.setattr("agent.credential_pool.get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:a")
+    monkeypatch.setattr("tools.delegate_tool_config._loaded_pool", lambda key: foreign_pool)
+    seen = []
+
+    def fake_agent(**kwargs):
+        child = MagicMock()
+        child.provider = kwargs["provider"]
+        child.requested_provider = kwargs["requested_provider"]
+        child.base_url = kwargs["base_url"]
+        child.api_key = kwargs["api_key"]
+        child._credential_pool = None
+        child._swap_credential.side_effect = lambda entry: setattr(child, "api_key", entry.api_key)
+        seen.append(child)
+        return child
+
+    with patch("tools.delegate_tool._load_config", return_value=cfg), patch("run_agent.AIAgent", side_effect=fake_agent), patch(
+        "tools.delegate_tool._run_batch", side_effect=lambda *_: json.dumps({"ok": True})
+    ):
+        result = json.loads(delegate_task(goal="offline", model_profile="other", parent_agent=parent))
+    assert result == {"ok": True}
+    assert seen[0].requested_provider == "named-b"
+    assert seen[0].api_key == "fixed-b"
+    assert _lease_child_credential(seen[0]) == (None, None)
+    assert seen[0].api_key == "fixed-b"
+    foreign_pool.acquire_lease.assert_not_called()
+
+
+def test_provider_only_fixed_key_and_derived_named_pool_before_dispatch():
+    url = "http://127.0.0.1:9/v1"
+    parent = _parent()
+    resolved = {"provider": "custom", "model": "fixture-m", "base_url": url,
+                "api_key": "provider-owned", "api_mode": "chat_completions"}
+    pool = MagicMock()
+    pool.has_credentials.return_value = True
+    seen = []
+
+    def fake_agent(**kwargs):
+        child = MagicMock()
+        child.provider = kwargs["provider"]
+        child.requested_provider = kwargs["requested_provider"]
+        child.api_key = kwargs["api_key"]
+        child.base_url = kwargs["base_url"]
+        child._credential_pool = None
+        seen.append(child)
+        return child
+
+    fixed = {"provider": "named-b", "model": "fixture-m", "api_key": "tier-owned"}
+    derived = {"provider": "named-b", "model": "fixture-m", "base_url": url}
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=resolved), patch(
+        "agent.credential_pool.get_custom_provider_pool_key", return_value="custom:named-b"
+    ) as key_lookup, patch("agent.credential_pool.load_pool", return_value=pool), patch(
+        "tools.delegate_tool._run_batch", side_effect=lambda *_: json.dumps({"ok": True})
+    ), patch("run_agent.AIAgent", side_effect=fake_agent):
+        for route in (fixed, derived):
+            with patch("tools.delegate_tool._load_config", return_value={"model_pool": {"standard": route}}):
+                assert json.loads(delegate_task(goal="offline", parent_agent=parent)) == {"ok": True}
+    assert (seen[0].requested_provider, seen[0].api_key, seen[0]._credential_pool) == (
+        "named-b", "tier-owned", None,
+    )
+    assert (seen[1].requested_provider, seen[1].api_key) == ("named-b", "provider-owned")
+    assert seen[1]._credential_pool is pool
+    assert any(call.kwargs.get("provider_name") == "named-b" for call in key_lookup.call_args_list)
+
+
+def test_explicit_pool_mode_must_be_supported_before_public_dispatch():
+    from tools.delegate_tool import _build_dynamic_schema_overrides
+    for mode in ([], {}, True, 42, "unsupported-wire"):
+        cfg = {"model_pool": {"standard": {**_route("s"), "api_mode": mode}}}
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "tools.delegation_live_log.create_live_transcripts"
+        ) as live, patch("tools.delegate_tool._build_child_preserving_parent_tools") as build:
+            payload = json.loads(delegate_task(goal="offline", parent_agent=_parent()))
+            props = _build_dynamic_schema_overrides()["parameters"]["properties"]
+        assert "api_mode" in payload["error"]
+        assert "enum" not in props["model_profile"]
+        assert any("api_mode" in i.message and i.severity == "error" for i in validate_config_structure({"delegation": cfg}))
+        live.assert_not_called()
+        build.assert_not_called()
+    for mode in (None, "responses"):
+        cfg = {"model_pool": {"standard": {**_route("s"), "api_mode": mode}}}
+        assert not [i for i in validate_config_structure({"delegation": cfg}) if i.severity == "error"]
+
+
 def test_fallback_route_log_allowlists_labels_without_inline_key():
     opaque_key = "opaque-fixture-value"
     cfg = {

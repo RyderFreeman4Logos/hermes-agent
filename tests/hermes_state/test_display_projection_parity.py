@@ -61,6 +61,56 @@ def _rest_display(db, sid):
     ]
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("limit", [1, 2, 3])
+def test_bounded_resume_keeps_final_replay_representative_and_fills(db, legacy, limit):
+    db.create_session("replay", source="cli")
+    db.append_messages_batch("replay", [
+        {"role": "assistant", "content": "earlier", "timestamp": 1.0},
+        {"role": "user", "content": "ask", "timestamp": 2.0},
+        {"role": "user", "content": "ask", "timestamp": 3.0},
+        {"role": "assistant", "content": "answer", "timestamp": 4.0},
+    ])
+    if legacy:
+        db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+        db._conn.commit()
+    _, full = db.get_resume_conversations("replay")
+    _, bounded = db.get_resume_conversations("replay", max_display_messages=limit)
+    assert bounded == full[-limit:]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_bounded_resume_does_not_expand_across_answer_barrier(db, legacy):
+    db.create_session("replay", source="cli")
+    db.append_messages_batch("replay", [
+        {"role": "user", "content": "same", "timestamp": 1.0},
+        {"role": "assistant", "content": "first answer", "timestamp": 2.0},
+        {"role": "user", "content": "same", "timestamp": 3.0},
+        {"role": "assistant", "content": "second answer", "timestamp": 4.0},
+    ])
+    if legacy:
+        db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+        db._conn.commit()
+    pages = []
+    reader = db._legacy_display_page if legacy else db._read_all
+
+    def traced(*args, **kwargs):
+        result = reader(*args, **kwargs)
+        if legacy or "FROM page ORDER BY logical_order ASC" in args[0]:
+            pages.append(len(result))
+        return result
+
+    if legacy:
+        db._legacy_display_page = traced
+    else:
+        db._read_all = traced
+    _, display = db.get_resume_conversations("replay", max_display_messages=2)
+    assert [(m["content"], m["timestamp"]) for m in display] == [
+        ("same", 3.0), ("second answer", 4.0),
+    ]
+    assert pages == [2]
+
+
 class TestDisplayProjectionParity:
     def test_resume_display_matches_the_rest_transcript(self, db):
         sid = _compact_in_place(db, "chat")

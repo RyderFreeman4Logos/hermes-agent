@@ -1697,6 +1697,13 @@ class SessionMessagesMixin:
         if max_display_messages is not None and max_display_messages < 0:
             raise ValueError("max_display_messages must be non-negative")
         session_ids = self._resume_lineage_ids(session_id)
+        rows = []
+        model_history = []
+        if max_display_messages is not None:
+            tip_rows = self._fetch_conversation_rows([session_id], " AND active = 1", with_session_id=True)
+            model_history = self._rows_to_conversation(
+                tip_rows, session_id=session_id, include_ancestors=False,
+                repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         if max_display_messages is None:
             rows = self._fetch_conversation_rows(session_ids, _DISPLAY_ACTIVE_CLAUSE, with_session_id=True)
             tip_rows = [r for r in rows if r["session_id"] == session_id and r["active"]]
@@ -1716,34 +1723,60 @@ class SessionMessagesMixin:
                           AND (display_identity IS NULL OR display_order IS NULL) LIMIT 1""",
                     tuple(session_ids),
                 ) is None
-            if max_display_messages and indexed:
-                # The window retains the existing display-generation contract: active wins, then the newest
-                # representative, while MIN(id) keeps the logical message's original order. Only the bounded
-                # page crosses the SQLite/Python boundary.
-                rows = self._read_all(f"""WITH ranked AS (
-                        SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}, display_identity,
-                               MIN(id) OVER (PARTITION BY display_identity) AS logical_order,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY display_identity ORDER BY active DESC, id DESC
-                               ) AS generation_rank
-                        FROM messages
-                        WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
-                          {DISPLAY_VISIBLE_SQL}
-                    ), page AS (
-                        SELECT * FROM ranked WHERE generation_rank = 1
-                        ORDER BY logical_order DESC LIMIT ?
-                    )
-                    SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}
-                    FROM page ORDER BY logical_order ASC""", (*session_ids, max_display_messages))
-            elif max_display_messages:
-                # Legacy stores stay read-only: stream identities, fetch only the selected payloads.
-                rows = self._legacy_display_page(session_ids, active_clause=_DISPLAY_ACTIVE_CLAUSE,
-                                                 limit=max_display_messages, offset=0, latest=True)
+            if max_display_messages:
+                def read_page(size):
+                    if not indexed:
+                        # Legacy stores stay read-only: stream identities, fetch only selected payloads.
+                        return self._legacy_display_page(session_ids, active_clause=_DISPLAY_ACTIVE_CLAUSE,
+                                                         limit=size, offset=0, latest=True)
+                    # The window retains generation order and active/newest representative selection.
+                    return self._read_all(f"""WITH ranked AS (
+                            SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}, display_identity,
+                                   MIN(id) OVER (PARTITION BY display_identity) AS logical_order,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY display_identity ORDER BY active DESC, id DESC
+                                   ) AS generation_rank
+                            FROM messages
+                            WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
+                              {DISPLAY_VISIBLE_SQL}
+                        ), page AS (
+                            SELECT * FROM ranked WHERE generation_rank = 1
+                            ORDER BY logical_order DESC LIMIT ?
+                        )
+                        SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}
+                        FROM page ORDER BY logical_order ASC""", (*session_ids, size))
+
+                size = max_display_messages
+                while True:
+                    rows = read_page(size)
+                    projected = self._rows_to_conversation(
+                        rows, session_id=session_id, include_ancestors=True,
+                        repair_alternation=False, include_row_ids=True)
+                    # A replayed user at the cut may be removed by an older turn.
+                    # Probe identity without fetching that older payload first.
+                    first = projected[0] if projected else None
+                    first_row = next((row for row in rows if first and row["id"] == first["_row_id"]), None)
+                    older_replay = False
+                    if first_row is not None and first is not None and first["role"] == "user":
+                        older_replay = self._read_one(
+                            f"""SELECT 1 FROM messages WHERE session_id IN ({placeholders})
+                                AND (active = 1 OR compacted = 1) AND id < ? AND role = 'user'
+                                AND id > COALESCE((SELECT MAX(id) FROM messages
+                                    WHERE session_id IN ({placeholders}) AND id < ? AND role = 'assistant'
+                                    AND (COALESCE(content, '') != '' OR COALESCE(tool_calls, '') != '')), 0)
+                                AND content = ? AND (timestamp IS NULL OR timestamp IS NOT ?) LIMIT 1""",
+                            (*session_ids, first["_row_id"], *session_ids, first["_row_id"],
+                             first_row["content"], first.get("timestamp")),
+                        ) is not None
+                    if (len(projected) >= max_display_messages and not older_replay) or len(rows) < size:
+                        break
+                    size = max(size + 1, size * 2)
+                return model_history, projected[-max_display_messages:]
         # The model projection stays active-only: it is the compressed working context.
-        model_history = self._rows_to_conversation(
-            tip_rows, session_id=session_id,
-            include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
-        # Bounded selectors already dedupe and order by the logical origin, not the representative id.
+        if max_display_messages is None:
+            model_history = self._rows_to_conversation(
+                tip_rows, session_id=session_id, include_ancestors=False,
+                repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(
             rows, session_id=session_id,
             include_ancestors=True, repair_alternation=False, include_row_ids=True)

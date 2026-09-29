@@ -255,6 +255,33 @@ def test_omitted_background_timeout_above_threshold_auto_promotes(
     assert not tt._test_env.execute.called
 
 
+@pytest.mark.parametrize("threshold,promoted", [(100, True), (180, False), (200, False)])
+def test_omitted_timeout_uses_effective_default_for_custom_threshold(
+    monkeypatch, tmp_path, threshold, promoted
+):
+    tt, result = _call_terminal_handler(
+        monkeypatch, tmp_path, extra={"auto_background_timeout_threshold": threshold}
+    )
+    assert (result.get("session_id") == "proc_silent_test") is promoted
+    assert (not tt._test_env.execute.called) is promoted
+    if promoted:
+        assert result.get("notify_on_complete") is True
+
+
+@pytest.mark.parametrize("background", [False, None])
+def test_explicit_over_cap_timeout_precedes_custom_threshold(monkeypatch, tmp_path, background):
+    tt, result = _call_terminal_handler(
+        monkeypatch, tmp_path, background=background, timeout=7200,
+        extra={"auto_background_timeout_threshold": 100},
+    )
+    if background is False:
+        assert "exceeds the maximum" in result["error"]
+        assert not tt._test_env.execute.called
+    else:
+        assert result.get("session_id") == "proc_silent_test"
+        assert result.get("notify_on_complete") is True
+
+
 def test_custom_threshold_just_over_auto_promotes(monkeypatch, tmp_path):
     tt, result = _call_terminal_handler(
         monkeypatch,

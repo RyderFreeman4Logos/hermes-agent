@@ -425,6 +425,8 @@ class TestLiveConfigReread:
                     "fast": {
                         "provider": "custom",
                         "model": "fast-model",
+                        "base_url": "http://127.0.0.1:8/v1",
+                        "api_key": "test-key",
                         "fallback_chain": [
                             {"provider": "custom", "model": "fast-fb"}
                         ],

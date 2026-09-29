@@ -1265,22 +1265,10 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     delegation_cfg = config.get("delegation")
     if isinstance(delegation_cfg, dict):
-        pool = delegation_cfg.get("model_pool")
-        if isinstance(pool, dict) and pool:
-            from tools.delegate_tool_config import _pool_route_error
-            for name, profile in pool.items():
-                error = _pool_route_error(str(name), profile)
-                if error:
-                    _issue(issues, "error", f"delegation.model_pool.{name}: {error}",
-                           "Complete this tier's route without borrowing parent or global routing.")
-            names = [str(name) for name in pool if str(name).strip()]
-            if "standard" not in names:
-                _issue(
-                    issues, "error",
-                    "delegation.model_pool is non-empty but has no 'standard' profile",
-                    "Add an explicit standard profile, or remove model_pool. "
-                    "YAML key order is not a routing default.",
-                )
+        from tools.delegate_tool_config import _model_pool_errors
+        for error in _model_pool_errors(delegation_cfg.get("model_pool")):
+            _issue(issues, "error", error, "Use a mapping of named tiers with complete routes; "
+                   "an absent or empty model_pool retains legacy routing.")
 
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)

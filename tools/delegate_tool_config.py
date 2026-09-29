@@ -329,15 +329,46 @@ def _pool_route_error(name: str, profile: Any) -> Optional[str]:
     """Structural requirements of an exclusive named delegation route."""
     if not isinstance(profile, dict):
         return f"{name!r} is not a mapping."
-    if not str(profile.get("model") or "").strip():
+    for field in ("model", "provider", "base_url", "api_key"):
+        value = profile.get(field)
+        if value is not None and (not isinstance(value, str) or (value and not value.strip())):
+            return f"{name!r} has an invalid {field}; expected a string."
+    if not (profile.get("model") or "").strip():
         return f"{name!r} requires a model."
-    provider = str(profile.get("provider") or "").strip()
-    endpoint = str(profile.get("base_url") or "").strip()
+    provider = (profile.get("provider") or "").strip()
+    endpoint = (profile.get("base_url") or "").strip()
     if not provider and not endpoint:
         return f"{name!r} requires a provider or base_url."
-    if (not provider or provider == "custom") and not str(profile.get("api_key") or "").strip():
+    if (not provider or provider == "custom") and not (profile.get("api_key") or "").strip():
         return f"{name!r} requires an api_key for its endpoint."
+    if "fallback_chain" in profile:
+        chain = profile["fallback_chain"]
+        if not isinstance(chain, list) or any(
+            not isinstance(entry, dict) or any(
+                not isinstance(entry.get(field), str) or not entry[field].strip()
+                for field in ("provider", "model")
+            ) for entry in chain
+        ):
+            return f"{name!r} has an invalid fallback_chain; expected a list of provider/model routes."
     return None
+
+def _model_pool_errors(pool: Any) -> List[str]:
+    """One structural admission contract for config diagnostics and runtime."""
+    if pool is None or pool == {}:
+        return []  # absent/null/empty mapping retain legacy delegation routing
+    if not isinstance(pool, dict):
+        return ["delegation.model_pool must be a mapping of named tiers."]
+    errors = []
+    for name, profile in pool.items():
+        if not isinstance(name, str) or not name or name != name.strip():
+            errors.append(f"delegation.model_pool has an invalid tier name {name!r}.")
+            continue
+        error = _pool_route_error(name, profile)
+        if error:
+            errors.append(f"delegation.model_pool.{name}: {error}")
+    if "standard" not in pool:
+        errors.append("delegation.model_pool is non-empty but has no 'standard' profile")
+    return errors
 
 def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
     """``delegation.base_url`` branch: provider/api_mode from URL heuristics."""

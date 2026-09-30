@@ -775,12 +775,13 @@ class SessionDB(
         if qpath is None and self.db_path.exists() and has_invalid_sqlite_header_preopen(self.db_path):
             raise sqlite3.DatabaseError(msg)
 
-    def _open_writer_conn(self) -> sqlite3.Connection:
+    def _open_writer_conn(self, *, handoff=None) -> sqlite3.Connection:
         """Connect + WAL/pragma/tokenizer setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
         conn = _connect_tracked_db(
             str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            **({"handoff": handoff} if handoff is not None else {}),
         )
         try:
             conn.row_factory = sqlite3.Row

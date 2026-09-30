@@ -23,6 +23,60 @@ logger = logging.getLogger(__name__)
 _live_lock = threading.RLock()
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
+# Immutable admission tokens survive rename/replacement; never restat at close.
+_live_tokens: dict[object, tuple[str, frozenset[tuple[int, int]]]] = {}
+_manual_tokens: dict[str, list[object]] = {}
+_reservations: list[_Handoff] = []
+_SIDECARS = ("-wal", "-shm", "-journal")
+
+
+def _identity(path):
+    try:
+        info = os.stat(path)
+        return info.st_dev, info.st_ino
+    except FileNotFoundError:
+        return None
+
+
+def _bundle(key):
+    return (key, *(key + suffix for suffix in _SIDECARS))
+
+
+def _identities(key):
+    return frozenset(identity for path in _bundle(key) if (identity := _identity(path)) is not None)
+
+
+class _Handoff:
+    """Strongly owned reservation and explicit capability for repair-only I/O."""
+
+    def __init__(self, key, tokens):
+        self.key = key
+        self.main_identity = _identity(key)
+        self.paths = frozenset(_bundle(key))
+        self.identities = _identities(key)
+        self.tokens = set(tokens)
+        self.thread = threading.get_ident()
+        self.pending = 0
+
+    def matches(self, key):
+        # Keep sidecars created by owner SQL claimed before any alias opener.
+        self.identities |= _identities(self.key)
+        return key in self.paths or _identity(key) in self.identities
+
+
+def _reservation(key, handoff=None):
+    for claim in _reservations:
+        if claim.matches(key):
+            if claim is not handoff or claim.thread != threading.get_ident():
+                raise LiveConnectionError(f"SQLite lifecycle reserved for recovery: {key}")
+            # Inode ownership is not permission to reopen a replaced path/generation.
+            if (_identity(claim.key) != claim.main_identity
+                    or os.stat(claim.key).st_nlink != 1):
+                raise LiveConnectionError(f"SQLite recovery pathname changed: {claim.key}")
+            return claim
+    if handoff is not None and handoff not in _reservations:
+        raise LiveConnectionError("SQLite recovery capability has expired")
+    return None
 
 
 class UntrackableConnectionError(RuntimeError):
@@ -58,7 +112,12 @@ def track_connection(path: Path | str) -> None:
     """Record that this process holds a connection to *path* (prefer :func:`connect_tracked`; this
     is for callers managing their own connection objects, and for tests)."""
     with _live_lock:
-        _track_key(_key(path))
+        key = _key(path)
+        _reservation(key)
+        token = object()
+        _manual_tokens.setdefault(key, []).append(token)
+        _live_tokens[token] = (key, _identities(key))
+        _track_key(key)
 
 
 def _track_key(key: str, delta: int = 1) -> None:
@@ -73,7 +132,20 @@ def _track_key(key: str, delta: int = 1) -> None:
 def untrack_connection(path: Path | str) -> None:
     """Record that one connection to *path* has been closed."""
     with _live_lock:
-        _track_key(_key(path), -1)
+        key = _key(path)
+        tokens = _manual_tokens.get(key, [])
+        if tokens:
+            _untrack_token(tokens.pop())
+        if not tokens:
+            _manual_tokens.pop(key, None)
+
+
+def _untrack_token(token):
+    entry = _live_tokens.pop(token, None)
+    if entry is not None:
+        _track_key(entry[0], -1)
+    for claim in _reservations:
+        claim.tokens.discard(token)
 
 
 def _live_main_key(key: str) -> Optional[str]:
@@ -81,11 +153,13 @@ def _live_main_key(key: str) -> Optional[str]:
 
     SQLite locks the main file and its WAL sidecars; a raw ``close()`` of any of those
     inodes cancels this process's POSIX locks, but the registry is keyed by the main path."""
-    if key in _live_connections:
-        return key
-    for suffix in ("-wal", "-shm"):
-        if key.endswith(suffix) and key[:-len(suffix)] in _live_connections:
-            return key[:-len(suffix)]
+    identity = _identity(key)
+    for main, captured in _live_tokens.values():
+        if key in _bundle(main) or (identity is not None and identity in captured):
+            return main
+        # Sidecars may be created after connect; stat only, never open a raw FD.
+        if _identity(main) in captured and identity is not None and identity in _identities(main):
+            return main
     return None
 
 
@@ -108,17 +182,36 @@ class _TrackingMixin:
     """
 
     _hermes_tracked_path: str | None = None
+    _hermes_tracking_token: object | None = None
+    _hermes_identity_uncertain: bool = False
 
     def close(self) -> None:  # type: ignore[misc]
         with _live_lock:
-            path = getattr(self, "_hermes_tracked_path", None)
-            # Close first; untrack only once the descriptor is actually gone. Untracking before a failing
-            # close (e.g. cross-thread ProgrammingError) leaves the FD open while the byte-probe guard
-            # thinks nothing is live — see #75629.
-            super().close()  # type: ignore[misc]
-            if path is not None:
-                self._hermes_tracked_path = None
-                untrack_connection(path)
+            token = getattr(self, "_hermes_tracking_token", None)
+            claim = next((r for r in _reservations if token in r.tokens), None)
+            if claim is not None and claim.thread != threading.get_ident():
+                raise LiveConnectionError("Only the admitted recovery owner may close this connection")
+            if claim is not None:
+                claim.pending += 1
+        # ponytail: ordinary open/close keep the inherited global syscall boundary;
+        # admitted recovery I/O alone leaves the metadata lock during slow work.
+        guard = contextlib.nullcontext() if claim is not None else _live_lock
+        try:
+            with guard:
+                with _live_lock:
+                    current = next((r for r in _reservations if token in r.tokens), None)
+                    if current is not None and current is not claim:
+                        raise LiveConnectionError("Connection was reserved before close")
+                super().close()  # type: ignore[misc]
+                with _live_lock:
+                    if token is not None:
+                        self._hermes_tracking_token = None
+                        self._hermes_tracked_path = None
+                        _untrack_token(token)
+        finally:
+            if claim is not None:
+                with _live_lock:
+                    claim.pending -= 1
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):
@@ -145,37 +238,59 @@ def _tracking_factory(factory: type) -> type:
 
 
 def connect_tracked(
-    path: Path | str, *, tracking_path: Path | str | None = None, connect_fn=None, **kwargs,
+    path: Path | str, *, tracking_path: Path | str | None = None, connect_fn=None, handoff=None, **kwargs,
 ) -> sqlite3.Connection:
-    """``sqlite3.connect`` that registers the connection for the lifetime of the fd (released on
-    ``close()``). Use for any database that might be byte-probed (``state.db``, ``kanban.db``).
-    Open and registration happen together under ``_live_lock`` so a concurrent
-    :func:`read_header_bytes_preopen` cannot slip between them and cancel this connection's locks."""
+    """Open and publish a tracked handle atomically against raw access and recovery.
+
+    Ordinary calls retain the inherited global syscall boundary. Only an explicit
+    reservation capability permits target I/O outside it, before publication.
+    """
+    from urllib.parse import unquote, urlsplit
     opener = connect_fn if connect_fn is not None else sqlite3.connect
     kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
-
+    spelling = tracking_path if tracking_path is not None else path
+    if str(spelling).startswith("file:"):
+        spelling = unquote(urlsplit(str(spelling)).path)
+    key = _key(spelling)
     with _live_lock:
-        conn = opener(str(path), **kwargs)
-        try:
-            resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
-            if resolved is None:
-                return conn  # in-memory / unnamed: nothing on disk to byte-probe
-            if not isinstance(conn, _TrackingMixin):
-                # The opener substituted its own factory and discarded ours (test doubles
-                # simulating FTS5-less runtimes do this). Retag the instance's class so close()
-                # still releases the registry entry rather than silently losing probe safety.
-                conn = _retrofit_tracking(conn, resolved)
-            conn._hermes_tracked_path = resolved
-            _track_key(resolved)
-            return conn
-        except Exception:
+        claim = _reservation(key, handoff)
+        if claim is not None:
+            claim.pending += 1
+    guard = contextlib.nullcontext() if claim is not None else _live_lock
+    try:
+        with guard:
+            with _live_lock:
+                _reservation(key, handoff)
+                before = _identity(key)
+            conn = opener(str(path), **kwargs)
             try:
-                # Close via sqlite3 directly: the tracking entry was either never made or is
-                # being unwound here.
+                resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
+                if resolved is None:
+                    return conn
+                if not isinstance(conn, _TrackingMixin):
+                    conn = _retrofit_tracking(conn, resolved)
+                with _live_lock:
+                    token = object()
+                    captured = _identities(resolved)
+                    conn._hermes_identity_uncertain = before is not None and before != _identity(resolved)
+                    if before is not None:
+                        captured = captured | {before}
+                    conn._hermes_tracked_path = resolved
+                    conn._hermes_tracking_token = token
+                    _live_tokens[token] = (resolved, captured)
+                    _track_key(resolved)
+                    if claim is not None:
+                        claim.tokens.add(token)
+                return conn
+            except BaseException:
+                # The ordinary syscall boundary or the admitted reservation still
+                # excludes raw I/O while setup unwinds.
                 sqlite3.Connection.close(conn)
-            except Exception:
-                pass
-            raise
+                raise
+    finally:
+        if claim is not None:
+            with _live_lock:
+                claim.pending -= 1
 
 
 def _retrofit_tracking(conn: sqlite3.Connection, resolved: str) -> sqlite3.Connection:
@@ -227,6 +342,10 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
     overwritten?). Check and open/read/close run together under ``_live_lock`` so a connection
     cannot be opened between deciding "nothing is live" and closing this descriptor."""
     with _live_lock:
+        try:
+            _reservation(_key(path))
+        except LiveConnectionError:
+            return None
         if not force and _live_main_key(_key(path)) is not None:
             logger.debug(
                 "refusing byte-level read of %s: a live connection exists in "
@@ -242,41 +361,67 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
 
 @contextlib.contextmanager
 def connection_handoff(path: Path | str, connection: sqlite3.Connection, *, owned_readers=()):
-    """Exclude tracked open/close operations while a sole owner retires and reopens its connection.
+    """Atomically try sole-owner admission, then retain only target-path/inode claims.
 
-    Non-blocking: callers already hold a SessionDB writer lock; waiting here could invert
-    a concurrent opener's lifecycle-lock -> schema-init order. Peers, checked-out readers,
-    and partially opened connections refuse the handoff, not just registry-owned writers.
-    The caller must close the admitted connection before any raw access or repair guard open.
+    Never wait while the caller owns a writer lock. Ordinary physical opens/closes
+    still hold the short lifecycle boundary, so unregistered/pending handles refuse.
+    Hardlinks are not repair authority: distinct WAL bundles are ambiguous.
     """
     if not _live_lock.acquire(blocking=False):
         yield False
         return
+    claim = None
     try:
         key = _key(path)
         owned = (connection, *owned_readers)
-        yield (len({id(conn) for conn in owned}) == len(owned)
-               and all(getattr(conn, "_hermes_tracked_path", None) == key for conn in owned)
-               and _live_connections.get(key) == len(owned))
+        tokens = {getattr(conn, "_hermes_tracking_token", None) for conn in owned}
+        identity = _identity(key)
+        live = {token for token, (main, captured) in _live_tokens.items()
+                if main == key or (identity is not None and identity in captured)}
+        if (identity is not None and os.stat(key).st_nlink == 1
+                and len(tokens) == len(owned) and None not in tokens and live == tokens
+                and all(getattr(conn, "_hermes_tracked_path", None) == key
+                        and not getattr(conn, "_hermes_identity_uncertain", False) for conn in owned)
+                and all(identity in _live_tokens[token][1] for token in tokens if token in _live_tokens)
+                and not any(r.matches(key) for r in _reservations)):
+            claim = _Handoff(key, tokens)
+            _reservations.append(claim)
     finally:
         _live_lock.release()
+    try:
+        yield claim if claim is not None else False
+    finally:
+        if claim is not None:
+            with _live_lock:
+                if claim.pending:
+                    raise RuntimeError("SQLite recovery ended with pending physical I/O")
+                _reservations.remove(claim)
 
 
 @contextlib.contextmanager
-def offline_file_access(path: Path | str, *, what: str = "read"):
-    """Hold the connection-lifecycle lock across a raw read of a database file: checking
-    :func:`has_live_connection` and *then* doing raw I/O is a check/use race (a connection opened
-    in between loses its POSIX locks to the raw ``close()``). Held only for the raw I/O."""
+def offline_file_access(path: Path | str, *, what: str = "read", handoff=None):
+    """Exclude physical SQLite lifecycle through raw I/O, target-only under repair."""
+    key = _key(path)
     with _live_lock:
-        main = _live_main_key(_key(path))
-        if main is not None:
-            subject = "it" if main == _key(path) else f"its main database {main}"
-            raise LiveConnectionError(
-                f"Refusing to {what} {path}: a connection to {subject} is still open "
-                "in this process, and raw file access would cancel that "
-                "connection's POSIX advisory locks. Close all database "
-                "handles (stop the gateway/dashboard) and retry.")
-        yield
+        claim = _reservation(key, handoff)
+        if claim is not None:
+            claim.pending += 1
+    guard = contextlib.nullcontext() if claim is not None else _live_lock
+    try:
+        with guard:
+            with _live_lock:
+                _reservation(key, handoff)
+                main = _live_main_key(key)
+                if main is not None:
+                    raise LiveConnectionError(
+                        f"Refusing to {what} {path}: a connection to {main} is still open "
+                        "in this process, and raw file access would cancel its POSIX locks. "
+                        "Close all database handles and retry.")
+            yield
+    finally:
+        if claim is not None:
+            with _live_lock:
+                claim.pending -= 1
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

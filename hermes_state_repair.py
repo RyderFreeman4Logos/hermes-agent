@@ -6,6 +6,7 @@ Patchable helpers are looked up as module globals at call time, so tests patch `
 from __future__ import annotations
 
 import contextlib
+from contextvars import ContextVar
 import datetime
 import hashlib
 import itertools
@@ -32,6 +33,17 @@ from hermes_state_common import (
 logger = logging.getLogger("hermes_state")
 
 _REPAIR_LOCK_POLL_SECONDS = 0.1
+_repair_handoff = ContextVar("repair_handoff", default=None)
+
+
+@contextlib.contextmanager
+def _repair_io_scope(handoff):
+    """Bind repair helpers to the explicit target reservation; no ambient opener permission."""
+    token = _repair_handoff.set(handoff)
+    try:
+        yield
+    finally:
+        _repair_handoff.reset(token)
 # Snapshot copies are data transfer, not locking: bounded separately at 10 MiB/s (historical two-minute floor).
 _REPAIR_SNAPSHOT_MIN_THROUGHPUT_BYTES_PER_SECOND = 10 * 1024 * 1024
 # ── Repair-loop bounding + dead-backup hygiene (#86747) ───────────────────── ``_claim_repair_attempt``
@@ -86,7 +98,7 @@ def _read_offline(db_path: Path, what: str, reader) -> Optional[str]:
     except ImportError:
         offline_file_access, LiveConnectionError = (lambda _p, **_k: contextlib.nullcontext()), OSError
     try:
-        with offline_file_access(db_path, what=what):
+        with offline_file_access(db_path, what=what, handoff=_repair_handoff.get()):
             return reader()
     except (LiveConnectionError, OSError):
         return None
@@ -590,7 +602,8 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
-    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None)
+    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None,
+                           handoff=_repair_handoff.get())
     _reapply_durability_barriers(conn)
     return conn
 

@@ -444,6 +444,9 @@ def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
     return _state_holders.foreign_state_db_holders(db_path)
 
 
+_advisory_write_owners = threading.local()
+
+
 @contextmanager
 def _session_db_advisory_write_lock(
     db_path: Path, *, deadline: float, patience_s: float
@@ -451,7 +454,8 @@ def _session_db_advisory_write_lock(
     """Serialize SessionDB writers across processes with a sidecar flock.
 
     The OFD guard in hermes_state_lockguard keeps a live WAL generation; it is
-    not a writer mutex. This sidecar is.
+    not a writer mutex. This sidecar is. Nested scopes in the owning thread
+    borrow outer custody by actual sidecar inode; forked children are not owners.
     """
     if sys.platform == "win32":
         yield
@@ -459,6 +463,14 @@ def _session_db_advisory_write_lock(
     lock_path = Path(str(db_path) + ".write.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as handle:
+        identity = os.fstat(handle.fileno())
+        owner_key = (os.getpid(), identity.st_dev, identity.st_ino)
+        held = getattr(_advisory_write_owners, "held", None)
+        if held is None:
+            held = _advisory_write_owners.held = set()
+        if owner_key in held:
+            yield
+            return
         acquired = False
         try:
             while not acquired:
@@ -475,9 +487,11 @@ def _session_db_advisory_write_lock(
                             f"state.db write lock for over {patience_s:.0f}s)"
                         ) from exc
                     time.sleep(min(0.02, remaining_s))
+            held.add(owner_key)
             yield
         finally:
             if acquired:
+                held.discard(owner_key)
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 

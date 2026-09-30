@@ -264,15 +264,21 @@ def connect_tracked(
                 before = _identity(key)
             conn = opener(str(path), **kwargs)
             try:
-                resolved = _key(tracking_path) if tracking_path is not None else _canonical_db_path(conn)
+                actual = _canonical_db_path(conn)
+                resolved = _key(tracking_path) if tracking_path is not None else actual
                 if resolved is None:
                     return conn
                 if not isinstance(conn, _TrackingMixin):
                     conn = _retrofit_tracking(conn, resolved)
                 with _live_lock:
                     token = object()
-                    captured = _identities(resolved)
-                    conn._hermes_identity_uncertain = before is not None and before != _identity(resolved)
+                    captured = _identities(resolved) | _identities(key)
+                    if actual is not None:
+                        captured |= _identities(actual)
+                    conn._hermes_identity_uncertain = (
+                        actual is None or actual != key or resolved != key
+                        or (before is not None and before != _identity(resolved))
+                    )
                     if before is not None:
                         captured = captured | {before}
                     conn._hermes_tracked_path = resolved
@@ -400,28 +406,28 @@ def connection_handoff(path: Path | str, connection: sqlite3.Connection, *, owne
 
 @contextlib.contextmanager
 def offline_file_access(path: Path | str, *, what: str = "read", handoff=None):
-    """Exclude physical SQLite lifecycle through raw I/O, target-only under repair."""
+    """Exclude target opens throughout raw I/O without fencing unrelated databases."""
     key = _key(path)
     with _live_lock:
         claim = _reservation(key, handoff)
-        if claim is not None:
-            claim.pending += 1
-    guard = contextlib.nullcontext() if claim is not None else _live_lock
+        main = _live_main_key(key)
+        if main is not None:
+            raise LiveConnectionError(
+                f"Refusing to {what} {path}: a connection to {main} is still open "
+                "in this process, and raw file access would cancel its POSIX locks. "
+                "Close all database handles and retry.")
+        temporary = claim is None
+        if temporary:
+            claim = _Handoff(key, ())
+            _reservations.append(claim)
+        claim.pending += 1
     try:
-        with guard:
-            with _live_lock:
-                _reservation(key, handoff)
-                main = _live_main_key(key)
-                if main is not None:
-                    raise LiveConnectionError(
-                        f"Refusing to {what} {path}: a connection to {main} is still open "
-                        "in this process, and raw file access would cancel its POSIX locks. "
-                        "Close all database handles and retry.")
-            yield
+        yield
     finally:
-        if claim is not None:
-            with _live_lock:
-                claim.pending -= 1
+        with _live_lock:
+            claim.pending -= 1
+            if temporary:
+                _reservations.remove(claim)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

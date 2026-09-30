@@ -8,6 +8,7 @@ import pytest
 from hermes_cli import sqlite_safe_read as safe
 from hermes_state import SessionDB
 import hermes_state_repair as repair
+from hermes_state_registry import acquire, release as registry_release
 def _stale_owner(tmp_path, monkeypatch, *, backup=False):
     path = tmp_path / "state.db"
     monkeypatch.setattr("hermes_state_wal.is_sqlite_wal_reset_vulnerable", lambda **kwargs: False)
@@ -78,9 +79,9 @@ def test_reservation_is_explicit_and_blocks_original_and_renamed_inode(tmp_path)
                         pytest.fail("reservation bypassed")
 
 
-@pytest.mark.parametrize("stage", ["forensic", "scratch", "comparison", "reopen"])
+@pytest.mark.parametrize("stage", ["forensic", "forensic-backup", "staging", "scratch", "comparison", "promotion", "reopen"])
 def test_recovery_does_not_block_unrelated_lifecycle(tmp_path, monkeypatch, stage):
-    with _stale_owner(tmp_path, monkeypatch, backup=stage == "forensic") as db:
+    with _stale_owner(tmp_path, monkeypatch, backup=stage.startswith("forensic")) as db:
         unrelated = tmp_path / "unrelated.db"
         idle = safe.connect_tracked(unrelated, check_same_thread=False)
         entered, release, completed = threading.Event(), threading.Event(), threading.Event()
@@ -88,14 +89,15 @@ def test_recovery_does_not_block_unrelated_lifecycle(tmp_path, monkeypatch, stag
         def park():
             entered.set()
             assert release.wait(10)
-        if stage == "forensic":
+        if stage.startswith("forensic"):
             original = repair._backup_content_identity
             def parked(path):
                 # Park INSIDE sanctioned raw ownership, not before its lock entrance.
                 original_reader = repair._read_offline
                 def read_offline(path, what, reader):
                     def read():
-                        park()
+                        if (path == db.db_path) == (stage == "forensic"):
+                            park()
                         return reader()
                     return original_reader(path, what, read)
                 with monkeypatch.context() as patch:
@@ -114,6 +116,13 @@ def test_recovery_does_not_block_unrelated_lifecycle(tmp_path, monkeypatch, stag
                 park()
                 return original(*args)
             monkeypatch.setattr(repair, "_validate_fts_snapshot", parked)
+        elif stage in {"staging", "promotion"}:
+            original = repair._copy_database_snapshot
+            def parked(*args, **kwargs):
+                if ("source_connection" in kwargs) == (stage == "staging"):
+                    park()
+                return original(*args, **kwargs)
+            monkeypatch.setattr(repair, "_copy_database_snapshot", parked)
         else:
             original = db._open_writer_conn
             def parked(**kwargs):
@@ -130,6 +139,14 @@ def test_recovery_does_not_block_unrelated_lifecycle(tmp_path, monkeypatch, stag
                 idle.close()
                 with contextlib.closing(safe.connect_tracked(unrelated, timeout=0)) as conn:
                     conn.execute("SELECT 1")
+                shared = acquire(db_path=tmp_path / "shared.db")
+                try:
+                    reader = shared._checkout_read_conn()
+                    assert reader is not None
+                    shared._read_pool.put_nowait(reader)
+                    assert shared._evict_one_idle_read_conn()
+                finally:
+                    assert registry_release(shared)
                 completed.set()
             except BaseException as exc:
                 errors.append(repr(exc))

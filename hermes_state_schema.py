@@ -706,7 +706,7 @@ class SessionSchemaMixin:
         from hermes_state_repair import (
             _cross_process_repair_lock, _db_opens_cleanly, _live_writer_holds_db,
             _repair_conn, _repair_state_db_schema_locked, _strategy_drop_fts_vacuum,
-            _validate_fts_snapshot, _repair_io_scope,
+            _validate_fts_snapshot, _repair_io_scope, _repair_snapshot_timeout_seconds, _check_recovery_deadline,
         )
         _ensure_test_isolation(self.db_path)
         if self.read_only or self._quarantine_reason() is not None or self._conn.in_transaction:
@@ -737,6 +737,9 @@ class SessionSchemaMixin:
                         "SELECT value FROM state_meta WHERE key='db_file_generation'"
                     ).fetchone()
                     generation = tuple(generation) if generation is not None else None
+                    # Separate execution budget from flock entrance/backoff. Allow the
+                    # long rebuild/comparison plus both transfers at the existing size budget.
+                    deadline = time.monotonic() + 4 * _repair_snapshot_timeout_seconds(self.db_path)
 
                     def repair_snapshot(scratch, guard):
                         def validate_generation():
@@ -750,8 +753,11 @@ class SessionSchemaMixin:
                         validate_generation()
                         with _repair_conn(scratch) as conn:
                             _strategy_drop_fts_vacuum(conn)
+                            _check_recovery_deadline("scratch VACUUM")
                             conn.executescript(recovery_sql)
+                            _check_recovery_deadline("FTS rebuild")
                             _validate_fts_snapshot(guard, conn)
+                            _check_recovery_deadline("canonical comparison")
                         if (reason := _db_opens_cleanly(scratch)) is not None:
                             raise ValueError(reason)
                         validate_generation()
@@ -763,7 +769,7 @@ class SessionSchemaMixin:
                     # This was our admitted clean close, not a lost WAL generation.
                     self._db_sidecar_identity = {}
                     try:
-                        with _repair_io_scope(sole_owner):
+                        with _repair_io_scope(sole_owner, deadline=deadline):
                             if _live_writer_holds_db(self.db_path):
                                 return False
                             report = {"repaired": False, "strategy": None, "backup_path": None, "error": None}

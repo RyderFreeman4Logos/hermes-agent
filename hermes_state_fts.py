@@ -377,7 +377,7 @@ class SessionFtsSetupMixin:
             # lock, and nothing may be committed on a quarantined handle.
             self._raise_if_db_corrupt(storage=True)
             try:
-                with self._lock:
+                with self._advisory_write_lock(deadline=deadline), self._lock:
                     self._raise_if_db_replaced()
                     if self._conn is None:
                         self._reopen_after_close_locked(context="write")

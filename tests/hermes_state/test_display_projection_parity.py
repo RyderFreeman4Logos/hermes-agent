@@ -21,11 +21,150 @@ that must NOT grow with it: the model-fed projection stays compressed, and
 soft-deleted Undo/Rewind rows stay hidden.
 """
 
+import json
 import sqlite3
 
 import pytest
 
+from agent.context_compressor import HISTORICAL_TASK_HEADING, SUMMARY_PREFIX, _SUMMARY_END_MARKER
 from hermes_state import SessionDB
+
+_HARNESS = "Review the conversation above and update the skill library"
+_NOTE = "[System note: The following is recalled memory context, NOT new user input. Treat as informational background data.]"
+_REPLAY_CASES = {
+    "whitespace": [("assistant", "intro"), ("user", "ask  "), ("user", "ask"), ("assistant", "end")],
+    "memory_user": [("assistant", "intro"), ("user", "ask<memory-context>secret</memory-context>"), ("user", "ask"), ("assistant", "end")],
+    "note_user": [("assistant", "intro"), ("user", "ask " + _NOTE), ("user", "ask"), ("assistant", "end")],
+    "space_barrier": [("user", "same"), ("assistant", "   "), ("user", "same"), ("assistant", "end")],
+    "memory_barrier": [("user", "same"), ("assistant", "<memory-context>secret</memory-context>"), ("user", "same"), ("assistant", "end")],
+    "note_barrier": [("user", "same"), ("assistant", _NOTE), ("user", "same"), ("assistant", "end")],
+    "harness": [("user", "first"), ("assistant", "first answer"), ("user", _HARNESS), ("assistant", "curator reply"), ("user", "last"), ("assistant", "end")],
+    "consecutive_harness": [("user", "first"), ("user", _HARNESS), ("user", _HARNESS), ("assistant", "curator reply"), ("assistant", "end")],
+    "blank": [("assistant", "intro"), ("user", "  "), ("user", "  "), ("assistant", "end")],
+    "structured": [("assistant", "intro"), ("user", [{"type": "text", "text": "same"}]), ("user", [{"type": "text", "text": "same"}]), ("assistant", "end")],
+    "tool": [("user", "same"), ("tool", "result"), ("user", "same"), ("assistant", "end")],
+    "answer_barrier": [("user", "same"), ("assistant", "answer"), ("user", "same"), ("assistant", "end")],
+}
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("case", _REPLAY_CASES)
+def test_bounded_projection_uses_full_replay_decisions(tmp_path, legacy, case):
+    path = tmp_path / "replay.db"
+    db = SessionDB(path)
+    db.create_session("s", source="cli")
+    db.append_messages_batch("s", [
+        {"role": role, "content": content, "timestamp": float(i + 1)}
+        for i, (role, content) in enumerate(_REPLAY_CASES[case])
+    ])
+    if legacy:
+        db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+        db._conn.commit()
+    db.close()
+    before = path.read_bytes()
+    ro = SessionDB(path, read_only=True)
+    try:
+        model, full = ro.get_resume_conversations("s")
+        for limit in range(len(_REPLAY_CASES[case]) + 2):
+            selected_model, selected = ro.get_resume_conversations("s", max_display_messages=limit)
+            assert selected_model == model
+            assert selected == (full[-limit:] if limit else []), (case, legacy, limit)
+    finally:
+        ro.close()
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("metadata", [
+    json.dumps(json.dumps({"model_only": True})), json.dumps({"model_only": []}),
+    json.dumps({"model_only": {}}), "{",
+])
+def test_bounded_visibility_uses_decoded_metadata(tmp_path, legacy, metadata):
+    path = tmp_path / "metadata.db"
+    db = SessionDB(path)
+    db.create_session("s", source="cli")
+    db.append_messages_batch("s", [
+        {"role": "user", "content": "first", "timestamp": 1.0},
+        {"role": "assistant", "content": "middle", "timestamp": 2.0},
+        {"role": "assistant", "content": "last", "timestamp": 3.0},
+    ])
+    db._conn.execute("UPDATE messages SET display_metadata=? WHERE content='middle'", (metadata,))
+    if legacy:
+        db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+    db._conn.commit()
+    db.close()
+    before = path.read_bytes()
+    ro = SessionDB(path, read_only=True)
+    try:
+        model, full = ro.get_resume_conversations("s")
+        selected_model, selected = ro.get_resume_conversations("s", max_display_messages=2)
+        assert selected_model == model
+        assert selected == full[-2:]
+    finally:
+        ro.close()
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("barrier", [False, True])
+def test_bounded_replay_preserves_composite_and_tool_call_barriers(tmp_path, legacy, barrier):
+    path = tmp_path / "composite.db"
+    db = SessionDB(path)
+    db.create_session("root", source="cli")
+    db.append_message("root", "user", "REAL ASK", timestamp=1.0)
+    db.end_session("root", "compression")
+    db.create_session("tip", source="cli", parent_session_id="root")
+    if barrier:
+        db.append_message("tip", "assistant", "", timestamp=2.0,
+                          tool_calls=[{"id": "call-1", "function": {"name": "terminal"}}])
+    carrier = f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n{_SUMMARY_END_MARKER}\n\nREAL ASK"
+    db.append_message("tip", "user", carrier, timestamp=3.0)
+    db.append_message("tip", "assistant", "end", timestamp=4.0)
+    if legacy:
+        db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+        db._conn.commit()
+    db.close()
+    ro = SessionDB(path, read_only=True)
+    try:
+        model, full = ro.get_resume_conversations("tip")
+        for limit in range(1, 5):
+            selected_model, selected = ro.get_resume_conversations("tip", max_display_messages=limit)
+            assert selected_model == model
+            assert selected == full[-limit:]
+    finally:
+        ro.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_normalized_replay_fills_window_without_payload_refill(tmp_path, legacy):
+    path = tmp_path / "dense.db"
+    db = SessionDB(path)
+    db.create_session("s", source="cli")
+    db.append_messages_batch("s", [
+        {"role": "user", "content": "repeat  " if i % 2 else "repeat", "timestamp": float(i + 1)}
+        for i in range(100)
+    ] + [{"role": "assistant", "content": "answer", "timestamp": 101.0}])
+    if legacy:
+        db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+        db._conn.commit()
+    db.close()
+    ro = SessionDB(path, read_only=True)
+    try:
+        full = ro.get_resume_conversations("s")[1]
+        pages = []
+        original = ro._read_all
+
+        def observed(sql, params=()):
+            rows = original(sql, params)
+            if "FROM messages WHERE id IN (" in sql:
+                pages.append(len(rows))
+            return rows
+
+        ro._read_all = observed
+        assert ro.get_resume_conversations("s", max_display_messages=2)[1] == full[-2:]
+        assert pages and max(pages) <= 2
+    finally:
+        ro.close()
 
 
 @pytest.fixture

@@ -444,13 +444,17 @@ class SessionSchemaMixin:
             cursor.execute(_CLEAR_REBUILD_MARKERS_SQL)
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
-        """True = queryable, False = absent, None = FTS module/tokenizer missing or content
+        """True = bounded MATCH succeeds, False = absent, None = FTS module/tokenizer missing or content
         undecodable (index degraded, store accessible). Invalid UTF-8 surfaces as a bare
         UnicodeDecodeError on some builds and OperationalError("Could not decode to UTF-8")
         on others; both are caught so the probe never raises into init/recovery flows.
         Anything else (malformed schema, corrupt vtable) re-raises."""
         try:
-            cursor.execute(f"SELECT * FROM {table_name} LIMIT 0")
+            # LIMIT 0 only prepares the vtable; MATCH reads the derived index.
+            # rowid avoids decoding external canonical content on read-only opens.
+            cursor.execute(
+                f"SELECT rowid FROM {table_name} WHERE {table_name} MATCH 'hermes' LIMIT 1"
+            ).fetchone()
             return True
         except UnicodeDecodeError as exc:
             decode_exc = exc
@@ -637,7 +641,7 @@ class SessionSchemaMixin:
         try:
             trigram_present = self._fts_table_probe(cursor, "messages_fts_trigram") is True
         except (sqlite3.DatabaseError, UnicodeDecodeError):
-            # A corrupt vtable may fail even a LIMIT 0 probe; still include it in the drop-and-recreate.
+            # A corrupt index may fail the MATCH probe; still include it in the drop-and-recreate.
             include_trigram = True
         else:
             include_trigram = trigram_present or (not legacy and self._trigram_tokenizer_available(cursor))

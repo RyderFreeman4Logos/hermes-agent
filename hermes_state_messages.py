@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
@@ -1169,7 +1169,7 @@ class SessionMessagesMixin:
                 row["tool_call_id"], row["tool_calls"], row["tool_name"])
 
     def _is_model_only_row(self, row) -> bool:
-        """Python twin of :data:`DISPLAY_VISIBLE_SQL`."""
+        """Decoded metadata is the authority for display visibility."""
         return bool((self._decode_display_metadata(row["display_metadata"]) or {}).get(MODEL_ONLY_DISPLAY_METADATA_KEY))
 
     @staticmethod
@@ -1248,10 +1248,12 @@ class SessionMessagesMixin:
 
         return bool(self._execute_write(_do))
 
-    def _legacy_display_page(self, session_id: str, *, active_clause: str, limit: Optional[int], offset: int,
-                             latest: bool) -> List[Any]:
+    def _legacy_display_page(self, session_id: Union[str, List[str]], *, active_clause: str, limit: Optional[int], offset: int,
+                             latest: bool, ids_only: bool = False) -> List[Any]:
         """Project a legacy read-only display page without retaining transcript payloads."""
         representatives: Dict[bytes, Tuple[int, int]] = {}
+        session_ids = [session_id] if isinstance(session_id, str) else session_id
+        placeholders = _placeholders(session_ids)
         with self._read_ctx() as conn:
             conn.execute("BEGIN")
             try:
@@ -1263,8 +1265,8 @@ class SessionMessagesMixin:
                 rows = conn.execute(
                     "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, active, "
                     f"display_kind, display_metadata FROM messages {index_hint} "
-                    f"WHERE session_id = ?{active_clause} ORDER BY id ASC",
-                    (session_id,))
+                    f"WHERE session_id IN ({placeholders}){active_clause} ORDER BY id ASC",
+                    tuple(session_ids))
                 for row in rows:
                     if self._is_model_only_row(row):
                         continue
@@ -1278,13 +1280,15 @@ class SessionMessagesMixin:
                 identities = list(representatives)
                 identities = identities[::-1][offset:][:limit][::-1] if latest else identities[offset:][:limit]
                 selected_ids = [representatives[identity][1] for identity in identities]
+                if ids_only:
+                    return selected_ids
                 selected = {}
                 for start in range(0, len(selected_ids), 900):
                     chunk = selected_ids[start:start + 900]
                     selected.update({row["id"]: row for row in conn.execute(
-                        f"SELECT * FROM messages WHERE session_id = ?{active_clause} "
+                        f"SELECT * FROM messages WHERE session_id IN ({placeholders}){active_clause} "
                         f"AND id IN ({_placeholders(chunk)})",
-                        (session_id, *chunk))})
+                        (*session_ids, *chunk))})
                 return [selected[row_id] for row_id in selected_ids if row_id in selected]
             finally:
                 if conn.in_transaction:
@@ -1569,10 +1573,12 @@ class SessionMessagesMixin:
                     "see repair_message_sequence", repaired, session_id)
         return messages
 
-    def get_resume_conversations(self, session_id: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """``(model_history, display_history)`` for a resume from ONE SELECT; byte-identical to the separate
-        reads. model: the tip's active rows, alternation-repaired, summary marker kept for pre-compress
-        checkpointing. display: the full lineage (``/branch`` stands alone), compaction-archived rows deduped.
+    def get_resume_conversations(
+        self, session_id: str, *, max_display_messages: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """``(model_history, display_history)`` for a resume. Model history is always the complete active tip.
+        Display history is the full deduped lineage unless ``max_display_messages`` asks SQLite for only its
+        newest logical rows (``/branch`` still stands alone).
 
         The display projection also includes rows preserved by IN-PLACE compaction (``active=0,
         compacted=1``), deduped by :meth:`_dedupe_display_generations`. Without them a compacted
@@ -1580,14 +1586,131 @@ class SessionMessagesMixin:
         read as deleted even though every row is still on disk, and the REST transcript read (which has
         always included them) disagreed with this one about the same session (#92080).
         """
-        rows = self._fetch_conversation_rows(
-            self._resume_lineage_ids(session_id), _DISPLAY_ACTIVE_CLAUSE, with_session_id=True)
+        if max_display_messages is not None and max_display_messages < 0:
+            raise ValueError("max_display_messages must be non-negative")
+        session_ids = self._resume_lineage_ids(session_id)
+        rows = []
+        model_history = []
+        if max_display_messages is not None:
+            tip_rows = self._fetch_conversation_rows([session_id], " AND active = 1", with_session_id=True)
+            model_history = self._rows_to_conversation(
+                tip_rows, session_id=session_id, include_ancestors=False,
+                repair_alternation=True, include_row_ids=True, include_summary_markers=True)
+        if max_display_messages is None:
+            rows = self._fetch_conversation_rows(session_ids, _DISPLAY_ACTIVE_CLAUSE, with_session_id=True)
+            tip_rows = [r for r in rows if r["session_id"] == session_id and r["active"]]
+            rows = self._dedupe_display_generations(rows)
+        else:
+            tip_rows = self._fetch_conversation_rows([session_id], " AND active = 1", with_session_id=True)
+            if max_display_messages == 0:
+                rows = []
+            else:
+                placeholders = _placeholders(session_ids)
+                # Read-only stores may predate either display-index column.
+                with self._read_ctx() as conn:
+                    columns = set(self._message_column_names(conn))
+                indexed = {"display_identity", "display_order"} <= columns and self._read_one(
+                    f"""SELECT 1 FROM messages
+                        WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
+                          AND (display_identity IS NULL OR display_order IS NULL) LIMIT 1""",
+                    tuple(session_ids),
+                ) is None
+            if max_display_messages:
+                # Select replay representatives over fixed-width keys before transferring payload.
+                # Expanding a payload page across dense adjacent replays is unbounded in their count.
+                def replay_key(role, content, timestamp, kind, metadata, tool_calls):
+                    loaded = self._loaded_view_content(role, self._decode_content(content))
+                    if role == "assistant":
+                        return json.dumps([None, False, bool(loaded or
+                            _json_or(tool_calls, [], "Invalid tool calls")), False, False])
+                    if role != "user":
+                        return None
+                    from hermes_state import _is_background_review_harness_message
+                    msg = {"role": role, "content": loaded, "timestamp": timestamp,
+                           "display_kind": kind, "display_metadata": self._decode_display_metadata(metadata)}
+                    canonical, composite = self._canonical_replayed_user_content(msg)
+                    if canonical in (None, "", []):
+                        digest = None
+                    else:
+                        encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                                             separators=(",", ":"), default=str)
+                        digest = hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).hexdigest()
+                    return json.dumps([digest, composite, False,
+                                       _is_background_review_harness_message(msg), isinstance(canonical, str)])
+
+                # The read-only fallback uses the writer's non-reentrant lock; finish its
+                # identity scan before borrowing a connection for the metadata projection.
+                ids = None if indexed else self._legacy_display_page(
+                    session_ids, active_clause=_DISPLAY_ACTIVE_CLAUSE,
+                    limit=None, offset=0, latest=False, ids_only=True)
+                with self._read_ctx() as conn:
+                    conn.create_function("resume_key", 6, replay_key)
+                    conn.create_function("resume_visible", 1, lambda raw:
+                        int(not bool((self._decode_display_metadata(raw) or {}).get(MODEL_ONLY_DISPLAY_METADATA_KEY))))
+                    try:
+                        if indexed:
+                            metadata_rows = conn.execute(f"""WITH ranked AS (
+                                SELECT id, display_identity,
+                                       MIN(id) OVER (PARTITION BY display_identity) AS logical_order,
+                                       ROW_NUMBER() OVER (PARTITION BY display_identity
+                                           ORDER BY active DESC, id DESC) AS generation_rank
+                                FROM messages WHERE session_id IN ({placeholders})
+                                  AND (active = 1 OR compacted = 1) AND resume_visible(display_metadata)
+                            )
+                            SELECT m.id, m.role, m.timestamp,
+                                   resume_key(m.role,m.content,m.timestamp,m.display_kind,
+                                              m.display_metadata,m.tool_calls) AS replay
+                            FROM ranked r JOIN messages m ON m.id=r.id
+                            WHERE r.generation_rank=1 ORDER BY r.logical_order""", tuple(session_ids)).fetchall()
+                        else:
+                            metadata_rows = []
+                            for start in range(0, len(ids), 900):
+                                chunk = ids[start:start + 900]
+                                metadata_rows.extend(conn.execute(f"""SELECT id,role,timestamp,
+                                    resume_key(role,content,timestamp,display_kind,display_metadata,tool_calls)
+                                    AS replay FROM messages WHERE id IN ({_placeholders(chunk)})""", chunk))
+                            by_id = {row["id"]: row for row in metadata_rows}
+                            metadata_rows = [by_id[id_] for id_ in ids]
+                        from hermes_state import _REVIEW_HARNESS_PREFIXES, _strip_background_review_harness
+                        selected = []
+                        exact = {}
+                        for row in metadata_rows:
+                            replay = json.loads(row["replay"]) if row["replay"] else None
+                            msg = {"role": row["role"], "timestamp": row["timestamp"], "_row_id": row["id"],
+                                   "content": (_REVIEW_HARNESS_PREFIXES[0] if replay and replay[3] else
+                                               replay[2] if row["role"] == "assistant" and replay else "")}
+                            if row["role"] == "user":
+                                msg["_replay_canonical"] = replay[0] if replay else None
+                                msg["_replay_composite"] = replay[1] if replay else False
+                                msg["_replay_is_string"] = replay[4] if replay else False
+                            skip, clone_key = self._dedupe_replayed_user(selected, msg, exact)
+                            if skip:
+                                continue
+                            selected.append(msg)
+                            if clone_key is not None:
+                                exact[clone_key] = msg
+                        ids = [msg["_row_id"] for msg in
+                               _strip_background_review_harness(selected)[-max_display_messages:]]
+                    finally:
+                        conn.create_function("resume_key", 6, None)
+                        conn.create_function("resume_visible", 1, None)
+                rows_by_id = {}
+                for start in range(0, len(ids), 900):
+                    chunk = ids[start:start + 900]
+                    rows_by_id.update({row["id"]: row for row in self._read_all(
+                        f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM messages "
+                        f"WHERE id IN ({_placeholders(chunk)})", chunk)})
+                rows = [rows_by_id[id_] for id_ in ids if id_ in rows_by_id]
+                projected = self._rows_to_conversation(rows, session_id=session_id, include_ancestors=True,
+                                                       repair_alternation=False, include_row_ids=True)
+                return model_history, projected[-max_display_messages:]
         # The model projection stays active-only: it is the compressed working context.
-        model_history = self._rows_to_conversation(
-            [r for r in rows if r["session_id"] == session_id and r["active"]], session_id=session_id,
-            include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
+        if max_display_messages is None:
+            model_history = self._rows_to_conversation(
+                tip_rows, session_id=session_id, include_ancestors=False,
+                repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(
-            self._dedupe_display_generations(rows), session_id=session_id,
+            rows, session_id=session_id,
             include_ancestors=True, repair_alternation=False, include_row_ids=True)
         return model_history, display_history
 
@@ -1657,6 +1780,8 @@ class SessionMessagesMixin:
         """Return canonical live content and whether *msg* is composite."""
         if msg.get("role") != "user":
             return None, False
+        if "_replay_canonical" in msg:  # bounded metadata selector carries a fixed-width digest
+            return msg["_replay_canonical"], msg["_replay_composite"]
         handoff, live_view = split_user_originated_turn(msg)
         is_composite = handoff is not None and live_view is not None
         return live_view.get("content") if is_composite else msg.get("content"), is_composite
@@ -1687,7 +1812,8 @@ class SessionMessagesMixin:
             prev = messages[index]
             if prev.get("role") == "user":
                 prev_content, prev_is_composite = canonical(prev)
-                if prev_content == content and (prefer_current or prev_is_composite or isinstance(content, str)):
+                if prev_content == content and (prefer_current or prev_is_composite or
+                                               (isinstance(content, str) and msg.get("_replay_is_string", True))):
                     return index, prefer_current
             elif prev.get("role") == "assistant" and (prev.get("content") or prev.get("tool_calls")):
                 return None

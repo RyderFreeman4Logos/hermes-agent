@@ -71,6 +71,23 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     )
 
 
+def test_reader_start_failure_rolls_back_exact_registration(registry, monkeypatch):
+    session = _make_session(sid="failed-reader")
+    other = _make_session(sid="unrelated")
+    registry._running[other.id] = other
+
+    def fail_start(_thread):
+        assert registry._running[session.id] is session
+        raise RuntimeError("thread capacity")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread capacity"):
+        registry._track_started(session, lambda _session: None, "reader")
+    assert session.id not in registry._running
+    assert registry._running[other.id] is other
+    assert session._reader_thread is None
+
+
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
     old = _make_session(sid="proc_old", task_id="session-a")
     finished = _make_session(
@@ -2129,6 +2146,60 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+
+
+@pytest.mark.platforms("linux")
+class TestSpawnLocalFalseCompleteWhileAlive:
+    """Managed background must not complete while the launched PID still lives.
+
+    Issue #132: a long child (``hermes chat``) can close stdout while remaining
+    ``S``. The reader then treats pipe EOF + ``wait(timeout=5)`` as exit and
+    enqueues ``proc_* exit=None`` even though ``/proc/<pid>`` is still live.
+    """
+
+    def test_spawn_local_does_not_complete_while_pid_lives(self, registry, tmp_path):
+        child_script = (
+            "import os, time\n"
+            "os.close(1)\n"
+            "os.close(2)\n"
+            "time.sleep(30)\n"
+        )
+        # exec: Popen.pid is the long-lived process (wrapper/hermes-chat shape).
+        cmd = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(child_script)}"
+        session = registry.spawn_local(
+            cmd,
+            cwd=str(tmp_path),
+            notify_on_complete=True,
+        )
+        pid = session.pid
+        try:
+            deadline = time.monotonic() + 8.0
+            completions = []
+            while time.monotonic() < deadline:
+                completions.extend(registry.drain_notifications())
+                if completions:
+                    break
+                time.sleep(0.05)
+
+            os.kill(pid, 0)
+            assert completions == [], (
+                "process-complete while launched PID still lives "
+                f"(exit={completions[0][0].get('exit_code')!r})"
+            )
+
+            os.kill(pid, signal.SIGTERM)
+            done = _wait_until(
+                lambda: bool(registry.drain_notifications()),
+                timeout=5.0,
+                interval=0.05,
+            )
+            assert done, "no completion after launched PID became terminal"
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            registry.kill_process(session.id)
 
 # =========================================================================
 # systemd cgroup isolation for gateway-spawned local executors (#70716)

@@ -12,6 +12,8 @@ from tui_gateway import server
 @pytest.mark.parametrize("source,omit_messages", [("desktop", True), ("desktop", False), ("tui", True)])
 @pytest.mark.parametrize("profile", [None, "work"])
 def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monkeypatch, source, omit_messages, profile):
+    from hermes_state import resolved_max_resume_messages
+
     home = tmp_path / "work"
     home.mkdir()
     db = SessionDB(home / "state.db")
@@ -31,8 +33,8 @@ def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monk
     stored = db.get_session("tip")
     assert stored is not None
     stored_count = stored["message_count"]
-    _, display = db.get_resume_conversations("tip")
-    prefix = db.get_ancestor_display_prefix("tip")
+    _, display = db.get_resume_conversations("tip", max_display_messages=resolved_max_resume_messages() or None)
+    prefix = [m for m in display if m.get("_row_id") not in {row.get("_row_id") for row in expected}]
     display_reads = []
     original_display = db.get_resume_conversations
     original_prefix = db.get_ancestor_display_prefix
@@ -82,7 +84,7 @@ def test_deferred_resume_preserves_model_history_and_db_ownership(tmp_path, monk
         assert session["resume_history_ready"].wait(5)
         assert built.wait(5)
         model_only = source == "desktop" and omit_messages
-        assert display_reads == ([] if model_only else ["display", "prefix"])
+        assert display_reads == ([] if model_only else ["display"])
         assert session["history"] == expected
         assert session["display_history_prefix"] == ([] if model_only else prefix)
         count = stored_count if model_only else len(display)
@@ -153,3 +155,57 @@ def test_model_hydration_discards_stale_results_and_closes_owned_db(tmp_path, mo
         assert closed.wait(5)
         server._sessions.pop("hydrating", None)
         original_close()
+
+
+def test_deferred_hydration_uses_the_bounded_display_window(tmp_path, monkeypatch):
+    """A lineage under the resume guard but over the display window must not be fully materialized.
+
+    Deferred resume without ``omit_messages`` hydrates through ``_load_resume_transcript``.
+    The tip-only guard lets that path through; the display read must still use the SQL window
+    and keep ancestor identity. A 20k-row store is unnecessary: the bound is the configured limit.
+    """
+    from hermes_state import SessionDB
+
+    limit = 4
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("parent", source="tui")
+    db.append_messages_batch("parent", [
+        {"role": "user", "content": f"ancestor-{i}", "timestamp": float(i)} for i in range(6)
+    ])
+    db.end_session("parent", "compression")
+    db.create_session("tip", source="tui", parent_session_id="parent")
+    db.append_messages_batch("tip", [
+        {"role": "user", "content": "ancestor-5", "timestamp": 5.0},
+        {"role": "assistant", "content": "tip-answer", "timestamp": 6.0},
+    ])
+    monkeypatch.setattr("hermes_state.resolved_max_resume_messages", lambda: limit)
+    lineage_reads = []
+    original_read_all = db._read_all
+
+    def record_read(sql, params=()):
+        rows = original_read_all(sql, params)
+        if "FROM messages" in sql and "COUNT" not in sql.upper():
+            lineage_reads.append(len(rows))
+        return rows
+
+    db._read_all = record_read
+    session = server._deferred_session_record("tip", cols=80, cwd=str(tmp_path), history=[], lease=None)
+    session.update(resume_history_ready=threading.Event(), resume_hydrating=True, resume_message_count=99)
+    built = threading.Event()
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_k: built.set())
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *_a, **_k: None)
+    monkeypatch.setitem(server._sessions, "hyd-window", session)
+    try:
+        server._schedule_resume_hydration("hyd-window", "tip", db)
+        assert session["resume_history_ready"].wait(5)
+        assert built.wait(5)
+        assert session.get("resume_history_error") is None
+        assert [m["content"] for m in session["history"]] == ["ancestor-5", "tip-answer"]
+        prefix = [m["content"] for m in session["display_history_prefix"]]
+        assert prefix == ["ancestor-3", "ancestor-4"]
+        assert "ancestor-0" not in prefix
+        assert lineage_reads
+        assert max(lineage_reads) <= limit
+    finally:
+        server._sessions.pop("hyd-window", None)
+        db.close()

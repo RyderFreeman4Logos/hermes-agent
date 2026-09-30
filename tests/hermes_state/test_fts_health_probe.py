@@ -189,6 +189,108 @@ def test_header_recovery_refuses_or_rolls_back_without_losing_store(tmp_path, mo
             assert db._db_replaced and db._conn is None
 
 
+@pytest.mark.parametrize(
+    ("plugin_id", "replacement", "scratch_type", "should_recover"),
+    [
+        pytest.param(1, 1.0, "real", False, id="integer-to-real"),
+        pytest.param(2, 1, "integer", False, id="real-to-integer"),
+        pytest.param(1, 2, "integer", False, id="integer-same-class-change"),
+        pytest.param(2, 2.0, "real", False, id="real-same-class-change"),
+        pytest.param(3, "changed text", "text", False, id="text-control"),
+        pytest.param(4, bytes((1, 255)), "blob", False, id="blob-control"),
+        pytest.param(5, "not null", "text", False, id="null-change"),
+        pytest.param(5, None, "null", True, id="null-unchanged-control"),
+    ],
+)
+def test_scratch_canonical_comparison_preserves_sqlite_storage_classes(
+    tmp_path, monkeypatch, caplog, plugin_id, replacement, scratch_type, should_recover
+):
+    import hermes_state_repair as repair
+
+    path = tmp_path / "state.db"
+    monkeypatch.setattr(
+        "hermes_state_wal.is_sqlite_wal_reset_vulnerable", lambda **kwargs: False
+    )
+    with SessionDB(db_path=path) as seed:
+        seed.create_session("s", source="cli")
+        seed.append_message("s", role="user", content="seed")
+        seed_conn = seed._conn
+        assert seed_conn is not None
+        seed_conn.execute(
+            "CREATE TABLE plugin(id INTEGER PRIMARY KEY AUTOINCREMENT, payload)"
+        )
+        seed_conn.executemany(
+            "INSERT INTO plugin VALUES (?, ?)",
+            [(1, 1), (2, 1.0), (3, "text"), (4, bytes((0, 255))), (5, None)],
+        )
+        seed_conn.execute("INSERT INTO plugin VALUES(37, 'sequence')")
+        seed_conn.execute("DELETE FROM plugin WHERE id=37")
+        seed_conn.execute(
+            "UPDATE messages_fts_data SET block=X'DEADBEEFDEADBEEFDEADBEEFDEADBEEF'"
+        )
+        seed.append_message("s", role="user", content="canonical survives")
+
+    with monkeypatch.context() as opening:
+        opening.setattr(
+            SessionDB,
+            "_foreign_state_db_holders",
+            lambda self: [(222, str(path))],
+        )
+        db = SessionDB(db_path=path)
+    with db:
+        def connection():
+            conn = db._conn
+            assert conn is not None
+            return conn
+
+        def rows():
+            return [
+                tuple(row)
+                for row in connection().execute(
+                    "SELECT rowid, id, payload, typeof(payload) FROM plugin ORDER BY id"
+                )
+            ]
+
+        before = rows()
+        sequence_before = connection().execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='plugin'"
+        ).fetchone()[0]
+        assert sequence_before == 37
+        inode = path.stat().st_ino
+        reached = []
+        original = repair._strategy_drop_fts_vacuum
+
+        def mutate_scratch(conn):
+            original(conn)
+            conn.execute(
+                "UPDATE plugin SET payload=? WHERE id=?", (replacement, plugin_id)
+            )
+            reached.append(
+                tuple(
+                    conn.execute(
+                        "SELECT payload, typeof(payload) FROM plugin WHERE id=?",
+                        (plugin_id,),
+                    ).fetchone()
+                )
+            )
+
+        monkeypatch.setattr(repair, "_strategy_drop_fts_vacuum", mutate_scratch)
+        recovered = db.retry_deferred_fts_recovery()
+
+        assert reached == [(replacement, scratch_type)]
+        assert recovered is should_recover
+        assert rows() == before
+        assert connection().execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='plugin'"
+        ).fetchone()[0] == sequence_before
+        assert path.stat().st_ino == inode
+        if should_recover:
+            assert db._fts_enabled and not db._fts_stale
+        else:
+            assert db._fts_stale and not db._fts_enabled
+            assert "FTS repair changed canonical rows in plugin" in caplog.text
+
+
 def test_healthy_write_probe_rolls_back_every_probe_row(tmp_path):
     path = tmp_path / "state.db"
     with SessionDB(db_path=path) as db:

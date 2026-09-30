@@ -1174,7 +1174,12 @@ def _validate_fts_snapshot(original: sqlite3.Connection, repaired: sqlite3.Conne
         width = len(original.execute(sql + " LIMIT 0", args).description)
         sql += " ORDER BY " + ",".join(str(i) for i in range(1, width + 1))
         for left, right in itertools.zip_longest(original.execute(sql, args), repaired.execute(sql, args)):
-            if left is None or right is None or tuple(left) != tuple(right):
+            if (
+                left is None
+                or right is None
+                or tuple((type(value), value) for value in left)
+                != tuple((type(value), value) for value in right)
+            ):
                 raise ValueError(f"FTS repair changed canonical rows in {name}")
     if repaired.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise ValueError("FTS repair snapshot has foreign-key violations")

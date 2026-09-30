@@ -10,6 +10,7 @@ import hashlib
 import logging
 import json
 import os
+import queue
 import sqlite3
 import tempfile
 import time
@@ -562,6 +563,9 @@ class SessionSchemaMixin:
         """Atomically rebuild stale base/trigram indexes and resume syncing. *timeout_seconds*
         bounds the admission wait (None = full startup budget, ``0`` = non-blocking retry).
         Fails closed: holders or a lost admission race leave the breadcrumb set."""
+        if self.read_only or self._quarantine_reason() is not None:
+            return False
+        self._halt_if_db_generation_changed()
         foreign_holders = self._foreign_state_db_holders()
         if foreign_holders and self._defer_stale_fts_for_holders(cursor, foreign_holders):
             return False
@@ -621,6 +625,7 @@ class SessionSchemaMixin:
                 cursor = self._conn.cursor()
                 legacy = self._db_has_legacy_inline_fts(cursor)
                 recovered = self._recover_stale_fts(cursor, legacy=legacy, timeout_seconds=0.0)
+                cursor = self._conn.cursor()  # scratch recovery may have reopened the owned writer
                 if recovered:
                     # CJK was detached alongside the base indexes; its own ensure path
                     # decides when it comes back online.
@@ -673,16 +678,126 @@ class SessionSchemaMixin:
             # Stale indexes must stay detached even on builds whose DDL transaction behavior differs.
             self._drop_all_fts_triggers(cursor)
             self._conn.commit()
-            logger.error(
-                "Automatic rebuild of stale FTS indexes failed (%s); "
-                "canonical writes remain enabled with FTS detached.", exc,
-            )
-            return False
+            if not ("vtable constructor failed: messages_fts" in str(exc).lower()
+                    and self._recover_stale_fts_snapshot(recovery_sql)):
+                logger.error(
+                    "Automatic rebuild of stale FTS indexes failed (%s); "
+                    "canonical writes remain enabled with FTS detached.", exc,
+                )
+                return False
         self._fts_stale = False
         self._fts_enabled = True
         self._trigram_available = include_trigram
         logger.warning("Rebuilt stale state.db FTS indexes from canonical messages and restored sync triggers.")
         return True
+
+    def _recover_stale_fts_snapshot(self, recovery_sql: str) -> bool:
+        """Transfer sole connection ownership to existing scratch/backup repair, never live surgery.
+
+        Order: writer lock (or unpublished startup) -> FTS admission -> nonblocking repair
+        lock -> nonblocking connection-lifecycle exclusion -> SQLite exclusive guard.
+        Checked-out readers/peers refuse; idle owned readers are closed and reopened lazily.
+        FTS retry/backoff remains the budget, independent of malformed-schema repair's ledger.
+        """
+        from hermes_cli.sqlite_safe_read import connection_handoff, connect_tracked
+        from hermes_state import _ensure_test_isolation
+        from hermes_state_common import stat_db_file_identity
+        from hermes_state_dbfile import _stat_sqlite_sidecar_identity, refuse_deleted_wal_generation
+        from hermes_state_repair import (
+            _cross_process_repair_lock, _db_opens_cleanly, _live_writer_holds_db,
+            _repair_conn, _repair_state_db_schema_locked, _strategy_drop_fts_vacuum,
+            _validate_fts_snapshot,
+        )
+        _ensure_test_isolation(self.db_path)
+        if self.read_only or self._quarantine_reason() is not None or self._conn.in_transaction:
+            return False
+        self._halt_if_db_generation_changed()
+        with _cross_process_repair_lock(self.db_path, timeout_seconds=0.0) as admitted:
+            if not admitted:
+                return False
+            with self._read_conns_lock:
+                was_closed = self._read_conns_closed
+                self._read_conns_closed = True
+            idle_readers = []
+            try:
+                while True:
+                    try:
+                        idle_readers.append(self._read_pool.get_nowait())
+                    except queue.Empty:
+                        break
+                with connection_handoff(self.db_path, self._conn, owned_readers=idle_readers) as sole_owner:
+                    if not sole_owner:
+                        return False
+                    self._halt_if_db_generation_changed()
+                    while idle_readers:
+                        self._close_read_conn(idle_readers.pop())
+                    identity = stat_db_file_identity(self.db_path)
+                    application_id = self._conn.execute("PRAGMA application_id").fetchone()[0]
+                    generation = self._conn.execute(
+                        "SELECT value FROM state_meta WHERE key='db_file_generation'"
+                    ).fetchone()
+                    generation = tuple(generation) if generation is not None else None
+
+                    def repair_snapshot(scratch, guard):
+                        def validate_generation():
+                            row = guard.execute("SELECT value FROM state_meta WHERE key='db_file_generation'").fetchone()
+                            if (stat_db_file_identity(self.db_path) != identity
+                                    or guard.execute("PRAGMA application_id").fetchone()[0] != application_id
+                                    or (tuple(row) if row is not None else None) != generation):
+                                raise ValueError("state.db generation changed during FTS repair handoff")
+                            refuse_deleted_wal_generation(self.db_path)
+
+                        validate_generation()
+                        with _repair_conn(scratch) as conn:
+                            _strategy_drop_fts_vacuum(conn)
+                            conn.executescript(recovery_sql)
+                            _validate_fts_snapshot(guard, conn)
+                        if (reason := _db_opens_cleanly(scratch)) is not None:
+                            raise ValueError(reason)
+                        validate_generation()
+
+                    import hermes_state_lockguard as lockguard
+                    lockguard.release(self._wal_lock_guard)
+                    self._conn.close()
+                    self._conn = None
+                    # This was our admitted clean close, not a lost WAL generation.
+                    self._db_sidecar_identity = {}
+                    try:
+                        if _live_writer_holds_db(self.db_path):
+                            return False
+                        report = {"repaired": False, "strategy": None, "backup_path": None, "error": None}
+                        result = _repair_state_db_schema_locked(
+                            self.db_path, backup=True, report=report, repair_snapshot=repair_snapshot,
+                        )
+                        if not result.get("repaired"):
+                            logger.warning("Stale FTS snapshot recovery refused: %s", result.get("error"))
+                        return bool(result.get("repaired"))
+                    finally:
+                        refuse_deleted_wal_generation(self.db_path)
+                        if stat_db_file_identity(self.db_path) != identity:
+                            self._db_replaced = True
+                            raise ValueError("state.db replaced during FTS repair handoff; refusing reopen")
+                        with contextlib.closing(connect_tracked(
+                            self.db_path.resolve().as_uri() + "?mode=ro", uri=True,
+                            tracking_path=self.db_path, timeout=0.0,
+                        )) as reader:
+                            current_generation = reader.execute(
+                                "SELECT value FROM state_meta WHERE key='db_file_generation'"
+                            ).fetchone()
+                            changed = (reader.execute("PRAGMA application_id").fetchone()[0] != application_id
+                                       or current_generation != generation)
+                        if changed:
+                            self._db_replaced = True
+                            raise ValueError("state.db generation changed during FTS handoff; refusing reopen")
+                        self._conn = self._open_writer_conn()
+                        if self._wal_active:
+                            self._wal_lock_guard = lockguard.hold(self.db_path)
+                        self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)
+            finally:
+                with self._read_conns_lock:
+                    for conn in idle_readers:
+                        self._read_pool.put_nowait(conn)
+                    self._read_conns_closed = was_closed
 
     def _trigram_tokenizer_available(self, cursor: sqlite3.Cursor) -> bool:
         """Probe trigram support without publishing a persistent FTS object."""
@@ -1177,7 +1292,9 @@ class SessionSchemaMixin:
         if not self._fts_stale:
             self._migrate_misaligned_fts_source(cursor, legacy=legacy_fts)
         if self._fts_stale:
-            if self._recover_stale_fts(cursor, legacy=legacy_fts):
+            recovered = self._recover_stale_fts(cursor, legacy=legacy_fts)
+            cursor = self._conn.cursor()  # scratch recovery may have reopened the owned writer
+            if recovered:
                 # CJK was detached alongside the base indexes; its ensure path decides when it returns.
                 self._ensure_fts_cjk_schema(cursor)
             else:

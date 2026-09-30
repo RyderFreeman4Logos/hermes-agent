@@ -241,6 +241,28 @@ def read_header_bytes_preopen(path: Path | str, *, length: int = 100, force: boo
 
 
 @contextlib.contextmanager
+def connection_handoff(path: Path | str, connection: sqlite3.Connection, *, owned_readers=()):
+    """Exclude tracked open/close operations while a sole owner retires and reopens its connection.
+
+    Non-blocking: callers already hold a SessionDB writer lock; waiting here could invert
+    a concurrent opener's lifecycle-lock -> schema-init order. Peers, checked-out readers,
+    and partially opened connections refuse the handoff, not just registry-owned writers.
+    The caller must close the admitted connection before any raw access or repair guard open.
+    """
+    if not _live_lock.acquire(blocking=False):
+        yield False
+        return
+    try:
+        key = _key(path)
+        owned = (connection, *owned_readers)
+        yield (len({id(conn) for conn in owned}) == len(owned)
+               and all(getattr(conn, "_hermes_tracked_path", None) == key for conn in owned)
+               and _live_connections.get(key) == len(owned))
+    finally:
+        _live_lock.release()
+
+
+@contextlib.contextmanager
 def offline_file_access(path: Path | str, *, what: str = "read"):
     """Hold the connection-lifecycle lock across a raw read of a database file: checking
     :func:`has_live_connection` and *then* doing raw I/O is a check/use race (a connection opened

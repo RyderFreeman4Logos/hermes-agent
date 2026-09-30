@@ -1279,7 +1279,7 @@ class SessionMessagesMixin:
                 row["tool_call_id"], row["tool_calls"], row["tool_name"])
 
     def _is_model_only_row(self, row) -> bool:
-        """Python twin of :data:`DISPLAY_VISIBLE_SQL`."""
+        """Decoded metadata is the authority for display visibility."""
         return bool((self._decode_display_metadata(row["display_metadata"]) or {}).get(MODEL_ONLY_DISPLAY_METADATA_KEY))
 
     @staticmethod
@@ -1729,19 +1729,24 @@ class SessionMessagesMixin:
                 # Select replay representatives over fixed-width keys before transferring payload.
                 # Expanding a payload page across dense adjacent replays is unbounded in their count.
                 def replay_key(role, content, timestamp, kind, metadata, tool_calls):
+                    loaded = self._loaded_view_content(role, self._decode_content(content))
                     if role == "assistant":
-                        return json.dumps([bool(self._decode_content(content) or
-                                                _json_or(tool_calls, [], "Invalid tool calls"))])
+                        return json.dumps([None, False, bool(loaded or
+                            _json_or(tool_calls, [], "Invalid tool calls")), False, False])
                     if role != "user":
                         return None
-                    msg = {"role": role, "content": self._decode_content(content), "timestamp": timestamp,
+                    from hermes_state import _is_background_review_harness_message
+                    msg = {"role": role, "content": loaded, "timestamp": timestamp,
                            "display_kind": kind, "display_metadata": self._decode_display_metadata(metadata)}
                     canonical, composite = self._canonical_replayed_user_content(msg)
                     if canonical in (None, "", []):
-                        return None
-                    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, default=str)
-                    return json.dumps([hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).hexdigest(),
-                                       composite, isinstance(canonical, str)])
+                        digest = None
+                    else:
+                        encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                                             separators=(",", ":"), default=str)
+                        digest = hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).hexdigest()
+                    return json.dumps([digest, composite, False,
+                                       _is_background_review_harness_message(msg), isinstance(canonical, str)])
 
                 # The read-only fallback uses the writer's non-reentrant lock; finish its
                 # identity scan before borrowing a connection for the metadata projection.
@@ -1750,6 +1755,8 @@ class SessionMessagesMixin:
                     limit=None, offset=0, latest=False, ids_only=True)
                 with self._read_ctx() as conn:
                     conn.create_function("resume_key", 6, replay_key)
+                    conn.create_function("resume_visible", 1, lambda raw:
+                        int(not bool((self._decode_display_metadata(raw) or {}).get(MODEL_ONLY_DISPLAY_METADATA_KEY))))
                     try:
                         if indexed:
                             metadata_rows = conn.execute(f"""WITH ranked AS (
@@ -1758,7 +1765,7 @@ class SessionMessagesMixin:
                                        ROW_NUMBER() OVER (PARTITION BY display_identity
                                            ORDER BY active DESC, id DESC) AS generation_rank
                                 FROM messages WHERE session_id IN ({placeholders})
-                                  AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}
+                                  AND (active = 1 OR compacted = 1) AND resume_visible(display_metadata)
                             )
                             SELECT m.id, m.role, m.timestamp,
                                    resume_key(m.role,m.content,m.timestamp,m.display_kind,
@@ -1774,34 +1781,29 @@ class SessionMessagesMixin:
                                     AS replay FROM messages WHERE id IN ({_placeholders(chunk)})""", chunk))
                             by_id = {row["id"]: row for row in metadata_rows}
                             metadata_rows = [by_id[id_] for id_ in ids]
+                        from hermes_state import _REVIEW_HARNESS_PREFIXES, _strip_background_review_harness
                         selected = []
                         exact = {}
                         for row in metadata_rows:
                             replay = json.loads(row["replay"]) if row["replay"] else None
-                            key = (row["timestamp"], replay[0]) if row["role"] == "user" and replay and row["timestamp"] is not None else None
-                            duplicate = exact.get(key) if key is not None else None
-                            if duplicate is not None and duplicate not in selected:
-                                duplicate = None
-                            prefer_current = duplicate is not None
-                            if duplicate is None and row["role"] == "user" and replay:
-                                for earlier in reversed(selected):
-                                    if earlier["role"] == "assistant" and json.loads(earlier["replay"] or "[false]")[0]:
-                                        break
-                                    prev = json.loads(earlier["replay"]) if earlier["replay"] else None
-                                    if earlier["role"] == "user" and prev and prev[0] == replay[0] and (replay[1] or prev[1] or replay[2]):
-                                        duplicate = earlier
-                                        prefer_current = replay[1]
-                                        break
-                            if duplicate is not None:
-                                if not prefer_current:
-                                    continue
-                                selected.remove(duplicate)
-                            selected.append(row)
-                            if key is not None:
-                                exact[key] = row
-                        ids = [row["id"] for row in selected[-max_display_messages:]]
+                            msg = {"role": row["role"], "timestamp": row["timestamp"], "_row_id": row["id"],
+                                   "content": (_REVIEW_HARNESS_PREFIXES[0] if replay and replay[3] else
+                                               replay[2] if row["role"] == "assistant" and replay else "")}
+                            if row["role"] == "user":
+                                msg["_replay_canonical"] = replay[0] if replay else None
+                                msg["_replay_composite"] = replay[1] if replay else False
+                                msg["_replay_is_string"] = replay[4] if replay else False
+                            skip, clone_key = self._dedupe_replayed_user(selected, msg, exact)
+                            if skip:
+                                continue
+                            selected.append(msg)
+                            if clone_key is not None:
+                                exact[clone_key] = msg
+                        ids = [msg["_row_id"] for msg in
+                               _strip_background_review_harness(selected)[-max_display_messages:]]
                     finally:
                         conn.create_function("resume_key", 6, None)
+                        conn.create_function("resume_visible", 1, None)
                 rows_by_id = {}
                 for start in range(0, len(ids), 900):
                     chunk = ids[start:start + 900]
@@ -1888,6 +1890,8 @@ class SessionMessagesMixin:
         """Return canonical live content and whether *msg* is composite."""
         if msg.get("role") != "user":
             return None, False
+        if "_replay_canonical" in msg:  # bounded metadata selector carries a fixed-width digest
+            return msg["_replay_canonical"], msg["_replay_composite"]
         handoff, live_view = split_user_originated_turn(msg)
         is_composite = handoff is not None and live_view is not None
         return live_view.get("content") if is_composite else msg.get("content"), is_composite
@@ -1918,7 +1922,8 @@ class SessionMessagesMixin:
             prev = messages[index]
             if prev.get("role") == "user":
                 prev_content, prev_is_composite = canonical(prev)
-                if prev_content == content and (prefer_current or prev_is_composite or isinstance(content, str)):
+                if prev_content == content and (prefer_current or prev_is_composite or
+                                               (isinstance(content, str) and msg.get("_replay_is_string", True))):
                     return index, prefer_current
             elif prev.get("role") == "assistant" and (prev.get("content") or prev.get("tool_calls")):
                 return None

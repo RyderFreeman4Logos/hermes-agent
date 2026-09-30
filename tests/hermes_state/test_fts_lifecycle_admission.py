@@ -136,6 +136,11 @@ def test_recovery_does_not_block_unrelated_lifecycle(tmp_path, monkeypatch, stag
                 errors.append(repr(exc))
         def unrelated_work():
             try:
+                with pytest.raises(safe.LiveConnectionError):
+                    safe.connect_tracked(db.db_path, timeout=0)
+                with pytest.raises(safe.LiveConnectionError):
+                    with safe.offline_file_access(db.db_path):
+                        pytest.fail("target reservation lost during slow work")
                 idle.close()
                 with contextlib.closing(safe.connect_tracked(unrelated, timeout=0)) as conn:
                     conn.execute("SELECT 1")

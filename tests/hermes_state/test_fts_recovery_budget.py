@@ -1,4 +1,7 @@
 """One cooperative execution budget, independent of lock entrance/backoff."""
+import contextlib
+import sqlite3
+import time
 import pytest
 
 from hermes_state import SessionDB
@@ -61,3 +64,37 @@ def test_staging_baseexception_cleans_scratch_and_reopens_owner(tmp_path, monkey
         assert db._conn is not None and not db._read_conns_closed
         assert [tuple(r) for r in db._conn.execute("SELECT * FROM messages")] == before
         assert not db.db_path.with_name("state.db.repair-scratch").exists()
+
+
+def test_sqlite_progress_callback_interrupts_and_rolls_back(tmp_path):
+    path = tmp_path / "progress.db"
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE canonical(value)")
+        conn.execute("INSERT INTO canonical VALUES('retained')")
+        conn.commit()
+    with repair._repair_io_scope(None, deadline=time.monotonic() - 1):
+        with repair._repair_conn(path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+                conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) "
+                             "INSERT INTO canonical SELECT x FROM n")
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("SELECT * FROM canonical").fetchall() == [('retained',)]
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ('ok',)
+
+
+def test_execution_budget_interrupts_partial_promotion_without_partial_commit(tmp_path):
+    source, target = tmp_path / 'source.db', tmp_path / 'target.db'
+    with contextlib.closing(sqlite3.connect(source)) as conn:
+        conn.execute("CREATE TABLE canonical(value)")
+        conn.execute("INSERT INTO canonical VALUES(zeroblob(4*1024*1024))")
+        conn.commit()
+    with contextlib.closing(sqlite3.connect(target)) as guard:
+        guard.execute("CREATE TABLE canonical(value)")
+        guard.execute("INSERT INTO canonical VALUES('retained')")
+        guard.commit()
+        with repair._repair_io_scope(None, deadline=time.monotonic() - 1):
+            with pytest.raises(TimeoutError, match="snapshot transfer"):
+                repair._copy_database_snapshot(source, target, destination_connection=guard)
+        assert guard.execute("SELECT * FROM canonical").fetchall() == [('retained',)]
+        assert guard.execute("PRAGMA integrity_check").fetchone() == ('ok',)

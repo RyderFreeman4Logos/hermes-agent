@@ -25,6 +25,7 @@ _live_lock = threading.RLock()
 _live_connections: dict[str, int] = {}
 # Immutable admission tokens survive rename/replacement; never restat at close.
 _live_tokens: dict[object, tuple[str, frozenset[tuple[int, int]]]] = {}
+_unknown_tokens: set[object] = set()
 _manual_tokens: dict[str, list[object]] = {}
 _reservations: list[_Handoff] = []
 _SIDECARS = ("-wal", "-shm", "-journal")
@@ -117,6 +118,8 @@ def track_connection(path: Path | str) -> None:
         token = object()
         _manual_tokens.setdefault(key, []).append(token)
         _live_tokens[token] = (key, _identities(key))
+        if _identity(key) is None:
+            _unknown_tokens.add(token)
         _track_key(key)
 
 
@@ -141,6 +144,7 @@ def untrack_connection(path: Path | str) -> None:
 
 
 def _untrack_token(token):
+    _unknown_tokens.discard(token)
     entry = _live_tokens.pop(token, None)
     if entry is not None:
         _track_key(entry[0], -1)
@@ -152,7 +156,10 @@ def _live_main_key(key: str) -> Optional[str]:
     """The tracked main-database key that makes *key* live, or ``None`` (caller holds ``_live_lock``).
 
     SQLite locks the main file and its WAL sidecars; a raw ``close()`` of any of those
-    inodes cancels this process's POSIX locks, but the registry is keyed by the main path."""
+    inodes cancels this process's POSIX locks. Unknown disk bindings fence every raw
+    operation until a successful physical close settles their custody."""
+    if _unknown_tokens:
+        return _live_tokens[next(iter(_unknown_tokens))][0]
     identity = _identity(key)
     for main, captured in _live_tokens.values():
         if key in _bundle(main) or (identity is not None and identity in captured):
@@ -267,16 +274,21 @@ def connect_tracked(
                 actual = _canonical_db_path(conn)
                 resolved = _key(tracking_path) if tracking_path is not None else actual
                 if resolved is None:
-                    return conn
+                    uri = urlsplit(str(path))
+                    if str(path) == ':memory:' or (kwargs.get('uri') and
+                            (uri.path == ':memory:' or 'mode=memory' in uri.query.split('&'))):
+                        return conn  # known memory connections have no disk descriptor
+                    resolved = key  # unknown file-backed identity must retain custody
                 if not isinstance(conn, _TrackingMixin):
                     conn = _retrofit_tracking(conn, resolved)
                 with _live_lock:
                     token = object()
-                    captured = _identities(resolved) | _identities(key)
+                    post_key = _key(spelling)
+                    captured = _identities(resolved) | _identities(key) | _identities(post_key)
                     if actual is not None:
                         captured |= _identities(actual)
                     conn._hermes_identity_uncertain = (
-                        actual is None or actual != key or resolved != key
+                        actual is None or actual != key or resolved != key or post_key != key
                         or (before is not None and before != _identity(resolved))
                     )
                     if before is not None:
@@ -284,6 +296,8 @@ def connect_tracked(
                     conn._hermes_tracked_path = resolved
                     conn._hermes_tracking_token = token
                     _live_tokens[token] = (resolved, captured)
+                    if actual is None:
+                        _unknown_tokens.add(token)
                     _track_key(resolved)
                     if claim is not None:
                         claim.tokens.add(token)
@@ -385,6 +399,7 @@ def connection_handoff(path: Path | str, connection: sqlite3.Connection, *, owne
         live = {token for token, (main, captured) in _live_tokens.items()
                 if main == key or (identity is not None and identity in captured)}
         if (identity is not None and os.stat(key).st_nlink == 1
+                and not _unknown_tokens
                 and len(tokens) == len(owned) and None not in tokens and live == tokens
                 and all(getattr(conn, "_hermes_tracked_path", None) == key
                         and not getattr(conn, "_hermes_identity_uncertain", False) for conn in owned)

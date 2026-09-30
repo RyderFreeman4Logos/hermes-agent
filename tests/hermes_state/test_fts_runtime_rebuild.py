@@ -18,6 +18,7 @@ import logging
 import os
 import sqlite3
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,6 +57,29 @@ def _corrupt_trigram_fts(db_path):
     )
     raw.commit()
     raw.close()
+
+
+def _inject_scoped_match_failure(db, monkeypatch, table):
+    """Inject scoped evidence at the MATCH read boundary, not into the handler.
+
+    SQLite 3.40.1 reports generic CORRUPT for the joined search after a physical
+    FTS stomp, despite CORRUPT_VTAB on an index-only query in another connection.
+    Physical diagnostic/refusal coverage stays separate below.
+    """
+    read_all = db._read_all
+    failures = []
+
+    def read(sql, params):
+        if f"{table} MATCH ?" in sql and not failures:
+            exc = sqlite3.DatabaseError("database disk image is malformed")
+            exc.sqlite_errorcode = sqlite3.SQLITE_CORRUPT_VTAB
+            exc.sqlite_errorname = "SQLITE_CORRUPT_VTAB"
+            failures.append(exc)
+            raise exc
+        return read_all(sql, params)
+
+    monkeypatch.setattr(db, "_read_all", read)
+    return failures
 
 
 def _message_contents(db_path):
@@ -209,7 +233,11 @@ class TestRuntimeFtsRebuild:
         other.touch()
         os.symlink(str(other), str(proc_root / "333" / "fd" / "3"))
 
-        monkeypatch.setattr(hermes_state_holders.os, "getpid", lambda: 111)
+        # Project /proc only in the holder module, leaving HomeIOGuard and
+        # pathlib on the real OS (the same pattern as test_state_db_holders).
+        projected_os = SimpleNamespace(**vars(os))
+        projected_os.getpid = lambda: 111
+        monkeypatch.setattr(hermes_state_holders, "os", projected_os)
         real_listdir = os.listdir
         def _listdir(path):
             if isinstance(path, str):
@@ -256,7 +284,11 @@ class TestRuntimeFtsRebuild:
             b"python3\x00-m\x00hermes_cli.main\x00chat\x00"
         )
 
-        monkeypatch.setattr(hermes_state_holders.os, "getpid", lambda: 111)
+        # Project /proc only in the holder module, leaving HomeIOGuard and
+        # pathlib on the real OS (the same pattern as test_state_db_holders).
+        projected_os = SimpleNamespace(**vars(os))
+        projected_os.getpid = lambda: 111
+        monkeypatch.setattr(hermes_state_holders, "os", projected_os)
         real_listdir = os.listdir
         def _listdir(path):
             if isinstance(path, str):
@@ -432,8 +464,10 @@ class TestRuntimeFtsRebuild:
     def test_search_messages_defers_rebuild_after_fts_corruption(
         self, db, tmp_path, monkeypatch
     ):
-        """A read-only session that only SEARCHES (no write after corruption)
-        must stay available without starting an unbounded index scan.
+        """Scoped MATCH failure detaches FTS and reads real canonical rows.
+
+        Use deterministic CORRUPT_VTAB at the query boundary; the physical
+        joined-search fixture's unscoped error must instead fail closed.
         """
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
@@ -441,7 +475,7 @@ class TestRuntimeFtsRebuild:
         db.create_session("s1", source="test")
         db.append_message("s1", "user", "a searchable needle here")
 
-        _corrupt_fts(db_path)
+        failures = _inject_scoped_match_failure(db, monkeypatch, "messages_fts")
         monkeypatch.setattr(
             db,
             "rebuild_fts",
@@ -450,6 +484,7 @@ class TestRuntimeFtsRebuild:
 
         results = db.search_messages("needle")
 
+        assert len(failures) == 1
         assert db._fts_stale is True
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
@@ -459,8 +494,7 @@ class TestRuntimeFtsRebuild:
     def test_trigram_search_defers_rebuild_after_fts_corruption(
         self, db, tmp_path, monkeypatch
     ):
-        """The CJK/trigram MATCH branch has the same read-corruption exposure
-        as the main FTS5 branch and must fall back to canonical rows.
+        """The trigram handler also falls back on deterministic scoped evidence.
         """
         if not db._fts_enabled:
             pytest.skip("FTS5 unavailable in this build")
@@ -470,7 +504,7 @@ class TestRuntimeFtsRebuild:
         db.create_session("s1", source="test")
         db.append_message("s1", "user", "关于大别山项目的进展报告")
 
-        _corrupt_trigram_fts(db_path)
+        failures = _inject_scoped_match_failure(db, monkeypatch, "messages_fts_trigram")
         monkeypatch.setattr(
             db,
             "rebuild_fts",
@@ -480,6 +514,7 @@ class TestRuntimeFtsRebuild:
         # >=3 CJK chars per token → routed to the trigram branch.
         results = db.search_messages("大别山项目")
 
+        assert len(failures) == 1
         assert db._fts_stale is True
         assert _meta_value(db_path, FTS_STALE_KEY) == "1"
         assert _base_fts_triggers(db_path) == set()
@@ -920,6 +955,51 @@ class TestPhysicalCorruptionAcceptance:
     byte flips (canonical tree) and shadow-table stomps (FTS-only) and assert
     the two corruption classes are handled differently end to end.
     """
+
+    @pytest.mark.parametrize("table,query,text,corrupt", [
+        ("messages_fts", "needle", "a searchable needle here", _corrupt_fts),
+        ("messages_fts_trigram", "大别山项目", "关于大别山项目的进展报告", _corrupt_trigram_fts),
+    ])
+    def test_physical_search_corruption_preserves_diagnostic_boundary(
+        self, db, tmp_path, monkeypatch, table, query, text, corrupt
+    ):
+        """A real shadow stomp is not proof the joined error is FTS-scoped.
+
+        Preserve the original physical search fixtures: on SQLite 3.40.1 their
+        joined query yields genuine generic CORRUPT and must propagate without
+        detaching anything. A scoped runtime may safely take the other arm.
+        """
+        path = tmp_path / "state.db"
+        db.create_session("s1", source="test")
+        db.append_message("s1", "user", text)
+        corrupt(path)
+        monkeypatch.setattr(db, "rebuild_fts", lambda: pytest.fail("live search must not rebuild"))
+
+        # Use the exact same JOIN/snippet SQL and owning read connection as
+        # search, not a fresh index-only connection that returns a different code.
+        sql, params = db._fts_match_sql(
+            table, query, "ORDER BY rank", limit=20, offset=0,
+            include_inactive=False, source_filter=None, exclude_sources=None, role_filter=None,
+        )
+        with pytest.raises(sqlite3.DatabaseError) as observed:
+            db._read_all(sql, params)
+        code = observed.value.sqlite_errorcode
+        assert code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_CORRUPT_VTAB)
+        if code == sqlite3.SQLITE_CORRUPT:
+            assert not db._is_fts_write_corruption_error(observed.value)
+            with pytest.raises(sqlite3.DatabaseError) as caught:
+                db.search_messages(query)
+            assert caught.value.sqlite_errorcode == sqlite3.SQLITE_CORRUPT
+            assert not db._fts_stale
+            assert _meta_value(path, FTS_STALE_KEY) is None
+            assert _base_fts_triggers(path) == set(_FTS_TRIGGERS)
+        else:
+            results = db.search_messages(query)
+            assert results and any(query in row["snippet"] for row in results)
+            assert db._fts_stale
+            assert _meta_value(path, FTS_STALE_KEY) == "1"
+            assert _base_fts_triggers(path) == set()
+        assert _message_contents(path) == [text]
 
     def test_canonical_btree_corruption_fails_closed(
         self, tmp_path, caplog

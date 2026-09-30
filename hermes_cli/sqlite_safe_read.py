@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # Guards BOTH the registry and the lifecycle syscalls it describes. Reentrant
 # because connect_tracked -> _canonical_db_path -> ... stays on one thread.
 _live_lock = threading.RLock()
+_admission_changed = threading.Condition(_live_lock)
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
 # Immutable admission tokens survive rename/replacement; never restat at close.
@@ -50,7 +51,7 @@ def _identities(key):
 class _Handoff:
     """Strongly owned reservation and explicit capability for repair-only I/O."""
 
-    def __init__(self, key, tokens):
+    def __init__(self, key, tokens, *, snapshot=False):
         self.key = key
         self.main_identity = _identity(key)
         self.paths = frozenset(_bundle(key))
@@ -59,6 +60,7 @@ class _Handoff:
         self.thread = threading.get_ident()
         self.pending = 0
         self.raw = 0
+        self.snapshot = snapshot
 
     def matches(self, key):
         # Keep sidecars created by owner SQL claimed before any alias opener.
@@ -254,8 +256,10 @@ def connect_tracked(
 ) -> sqlite3.Connection:
     """Open and publish a tracked handle atomically against raw access and recovery.
 
-    Ordinary calls retain the inherited global syscall boundary. Only an explicit
-    reservation capability permits target I/O outside it, before publication.
+    Ordinary native calls wait for foreign snapshots, without holding the metadata
+    lock during that wait. Recovery reservations and uncertain/custom targets refuse.
+    Physical ordinary opens retain the inherited global syscall boundary; only an
+    explicit reservation capability permits target I/O outside it, before publication.
     """
     from urllib.parse import quote, unquote, urlsplit
     opener = connect_fn if connect_fn is not None else sqlite3.connect
@@ -272,13 +276,20 @@ def connect_tracked(
     target = str(path) if opaque or memory or not str(path) else (
         uri._replace(path=quote(key, safe='/')).geturl() if uri is not None else key)
 
-    def admit(*resources):
+    def admit(*resources, wait_snapshot=False):
+        candidates = [candidate for resource in (key, *resources) for candidate in _bundle(resource)]
+        # Recheck the entire resource set after a wake: waiting for one sidecar
+        # must not leave an earlier main-file admission stale.
+        while (wait_snapshot and not opaque and label == key and handoff is None
+               and any(r.snapshot and r.thread != threading.get_ident()
+                       and any(r.matches(candidate) for candidate in candidates)
+                       for r in _reservations)):
+            _admission_changed.wait()
         claim = _reservation(key, handoff)
-        for resource in (key, *resources):
-            for candidate in _bundle(resource):
-                reservation = _reservation(candidate, handoff)
-                if reservation is not None and reservation.raw:
-                    raise ConnectionAdmissionError(f"SQLite resource is in raw access: {candidate}")
+        for candidate in candidates:
+            reservation = _reservation(candidate, handoff)
+            if reservation is not None and reservation.raw:
+                raise ConnectionAdmissionError(f"SQLite resource is in raw access: {candidate}")
         # A user opener/factory may ignore path or retarget it. It can run only
         # under the global syscall boundary with no foreign raw-I/O reservation.
         if opaque and any(r.raw or r is not handoff or r.thread != threading.get_ident() for r in _reservations):
@@ -286,14 +297,15 @@ def connect_tracked(
         return claim
 
     with _live_lock:
-        claim = admit(label)
+        claim = admit(label, wait_snapshot=True)
         if claim is not None:
             claim.pending += 1
     guard = contextlib.nullcontext() if claim is not None and not opaque else _live_lock
     try:
         with guard:
             with _live_lock:
-                admit(label, _key(spelling))
+                post_key = _key(spelling)
+                admit(label, post_key, wait_snapshot=post_key == key)
                 before = _identity(key)
             conn = opener(target, **kwargs)
             try:
@@ -446,7 +458,11 @@ def connection_handoff(path: Path | str, connection: sqlite3.Connection, *, owne
 
 @contextlib.contextmanager
 def offline_file_access(path: Path | str, *, what: str = "read", handoff=None):
-    """Exclude target opens throughout raw I/O without fencing unrelated databases."""
+    """Reserve raw I/O per resource without fencing unrelated databases.
+
+    Native ordinary opens wait until raw custody ends. Same-thread/capability
+    overlap refuses, so an owner never waits for its own scope to exit.
+    """
     key = _key(path)
     with _live_lock:
         claim = _reservation(key, handoff)
@@ -458,7 +474,7 @@ def offline_file_access(path: Path | str, *, what: str = "read", handoff=None):
                 "Close all database handles and retry.")
         temporary = claim is None
         if temporary:
-            claim = _Handoff(key, ())
+            claim = _Handoff(key, (), snapshot=True)
             _reservations.append(claim)
         claim.pending += 1
         claim.raw += 1
@@ -470,6 +486,7 @@ def offline_file_access(path: Path | str, *, what: str = "read", handoff=None):
             claim.pending -= 1
             if temporary:
                 _reservations.remove(claim)
+                _admission_changed.notify_all()
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

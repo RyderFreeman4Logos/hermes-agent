@@ -706,7 +706,7 @@ class SessionSchemaMixin:
         from hermes_state_repair import (
             _cross_process_repair_lock, _db_opens_cleanly, _live_writer_holds_db,
             _repair_conn, _repair_state_db_schema_locked, _strategy_drop_fts_vacuum,
-            _validate_fts_snapshot,
+            _validate_fts_snapshot, _repair_io_scope,
         )
         _ensure_test_isolation(self.db_path)
         if self.read_only or self._quarantine_reason() is not None or self._conn.in_transaction:
@@ -763,12 +763,13 @@ class SessionSchemaMixin:
                     # This was our admitted clean close, not a lost WAL generation.
                     self._db_sidecar_identity = {}
                     try:
-                        if _live_writer_holds_db(self.db_path):
-                            return False
-                        report = {"repaired": False, "strategy": None, "backup_path": None, "error": None}
-                        result = _repair_state_db_schema_locked(
-                            self.db_path, backup=True, report=report, repair_snapshot=repair_snapshot,
-                        )
+                        with _repair_io_scope(sole_owner):
+                            if _live_writer_holds_db(self.db_path):
+                                return False
+                            report = {"repaired": False, "strategy": None, "backup_path": None, "error": None}
+                            result = _repair_state_db_schema_locked(
+                                self.db_path, backup=True, report=report, repair_snapshot=repair_snapshot,
+                            )
                         if not result.get("repaired"):
                             logger.warning("Stale FTS snapshot recovery refused: %s", result.get("error"))
                         return bool(result.get("repaired"))
@@ -780,6 +781,7 @@ class SessionSchemaMixin:
                         with contextlib.closing(connect_tracked(
                             self.db_path.resolve().as_uri() + "?mode=ro", uri=True,
                             tracking_path=self.db_path, timeout=0.0,
+                            handoff=sole_owner,
                         )) as reader:
                             current_generation = reader.execute(
                                 "SELECT value FROM state_meta WHERE key='db_file_generation'"
@@ -789,7 +791,7 @@ class SessionSchemaMixin:
                         if changed:
                             self._db_replaced = True
                             raise ValueError("state.db generation changed during FTS handoff; refusing reopen")
-                        self._conn = self._open_writer_conn()
+                        self._conn = self._open_writer_conn(handoff=sole_owner)
                         if self._wal_active:
                             self._wal_lock_guard = lockguard.hold(self.db_path)
                         self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path)

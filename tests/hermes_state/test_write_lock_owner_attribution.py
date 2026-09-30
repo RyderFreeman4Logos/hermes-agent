@@ -12,10 +12,90 @@ import subprocess
 import sys
 import textwrap
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_state_lockowners import parse_proc_locks, state_db_write_lock_holders
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("control", ["writer", "inode", "device", "pid", "read", "open", "kernel-device"])
+def test_kernel_device_alias_requires_matching_owner_fd_lock(tmp_path, monkeypatch, control):
+    """An open FD alone, or an unrelated kernel lock, is not writer proof."""
+    import hermes_state_lockowners as owners
+
+    db = tmp_path / "state.db"
+    db.touch()
+    st = db.stat()
+    pid = 4242
+    kernel_dev = os.makedev(0, os.minor(st.st_dev) + 100)
+    ident = f"{os.major(kernel_dev):x}:{os.minor(kernel_dev):x}:{st.st_ino}"
+    row = f"1: POSIX ADVISORY WRITE {pid} {ident} 1073741825 1073741825"
+    lock = row
+    if control == "pid":
+        lock = lock.replace(str(pid), "4243")
+    elif control == "read":
+        lock = lock.replace("WRITE", "READ")
+    elif control == "kernel-device":
+        lock = lock.replace(ident, f"00:ff:{st.st_ino}")
+    fdinfo = "ino:\t" + str(st.st_ino) + "\n"
+    if control != "open":
+        fdinfo += "lock:\t" + lock + "\n"
+    projected_os = SimpleNamespace(**vars(os))
+    projected_os.listdir = lambda path: ["3"] if path == f"/proc/{pid}/fd" else []
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        if str(path) == f"/proc/{pid}/fd/3":
+            values = list(st)
+            if control in ("inode", "device"):
+                values[1 if control == "inode" else 2] += 1
+            return os.stat_result(values)
+        return real_stat(path, *args, **kwargs)
+
+    projected_os.stat = stat
+    monkeypatch.setattr(owners, "os", projected_os)
+    real_open = open
+
+    def projected_open(path, *args, **kwargs):
+        if path == "/proc/locks":
+            return io.StringIO(row + "\n")
+        if path == f"/proc/{pid}/fdinfo/3":
+            return io.BytesIO(b"metadata:\t\xff\n" + fdinfo.encode("ascii"))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(owners, "open", projected_open, raising=False)
+    lines = owners.state_db_write_lock_holders(db)
+    assert bool(lines) == (control == "writer"), lines
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("mode", ["WRITE", "READ", "OPEN"])
+def test_real_posix_owner_fd_is_not_just_an_open_descriptor(tmp_path, mode):
+    db = tmp_path / "state.db"
+    db.touch()
+    holder = subprocess.Popen(
+        [sys.executable, "-c", textwrap.dedent("""
+            import fcntl, sys
+            f = open(sys.argv[1], 'r+')
+            if sys.argv[2] != 'OPEN':
+                access = fcntl.LOCK_EX if sys.argv[2] == 'WRITE' else fcntl.LOCK_SH
+                fcntl.lockf(f, access, 1, 1073741825)
+            print('held', flush=True)
+            sys.stdin.read()
+        """), str(db), mode], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        import select
+        assert holder.stdout is not None
+        assert select.select([holder.stdout], [], [], 5)[0], "child handshake timed out"
+        assert holder.stdout.readline().strip() == "held"
+        lines = state_db_write_lock_holders(db)
+        assert any(f"PID {holder.pid} " in line and "RESERVED" in line for line in lines) == (mode == "WRITE"), lines
+    finally:
+        holder.communicate("", timeout=5)
+    assert state_db_write_lock_holders(db) == []
 
 
 def test_parse_proc_locks_keeps_only_write_locks_on_our_inodes_and_decodes_the_wal_write_byte():

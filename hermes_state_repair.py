@@ -34,16 +34,30 @@ logger = logging.getLogger("hermes_state")
 
 _REPAIR_LOCK_POLL_SECONDS = 0.1
 _repair_handoff = ContextVar("repair_handoff", default=None)
+_repair_deadline = ContextVar("repair_deadline", default=None)
 
 
 @contextlib.contextmanager
-def _repair_io_scope(handoff):
+def _repair_io_scope(handoff, *, deadline=None):
     """Bind repair helpers to the explicit target reservation; no ambient opener permission."""
     token = _repair_handoff.set(handoff)
+    budget = _repair_deadline.set(deadline)
     try:
         yield
     finally:
+        _repair_deadline.reset(budget)
         _repair_handoff.reset(token)
+
+
+def _check_recovery_deadline(phase):
+    """Cooperative budget, not a hard bound on blocked filesystem syscalls.
+
+    Cleanup and generation-checked reopen settle synchronously outside this budget;
+    target ownership is never released while a physical operation remains running.
+    """
+    deadline = _repair_deadline.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"FTS snapshot recovery execution deadline exceeded during {phase}")
 # Snapshot copies are data transfer, not locking: bounded separately at 10 MiB/s (historical two-minute floor).
 _REPAIR_SNAPSHOT_MIN_THROUGHPUT_BYTES_PER_SECOND = 10 * 1024 * 1024
 # ── Repair-loop bounding + dead-backup hygiene (#86747) ───────────────────── ``_claim_repair_attempt``
@@ -374,6 +388,7 @@ def _backup_content_identity(db_path: Path) -> "Optional[str]":
             hasher.update(f"\0{label}:{path.stat().st_size}\0".encode())
             with open(path, "rb") as fh:
                 for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    _check_recovery_deadline("forensic hash")
                     hasher.update(chunk)
         return hasher.hexdigest()
     return _read_offline(db_path, "backup-identity", _digest)
@@ -477,7 +492,15 @@ def _publish_backup_bundle(db_path: Path, staging: Path, backup_path: Path) -> N
     published: "List[Path]" = []
     try:
         for src, staged, _dst in (main, *sidecars):
-            shutil.copy2(src, staged)
+            if _repair_deadline.get() is None:
+                shutil.copy2(src, staged)
+            else:
+                with open(src, "rb") as source, open(staged, "xb") as destination:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        _check_recovery_deadline("forensic copy")
+                        destination.write(chunk)
+                shutil.copystat(src, staged)
+                _check_recovery_deadline("forensic publication")
         for _src, staged, dst in (*sidecars, main):
             os.replace(staged, dst)
             published.append(dst)
@@ -605,12 +628,20 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None,
                            handoff=_repair_handoff.get())
     _reapply_durability_barriers(conn)
+    if (deadline := _repair_deadline.get()) is not None:
+        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     return conn
 
 
+@contextlib.contextmanager
 def _repair_conn(db_path: Path, *, timeout: float = 5.0):
     """A :func:`_connect_repair_durable` connection as a context manager, closed on exit."""
-    return contextlib.closing(_connect_repair_durable(db_path, timeout=timeout))
+    conn = _connect_repair_durable(db_path, timeout=timeout)
+    try:
+        yield conn
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.close()
 
 
 def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
@@ -641,6 +672,7 @@ def apply_durability_barriers(conn: sqlite3.Connection) -> bool:
 
 def _close_unpinned(conn: sqlite3.Connection) -> None:
     """Leave EXCLUSIVE locking mode (so the file is never left pinned) and close."""
+    conn.set_progress_handler(None, 0)
     with contextlib.suppress(Exception):
         conn.execute("PRAGMA locking_mode=NORMAL")
     conn.close()
@@ -694,6 +726,7 @@ def _copy_database_snapshot(source_path: Path, destination_path: Path, *,
     deadline = time.monotonic() + deadline_seconds
 
     def _check_deadline(_status: int, _remaining: int, _total: int) -> None:
+        _check_recovery_deadline("SQLite snapshot transfer")
         if time.monotonic() >= deadline:
             raise TimeoutError(f"timed out copying SQLite repair snapshot after {deadline_seconds:.0f}s")
 
@@ -839,6 +872,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                     return None
                 return f"fts5 write probe failed: {exc}"
             finally:
+                conn.set_progress_handler(None, 0)
                 with contextlib.suppress(sqlite3.Error):
                     conn.execute("ROLLBACK")
             return None
@@ -1003,6 +1037,7 @@ def _repair_state_db_schema_locked(
     it. Not mutating the original in the first place is the property that holds without a human in the loop.
     """
     scratch = db_path.with_name(f"{db_path.name}.repair-scratch")
+    _check_recovery_deadline("forensic admission")
     if (cleanup_error := _unlink_db_triple(scratch)) is not None:
         return _repair_skip(report, "aborted", f"could not remove a stale repair snapshot before probing state.db: {cleanup_error}")
     # Re-probe under the lock: a process we queued behind may have just repaired the file; redoing surgery
@@ -1016,6 +1051,7 @@ def _repair_state_db_schema_locked(
         if bpath is None:  # HARD STOP: the forensic image is the recovery path when every strategy fails.
             return _repair_skip(report, "aborted", "pre-repair backup refused; aborting schema repair to avoid "
                                 f"mutating the only copy of the damaged DB: {backup_error}")
+    _check_recovery_deadline("forensic backup")
     # The forensic copy precedes this guard on purpose: its live-holder checks would be poisoned by our own
     # exclusive connection. Everything touching the repair image or live promotion happens under writer exclusion.
     with _exclusive_repair_db_guard(db_path) as (live_guard, guard_error):
@@ -1026,13 +1062,12 @@ def _repair_state_db_schema_locked(
         if (space_error := _repair_scratch_space_error(db_path)) is not None:
             return _repair_skip(report, "aborted", space_error)
         try:
-            # Source = live_guard: it owns the exclusion, and a second connection could be blocked by our own
-            # EXCLUSIVE lock on some SQLite builds.
-            _copy_database_snapshot(db_path, scratch, source_connection=live_guard)
-        except (OSError, sqlite3.Error, TimeoutError) as exc:
-            _unlink_db_triple(scratch)
-            return _repair_skip(report, "aborted", f"could not stage a complete SQLite repair snapshot of {db_path}: {exc}", exc=exc)
-        try:
+            try:
+                # Reuse the continuously exclusive guard, not a second source connection.
+                _copy_database_snapshot(db_path, scratch, source_connection=live_guard)
+                _check_recovery_deadline("snapshot staging")
+            except (OSError, sqlite3.Error, TimeoutError) as exc:
+                return _repair_skip(report, "aborted", f"could not stage a complete SQLite repair snapshot of {db_path}: {exc}", exc=exc)
             # Private marker for the outer wrapper: a strategy failure consumes the persistent budget; a
             # promotion failure is classified separately.
             report["_repair_attempted"] = True
@@ -1049,6 +1084,7 @@ def _repair_state_db_schema_locked(
                 # Never ``os.replace`` the live DB: Windows rejects replacement under open handles and POSIX would
                 # leave those handles on the old inode. The guard keeps writer exclusion throughout.
                 try:
+                    _check_recovery_deadline("snapshot promotion")
                     _copy_database_snapshot(scratch, db_path, destination_connection=live_guard)
                 except (OSError, sqlite3.Error, TimeoutError) as exc:
                     report.update(repaired=False, strategy=None,
@@ -1202,6 +1238,7 @@ def _validate_fts_snapshot(original: sqlite3.Connection, repaired: sqlite3.Conne
     Only the recovery script's derived state_meta breadcrumbs may change.
     """
     from hermes_state_schema import _q
+    _check_recovery_deadline("canonical comparison")
     marker_keys = ("fts_stale", "fts_rebuild_deferral", "fts_rebuild_high_water",
                    "fts_rebuild_progress", "fts_tool_full_content_high_water")
 
@@ -1234,6 +1271,7 @@ def _validate_fts_snapshot(original: sqlite3.Connection, repaired: sqlite3.Conne
         width = len(original.execute(sql + " LIMIT 0", args).description)
         sql += " ORDER BY " + ",".join(str(i) for i in range(1, width + 1))
         for left, right in itertools.zip_longest(original.execute(sql, args), repaired.execute(sql, args)):
+            _check_recovery_deadline("canonical comparison")
             if (
                 left is None
                 or right is None

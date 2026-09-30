@@ -847,6 +847,8 @@ class SessionDB(
         writer, so reads skip self._lock; under DELETE journal mode (NFS fallback)
         readers hit SQLITE_BUSY storms, so the legacy locked path stays. Autocommit
         reads see everything committed so far (read-your-writes for flush-then-search)."""
+        from hermes_cli.sqlite_safe_read import ConnectionAdmissionError
+
         if not self._wal_active or self.read_only:
             return None
         with self._read_conns_lock:
@@ -874,7 +876,7 @@ class SessionDB(
             if conn is not None:
                 self._close_conn_logged(conn, "partially-opened read conn")
             self._read_budget.release()
-            if not isinstance(exc, sqlite3.Error):
+            if not isinstance(exc, (sqlite3.Error, ConnectionAdmissionError)):
                 raise
             with self._read_conns_lock:
                 self._read_open_failed_at = time.monotonic()

@@ -14,6 +14,7 @@ sqlite_master surgery path recovers the canonical data and self-heals on open.
 """
 import contextlib
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -380,7 +381,10 @@ def test_repair_rebuilds_stale_btree_indexes(tmp_path):
     # The real detector must see the real corruption...
     reason = hermes_state_repair._db_opens_cleanly(db_path)
     assert reason is not None
-    assert "wrong # of entries in index idx_messages_session" in reason
+    assert (
+        "wrong # of entries in index idx_messages_session" in reason
+        or re.search(r"row \d+ missing from index idx_messages_session(?:;|$)", reason)
+    ), reason
 
     # ...and the real repair ladder must fix it via REINDEX.
     report = repair_state_db_schema(db_path)

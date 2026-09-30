@@ -1192,6 +1192,8 @@ def _owned_fts_objects(conn: sqlite3.Connection) -> set[str]:
     def normalized(sql):
         return "".join(re.findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[^\s]", sql or ""))
 
+    rows = [tuple(row) for row in conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master")]
+    actual = {(kind, name, table, normalized(sql)) for kind, name, table, sql in rows}
     allowed = set()
     scripts = (FTS_SQL, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL,
                FTS_CJK_TABLE_SQL + FTS_CJK_TRIGGER_SQL)
@@ -1200,14 +1202,17 @@ def _owned_fts_objects(conn: sqlite3.Connection) -> set[str]:
             reference.execute("CREATE TABLE messages(id)")
             # Only the layout is needed, not the optional tokenizer's implementation.
             reference.executescript(script.replace("tokenize='cjk_unicode61'", "tokenize='unicode61'"))
+            layout = set()
             for kind, name, table, sql in reference.execute(
                 "SELECT type,name,tbl_name,sql FROM sqlite_master"
             ):
                 if _FTS_OBJECT_RE.fullmatch(name):
                     if name == "messages_fts_cjk":
                         sql = sql.replace("tokenize='unicode61'", "tokenize='cjk_unicode61'")
-                    allowed.add((kind, name, table, normalized(sql)))
-    rows = [tuple(row) for row in conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master")]
+                    layout.add((kind, name, table, normalized(sql)))
+            # Select the complete layout by its actual parent, never mix alternatives.
+            if any(row in actual for row in layout if row[1] in _FTS_TABLES):
+                allowed.update(layout)
     owned = set()
     for kind, name, table, sql in rows:
         if _FTS_OBJECT_RE.fullmatch(name):
@@ -1216,12 +1221,6 @@ def _owned_fts_objects(conn: sqlite3.Connection) -> set[str]:
             owned.add(name)
         elif kind == "table" and sql and re.match(r"CREATE\s+VIRTUAL\s+TABLE\b", sql, re.I):
             raise ValueError(f"cannot establish canonical virtual-table preservation for {name}")
-    for name in owned:
-        family = next((base for base in sorted(_FTS_TABLES, key=len, reverse=True)
-                       if name.startswith(base + "_")), None)
-        if family and name.removeprefix(family + "_") in ("data", "idx", "content", "docsize", "config"):
-            if family not in owned:
-                raise ValueError(f"cannot establish FTS shadow ownership of {name}")
     return owned
 
 

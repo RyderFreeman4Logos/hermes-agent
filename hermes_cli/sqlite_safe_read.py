@@ -58,6 +58,7 @@ class _Handoff:
         self.tokens = set(tokens)
         self.thread = threading.get_ident()
         self.pending = 0
+        self.raw = 0
 
     def matches(self, key):
         # Keep sidecars created by owner SQL claimed before any alias opener.
@@ -69,14 +70,14 @@ def _reservation(key, handoff=None):
     for claim in _reservations:
         if claim.matches(key):
             if claim is not handoff or claim.thread != threading.get_ident():
-                raise LiveConnectionError(f"SQLite lifecycle reserved for recovery: {key}")
+                raise ConnectionAdmissionError(f"SQLite lifecycle reserved for recovery: {key}")
             # Inode ownership is not permission to reopen a replaced path/generation.
             if (_identity(claim.key) != claim.main_identity
                     or os.stat(claim.key).st_nlink != 1):
-                raise LiveConnectionError(f"SQLite recovery pathname changed: {claim.key}")
+                raise ConnectionAdmissionError(f"SQLite recovery pathname changed: {claim.key}")
             return claim
     if handoff is not None and handoff not in _reservations:
-        raise LiveConnectionError("SQLite recovery capability has expired")
+        raise ConnectionAdmissionError("SQLite recovery capability has expired")
     return None
 
 
@@ -87,6 +88,10 @@ class UntrackableConnectionError(RuntimeError):
 
 class LiveConnectionError(RuntimeError):
     """A raw file operation was attempted on a database with live connections."""
+
+
+class ConnectionAdmissionError(LiveConnectionError):
+    """An expected pre-open reservation refusal; readers may use writer fallback."""
 
 
 def _key(path: Path | str) -> str:
@@ -252,31 +257,50 @@ def connect_tracked(
     Ordinary calls retain the inherited global syscall boundary. Only an explicit
     reservation capability permits target I/O outside it, before publication.
     """
-    from urllib.parse import unquote, urlsplit
+    from urllib.parse import quote, unquote, urlsplit
     opener = connect_fn if connect_fn is not None else sqlite3.connect
-    kwargs["factory"] = _tracking_factory(kwargs.get("factory", sqlite3.Connection))
-    spelling = tracking_path if tracking_path is not None else path
-    if str(spelling).startswith("file:"):
-        spelling = unquote(urlsplit(str(spelling)).path)
+    factory = kwargs.get("factory", sqlite3.Connection)
+    opaque = opener is not sqlite3.connect or factory not in (sqlite3.Connection, TrackedConnection)
+    kwargs["factory"] = _tracking_factory(factory)
+    uri = urlsplit(str(path)) if kwargs.get("uri") and str(path).startswith("file:") else None
+    memory = str(path) == ':memory:' or (uri is not None and
+             (uri.path == ':memory:' or 'mode=memory' in uri.query.split('&')))
+    spelling = unquote(uri.path) if uri is not None else path
     key = _key(spelling)
-    with _live_lock:
+    label = _key(tracking_path) if tracking_path is not None else key
+    # Resolve native filesystem aliases once; an advisory label never changes the target.
+    target = str(path) if opaque or memory or not str(path) else (
+        uri._replace(path=quote(key, safe='/')).geturl() if uri is not None else key)
+
+    def admit(*resources):
         claim = _reservation(key, handoff)
+        for resource in (key, *resources):
+            for candidate in _bundle(resource):
+                reservation = _reservation(candidate, handoff)
+                if reservation is not None and reservation.raw:
+                    raise ConnectionAdmissionError(f"SQLite resource is in raw access: {candidate}")
+        # A user opener/factory may ignore path or retarget it. It can run only
+        # under the global syscall boundary with no foreign raw-I/O reservation.
+        if opaque and any(r.raw or r is not handoff or r.thread != threading.get_ident() for r in _reservations):
+            raise ConnectionAdmissionError("Custom SQLite opener cannot prove its reserved resource")
+        return claim
+
+    with _live_lock:
+        claim = admit(label)
         if claim is not None:
             claim.pending += 1
-    guard = contextlib.nullcontext() if claim is not None else _live_lock
+    guard = contextlib.nullcontext() if claim is not None and not opaque else _live_lock
     try:
         with guard:
             with _live_lock:
-                _reservation(key, handoff)
+                admit(label, _key(spelling))
                 before = _identity(key)
-            conn = opener(str(path), **kwargs)
+            conn = opener(target, **kwargs)
             try:
                 actual = _canonical_db_path(conn)
-                resolved = _key(tracking_path) if tracking_path is not None else actual
+                resolved = label if tracking_path is not None else actual
                 if resolved is None:
-                    uri = urlsplit(str(path))
-                    if str(path) == ':memory:' or (kwargs.get('uri') and
-                            (uri.path == ':memory:' or 'mode=memory' in uri.query.split('&'))):
+                    if memory:
                         return conn  # known memory connections have no disk descriptor
                     resolved = key  # unknown file-backed identity must retain custody
                 if not isinstance(conn, _TrackingMixin):
@@ -284,6 +308,7 @@ def connect_tracked(
                 with _live_lock:
                     token = object()
                     post_key = _key(spelling)
+                    admit(resolved, post_key, actual or key)
                     captured = _identities(resolved) | _identities(key) | _identities(post_key)
                     if actual is not None:
                         captured |= _identities(actual)
@@ -436,10 +461,12 @@ def offline_file_access(path: Path | str, *, what: str = "read", handoff=None):
             claim = _Handoff(key, ())
             _reservations.append(claim)
         claim.pending += 1
+        claim.raw += 1
     try:
         yield
     finally:
         with _live_lock:
+            claim.raw -= 1
             claim.pending -= 1
             if temporary:
                 _reservations.remove(claim)

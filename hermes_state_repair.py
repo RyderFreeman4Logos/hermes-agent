@@ -753,7 +753,7 @@ _INTEGRITY_TREE_RE = re.compile(r"\bTree (\d+)\b")
 _INTEGRITY_MISSING_INDEX_RE = re.compile(r"missing from index (\S+)")
 
 
-def integrity_damage_is_structural(integrity_lines, master_rows) -> bool:
+def integrity_damage_is_structural(integrity_lines, master_rows, *, owned_fts=()) -> bool:
     """True when any damaged object named by ``PRAGMA integrity_check`` output lies outside
     the FTS shadow set: a ``Tree N`` id mapped through ``sqlite_master.rootpage``, an index in
     ``row N missing from index X``, or the file's own freelist. Unparseable lines are not
@@ -768,10 +768,10 @@ def integrity_damage_is_structural(integrity_lines, master_rows) -> bool:
         tree = _INTEGRITY_TREE_RE.search(text)
         if tree:
             name = name_by_rootpage.get(int(tree.group(1)), "")
-            if name and not _FTS_OBJECT_RE.fullmatch(name):
+            if name and name not in owned_fts:
                 return True
         missing = _INTEGRITY_MISSING_INDEX_RE.search(text)
-        if missing and not _FTS_OBJECT_RE.fullmatch(missing.group(1)):
+        if missing and missing.group(1) not in owned_fts:
             return True
     return False
 
@@ -789,6 +789,10 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
     try:
         master_rows = [tuple(r) for r in conn.execute(
             "SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0").fetchall()]
+        try:
+            owned = _owned_fts_objects(conn)
+        except ValueError:
+            return True
         lines = [str(r[0]) for r in conn.execute("PRAGMA integrity_check").fetchall()]
     except sqlite3.OperationalError:
         return False
@@ -797,7 +801,7 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
     finally:
         conn.close()
     return integrity_damage_is_structural(
-        itertools.chain.from_iterable(line.splitlines() for line in lines), master_rows)
+        itertools.chain.from_iterable(line.splitlines() for line in lines), master_rows, owned_fts=owned)
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:

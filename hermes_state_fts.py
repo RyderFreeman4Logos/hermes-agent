@@ -130,19 +130,18 @@ def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
 # FTS5 shadow tables the virtual-table engine owns. `sqlite3 .recover` re-emits them
 # as ordinary tables but cannot re-emit the CREATE VIRTUAL TABLE row, so every later
 # CREATE VIRTUAL TABLE fails with "fts5: error creating shadow table <name>: table
-# already exists" until the orphans are dropped (#103840).
+# already exists" (#103840). With the owning declaration absent, names/layout
+# cannot distinguish that residue from canonical extension tables; refuse deletion.
 _FTS5_SHADOW_SUFFIXES = ("content", "data", "docsize", "idx", "config")
 
 
 def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[str]) -> list[str]:
-    """Drop, per family, shadow tables whose virtual table row is absent from sqlite_master.
+    """Refuse ambiguous orphan names rather than deleting possibly canonical tables.
 
-    Matches exact shadow names only (never a prefix LIKE, so the base family cannot reach
-    ``messages_fts_trigram_*``) and leaves a family alone whenever its vtable is live. The
-    shadows are derived index state; the caller recreates and rebuilds from ``messages``.
-    Returns the families that were repaired.
+    A `.recover` residue and a normal extension table can have identical names and DDL.
+    With no owning vtable there is no provenance to authorize automatic destruction.
+    Keep the compatibility entry point; explicit offline recovery must resolve ownership.
     """
-    repaired: list[str] = []
     for family in families:
         vtable_live = cursor.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? "
@@ -158,14 +157,11 @@ def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[st
         ).fetchall()]
         if not orphans:
             continue
-        for name in orphans:
-            cursor.execute(f'DROP TABLE "{name}"')
-        logger.warning(
-            "Dropped orphan FTS5 shadow tables of %s (%s); the index is recreated from messages",
-            family, ", ".join(orphans),
+        raise sqlite3.OperationalError(
+            f"Cannot establish derived FTS ownership of orphan tables: {', '.join(orphans)}; "
+            "refusing automatic deletion"
         )
-        repaired.append(family)
-    return repaired
+    return []
 
 
 class SessionFtsSetupMixin:

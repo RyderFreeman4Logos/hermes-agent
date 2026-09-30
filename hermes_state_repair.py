@@ -161,7 +161,7 @@ def _acquire_repair_lock_windows(lock_path: Path, handle, timeout: float):
 
 
 @contextlib.contextmanager
-def _cross_process_repair_lock(db_path: Path):
+def _cross_process_repair_lock(db_path: Path, *, timeout_seconds=None):
     """Serialize state.db schema surgery across processes.
 
     Yields True when this process holds the repair lock, False when the bounded acquire timed out or the lock
@@ -177,6 +177,7 @@ def _cross_process_repair_lock(db_path: Path):
     #36644).
     """
     from hermes_state import _IS_WINDOWS, _REPAIR_LOCK_TIMEOUT_SECONDS
+    timeout = _REPAIR_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else max(float(timeout_seconds), 0.0)
     lock_path, handle = _open_lock_file(
         db_path, ".repair.lock", "repair", "skipping schema surgery rather than running it without cross-process authority.")
     if handle is None:
@@ -185,16 +186,16 @@ def _cross_process_repair_lock(db_path: Path):
     acquired = False
     try:
         if _IS_WINDOWS:
-            acquired = _acquire_repair_lock_windows(lock_path, handle, _REPAIR_LOCK_TIMEOUT_SECONDS)
+            acquired = _acquire_repair_lock_windows(lock_path, handle, timeout)
         else:
-            acquired, handle = _acquire_db_flock(str(lock_path), handle, _REPAIR_LOCK_TIMEOUT_SECONDS,
+            acquired, handle = _acquire_db_flock(str(lock_path), handle, timeout,
                                                  _REPAIR_LOCK_POLL_SECONDS, "state.db repair lock")
         if acquired is None:
             acquired = False  # non-contention failure already logged with its errno
         elif not acquired:
             logger.warning("state.db repair lock %s held by another process for more than %.0fs — skipping schema "
                            "surgery in this process to avoid racing the repairer. Recorded holder: %s.",
-                           lock_path, _REPAIR_LOCK_TIMEOUT_SECONDS,
+                           lock_path, timeout,
                            _describe_lock_holder(None if _IS_WINDOWS else _read_lock_holder_record(handle)))
         yield acquired
     finally:
@@ -700,7 +701,7 @@ def _schema_not_built(exc: BaseException) -> bool:
 # Hermes-owned FTS5 objects: the virtual tables and their shadow b-trees. Full-matched, so a
 # user-created lookalike (``archive_fts_data``) is not swept into the rebuildable set.
 _FTS_OBJECT_RE = re.compile(
-    r"messages_fts(_trigram|_cjk)?(_data|_idx|_content|_docsize|_config|_segdir|_segments)?"
+    r"messages_fts(_trigram|_cjk)?(_data|_idx|_content|_docsize|_config|_segdir|_segments|_src|_insert|_delete|_update)?"
 )
 _INTEGRITY_TREE_RE = re.compile(r"\bTree (\d+)\b")
 _INTEGRITY_MISSING_INDEX_RE = re.compile(r"missing from index (\S+)")
@@ -973,6 +974,7 @@ def _restore_journal_mode_after_repair(db_path: Path, before_mode: Optional[str]
 
 def _repair_state_db_schema_locked(
     db_path: Path, *, backup: bool, report: Dict[str, Any], journal_mode_before: Optional[str] = None,
+    repair_snapshot=None,
 ) -> Dict[str, Any]:
     """Repair strategies for :func:`repair_state_db_schema`; caller holds the cross-process repair lock.
 
@@ -992,7 +994,7 @@ def _repair_state_db_schema_locked(
         return _repair_skip(report, "aborted", f"could not remove a stale repair snapshot before probing state.db: {cleanup_error}")
     # Re-probe under the lock: a process we queued behind may have just repaired the file; redoing surgery
     # would undo it (the repair/re-corrupt cascade).
-    if _db_opens_cleanly(db_path) is None:
+    if repair_snapshot is None and _db_opens_cleanly(db_path) is None:
         report["repaired"], report["strategy"] = True, "already_healthy"
         return report
     if backup:
@@ -1021,7 +1023,15 @@ def _repair_state_db_schema_locked(
             # Private marker for the outer wrapper: a strategy failure consumes the persistent budget; a
             # promotion failure is classified separately.
             report["_repair_attempted"] = True
-            _run_repair_strategies(scratch, report)
+            if repair_snapshot is None:
+                _run_repair_strategies(scratch, report)
+            else:
+                try:
+                    repair_snapshot(scratch, live_guard)
+                except (OSError, sqlite3.Error, ValueError) as exc:
+                    report["error"] = str(exc)
+                else:
+                    report.update(repaired=True, strategy="stale_fts_snapshot")
             if report.get("repaired"):
                 # Never ``os.replace`` the live DB: Windows rejects replacement under open handles and POSIX would
                 # leave those handles on the old inode. The guard keeps writer exclusion throughout.
@@ -1117,10 +1127,57 @@ def _strategy_drop_fts_vacuum(conn: sqlite3.Connection) -> None:
     """Drop all FTS schema and VACUUM; indexes rebuild on the next open. The
     destructive one, and why strategies run on a scratch copy: on a damaged
     schema b-tree VACUUM silently drops every table hanging off the unreadable part."""
-    _edit_sqlite_master(conn, lambda: conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'") or True)
+    names = [name for (name,) in conn.execute("SELECT name FROM sqlite_master")
+             if _FTS_OBJECT_RE.fullmatch(name)]
+    _edit_sqlite_master(conn, lambda: conn.executemany("DELETE FROM sqlite_master WHERE name=?", [(n,) for n in names]) or True)
     # The schema parses now, so the barriers can stick — VACUUM rewrites the whole file.
     _reapply_durability_barriers(conn)
     conn.execute("VACUUM")
+
+
+def _validate_fts_snapshot(original: sqlite3.Connection, repaired: sqlite3.Connection) -> None:
+    """Require complete non-FTS schema and row equality, including rowids and sequence high-water.
+
+    Stream sorted rows rather than materializing a store. Unknown/unreadable objects refuse
+    promotion; VACUUM's implicit-rowid renumbering is not acceptable canonical preservation.
+    Only the recovery script's derived state_meta breadcrumbs may change.
+    """
+    from hermes_state_schema import _q
+    marker_keys = ("fts_stale", "fts_rebuild_deferral", "fts_rebuild_high_water",
+                   "fts_rebuild_progress", "fts_tool_full_content_high_water")
+
+    def schema(conn):
+        return [tuple(row) for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ) if not _FTS_OBJECT_RE.fullmatch(row[1])]
+
+    before = schema(original)
+    if before != schema(repaired):
+        raise ValueError("FTS repair changed canonical schema")
+    without_rowid = {row[1]: bool(row[4]) for row in original.execute("PRAGMA main.table_list")}
+    for kind, name, _table, ddl in before:
+        if kind != "table":
+            continue
+        if name not in without_rowid:
+            raise ValueError(f"cannot establish canonical rowid semantics for {name}")
+        projection = "*"
+        if not without_rowid[name]:
+            columns = {row[1].lower() for row in original.execute(f"PRAGMA table_xinfo({_q(name)})")}
+            rowid = next((alias for alias in ("rowid", "_rowid_", "oid") if alias not in columns), None)
+            if rowid is None:
+                raise ValueError(f"cannot establish canonical rowids for {name}")
+            projection = rowid + ", *"
+        sql = f"SELECT {projection} FROM {_q(name)}"
+        if name == "state_meta":
+            sql += " WHERE key NOT IN (" + ",".join("?" for _ in marker_keys) + ")"
+        args = marker_keys if name == "state_meta" else ()
+        width = len(original.execute(sql + " LIMIT 0", args).description)
+        sql += " ORDER BY " + ",".join(str(i) for i in range(1, width + 1))
+        for left, right in itertools.zip_longest(original.execute(sql, args), repaired.execute(sql, args)):
+            if left is None or right is None or tuple(left) != tuple(right):
+                raise ValueError(f"FTS repair changed canonical rows in {name}")
+    if repaired.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("FTS repair snapshot has foreign-key violations")
 
 
 # (name, body, success log, failure log) in escalation order. failure log None =

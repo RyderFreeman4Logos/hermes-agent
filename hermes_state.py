@@ -851,14 +851,14 @@ class SessionDB(
             raise
         return conn
 
-    def _connect_and_init(self) -> None:
+    def _connect_and_init(self, *, deadline: Optional[float] = None) -> None:
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
         _secure_state_db_files(self.db_path, create_main=True)
-        with self._advisory_write_lock():
+        with self._advisory_write_lock(deadline=deadline):
             self._conn = self._open_writer_conn()
             self._init_schema()
 
@@ -876,7 +876,7 @@ class SessionDB(
         deadline = time.monotonic() + self._WRITE_PATIENCE_S
         while True:
             try:
-                self._connect_and_init()
+                self._connect_and_init(deadline=deadline)
                 return
             except sqlite3.OperationalError as exc:
                 if not is_sqlite_lock_error(exc):
@@ -1521,7 +1521,8 @@ class SessionDB(
         if self._quarantine_reason() is not None:
             return
         try:
-            with self._advisory_write_lock():
+            # The caller's write is already committed: maintenance must not renew its patience.
+            with self._advisory_write_lock(deadline=time.monotonic()):
                 with self._lock:
                     if self._conn is None:
                         return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard

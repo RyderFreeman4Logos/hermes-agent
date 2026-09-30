@@ -5628,7 +5628,7 @@ class TestGetMessagesPagination:
 
         def record_legacy_page(*args, **kwargs):
             rows = original_legacy_page(*args, **kwargs)
-            legacy_pages.append((kwargs["limit"], len(rows)))
+            legacy_pages.append((kwargs.get("ids_only"), len(rows)))
             return rows
 
         db._legacy_display_page = record_legacy_page
@@ -5643,7 +5643,8 @@ class TestGetMessagesPagination:
             "SELECT COUNT(*) FROM messages WHERE display_identity IS NOT NULL OR display_order IS NOT NULL"
         ).fetchone()[0] == 0
         assert all(row_count <= 2 for _sql, row_count in reads)
-        assert legacy_pages == [(2, 2)]
+        assert [count for sql, count in reads if "FROM messages WHERE id IN (" in sql] == [2]
+        assert legacy_pages and all(ids_only and count >= len(display) for ids_only, count in legacy_pages)
 
     @pytest.mark.parametrize("legacy", [False, True])
     def test_resume_display_limit_counts_visible_logical_messages(self, db, legacy):

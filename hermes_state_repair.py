@@ -749,7 +749,9 @@ def _schema_not_built(exc: BaseException) -> bool:
 _FTS_OBJECT_RE = re.compile(
     r"messages_fts(_trigram|_cjk)?(_data|_idx|_content|_docsize|_config|_segdir|_segments|_src|_insert|_delete|_update)?"
 )
-_INTEGRITY_TREE_RE = re.compile(r"\bTree (\d+)\b")
+# SQLite reports a tree's root id, or the damaged page itself on older runtimes.
+# Page-only diagnostics grant classification only when that page is a known root.
+_INTEGRITY_TREE_RE = re.compile(r"\b(?:Tree|On tree page) (\d+)\b")
 _INTEGRITY_MISSING_INDEX_RE = re.compile(r"missing from index (\S+)")
 
 

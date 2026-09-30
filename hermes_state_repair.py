@@ -58,6 +58,41 @@ def _check_recovery_deadline(phase):
     deadline = _repair_deadline.get()
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError(f"FTS snapshot recovery execution deadline exceeded during {phase}")
+
+
+@contextlib.contextmanager
+def _fts_recovery_budget(db_path):
+    """Share one application deadline from admission through normal/scratch work.
+
+    Nested entry never restarts it. Mandatory physical settlement explicitly disables
+    this deadline while retaining the handoff; blocked kernel/VFS calls are not bounded.
+    """
+    deadline = _repair_deadline.get()
+    if deadline is None:
+        started = time.monotonic()
+        deadline = started + 4 * _repair_snapshot_timeout_seconds(db_path)
+    with _repair_io_scope(_repair_handoff.get(), deadline=deadline):
+        yield deadline
+
+
+@contextlib.contextmanager
+def _recovery_sql_budget(conn):
+    """Participating SQL is try-only for locks and cooperatively VM-interruptible.
+
+    The owned writer has no persistent progress handler. Restore its busy policy
+    and disable cancellation before rollback, trigger detachment or physical close.
+    """
+    _check_recovery_deadline("SQL admission")
+    busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    deadline = _repair_deadline.get()
+    try:
+        conn.execute("PRAGMA busy_timeout=0")
+        if deadline is not None:
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        yield
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.execute(f"PRAGMA busy_timeout={busy}")
 # Snapshot copies are data transfer, not locking: bounded separately at 10 MiB/s (historical two-minute floor).
 _REPAIR_SNAPSHOT_MIN_THROUGHPUT_BYTES_PER_SECOND = 10 * 1024 * 1024
 # ── Repair-loop bounding + dead-backup hygiene (#86747) ───────────────────── ``_claim_repair_attempt``
@@ -464,7 +499,13 @@ def _existing_malformed_backups(db_path: Path) -> "List[Path]":
     """Timestamped forensic backups of *db_path*, newest first."""
     prefix = f"{db_path.name}.malformed-backup-"
     try:
-        found = [p for p in db_path.parent.iterdir() if p.name.startswith(prefix) and not p.name.endswith(_DB_SIDECAR_SUFFIXES)]
+        found = []
+        for p in db_path.parent.iterdir():
+            _check_recovery_deadline("forensic inventory")
+            if p.name.startswith(prefix) and not p.name.endswith(_DB_SIDECAR_SUFFIXES):
+                found.append(p)
+    except TimeoutError:
+        raise  # TimeoutError is an OSError; expiry is not an unreadable directory.
     except OSError:
         return []
     return sorted(found, key=lambda p: p.name, reverse=True)
@@ -474,6 +515,7 @@ def _prune_malformed_backups(db_path: Path, keep: int = _MAX_MALFORMED_BACKUPS) 
     """Delete all but the *keep* newest forensic backups (and sidecars)."""
     for stale in _existing_malformed_backups(db_path)[keep:]:
         for victim in (stale, *_sidecars(stale)):
+            _check_recovery_deadline("optional forensic pruning")
             try:
                 victim.unlink(missing_ok=True)
             except OSError as exc:  # pragma: no cover - best effort
@@ -492,6 +534,7 @@ def _publish_backup_bundle(db_path: Path, staging: Path, backup_path: Path) -> N
     published: "List[Path]" = []
     try:
         for src, staged, _dst in (main, *sidecars):
+            _check_recovery_deadline("forensic copy admission")
             if _repair_deadline.get() is None:
                 shutil.copy2(src, staged)
             else:
@@ -502,6 +545,7 @@ def _publish_backup_bundle(db_path: Path, staging: Path, backup_path: Path) -> N
                 shutil.copystat(src, staged)
                 _check_recovery_deadline("forensic publication")
         for _src, staged, dst in (*sidecars, main):
+            _check_recovery_deadline("forensic publication")
             os.replace(staged, dst)
             published.append(dst)
     except Exception:
@@ -540,6 +584,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
     for seq in itertools.count(1):  # same-second collision must not overwrite the earlier forensic copy
+        _check_recovery_deadline("forensic filename collision")
         if not backup_path.exists():
             break
         backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}_{seq}")
@@ -549,6 +594,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
         # prefix-matches as a backup, sorts NEWEST and would otherwise survive prune forever.
         for pattern in (f"{db_path.name}.backup-staging-*", f"{db_path.name}.malformed-backup-*.incomplete*"):
             for old in db_path.parent.glob(pattern):
+                _check_recovery_deadline("optional staging debris sweep")
                 with contextlib.suppress(OSError):
                     old.unlink(missing_ok=True)
         with contextlib.suppress(OSError):
@@ -558,6 +604,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                 if src_id is not None and _backup_content_identity(newest[0]) == src_id:
                     logger.info("Reusing existing forensic backup %s (identical to the damaged DB).", newest[0])
                     return newest[0], None
+        _check_recovery_deadline("forensic disk admission")
         if (reason := _backup_free_space_error(db_path)) is not None:
             logger.error("Refusing forensic backup of %s: %s", db_path, reason)
             return None, reason
@@ -625,6 +672,8 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
+    if _repair_deadline.get() is not None:
+        timeout = 0.0  # no sequential busy-timeout restarts inside application work
     conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None,
                            handoff=_repair_handoff.get())
     _reapply_durability_barriers(conn)
@@ -1011,6 +1060,7 @@ def _restore_journal_mode_after_repair(db_path: Path, before_mode: Optional[str]
     """
     from hermes_state_wal import apply_wal_with_fallback
     try:
+        _check_recovery_deadline("optional post-promotion journal policy")
         if conn is None:
             with _repair_conn(db_path) as owned:
                 after = apply_wal_with_fallback(owned, db_label=db_path.name)

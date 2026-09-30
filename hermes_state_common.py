@@ -1124,7 +1124,7 @@ def _lock_holder_provably_dead(record) -> bool:
     return current_ticks is not None and current_ticks != recorded_ticks  # different start time: PID recycled
 
 
-def _acquire_db_flock(lock_path, handle, timeout_seconds, poll_seconds, description):
+def _acquire_db_flock(lock_path, handle, timeout_seconds, poll_seconds, description, *, absolute_deadline=None):
     """Bounded POSIX flock acquire with orphaned-holder break.  Returns ``(acquired, handle)``; *handle* may
     have been re-opened and the caller closes whichever comes back.  *acquired*: True, False (a holder kept
     the lock past the deadline) or None (non-contention ``OSError``, already logged: treat as not acquired
@@ -1139,8 +1139,12 @@ def _acquire_db_flock(lock_path, handle, timeout_seconds, poll_seconds, descript
     """
     import fcntl
     deadline = time.monotonic() + timeout_seconds
+    if absolute_deadline is not None:
+        deadline = min(deadline, absolute_deadline)
     broke_lock = False
     while True:
+        if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+            return False, handle
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError) as exc:
@@ -1150,8 +1154,10 @@ def _acquire_db_flock(lock_path, handle, timeout_seconds, poll_seconds, descript
                                description, lock_path, exc, timeout_seconds)
                 return None, handle
             if time.monotonic() < deadline:
-                time.sleep(poll_seconds)
+                time.sleep(min(poll_seconds, max(deadline - time.monotonic(), 0.0)))
                 continue
+            if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+                return False, handle
             if broke_lock:
                 return False, handle
             record = _read_lock_holder_record(handle)
@@ -1169,6 +1175,8 @@ def _acquire_db_flock(lock_path, handle, timeout_seconds, poll_seconds, descript
                 return False, handle
             broke_lock = True
             deadline = time.monotonic() + _LOCK_BREAK_REACQUIRE_SECONDS
+            if absolute_deadline is not None:
+                deadline = min(deadline, absolute_deadline)
             continue
         # A breaker may have replaced the file while we waited; a lock on a dead inode excludes nobody.
         try:
@@ -1219,12 +1227,12 @@ def _acquire_msvcrt_lock(lock_path, handle, timeout):
 
 
 @contextlib.contextmanager
-def fts_rebuild_admission(db_path, *, timeout_seconds=None):
+def fts_rebuild_admission(db_path, *, timeout_seconds=None, deadline=None):
     """Serialize full structural FTS rebuilds on *db_path* across processes.  Yields True when this process
     holds the authority, False when the bounded acquire timed out or the lock file could not be opened: the
     caller must NOT rebuild (fail closed; the stale breadcrumb guarantees a retry).  ``db_path`` None
     (in-memory) yields True.  In-process retries pass ``timeout_seconds=0`` so a live holder never stalls a
-    long-lived writer; the orphan break still applies."""
+    long-lived writer; the orphan break still applies within an optional shared application deadline."""
     if db_path is None:
         yield True
         return
@@ -1243,10 +1251,13 @@ def fts_rebuild_admission(db_path, *, timeout_seconds=None):
     acquired = False
     try:
         if _IS_WINDOWS:
+            if deadline is not None:
+                timeout = min(timeout, max(deadline - time.monotonic(), 0.0))
             acquired = _acquire_msvcrt_lock(lock_path, handle, timeout)
         else:
             acquired, handle = _acquire_db_flock(
-                lock_path, handle, timeout, _FTS_REBUILD_LOCK_POLL_SECONDS, "FTS rebuild lock")
+                lock_path, handle, timeout, _FTS_REBUILD_LOCK_POLL_SECONDS, "FTS rebuild lock",
+                **({"absolute_deadline": deadline} if deadline is not None else {}))
         if acquired is None:
             # Already logged with the real errno; "held by another process" would be a lie.
             acquired = False

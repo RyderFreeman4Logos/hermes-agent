@@ -92,23 +92,69 @@ def test_bounded_resume_does_not_expand_across_answer_barrier(db, legacy):
         db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
         db._conn.commit()
     pages = []
-    reader = db._legacy_display_page if legacy else db._read_all
+    reader = db._read_all
 
     def traced(*args, **kwargs):
         result = reader(*args, **kwargs)
-        if legacy or "FROM page ORDER BY logical_order ASC" in args[0]:
+        if "FROM messages WHERE id IN (" in args[0]:
             pages.append(len(result))
         return result
 
-    if legacy:
-        db._legacy_display_page = traced
-    else:
-        db._read_all = traced
+    db._read_all = traced
     _, display = db.get_resume_conversations("replay", max_display_messages=2)
     assert [(m["content"], m["timestamp"]) for m in display] == [
         ("same", 3.0), ("second answer", 4.0),
     ]
     assert pages == [2]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("boundary", ["adjacent", "hidden", "answer", "branch"])
+def test_dense_replay_selects_before_bounded_payload_transfer(tmp_path, legacy, boundary):
+    path = tmp_path / "dense.db"
+    db = SessionDB(path)
+    db.create_session("root", source="cli")
+    db.append_messages_batch("root", [
+        {"role": "user", "content": "same" + "x" * 4096, "timestamp": float(i)}
+        for i in range(100)
+    ])
+    target = "root"
+    if boundary == "branch":
+        db.create_session("branch", source="cli", parent_session_id="root",
+                          model_config={"_branched_from": "root"})
+        target = "branch"
+    elif boundary == "hidden":
+        db.append_message("root", "assistant", "invisible", display_metadata={"model_only": True})
+    elif boundary == "answer":
+        db.append_message("root", "assistant", "first answer")
+    db.append_messages_batch(target, [
+        {"role": "user", "content": "same" + "x" * 4096, "timestamp": 200.0},
+        {"role": "assistant", "content": "end", "timestamp": 201.0},
+    ])
+    if legacy:
+        db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+        db._conn.commit()
+    db.close()
+    before = path.read_bytes()
+    ro = SessionDB(path, read_only=True)
+    try:
+        _, full = ro.get_resume_conversations(target)
+        payload_pages = []
+        reader = ro._read_all
+
+        def observed(sql, params=()):
+            rows = reader(sql, params)
+            if "FROM messages WHERE id IN (" in sql:
+                payload_pages.append(len(rows))
+            return rows
+
+        ro._read_all = observed
+        _, bounded = ro.get_resume_conversations(target, max_display_messages=2)
+        assert bounded == full[-2:]
+        assert payload_pages and max(payload_pages) <= 2
+    finally:
+        ro.close()
+        assert path.read_bytes() == before
 
 
 class TestDisplayProjectionParity:

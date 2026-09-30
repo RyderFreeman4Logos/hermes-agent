@@ -1249,7 +1249,7 @@ class SessionMessagesMixin:
         return bool(self._execute_write(_do))
 
     def _legacy_display_page(self, session_id: Union[str, List[str]], *, active_clause: str, limit: Optional[int], offset: int,
-                             latest: bool) -> List[Any]:
+                             latest: bool, ids_only: bool = False) -> List[Any]:
         """Project a legacy read-only display page without retaining transcript payloads."""
         representatives: Dict[bytes, Tuple[int, int]] = {}
         session_ids = [session_id] if isinstance(session_id, str) else session_id
@@ -1280,6 +1280,8 @@ class SessionMessagesMixin:
                 identities = list(representatives)
                 identities = identities[::-1][offset:][:limit][::-1] if latest else identities[offset:][:limit]
                 selected_ids = [representatives[identity][1] for identity in identities]
+                if ids_only:
+                    return selected_ids
                 selected = {}
                 for start in range(0, len(selected_ids), 900):
                     chunk = selected_ids[start:start + 900]
@@ -1614,53 +1616,91 @@ class SessionMessagesMixin:
                     tuple(session_ids),
                 ) is None
             if max_display_messages:
-                def read_page(size):
-                    if not indexed:
-                        # Legacy stores stay read-only: stream identities, fetch only selected payloads.
-                        return self._legacy_display_page(session_ids, active_clause=_DISPLAY_ACTIVE_CLAUSE,
-                                                         limit=size, offset=0, latest=True)
-                    # The window retains generation order and active/newest representative selection.
-                    return self._read_all(f"""WITH ranked AS (
-                            SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}, display_identity,
-                                   MIN(id) OVER (PARTITION BY display_identity) AS logical_order,
-                                   ROW_NUMBER() OVER (
-                                       PARTITION BY display_identity ORDER BY active DESC, id DESC
-                                   ) AS generation_rank
-                            FROM messages
-                            WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
-                              {DISPLAY_VISIBLE_SQL}
-                        ), page AS (
-                            SELECT * FROM ranked WHERE generation_rank = 1
-                            ORDER BY logical_order DESC LIMIT ?
-                        )
-                        SELECT session_id, {self._CONVERSATION_ROW_COLUMNS}
-                        FROM page ORDER BY logical_order ASC""", (*session_ids, size))
+                # Select replay representatives over fixed-width keys before transferring payload.
+                # Expanding a payload page across dense adjacent replays is unbounded in their count.
+                def replay_key(role, content, timestamp, kind, metadata, tool_calls):
+                    if role == "assistant":
+                        return json.dumps([bool(self._decode_content(content) or
+                                                _json_or(tool_calls, [], "Invalid tool calls"))])
+                    if role != "user":
+                        return None
+                    msg = {"role": role, "content": self._decode_content(content), "timestamp": timestamp,
+                           "display_kind": kind, "display_metadata": self._decode_display_metadata(metadata)}
+                    canonical, composite = self._canonical_replayed_user_content(msg)
+                    if canonical in (None, "", []):
+                        return None
+                    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, default=str)
+                    return json.dumps([hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).hexdigest(),
+                                       composite, isinstance(canonical, str)])
 
-                size = max_display_messages
-                while True:
-                    rows = read_page(size)
-                    projected = self._rows_to_conversation(
-                        rows, session_id=session_id, include_ancestors=True,
-                        repair_alternation=False, include_row_ids=True)
-                    # A replayed user at the cut may be removed by an older turn.
-                    # Probe identity without fetching that older payload first.
-                    first = projected[0] if projected else None
-                    first_row = next((row for row in rows if first and row["id"] == first["_row_id"]), None)
-                    older_replay = False
-                    if first_row is not None and first is not None and first["role"] == "user":
-                        older_replay = self._read_one(
-                            f"""SELECT 1 FROM messages WHERE session_id IN ({placeholders})
-                                AND (active = 1 OR compacted = 1) AND id < ? AND role = 'user'
-                                AND id > COALESCE((SELECT MAX(id) FROM messages
-                                    WHERE session_id IN ({placeholders}) AND id < ? AND role = 'assistant'
-                                    AND (COALESCE(content, '') != '' OR COALESCE(tool_calls, '') != '')), 0)
-                                AND content = ? AND (timestamp IS NULL OR timestamp IS NOT ?) LIMIT 1""",
-                            (*session_ids, first["_row_id"], *session_ids, first["_row_id"],
-                             first_row["content"], first.get("timestamp")),
-                        ) is not None
-                    if (len(projected) >= max_display_messages and not older_replay) or len(rows) < size:
-                        break
-                    size = max(size + 1, size * 2)
+                # The read-only fallback uses the writer's non-reentrant lock; finish its
+                # identity scan before borrowing a connection for the metadata projection.
+                ids = None if indexed else self._legacy_display_page(
+                    session_ids, active_clause=_DISPLAY_ACTIVE_CLAUSE,
+                    limit=None, offset=0, latest=False, ids_only=True)
+                with self._read_ctx() as conn:
+                    conn.create_function("resume_key", 6, replay_key)
+                    try:
+                        if indexed:
+                            metadata_rows = conn.execute(f"""WITH ranked AS (
+                                SELECT id, display_identity,
+                                       MIN(id) OVER (PARTITION BY display_identity) AS logical_order,
+                                       ROW_NUMBER() OVER (PARTITION BY display_identity
+                                           ORDER BY active DESC, id DESC) AS generation_rank
+                                FROM messages WHERE session_id IN ({placeholders})
+                                  AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}
+                            )
+                            SELECT m.id, m.role, m.timestamp,
+                                   resume_key(m.role,m.content,m.timestamp,m.display_kind,
+                                              m.display_metadata,m.tool_calls) AS replay
+                            FROM ranked r JOIN messages m ON m.id=r.id
+                            WHERE r.generation_rank=1 ORDER BY r.logical_order""", tuple(session_ids)).fetchall()
+                        else:
+                            metadata_rows = []
+                            for start in range(0, len(ids), 900):
+                                chunk = ids[start:start + 900]
+                                metadata_rows.extend(conn.execute(f"""SELECT id,role,timestamp,
+                                    resume_key(role,content,timestamp,display_kind,display_metadata,tool_calls)
+                                    AS replay FROM messages WHERE id IN ({_placeholders(chunk)})""", chunk))
+                            by_id = {row["id"]: row for row in metadata_rows}
+                            metadata_rows = [by_id[id_] for id_ in ids]
+                        selected = []
+                        exact = {}
+                        for row in metadata_rows:
+                            replay = json.loads(row["replay"]) if row["replay"] else None
+                            key = (row["timestamp"], replay[0]) if row["role"] == "user" and replay and row["timestamp"] is not None else None
+                            duplicate = exact.get(key) if key is not None else None
+                            if duplicate is not None and duplicate not in selected:
+                                duplicate = None
+                            prefer_current = duplicate is not None
+                            if duplicate is None and row["role"] == "user" and replay:
+                                for earlier in reversed(selected):
+                                    if earlier["role"] == "assistant" and json.loads(earlier["replay"] or "[false]")[0]:
+                                        break
+                                    prev = json.loads(earlier["replay"]) if earlier["replay"] else None
+                                    if earlier["role"] == "user" and prev and prev[0] == replay[0] and (replay[1] or prev[1] or replay[2]):
+                                        duplicate = earlier
+                                        prefer_current = replay[1]
+                                        break
+                            if duplicate is not None:
+                                if not prefer_current:
+                                    continue
+                                selected.remove(duplicate)
+                            selected.append(row)
+                            if key is not None:
+                                exact[key] = row
+                        ids = [row["id"] for row in selected[-max_display_messages:]]
+                    finally:
+                        conn.create_function("resume_key", 6, None)
+                rows_by_id = {}
+                for start in range(0, len(ids), 900):
+                    chunk = ids[start:start + 900]
+                    rows_by_id.update({row["id"]: row for row in self._read_all(
+                        f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM messages "
+                        f"WHERE id IN ({_placeholders(chunk)})", chunk)})
+                rows = [rows_by_id[id_] for id_ in ids if id_ in rows_by_id]
+                projected = self._rows_to_conversation(rows, session_id=session_id, include_ancestors=True,
+                                                       repair_alternation=False, include_row_ids=True)
                 return model_history, projected[-max_display_messages:]
         # The model projection stays active-only: it is the compressed working context.
         if max_display_messages is None:

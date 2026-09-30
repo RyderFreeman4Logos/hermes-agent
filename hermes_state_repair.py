@@ -1123,12 +1123,58 @@ def _strategy_dedup_schema(conn: sqlite3.Connection) -> None:
     _edit_sqlite_master(conn, _dedup)
 
 
+def _owned_fts_objects(conn: sqlite3.Connection) -> set[str]:
+    """Prove derived ownership from shipped DDL and SQLite-generated shadow layouts.
+
+    Reserved names alone confer no deletion authority. Unknown virtual extensions and
+    orphan/ambiguous shadows refuse rather than guessing how to reconstruct canonical state.
+    """
+    from hermes_state_common import FTS_SQL, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL
+    from hermes_state_fts import FTS_CJK_TABLE_SQL, FTS_CJK_TRIGGER_SQL
+
+    # SQLite supplies its own shadow DDL; these disposable in-memory references never
+    # read or reconstruct user data. Preserve quoted/literal bytes; only whitespace differs.
+    def normalized(sql):
+        return "".join(re.findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[^\s]", sql or ""))
+
+    allowed = set()
+    scripts = (FTS_SQL, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL,
+               FTS_CJK_TABLE_SQL + FTS_CJK_TRIGGER_SQL)
+    for script in scripts:
+        with contextlib.closing(sqlite3.connect(":memory:")) as reference:
+            reference.execute("CREATE TABLE messages(id)")
+            # Only the layout is needed, not the optional tokenizer's implementation.
+            reference.executescript(script.replace("tokenize='cjk_unicode61'", "tokenize='unicode61'"))
+            for kind, name, table, sql in reference.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master"
+            ):
+                if _FTS_OBJECT_RE.fullmatch(name):
+                    if name == "messages_fts_cjk":
+                        sql = sql.replace("tokenize='unicode61'", "tokenize='cjk_unicode61'")
+                    allowed.add((kind, name, table, normalized(sql)))
+    rows = [tuple(row) for row in conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master")]
+    owned = set()
+    for kind, name, table, sql in rows:
+        if _FTS_OBJECT_RE.fullmatch(name):
+            if (kind, name, table, normalized(sql)) not in allowed:
+                raise ValueError(f"cannot establish derived FTS ownership of {name}")
+            owned.add(name)
+        elif kind == "table" and sql and re.match(r"CREATE\s+VIRTUAL\s+TABLE\b", sql, re.I):
+            raise ValueError(f"cannot establish canonical virtual-table preservation for {name}")
+    for name in owned:
+        family = next((base for base in sorted(_FTS_TABLES, key=len, reverse=True)
+                       if name.startswith(base + "_")), None)
+        if family and name.removeprefix(family + "_") in ("data", "idx", "content", "docsize", "config"):
+            if family not in owned:
+                raise ValueError(f"cannot establish FTS shadow ownership of {name}")
+    return owned
+
+
 def _strategy_drop_fts_vacuum(conn: sqlite3.Connection) -> None:
     """Drop all FTS schema and VACUUM; indexes rebuild on the next open. The
     destructive one, and why strategies run on a scratch copy: on a damaged
     schema b-tree VACUUM silently drops every table hanging off the unreadable part."""
-    names = [name for (name,) in conn.execute("SELECT name FROM sqlite_master")
-             if _FTS_OBJECT_RE.fullmatch(name)]
+    names = _owned_fts_objects(conn)
     _edit_sqlite_master(conn, lambda: conn.executemany("DELETE FROM sqlite_master WHERE name=?", [(n,) for n in names]) or True)
     # The schema parses now, so the barriers can stick — VACUUM rewrites the whole file.
     _reapply_durability_barriers(conn)
@@ -1147,9 +1193,10 @@ def _validate_fts_snapshot(original: sqlite3.Connection, repaired: sqlite3.Conne
                    "fts_rebuild_progress", "fts_tool_full_content_high_water")
 
     def schema(conn):
+        owned = _owned_fts_objects(conn)
         return [tuple(row) for row in conn.execute(
             "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
-        ) if not _FTS_OBJECT_RE.fullmatch(row[1])]
+        ) if row[1] not in owned]
 
     before = schema(original)
     if before != schema(repaired):
@@ -1169,7 +1216,7 @@ def _validate_fts_snapshot(original: sqlite3.Connection, repaired: sqlite3.Conne
             projection = rowid + ", *"
         sql = f"SELECT {projection} FROM {_q(name)}"
         if name == "state_meta":
-            sql += " WHERE key NOT IN (" + ",".join("?" for _ in marker_keys) + ")"
+            sql += " WHERE key IS NULL OR key NOT IN (" + ",".join("?" for _ in marker_keys) + ")"
         args = marker_keys if name == "state_meta" else ()
         width = len(original.execute(sql + " LIMIT 0", args).description)
         sql += " ORDER BY " + ",".join(str(i) for i in range(1, width + 1))

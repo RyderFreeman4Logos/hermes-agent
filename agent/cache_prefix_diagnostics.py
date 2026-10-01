@@ -87,19 +87,21 @@ def _private_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _flock_now(fd: int) -> None:
+    # ponytail: one nonblocking try. A busy diagnostic lock is skipped, never waited.
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise OSError("diagnostic lock is busy") from None
+
+
 def _key(directory: Path) -> bytes:
-    path = directory / "codex-cache-prefix.key"
-    with _key_lock:
-        lock_fd = _open_private(directory / "codex-cache-prefix.lock", os.O_RDWR | os.O_CREAT)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            return _key_locked(path)
-        finally:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(lock_fd)
+    if not _key_lock.acquire(blocking=False):
+        raise OSError("diagnostic lock is busy")
+    try:
+        return _key_locked(directory / "codex-cache-prefix.key")
+    finally:
+        _key_lock.release()
 
 
 def _key_locked(path: Path) -> bytes:
@@ -198,9 +200,11 @@ def _usage(response: Any) -> dict[str, int | None]:
 def _append(row: dict[str, Any], *, home: Path | None = None) -> None:
     directory, output, rotated, lock_path = _paths(home)
     _private_dir(directory)
+    if not _key_lock.acquire(blocking=False):
+        return
     lock_fd = _open_private(lock_path, os.O_RDWR | os.O_CREAT)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _flock_now(lock_fd)
         last_sequence = -1
         for path in (output, rotated):
             try:
@@ -236,8 +240,12 @@ def _append(row: dict[str, Any], *, home: Path | None = None) -> None:
         finally:
             os.close(fd)
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
         os.close(lock_fd)
+        _key_lock.release()
 
 
 def begin_attempt(request: dict[str, Any], *, session_id: str, turn_id: str, api_id: str, ordinal: int, retry: int, role: str = "unknown", route: str = "codex_responses") -> tuple[bytes, dict[str, Any]] | None:

@@ -10,10 +10,11 @@ three axes — credential surface (401/402), endpoint (DNS/refused), model deplo
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli.route_identity import normalize_route_base_url
 
@@ -36,9 +37,33 @@ def _norm(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 
+def _credential_fingerprint(value: Any) -> bytes:
+    """One-way comparison token. Raw credentials never enter identities."""
+    if not isinstance(value, str) or not value.strip():
+        return b""
+    return hashlib.blake2b(value.strip().encode("utf-8"), digest_size=16).digest()
+
+
+def _credential_owner(provider: str) -> str:
+    """Use the runtime resolver's named owner, never endpoint or key equality."""
+    from hermes_cli.auth import AuthError, PROVIDER_REGISTRY, resolve_provider
+    from hermes_cli.providers import custom_provider_slug
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+
+    entry = _get_named_custom_provider(provider)
+    if entry is not None:
+        return custom_provider_slug(entry.get("name", ""), entry.get("provider_key", ""))
+    if not provider or provider in PROVIDER_REGISTRY:
+        return provider
+    try:
+        return resolve_provider(provider)
+    except AuthError:
+        return ""
+
+
 @dataclass(frozen=True)
 class BackendIdentity:
-    """Normalized identity of one (provider, model, endpoint) deployment.
+    """Normalized identity of one (provider, model, endpoint, credential) deployment.
 
     Empty fields mean "unknown" — an unknown axis can neither prove sameness nor difference
     on its own; the remaining axes decide."""
@@ -46,32 +71,45 @@ class BackendIdentity:
     provider: str = ""
     model: str = ""
     base_url: str = ""
+    credential_fingerprint: bytes = b""
+    credential_owner: str = ""
 
     @classmethod
     def build(
         cls, provider: Optional[str] = None, model: Optional[str] = None,
-        base_url: Optional[str] = None,
+        base_url: Optional[str] = None, api_key: Any = None,
     ) -> "BackendIdentity":
         return cls(
             provider=_norm(provider), model=_norm(model),
             base_url=normalize_route_base_url(base_url),
+            credential_fingerprint=_credential_fingerprint(api_key),
+            credential_owner=_credential_owner(_norm(provider)),
         )
 
 
 def _both_first_class(a: BackendIdentity, b: BackendIdentity) -> bool:
-    """True when both providers are distinct registered first-class providers.
+    """True for distinct registered or configured owners, even on one host.
 
-    Two different registry providers have distinct credential surfaces even when they share an
-    inference host (xai-oauth vs xai). Custom/shim aliases are NOT in the registry, so two
-    aliases pointing at one URL still count as the same backend."""
+    Unconfigured shim labels alone do not establish independent ownership."""
     if not a.provider or not b.provider or a.provider == b.provider:
         return False
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
 
-        return a.provider in PROVIDER_REGISTRY and b.provider in PROVIDER_REGISTRY
+        owners = (a.credential_owner, b.credential_owner)
+        return owners[0] != owners[1] and all(
+            owner in PROVIDER_REGISTRY or owner.startswith("custom:") for owner in owners
+        )
     except Exception:
         return False
+
+
+def _fingerprints_match(a: BackendIdentity, b: BackendIdentity) -> bool:
+    return bool(
+        a.credential_fingerprint
+        and b.credential_fingerprint
+        and a.credential_fingerprint == b.credential_fingerprint
+    )
 
 
 def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
@@ -79,12 +117,16 @@ def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
 
     Conservative: an unprovable axis answers "different" (one wasted RTT) rather than "same"
     (stranded failover). Same label = same configured credential; custom entries can each carry
-    their own api_key, so a shared URL alone is only a weak signal when a label is missing."""
+    their own api_key, so a shared URL alone is only a weak signal when a label is missing.
+    Fingerprints disambiguate keys within one canonical owner; distinct owners stay separate."""
     if a.provider and b.provider:
-        # Different labels = different credential config (first-class registry providers explicitly so —
-        # #70893; custom entries can each carry their own api_key, so sameness is unprovable and we must not
-        # skip).
-        return a.provider == b.provider
+        if (a.credential_owner or a.provider) != (b.credential_owner or b.provider):
+            return False
+        if a.credential_fingerprint or b.credential_fingerprint:
+            return _fingerprints_match(a, b)
+        return True
+    if a.credential_fingerprint or b.credential_fingerprint:
+        return _fingerprints_match(a, b)
     return bool(a.base_url and a.base_url == b.base_url)
 
 
@@ -102,7 +144,9 @@ def same_deployment(a: BackendIdentity, b: BackendIdentity) -> bool:
     Provider+model must match; base_url distinguishes only when BOTH sides carry an explicit URL
     (same provider+model on two explicit URLs is a pool, not a dup). Different labels with the
     same URL + model are still one deployment (same-host shim aliases) — unless both labels are
-    first-class registry providers."""
+    registered or configured owners. Explicitly different keys are independent deployments."""
+    if a.credential_fingerprint and b.credential_fingerprint and not _fingerprints_match(a, b):
+        return False
     if not (a.provider and b.provider and a.provider == b.provider):
         return bool(
             a.base_url

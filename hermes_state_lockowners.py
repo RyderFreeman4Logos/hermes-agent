@@ -78,6 +78,57 @@ def parse_proc_locks(text: str, inodes: Dict[Tuple[int, int], str]) -> List[Tupl
     return found
 
 
+def _fd_writer_holders(text: str, inodes: Dict[Tuple[int, int], str]) -> List[Tuple[int, str, str]]:
+    """Resolve kernel device aliases only through the named owner's matching locked FD.
+
+    Btrfs exports a superblock device in lock rows but a subvolume device in stat.
+    The proc FD stat preserves the full subvolume identity; its fdinfo must also
+    contain the exact POSIX WRITE row. No pathname or inode-only equivalence is used.
+    """
+    found = []
+    for row in text.splitlines():
+        fields = row.split()
+        if (len(fields) != 8 or fields[1:4] != ["POSIX", "ADVISORY", "WRITE"]
+                or not all(field.isascii() for field in fields)):
+            continue
+        try:
+            pid = int(fields[4])
+            major, minor, ino = fields[5].split(":")
+            key = (os.makedev(int(major, 16), int(minor, 16)), int(ino))
+        except ValueError:
+            continue
+        if pid <= 0 or key in inodes or not any(ino == str(i) for _, i in inodes):
+            continue
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            if not fd.isascii() or not fd.isdecimal():
+                continue
+            path = f"/proc/{pid}/fd/{fd}"
+            try:
+                before = os.stat(path)
+                identity = (before.st_dev, before.st_ino)
+                sidecar = inodes.get(identity)
+                if sidecar is None:
+                    continue
+                with open(f"/proc/{pid}/fdinfo/{fd}", "rb") as handle:
+                    info = handle.read()
+                after = os.stat(path)
+            except OSError:
+                continue
+            if (after.st_dev, after.st_ino) != identity:
+                continue
+            # Parse only control records: unrelated proc metadata need not be UTF-8.
+            locks = [line.split()[1:] for line in info.splitlines() if line.startswith(b"lock:")]
+            expected = [field.encode("ascii") for field in fields[1:]]
+            if any(lock[1:] == expected for lock in locks):
+                found.extend(parse_proc_locks(row, {key: sidecar}))
+                break
+    return found
+
+
 def state_db_write_lock_holders(db_path) -> List[str]:
     """Operator-facing lines naming the processes that hold a write-class lock on ``db_path``.
 
@@ -102,7 +153,8 @@ def state_db_write_lock_holders(db_path) -> List[str]:
                 text = handle.read()
         except OSError:
             return []
-        held.extend(entry for entry in parse_proc_locks(text, inodes) if entry not in held)
+        entries = parse_proc_locks(text, inodes) + _fd_writer_holders(text, inodes)
+        held.extend(entry for entry in entries if entry not in held)
     from hermes_state_holders import describe_holder_pid
 
     lines = []

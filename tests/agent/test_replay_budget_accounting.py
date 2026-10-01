@@ -16,8 +16,10 @@ import pytest
 
 from agent.context_compressor import (
     _ALWAYS_REPLAYED_BUDGET_KEYS,
+    _CHARS_PER_TOKEN,
     _NEWEST_TURN_ONLY_BUDGET_KEYS,
     _REPLAY_BUDGET_KEYS,
+    _content_length_for_budget,
     _estimate_msg_budget_tokens,
 )
 from agent.model_metadata import estimate_tokens_rough
@@ -58,7 +60,28 @@ def test_api_content_matches_wire_substitution_without_mutation(message):
     tokens = _estimate_msg_budget_tokens(message)
 
     expected_content = wire_message.get("content") or ""
-    assert tokens == estimate_tokens_rough(expected_content) + 10
+    if isinstance(expected_content, (list, dict)):
+        expected = _content_length_for_budget(expected_content) // _CHARS_PER_TOKEN + 10
+    else:
+        expected = estimate_tokens_rough(expected_content) + 10
+    assert tokens == expected
+    assert message == original
+
+
+def test_text_parts_sidecar_charges_part_text_not_repr():
+    """A text-only parts list is the wire body, not its Python repr."""
+    body = "timing row " * 4000
+    message = {
+        "role": "user",
+        "content": "display",
+        "api_content": [{"type": "text", "text": body}],
+    }
+    original = dict(message)
+    tokens = _estimate_msg_budget_tokens(message)
+    length_charge = _content_length_for_budget(message["api_content"]) // _CHARS_PER_TOKEN + 10
+    repr_charge = estimate_tokens_rough(message["api_content"]) + 10
+    assert length_charge != repr_charge
+    assert tokens == length_charge
     assert message == original
 
 

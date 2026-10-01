@@ -1347,12 +1347,8 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     wire_msg = dict(msg)
     substitute_api_content(wire_msg)
     content = wire_msg.get("content") or ""
-    if isinstance(content, list) and any(_is_image_part(part) for part in content):
+    if isinstance(content, (list, dict)):
         text_tokens = _content_length_for_budget(content) // _CHARS_PER_TOKEN
-    elif isinstance(content, dict) and content.get("_multimodal"):
-        text_tokens = _content_length_for_budget(
-            content.get("content") or content.get("text_summary") or ""
-        ) // _CHARS_PER_TOKEN
     else:
         text_tokens = estimate_tokens_rough(content)
     tokens = text_tokens + 10  # +10 for role/key overhead

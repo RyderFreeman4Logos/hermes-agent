@@ -83,11 +83,11 @@ def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
 
 def _record_attempt(
     request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None,
-    physical_send_ordinal: int = 0, scope: dict[str, str] | None = None,
+    physical_send_ordinal: int = 0, scope: dict[str, str] | None = None, count: bool = True,
 ) -> Any:
     """Count one physical send and bind the Codex digest to its final kwargs."""
     context = _PHYSICAL_DIAGNOSTICS.get()
-    if context is not None:
+    if context is not None and count:
         context.ordinals.append(physical_send_ordinal)
     if str((metadata or {}).get("api_mode") or "") != "codex_responses":
         return None
@@ -123,13 +123,16 @@ def _diagnostic_scope(context: _PhysicalDiagnosticContext):
 
 
 def physical_send(request: dict[str, Any], callback: Callable[[dict[str, Any]], Any]) -> Any:
-    """Record final public-SDK kwargs once that physical call has finished.
+    """Record one finished public-SDK call, not a proven wire send.
 
     The Codex digest starts before the call so a stream can finish the same
-    row, but the send counter moves only after success or failure. Returning
-    an awaitable is not completion. A callback that is already
-    ``physical_send`` is not recorded twice. Identity equality only stops
-    same-call reentry; it does not prove a different request was sent.
+    row. The counter moves after the callback returns or raises, and after an
+    awaitable finishes, including cancel. It does not move when the callback
+    only returns an unfinished awaitable, and it cannot tell an SDK build
+    error from a write that then raised. Primary and aux builders default
+    ``max_retries`` to 0; a client built without that default can still retry
+    inside this one call. A callback that is already ``physical_send`` is not
+    recorded twice. Identity equality only stops same-call reentry.
     """
     context = _PHYSICAL_DIAGNOSTICS.get()
     if context is None or context.latest_event is request:
@@ -144,7 +147,11 @@ def physical_send(request: dict[str, Any], callback: Callable[[dict[str, Any]], 
         context.ordinal += 1
         context.latest_event = request
 
-    result = callback(request)
+    try:
+        result = callback(request)
+    except BaseException:
+        _mark()
+        raise
     if inspect.isawaitable(result):
         async def finish() -> Any:
             try:

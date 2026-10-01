@@ -1184,15 +1184,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         stream_kwargs["stream"] = True
         final_kwargs = bypass_sdk_request_transform(stream_kwargs)
         context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
-        if context is not None and context.codex_token is None:
-            context.codex_token = relay_llm._record_attempt(
-                final_kwargs, name=str(getattr(agent, "provider", "") or "codex"),
-                model_name=str(model or ""), metadata=context.metadata,
-                physical_send_ordinal=context.ordinal, scope=context.scope,
-            )
-        if context is not None:
-            diagnostic_token = context.codex_token
-        return active_client.responses.create(**final_kwargs)
+
+        def create(request: dict[str, Any]):
+            nonlocal diagnostic_token
+            if context is not None and context.codex_token is None:
+                context.codex_token = relay_llm._record_attempt(
+                    request, name=str(getattr(agent, "provider", "") or "codex"),
+                    model_name=str(model or ""), metadata=context.metadata,
+                    physical_send_ordinal=context.ordinal, scope=context.scope, count=False,
+                )
+            try:
+                return active_client.responses.create(**request)
+            finally:
+                if context is not None:
+                    diagnostic_token = context.codex_token
+
+        return create(final_kwargs)
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)

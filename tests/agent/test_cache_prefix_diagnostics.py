@@ -387,8 +387,7 @@ def test_multiprocess_append_is_lossless(tmp_path, monkeypatch):
     for process in processes: process.start()
     for process in processes: process.join()
     assert all(process.exitcode == 0 for process in processes)
-    # A busy nonblocking lock skips that writer instead of waiting.
-    assert 1 <= len(rows(tmp_path)) <= 4
+    assert len(rows(tmp_path)) == 4
 
 
 def test_unsupported_opener_never_invents_dispatch_evidence(tmp_path, monkeypatch):
@@ -923,7 +922,7 @@ def test_public_codex_sink_keeps_origin_across_scope_exit(tmp_path, monkeypatch)
 def _read_private_key(home):
     os.environ["HERMES_HOME"] = str(home)
     diagnostics._enabled = lambda: True
-    diagnostics.begin_attempt({}, session_id="", turn_id="", api_id="", ordinal=0, retry=0)
+    assert diagnostics.begin_attempt({}, session_id="", turn_id="", api_id="", ordinal=0, retry=0) is None
 
 
 def test_nonregular_key_and_lock_fail_closed_without_blocking(tmp_path):
@@ -946,34 +945,38 @@ def test_nonregular_key_and_lock_fail_closed_without_blocking(tmp_path):
             child.join(2)
         assert not child.is_alive()
         assert not blocked, name
+        assert child.exitcode == 0
+        leaf.unlink()
 
 
-def _child_begin_finish(home, phase, ready):
+def _child_begin_finish(home, phase, ready, token, completed=None):
     os.environ["HERMES_HOME"] = str(home)
     diagnostics._enabled = lambda: True
     ready.set()
-    token = diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
     if phase == "begin":
-        return
-    diagnostics.finish_attempt(token)
+        assert diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0) is None
+    else:
+        assert token is not None
+        diagnostics.finish_attempt(token)
+    assert len(rows(home)) == 1
+    if completed is not None:
+        completed.set()
 
 
 @pytest.mark.parametrize("phase", ["begin", "finish"])
-def test_held_regular_lock_fails_open(tmp_path, phase):
+def test_held_regular_lock_fails_open(tmp_path, monkeypatch, phase):
     """A cooperating holder of the 0600 lock must not stall begin or finish."""
     import fcntl
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
-    enable_home = home
-    os.environ["HERMES_HOME"] = str(enable_home)
-    diagnostics._enabled = lambda: True
+    enable(home, monkeypatch)
     token = diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
     diagnostics.finish_attempt(token)
     lock = home / "cache" / "codex-cache-prefix.lock"
     fd = os.open(lock, os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
     ready = multiprocessing.get_context("fork").Event()
-    child = multiprocessing.get_context("fork").Process(target=_child_begin_finish, args=(home, phase, ready))
+    child = multiprocessing.get_context("fork").Process(target=_child_begin_finish, args=(home, phase, ready, token))
     try:
         child.start()
         assert ready.wait(2)
@@ -988,13 +991,24 @@ def test_held_regular_lock_fails_open(tmp_path, phase):
         os.close(fd)
 
 
-def test_process_key_lock_contention_skips(tmp_path, monkeypatch):
-    """A held in-process key lock is skipped, not waited on."""
+@pytest.mark.parametrize("phase", ["begin", "finish"])
+def test_process_key_lock_contention_skips(tmp_path, monkeypatch, phase):
+    """Both phases return within a bound even when the process lock is stuck."""
     enable(tmp_path, monkeypatch)
+    token = diagnostics.begin_attempt(request(), session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+    diagnostics.finish_attempt(token)
+    ready = threading.Event()
+    completed = threading.Event()
+    worker = threading.Thread(target=_child_begin_finish, args=(tmp_path, phase, ready, token, completed), daemon=True)
     diagnostics._key_lock.acquire()
     try:
-        assert diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0) is None
+        worker.start()
+        assert ready.wait(2)
+        worker.join(2)
+        assert not worker.is_alive()
+        assert completed.is_set()
     finally:
         diagnostics._key_lock.release()
+        worker.join(2)
     token = diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
     assert token is not None

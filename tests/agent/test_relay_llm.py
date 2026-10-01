@@ -53,8 +53,7 @@ def relay_turn(tmp_path, monkeypatch):
         relay_runtime._reset_for_tests()
 
 
-@pytest.mark.asyncio
-async def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypatch):
+def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypatch):
     contexts = _capture_attempt_diagnostics(monkeypatch)
     sends = []
 
@@ -81,11 +80,11 @@ async def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypat
         lambda request: relay_llm.physical_send(request, send),
         **common,
     )
-    await relay_llm.execute_async(
+    asyncio.run(relay_llm.execute_async(
         {"model": "model", "messages": []},
         lambda request: relay_llm.physical_send_async(request, send_async),
         **common,
-    )
+    ))
     stream = relay_llm.stream_current(
         {"model": "model", "messages": [], "stream": True},
         lambda request: relay_llm.physical_send(request, send_stream),

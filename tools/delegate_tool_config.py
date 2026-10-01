@@ -381,6 +381,8 @@ def _model_pool_errors(pool: Any) -> List[str]:
 
 def _require_pool_provider(configured_provider: Optional[str], runtime: dict) -> None:
     """A named tier may not use the general resolver's ambient fallback."""
+    if not isinstance(runtime, dict):
+        raise ValueError(f"Delegation model_pool provider '{configured_provider}' did not resolve runtime credentials.")
     from hermes_cli.providers import normalize_provider
     from hermes_cli.runtime_provider import _same_registered_provider
     from hermes_cli.runtime_provider_custom import _get_named_custom_provider, expand_direct_api_alias
@@ -444,6 +446,11 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusi
             from hermes_cli.runtime_provider import resolve_runtime_provider
             runtime = resolve_runtime_provider(requested=v["provider"], target_model=v["model"])
         except Exception as exc:
+            if exclusive:
+                raise ValueError(
+                    f"Cannot resolve delegation provider '{v['provider']}': {exc}. "
+                    "Cannot safely validate its credentials for this exclusive model-pool route."
+                ) from exc
             logger.debug(
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",
                 v["provider"], exc,

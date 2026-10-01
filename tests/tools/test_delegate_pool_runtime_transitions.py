@@ -93,7 +93,9 @@ def test_public_fallback_restore_uses_only_primary_owner(tmp_path, direct, fixed
     from tools.delegate_tool import delegate_task
     from tools.delegate_tool_child_run import _lease_child_credential
 
+    primary_overrides = {"extra_body": {"route": "primary"}}
     route = {"provider": "owner-b", "model": "fixture-primary-m", "api_mode": "chat_completions",
+             "request_overrides": primary_overrides,
              "fallback_chain": [{"provider": "owner-a", "model": "fixture-fallback-m"}]}
     if direct:
         route["base_url"] = URL
@@ -153,6 +155,7 @@ def test_public_fallback_restore_uses_only_primary_owner(tmp_path, direct, fixed
                     "fixture-primary-m", key, None if fixed else own,
                 )
                 assert child.requested_provider == "owner-b"
+                assert child.request_overrides == primary_overrides
             if fixed or cooldown_owner == "monotonic":
                 load.assert_not_called()
             else:

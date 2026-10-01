@@ -460,30 +460,36 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued_transport is not None and not _transport_is_dead(queued_transport):
             _attach_session_transport(session, queued_transport)
         completion_events = queued.get("completion_events") if queued.get("structured_completion") else None
+        completion_receipt = None
         if isinstance(completion_events, list) and completion_events:
-            session["_completion_active_receipt"] = {
+            completion_receipt = {
                 "events": [dict(event) for event in completion_events if isinstance(event, dict)],
                 "generation": queue_generation,
             }
+            session["_completion_active_receipt"] = completion_receipt
     # A structured receipt belongs to the local turn's core-ingestion hook.
     # A compute-host bridge cannot consume that hook, so an otherwise active
     # host must not receive this particular queued envelope.
     use_compute_host = _session_uses_compute_host(session) and not completion_events
     with session["history_lock"]:
-        if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
-            # Generation bump cancelled the claim (Stop, compress re-anchor, …): don't dispatch, but restore the
-            # envelope (claimed head first, then whatever advanced into the slot) so a legitimate follow-up isn't dropped.
-            # See #84417.
+        receipt_owned = (completion_receipt is None
+                         or session.get("_completion_active_receipt") is completion_receipt)
+        if (int(session.get("_queued_prompt_generation", 0)) != queue_generation
+                or not receipt_owned):
+            # A reset may cancel this claim; a lifecycle reclaimer may already own its receipt.
+            # Restore the claimed envelope only while this drain still owns that exact receipt.
+            # Keep any newer user prompts even when a reclaimer took the receipt.
             advanced = session.get("queued_prompt")
-            _ac_set_queue(session, [queued, *([advanced] if advanced else []), *(session.get("queued_prompts") or [])])
-            if completion_events:
-                # The restored envelope owns this receipt again; no active turn was dispatched.
+            restore_claimed = [queued] if receipt_owned else []
+            _ac_set_queue(session, [*restore_claimed, *([advanced] if advanced else []),
+                                    *(session.get("queued_prompts") or [])])
+            if completion_receipt is not None and receipt_owned:
                 session.pop("_completion_active_receipt", None)
             session["running"] = False
             return True
     kwargs: dict = {"queued_prompt_generation": queue_generation}
-    if isinstance(completion_events, list) and completion_events:
-        kwargs["completion_receipt"] = session.get("_completion_active_receipt")
+    if completion_receipt is not None:
+        kwargs["completion_receipt"] = completion_receipt
     if queued.get("image_paths"):
         kwargs["image_paths"] = queued["image_paths"]
     # Re-place the accept-time rows (if any) at the transcript END before the turn's rows follow

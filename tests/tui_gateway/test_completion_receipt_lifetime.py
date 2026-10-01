@@ -142,6 +142,131 @@ def test_cancelled_drain_returns_receipt_to_queue_once(monkeypatch):
     assert "_completion_active_receipt" not in session
 
 
+def test_public_session_interrupt_does_not_restore_reclaimed_claim_receipt(monkeypatch, tmp_path):
+    from tui_gateway.session_auto_continue import _reclaim_queued_completion_receipts
+
+    event = _completion("proc_public_stop_claim")
+    envelope = {"text": "completion", "transport": None,
+                "structured_completion": True, "completion_events": [event]}
+    first = {"text": "user follow-up", "transport": None}
+    second = {"text": "later user follow-up", "transport": None}
+    sid = "receipt-public-stop-claim"
+    session = _session(running=False, profile_home=tmp_path, queued_prompt=envelope)
+    calls = 0
+
+    def stop_after_claim(_session):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            response = server.handle_request({
+                "id": "stop-at-claim", "method": "session.interrupt",
+                "params": {"session_id": sid},
+            })
+            assert response["result"]["status"] == "interrupted"
+            session["queued_prompt"] = first
+            session["queued_prompts"] = [second]
+        return False
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", stop_after_claim)
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda: None)
+    monkeypatch.setattr(server, "_resume_wake_after_interrupt", lambda: None)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args: None)
+    monkeypatch.setattr(server, "_clear_pending", lambda *_args: None)
+    dispatch_calls = []
+    monkeypatch.setattr(server, "_run_prompt_submit",
+                        lambda *_args, **_kwargs: dispatch_calls.append(True))
+    server._sessions[sid] = session
+    try:
+        assert server._drain_queued_prompt("rid", sid, session)
+        assert not dispatch_calls
+        _reclaim_queued_completion_receipts(session)
+        assert session["_completion_pending"] == [event]
+        assert session["queued_prompt"] is first
+        assert session["queued_prompts"] == [second]
+        assert "_completion_active_receipt" not in session
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_agent_reset_and_dying_poller_reclaim_preserve_user_prompt(monkeypatch):
+    from tui_gateway.session_auto_continue import _reclaim_queued_completion_receipts
+
+    event = _completion("proc_reset_claim")
+    envelope = {"text": "completion", "transport": None,
+                "structured_completion": True, "completion_events": [event]}
+    followup = {"text": "user after reset", "transport": None}
+    sid = "receipt-reset-claim"
+    session = _session(running=False, queued_prompt=envelope)
+    replacement = types.SimpleNamespace()
+    for name, value in {
+        "_load_show_reasoning": lambda: False,
+        "_load_tool_progress_mode": lambda: "all",
+        "_set_session_context": lambda *_args: None,
+        "_clear_session_context": lambda *_args: None,
+        "_session_source": lambda _session: "tui",
+        "_context_cwd_is_launch_artifact": lambda _session: False,
+        "_rebuild_session_agent": lambda *_args, **_kwargs: replacement,
+        "_session_info": lambda *_args, **_kwargs: {},
+        "_emit": lambda *_args, **_kwargs: None,
+        "_restart_slash_worker": lambda *_args, **_kwargs: None,
+    }.items():
+        monkeypatch.setattr(server, name, value)
+    calls = 0
+
+    def reset_after_claim(_session):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            server._reset_session_agent(sid, session)
+            session["queued_prompt"] = followup
+        return False
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", reset_after_claim)
+    dispatch_calls = []
+    monkeypatch.setattr(server, "_run_prompt_submit",
+                        lambda *_args, **_kwargs: dispatch_calls.append(True))
+    assert server._drain_queued_prompt("rid", sid, session)
+    assert not dispatch_calls
+    _reclaim_queued_completion_receipts(session)
+    assert session["_completion_pending"] == [event]
+    assert session["queued_prompt"] is followup
+    assert "_completion_active_receipt" not in session
+
+    monkeypatch.undo()
+    event = _completion("proc_poller_claim")
+    event_id = event["session_id"]
+    envelope = {"text": "completion", "transport": None,
+                "structured_completion": True, "completion_events": [event]}
+    followup = {"text": "user after close", "transport": None}
+    sid = "receipt-poller-claim"
+    session = _session(running=False, queued_prompt=envelope)
+    _clear_ids(event_id)
+    calls = 0
+
+    def reap_after_claim(_session):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            _dying_reclaim(sid, session)
+            session["queued_prompt"] = followup
+        return False
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", reap_after_claim)
+    dispatch_calls = []
+    monkeypatch.setattr(server, "_run_prompt_submit",
+                        lambda *_args, **_kwargs: dispatch_calls.append(True))
+    try:
+        with _isolated_queue(monkeypatch) as isolated:
+            assert server._drain_queued_prompt("rid", sid, session)
+            assert not dispatch_calls
+            assert _queued_ids(isolated) == [event_id]
+            assert session["queued_prompt"] is followup
+            assert session["_completion_pending"] == []
+            assert session.get("_completion_active_receipt") is None
+            assert int(session.get("_queued_prompt_generation", 0)) == 0
+    finally:
+        _clear_ids(event_id)
+
 def test_no_tool_requeue_then_reclaim_retains_each_owner(monkeypatch):
     event_id = "proc_ownerless_e"
     _clear_ids(event_id)

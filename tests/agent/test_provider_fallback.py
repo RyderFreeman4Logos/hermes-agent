@@ -310,14 +310,15 @@ class TestFallbackChainDedup:
         called = []
         def _resolve(provider, model=None, raw_codex=False, **kwargs):
             called.append((provider, model))
-            return _mock_client(), model
+            return _mock_client(api_key="test-key"), model
         with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve):
             with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
                 ok = agent._try_activate_fallback()
 
         assert ok is True
-        # The first entry was skipped — only the second reached resolve.
-        assert called == [("zai", "glm-4.7")], (
+        # Both resolve credentials; only the independent provider activates.
+        assert agent.provider == "zai"
+        assert called == [("openrouter", "z-ai/glm-4.7"), ("zai", "glm-4.7")], (
             f"expected fallback to skip same-state entry, got call order: {called}"
         )
 
@@ -332,11 +333,12 @@ class TestFallbackChainDedup:
         agent.model = "z-ai/glm-4.7"
         agent.base_url = "https://openrouter.ai/api/v1"
 
-        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(_mock_client(api_key="test-key"), agent.model)) as mock_resolve:
             ok = agent._try_activate_fallback()
 
         assert ok is False
-        mock_resolve.assert_not_called()
+        mock_resolve.assert_called_once()
 
     def test_allows_xai_api_fallback_from_xai_oauth_same_host_model(self):
         """xai-oauth and xai share api.x.ai but use different credentials.

@@ -2010,13 +2010,12 @@ def _raw_fallback_identity_is_known(fb: dict, candidate, failed, failure_scope) 
     """True when raw fields are sufficient for the selected failure axis."""
     from agent.backend_identity import FailureScope
 
-    if _raw_fallback_is_exact_self(fb, candidate, failed):
+    if not failed.credential_fingerprint and _raw_fallback_is_exact_self(fb, candidate, failed):
         return True
     if failure_scope is FailureScope.ENDPOINT:
         return bool(candidate.base_url and failed.base_url)
-    if failure_scope is FailureScope.CREDENTIAL:
-        return bool(candidate.provider and failed.provider and not _fallback_has_explicit_credential(fb))
-    return bool(candidate.model and failed.model and candidate.base_url and failed.base_url)
+    # Labels/URLs cannot establish the candidate's configured credential.
+    return False
 
 
 def _should_skip_fallback_candidate(

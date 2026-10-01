@@ -1825,22 +1825,22 @@ def test_managed_retry_records_rewritten_wire_only(relay_turn, monkeypatch):
     assert [context.ordinals for context in contexts] == [[0, 1]]
 
 
-def test_physical_send_marks_only_after_the_call_finishes():
+def test_physical_send_marks_after_return_or_raise():
     context = relay_llm._PhysicalDiagnosticContext("provider", "model", {"api_mode": "chat_completions"})
 
     def boom(_request):
-        raise RuntimeError("not sent")
+        raise RuntimeError("sdk call failed")
 
     async def unfinished(_request):
         raise RuntimeError("awaitable failed")
 
     with relay_llm._diagnostic_scope(context):
-        with pytest.raises(RuntimeError, match="not sent"):
+        with pytest.raises(RuntimeError, match="sdk call failed"):
             relay_llm.physical_send({"n": 1}, boom)
-        assert context.ordinals == []
+        assert context.ordinals == [0]
         pending = relay_llm.physical_send({"n": 2}, unfinished)
-        assert context.ordinals == []
+        assert context.ordinals == [0]
         with pytest.raises(RuntimeError, match="awaitable failed"):
             asyncio.run(pending)
-    assert context.ordinals == [0]
+    assert context.ordinals == [0, 1]
     assert context.latest_event == {"n": 2}

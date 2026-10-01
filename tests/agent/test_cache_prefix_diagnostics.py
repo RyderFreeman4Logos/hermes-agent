@@ -6,6 +6,8 @@ import os
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from agent import cache_prefix_diagnostics as diagnostics
 
 
@@ -367,6 +369,79 @@ def test_multiprocess_append_is_lossless(tmp_path, monkeypatch):
     for process in processes: process.join()
     assert all(process.exitcode == 0 for process in processes)
     assert len(rows(tmp_path)) == 4
+
+
+def test_codex_opener_counts_a_finished_create_not_its_start(tmp_path, monkeypatch):
+    from agent import relay_llm
+    from agent.codex_runtime import run_codex_stream
+    import httpx
+
+    enable(tmp_path, monkeypatch)
+    contexts = []
+    real_send = relay_llm.physical_send
+
+    def capture(request, callback):
+        def wrapped(final):
+            context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+            if context is not None and context not in contexts:
+                contexts.append(context)
+            return callback(final)
+
+        return real_send(request, wrapped)
+
+    monkeypatch.setattr(relay_llm, "physical_send", capture)
+
+    class Agent:
+        provider = "openai-codex"
+        session_id = "session"
+        _current_api_request_id = "session:task:turn:api:0"
+        _interrupt_requested = False
+        _fallback_index = 0
+        model = "model"
+
+        def _is_codex_backend(self): return True
+        def _fire_stream_delta(self, text): pass
+        def _fire_reasoning_delta(self, text): pass
+        def _touch_activity(self, text): pass
+        def _client_log_context(self): return "test"
+
+    def refusing(**kwargs):
+        raise TypeError("sdk build rejected the request")
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=refusing), base_url="https://chatgpt.com/backend-api/codex")
+    with pytest.raises(TypeError, match="sdk build rejected"):
+        run_codex_stream(Agent(), request(), client=client)
+    assert [context.ordinals for context in contexts] == [[0]]
+    row = rows(tmp_path)[0]
+    assert row["kind"] == "error" and "sdk build rejected" not in json.dumps(row)
+
+    contexts.clear()
+
+    class Wrote(httpx.WriteError):
+        pass
+
+    def wrote(**kwargs):
+        request = httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses")
+        raise Wrote("body reached the transport", request=request)
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=wrote), base_url="https://chatgpt.com/backend-api/codex")
+    with pytest.raises(httpx.WriteError):
+        run_codex_stream(Agent(), request(), client=client)
+    assert [context.ordinals for context in contexts] == [[0]]
+    row = rows(tmp_path)[1]
+    assert row["kind"] == "error" and "body reached" not in json.dumps(row)
+
+    contexts.clear()
+    seen = []
+
+    def opened(**kwargs):
+        seen.append(list(contexts[-1].ordinals))
+        return iter([{"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}}}}])
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=opened), base_url="https://chatgpt.com/backend-api/codex")
+    result = run_codex_stream(Agent(), request(), client=client)
+    assert result.status == "completed" and seen == [[]]
+    assert [context.ordinals for context in contexts] == [[0]]
 
 
 def test_history_overflow_digest_distinguishes_same_count_suffix(tmp_path, monkeypatch):

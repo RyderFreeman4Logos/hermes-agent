@@ -1,4 +1,8 @@
-"""Opt-in, local-only, opaque evidence for final Codex Responses attempts."""
+"""Opt-in, local-only, opaque evidence for final Codex Responses attempts.
+
+Best effort: ordinary writers serialize; lock timeouts or storage failures drop
+diagnostics without changing provider results. No durable replay is promised.
+"""
 from __future__ import annotations
 
 import fcntl
@@ -9,6 +13,8 @@ import os
 import secrets
 import stat
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +22,7 @@ from hermes_constants import get_hermes_home
 
 _MAX_BYTES = 4 * 1024 * 1024
 _MAX_HISTORY = 64
+_LOCK_TIMEOUT = 0.5
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _key_lock = threading.Lock()
@@ -87,21 +94,35 @@ def _private_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _flock_now(fd: int) -> None:
-    # ponytail: one nonblocking try. A busy diagnostic lock is skipped, never waited.
+@contextmanager
+def _locked(directory: Path):
+    # ponytail: one shared deadline for normal contention; stalled holders lose
+    # diagnostics, never provider results. No queue or background replay.
+    deadline = time.monotonic() + _LOCK_TIMEOUT
+    if not _key_lock.acquire(timeout=_LOCK_TIMEOUT):
+        raise OSError("diagnostic lock is busy")
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise OSError("diagnostic lock is busy") from None
+        fd = _open_private(directory / "codex-cache-prefix.lock", os.O_RDWR | os.O_CREAT)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise OSError("diagnostic lock is busy") from None
+                    time.sleep(min(0.01, remaining))
+            yield
+        finally:
+            os.close(fd)  # Closing also releases any acquired flock.
+    finally:
+        _key_lock.release()
 
 
 def _key(directory: Path) -> bytes:
-    if not _key_lock.acquire(blocking=False):
-        raise OSError("diagnostic lock is busy")
-    try:
+    with _locked(directory):
         return _key_locked(directory / "codex-cache-prefix.key")
-    finally:
-        _key_lock.release()
 
 
 def _key_locked(path: Path) -> bytes:
@@ -198,13 +219,9 @@ def _usage(response: Any) -> dict[str, int | None]:
 
 
 def _append(row: dict[str, Any], *, home: Path | None = None) -> None:
-    directory, output, rotated, lock_path = _paths(home)
+    directory, output, rotated, _ = _paths(home)
     _private_dir(directory)
-    if not _key_lock.acquire(blocking=False):
-        return
-    lock_fd = _open_private(lock_path, os.O_RDWR | os.O_CREAT)
-    try:
-        _flock_now(lock_fd)
+    with _locked(directory):
         last_sequence = -1
         for path in (output, rotated):
             try:
@@ -239,13 +256,6 @@ def _append(row: dict[str, Any], *, home: Path | None = None) -> None:
                 view = view[os.write(fd, view):]
         finally:
             os.close(fd)
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(lock_fd)
-        _key_lock.release()
 
 
 def begin_attempt(request: dict[str, Any], *, session_id: str, turn_id: str, api_id: str, ordinal: int, retry: int, role: str = "unknown", route: str = "codex_responses") -> tuple[bytes, dict[str, Any]] | None:

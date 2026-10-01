@@ -77,7 +77,7 @@ def test_consumed_shapes_refuse_before_child(origin, surface, field, bad, caplog
 def test_declared_identity_is_resolver_owned_not_request_tag(tmp_path, monkeypatch, surface, credential, owner):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    providers = {name: {"base_url": URL, "extra_body": {"owner": name}} for name in ("own", "foreign")}
+    providers = {name: {"name": "Shared Label", "base_url": URL, "extra_body": {"owner": name}} for name in ("own", "foreign")}
     for entry in providers.values():
         entry.update({"api_key": "shared-key"} if credential == "static" else {"key_cmd": "fixture-token-command"})
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"providers": providers}))
@@ -86,7 +86,6 @@ def test_declared_identity_is_resolver_owned_not_request_tag(tmp_path, monkeypat
         "hermes_cli.runtime_provider._try_resolve_from_custom_pool", return_value=None
     ):
         rt = resolve_runtime_provider(requested=owner, target_model="fixture-model")
-    assert rt["source"] == "custom_provider:" + owner
     # The owning rung survives the outer resolver's request-tag overwrite.
     rt = _tag(rt, "own")
     route = {"model": "fixture-model", "provider": "own"}

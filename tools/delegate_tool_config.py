@@ -450,7 +450,7 @@ def _require_pool_provider(configured_provider: Optional[str], runtime: dict) ->
             owned_key = named.get("api_key") or _key_env_secret(named, "delegation model_pool")
             # The resolver-owned rung identifies the declaration. Its request
             # tag may have been overwritten; equal endpoints/keys are not identity.
-            owns_identity = runtime.get("source") == f"custom_provider:{named.get('name')}"
+            owns_identity = runtime.get("source") == f"custom_provider:{named.get('provider_key') or named.get('name')}"
             if owns_identity and ((owned_key and owned_key == runtime.get("api_key")) or (
                 named.get("key_cmd") and callable(runtime.get("api_key"))
             )):

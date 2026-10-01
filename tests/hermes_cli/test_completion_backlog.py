@@ -6,8 +6,14 @@ def test_ready_completions_share_one_turn_across_interactive_routes(tmp_path):
     for surface in ("cli", "poller", "post-turn"):
         for scenario in ("backlog", "single", "mixed"):
             result = probe(surface, scenario, tmp_path / surface / scenario)
-            assert result["wire_turns"] == (5 if scenario == "mixed" else 1), result
-            assert result["payload_order"] == sorted(result["payload_order"]), result
+            expected_turns = 5 if scenario == "mixed" else 1
+            assert result["wire_turns"] == expected_turns, result
+            if (surface, scenario) == ("poller", "mixed"):
+                assert result["payload_order"] == [0, 0, 0, 0, 1, 2, 2, 2, 2, 3, 4, 4, 4, 4], result
+                assert result["payload_delivery_counts"] == [1] * 14, result
+                assert result["turn_payload_indices"] == [[0, 1, 2, 3], [4], [5, 6, 7, 8], [9], [10, 11, 12, 13]], result
+            else:
+                assert result["payload_order"] == sorted(result["payload_order"]), result
             if scenario == "mixed":
                 assert result["delegation_delivered_once"], result
             assert result["all_payloads_preserved"], result

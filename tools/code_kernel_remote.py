@@ -271,12 +271,16 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
                            sandbox_tools: frozenset, *, reset: bool,
                            idle_exit: int) -> Tuple[Optional[RemoteKernel], bool, bool, bool]:
     """Find/respawn the owner's kernel: (kernel|None, reused, state_reset, state_lost); reaps
-    idle-expired entries on the way in."""
+    idle-expired entries on the way in. A returned kernel owns one attachment
+    until the caller's cell settles; selection/publication reserves it under the registry lock."""
     key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
     state_lost = state_reset = False
     with _REGISTRY.lock:
         expired = _reap_unlocked(idle_exit)
         kernel = _REMOTE_KERNELS.get(key)
+        if kernel is not None and not reset:
+            kernel.attached += 1
+            kernel.last_used = time.monotonic()
     for doomed in expired:
         doomed.kill()
     if kernel is not None and reset:
@@ -287,6 +291,8 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         # the same answer: report the loss, respawn fresh (kill is then only
         # best-effort dir cleanup; the process is already gone).
         _REGISTRY.discard(key, kernel)
+        with _REGISTRY.lock:
+            kernel.attached -= 1
         kernel, state_lost = None, True
     reused = kernel is not None
     if kernel is None:
@@ -295,6 +301,8 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
             from agent.delegation_context import is_delegated_child_context
             kernel.pinned = is_delegated_child_context()
             with _REGISTRY.lock:
+                kernel.attached += 1
+                kernel.last_used = time.monotonic()
                 _REMOTE_KERNELS[key] = kernel
     return kernel, reused, state_reset, state_lost
 
@@ -347,9 +355,7 @@ def execute_in_remote_kernel(
     if kernel is None:
         return None  # fail open to per-call
     key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
-    kernel.last_used = time.monotonic()
     with _REGISTRY.lock:
-        kernel.attached += 1
         evicted = _evict_over_cap_unlocked(keep=key)
     for doomed in evicted:
         doomed.kill()

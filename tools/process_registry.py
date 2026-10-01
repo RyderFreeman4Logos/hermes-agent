@@ -1079,9 +1079,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
         # Let self-managing parents (notably Chromium/Electron) shut down their
         # tree before touching children. Killing their zygotes first can turn a
-        # graceful browser shutdown into a crash dump.
-        with suppress(gone):
+        # graceful browser shutdown into a crash dump. Owner signal failures
+        # propagate so kill_process can leave a live Popen running/unconsumed.
+        try:
             parent.terminate()
+        except gone:
+            pass
 
         grace = cls._daemon_term_grace_seconds()
 
@@ -1097,12 +1100,22 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
         # The snapshot is an anti-orphan guarantee: only descendants still alive
         # after the parent had its chance are asked to terminate themselves.
+        # A denied descendant is not retried via SIGKILL.
         remaining = descendants if grace <= 0 else [
             proc for proc in descendants if cls._proc_alive(proc)
         ]
+        denied_descendant_pids = set()
         for proc in remaining:
-            with suppress(gone):
+            try:
                 proc.terminate()
+            except gone:
+                continue
+            except Exception as exc:
+                denied_descendant_pids.add(getattr(proc, "pid", None))
+                logger.debug(
+                    "Skipping terminate for pid %s while killing tree of %s: %s",
+                    getattr(proc, "pid", None), pid, type(exc).__name__,
+                )
 
         # Preserve the existing SIGKILL escalation semantics for every owned
         # process that remains after its SIGTERM grace window. The parent is
@@ -1125,10 +1138,22 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 known = {proc.pid for proc in targets}
                 targets.extend(p for p in parent.children(recursive=True) if p.pid not in known)
         for proc in targets:
-            with suppress(gone):
+            if proc is not parent and getattr(proc, "pid", None) in denied_descendant_pids:
+                continue
+            try:
                 if cls._proc_alive(proc):
                     proc.kill()  # SIGKILL on POSIX
                     logger.info("Escalated to SIGKILL for pid %d (ignored SIGTERM within %.1fs grace)", proc.pid, grace)
+            except gone:
+                continue
+            except Exception as exc:
+                if proc is parent:
+                    raise
+                logger.debug(
+                    "Skipping kill for pid %s while killing tree of %s: %s",
+                    getattr(proc, "pid", None), pid, type(exc).__name__,
+                )
+
 
     @staticmethod
     def _live_descendants(pid: int) -> List[int]:

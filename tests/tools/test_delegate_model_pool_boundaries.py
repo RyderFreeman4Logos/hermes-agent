@@ -331,7 +331,7 @@ def test_named_pool_provider_can_resolve_its_own_endpoint_credential(same_endpoi
     captured = []
     with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
-        return_value={"provider": "custom", "model": "pool-model", "base_url": route["base_url"] if same_endpoint else "http://127.0.0.1:8/v1", "api_key": "provider-key"},
+        return_value={"provider": "custom", "model": "pool-model", "base_url": route["base_url"] if same_endpoint else "http://127.0.0.1:8/v1", "api_key": "provider-key", "source": "custom_provider:named-provider"},
     ), patch("hermes_cli.runtime_provider_custom._get_named_custom_provider",
              return_value={"name": "named-provider", "base_url": route["base_url"], "api_key": "provider-key"}), patch("tools.delegate_tool._build_child_preserving_parent_tools", side_effect=_fake_child(parent, captured)), patch(
         "tools.delegate_tool._run_batch", side_effect=_sync_result

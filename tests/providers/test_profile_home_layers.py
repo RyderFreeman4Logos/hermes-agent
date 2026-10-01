@@ -90,3 +90,33 @@ def test_plugin_installed_after_discovery_is_found_without_a_restart(homes):
 
     assert providers.get_provider_profile("late-install") is not None
     assert "late-install" in {p.name for p in providers.list_providers()}
+
+
+def test_auth_mirror_does_not_rescan_unpublished_home_layer(homes, monkeypatch):
+    import providers
+    from hermes_cli import auth, auth_plugin_providers
+
+    # Exercise the real mirror, including its provider-source and alias lookups.
+    monkeypatch.setattr(auth, "PROVIDER_REGISTRY", dict(auth.PROVIDER_REGISTRY))
+    monkeypatch.setattr(auth_plugin_providers, "PLUGIN_MIRRORED_PROVIDERS", set())
+    providers.list_providers()
+    monkeypatch.setattr(providers, "_HOME_LAYERS", {})
+    scan = providers._scan_home_layer
+    scans = []
+
+    def counted_scan(layer, key):
+        scans.append(key)
+        return scan(layer, key)
+
+    monkeypatch.setattr(providers, "_scan_home_layer", counted_scan)
+    launch, secondary = homes
+    for home in (launch, secondary, launch):
+        _bound(home, providers.list_providers)
+    assert len(scans) == 2, "auth readback must reuse each completed home scan"
+
+    _install(secondary, "mirror-late")
+    profile = _bound(secondary, lambda: providers.get_provider_profile("mirror-late"))
+    assert profile is not None
+    assert auth.PROVIDER_REGISTRY["mirror-late"].inference_base_url == profile.base_url
+    assert auth.PROVIDER_REGISTRY["mirror-late-alias"] is auth.PROVIDER_REGISTRY["mirror-late"]
+    assert len(scans) == 3, "a directory change still triggers one new scan"

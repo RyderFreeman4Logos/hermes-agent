@@ -4411,9 +4411,10 @@ def _try_configured_fallback_chain(
     failed_base_url: str = "", failure_scope: Any = None,
     start_index: int = 0, route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try remaining Codex entries on auxiliary.<task>.fallback_chain.
-    Non-Codex destinations fail closed (#160). ``failed_model`` scoping per
-    ``_failed_backend_skip``. Returns (client, model, provider_label) or (None, None, "")."""
+    """Try auxiliary.<task>.fallback_chain in order.
+    Compression honors every explicitly configured destination; other tasks remain
+    Codex-only (#160). ``failed_model`` scoping per ``_failed_backend_skip``.
+    Returns (client, model, provider_label) or (None, None, "")."""
     if not task:
         return None, None, ""
     chain = _get_auxiliary_task_config(task).get("fallback_chain")
@@ -4425,7 +4426,9 @@ def _try_configured_fallback_chain(
     min_ctx = _task_minimum_context_length(task)
     candidate_indices = [
         i for i in range(start_index, len(chain))
-        if isinstance(chain[i], dict) and _is_codex_provider(chain[i].get("provider"))
+        if isinstance(chain[i], dict) and (
+            task == "compression" or _is_codex_provider(chain[i].get("provider"))
+        )
     ]
     if not candidate_indices:
         _record_codex_skip(route_info, "unavailable")

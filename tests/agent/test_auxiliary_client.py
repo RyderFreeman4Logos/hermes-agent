@@ -5199,7 +5199,7 @@ class TestAuxUnhealthyCache:
             assert _is_provider_unhealthy("openrouter") is True
 
     def test_custom_billing_failure_keeps_distinct_endpoint_eligible(self):
-        """Hosted custom 402 quarantines that URL only; Codex-only chain does not admit custom."""
+        """Hosted custom 402 quarantines that URL only; compression may use its configured local endpoint."""
         from agent.auxiliary_client import (
             _is_provider_unhealthy,
             _mark_provider_unhealthy,
@@ -5236,16 +5236,16 @@ class TestAuxUnhealthyCache:
             "agent.auxiliary_client._resolve_fallback_entry",
             return_value=(local_client, "local-model"),
         ):
-            with pytest.raises(Exception, match="Payment Required"):
-                call_llm(
-                    task="compression",
-                    messages=[{"role": "user", "content": "summarize"}],
-                )
+            response = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+            assert response.choices[0].message.content == "local-ok"
 
         assert _is_provider_unhealthy("custom", hosted_url) is True
         assert _is_provider_unhealthy("custom", local_url) is False
         assert hosted_client.chat.completions.create.call_count == 1
-        assert local_client.chat.completions.create.call_count == 0
+        assert local_client.chat.completions.create.call_count == 1
 
     def test_custom_fallback_auth_failure_quarantines_failed_endpoint(self):
         """Terminal auth failure quarantines the fallback URL, not the active custom URL."""

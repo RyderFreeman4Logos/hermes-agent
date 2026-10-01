@@ -130,19 +130,18 @@ def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
 # FTS5 shadow tables the virtual-table engine owns. `sqlite3 .recover` re-emits them
 # as ordinary tables but cannot re-emit the CREATE VIRTUAL TABLE row, so every later
 # CREATE VIRTUAL TABLE fails with "fts5: error creating shadow table <name>: table
-# already exists" until the orphans are dropped (#103840).
+# already exists" (#103840). With the owning declaration absent, names/layout
+# cannot distinguish that residue from canonical extension tables; refuse deletion.
 _FTS5_SHADOW_SUFFIXES = ("content", "data", "docsize", "idx", "config")
 
 
 def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[str]) -> list[str]:
-    """Drop, per family, shadow tables whose virtual table row is absent from sqlite_master.
+    """Refuse ambiguous orphan names rather than deleting possibly canonical tables.
 
-    Matches exact shadow names only (never a prefix LIKE, so the base family cannot reach
-    ``messages_fts_trigram_*``) and leaves a family alone whenever its vtable is live. The
-    shadows are derived index state; the caller recreates and rebuilds from ``messages``.
-    Returns the families that were repaired.
+    A `.recover` residue and a normal extension table can have identical names and DDL.
+    With no owning vtable there is no provenance to authorize automatic destruction.
+    Keep the compatibility entry point; explicit offline recovery must resolve ownership.
     """
-    repaired: list[str] = []
     for family in families:
         vtable_live = cursor.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? "
@@ -158,14 +157,11 @@ def _drop_orphan_fts_shadow_tables(cursor: sqlite3.Cursor, families: Sequence[st
         ).fetchall()]
         if not orphans:
             continue
-        for name in orphans:
-            cursor.execute(f'DROP TABLE "{name}"')
-        logger.warning(
-            "Dropped orphan FTS5 shadow tables of %s (%s); the index is recreated from messages",
-            family, ", ".join(orphans),
+        raise sqlite3.OperationalError(
+            f"Cannot establish derived FTS ownership of orphan tables: {', '.join(orphans)}; "
+            "refusing automatic deletion"
         )
-        repaired.append(family)
-    return repaired
+    return []
 
 
 class SessionFtsSetupMixin:
@@ -326,7 +322,14 @@ class SessionFtsSetupMixin:
                 pass
 
     def _ensure_fts_schema(self, cursor: sqlite3.Cursor, table_name: str, ddl: str) -> bool:
-        status = self._fts_table_probe(cursor, table_name)
+        try:
+            status = self._fts_table_probe(cursor, table_name)
+        except sqlite3.DatabaseError as exc:
+            # Constructor health is checked before availability is published. Reuse the
+            # atomic detach, never rebuild here or reinterpret generic malformed images.
+            if not self._enter_fts_fail_open(exc, during_init=True):
+                raise
+            return False
         if status is None:
             return False
         try:
@@ -353,6 +356,7 @@ class SessionFtsSetupMixin:
 
     def _enter_fts_fail_open(
         self, exc: sqlite3.DatabaseError, *, deadline: float | None = None, patience_s: float | None = None,
+        during_init: bool = False,
     ) -> bool:
         """Detach corrupt FTS indexes so canonical writes can continue. Breadcrumb +
         trigger drop commit atomically: once triggers are absent the index has a
@@ -362,7 +366,7 @@ class SessionFtsSetupMixin:
         ``_WRITE_PATIENCE_S``), like ``_execute_write``: the writer connection's busy
         timeout is only 1 s, and the usual holder is a sibling writer detaching the
         same corrupt index — giving up after 1 s cost that turn's canonical write."""
-        if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
+        if (not self._fts_enabled and not during_init) or not self._is_fts_write_corruption_error(exc):
             return False
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S

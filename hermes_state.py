@@ -775,12 +775,13 @@ class SessionDB(
         if qpath is None and self.db_path.exists() and has_invalid_sqlite_header_preopen(self.db_path):
             raise sqlite3.DatabaseError(msg)
 
-    def _open_writer_conn(self) -> sqlite3.Connection:
+    def _open_writer_conn(self, *, handoff=None) -> sqlite3.Connection:
         """Connect + WAL/pragma/tokenizer setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
         conn = _connect_tracked_db(
             str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            **({"handoff": handoff} if handoff is not None else {}),
         )
         try:
             conn.row_factory = sqlite3.Row
@@ -846,6 +847,8 @@ class SessionDB(
         writer, so reads skip self._lock; under DELETE journal mode (NFS fallback)
         readers hit SQLITE_BUSY storms, so the legacy locked path stays. Autocommit
         reads see everything committed so far (read-your-writes for flush-then-search)."""
+        from hermes_cli.sqlite_safe_read import ConnectionAdmissionError
+
         if not self._wal_active or self.read_only:
             return None
         with self._read_conns_lock:
@@ -873,7 +876,7 @@ class SessionDB(
             if conn is not None:
                 self._close_conn_logged(conn, "partially-opened read conn")
             self._read_budget.release()
-            if not isinstance(exc, sqlite3.Error):
+            if not isinstance(exc, (sqlite3.Error, ConnectionAdmissionError)):
                 raise
             with self._read_conns_lock:
                 self._read_open_failed_at = time.monotonic()

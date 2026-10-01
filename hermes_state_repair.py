@@ -6,6 +6,7 @@ Patchable helpers are looked up as module globals at call time, so tests patch `
 from __future__ import annotations
 
 import contextlib
+from contextvars import ContextVar
 import datetime
 import hashlib
 import itertools
@@ -32,6 +33,66 @@ from hermes_state_common import (
 logger = logging.getLogger("hermes_state")
 
 _REPAIR_LOCK_POLL_SECONDS = 0.1
+_repair_handoff = ContextVar("repair_handoff", default=None)
+_repair_deadline = ContextVar("repair_deadline", default=None)
+
+
+@contextlib.contextmanager
+def _repair_io_scope(handoff, *, deadline=None):
+    """Bind repair helpers to the explicit target reservation; no ambient opener permission."""
+    token = _repair_handoff.set(handoff)
+    budget = _repair_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _repair_deadline.reset(budget)
+        _repair_handoff.reset(token)
+
+
+def _check_recovery_deadline(phase):
+    """Cooperative budget, not a hard bound on blocked filesystem syscalls.
+
+    Cleanup and generation-checked reopen settle synchronously outside this budget;
+    target ownership is never released while a physical operation remains running.
+    """
+    deadline = _repair_deadline.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"FTS snapshot recovery execution deadline exceeded during {phase}")
+
+
+@contextlib.contextmanager
+def _fts_recovery_budget(db_path):
+    """Share one application deadline from admission through normal/scratch work.
+
+    Nested entry never restarts it. Mandatory physical settlement explicitly disables
+    this deadline while retaining the handoff; blocked kernel/VFS calls are not bounded.
+    """
+    deadline = _repair_deadline.get()
+    if deadline is None:
+        started = time.monotonic()
+        deadline = started + 4 * _repair_snapshot_timeout_seconds(db_path)
+    with _repair_io_scope(_repair_handoff.get(), deadline=deadline):
+        yield deadline
+
+
+@contextlib.contextmanager
+def _recovery_sql_budget(conn):
+    """Participating SQL is try-only for locks and cooperatively VM-interruptible.
+
+    The owned writer has no persistent progress handler. Restore its busy policy
+    and disable cancellation before rollback, trigger detachment or physical close.
+    """
+    _check_recovery_deadline("SQL admission")
+    busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    deadline = _repair_deadline.get()
+    try:
+        conn.execute("PRAGMA busy_timeout=0")
+        if deadline is not None:
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        yield
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.execute(f"PRAGMA busy_timeout={busy}")
 # Snapshot copies are data transfer, not locking: bounded separately at 10 MiB/s (historical two-minute floor).
 _REPAIR_SNAPSHOT_MIN_THROUGHPUT_BYTES_PER_SECOND = 10 * 1024 * 1024
 # ── Repair-loop bounding + dead-backup hygiene (#86747) ───────────────────── ``_claim_repair_attempt``
@@ -86,7 +147,7 @@ def _read_offline(db_path: Path, what: str, reader) -> Optional[str]:
     except ImportError:
         offline_file_access, LiveConnectionError = (lambda _p, **_k: contextlib.nullcontext()), OSError
     try:
-        with offline_file_access(db_path, what=what):
+        with offline_file_access(db_path, what=what, handoff=_repair_handoff.get()):
             return reader()
     except (LiveConnectionError, OSError):
         return None
@@ -161,7 +222,7 @@ def _acquire_repair_lock_windows(lock_path: Path, handle, timeout: float):
 
 
 @contextlib.contextmanager
-def _cross_process_repair_lock(db_path: Path):
+def _cross_process_repair_lock(db_path: Path, *, timeout_seconds=None):
     """Serialize state.db schema surgery across processes.
 
     Yields True when this process holds the repair lock, False when the bounded acquire timed out or the lock
@@ -177,6 +238,7 @@ def _cross_process_repair_lock(db_path: Path):
     #36644).
     """
     from hermes_state import _IS_WINDOWS, _REPAIR_LOCK_TIMEOUT_SECONDS
+    timeout = _REPAIR_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else max(float(timeout_seconds), 0.0)
     lock_path, handle = _open_lock_file(
         db_path, ".repair.lock", "repair", "skipping schema surgery rather than running it without cross-process authority.")
     if handle is None:
@@ -185,16 +247,16 @@ def _cross_process_repair_lock(db_path: Path):
     acquired = False
     try:
         if _IS_WINDOWS:
-            acquired = _acquire_repair_lock_windows(lock_path, handle, _REPAIR_LOCK_TIMEOUT_SECONDS)
+            acquired = _acquire_repair_lock_windows(lock_path, handle, timeout)
         else:
-            acquired, handle = _acquire_db_flock(str(lock_path), handle, _REPAIR_LOCK_TIMEOUT_SECONDS,
+            acquired, handle = _acquire_db_flock(str(lock_path), handle, timeout,
                                                  _REPAIR_LOCK_POLL_SECONDS, "state.db repair lock")
         if acquired is None:
             acquired = False  # non-contention failure already logged with its errno
         elif not acquired:
             logger.warning("state.db repair lock %s held by another process for more than %.0fs — skipping schema "
                            "surgery in this process to avoid racing the repairer. Recorded holder: %s.",
-                           lock_path, _REPAIR_LOCK_TIMEOUT_SECONDS,
+                           lock_path, timeout,
                            _describe_lock_holder(None if _IS_WINDOWS else _read_lock_holder_record(handle)))
         yield acquired
     finally:
@@ -361,6 +423,7 @@ def _backup_content_identity(db_path: Path) -> "Optional[str]":
             hasher.update(f"\0{label}:{path.stat().st_size}\0".encode())
             with open(path, "rb") as fh:
                 for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    _check_recovery_deadline("forensic hash")
                     hasher.update(chunk)
         return hasher.hexdigest()
     return _read_offline(db_path, "backup-identity", _digest)
@@ -436,7 +499,13 @@ def _existing_malformed_backups(db_path: Path) -> "List[Path]":
     """Timestamped forensic backups of *db_path*, newest first."""
     prefix = f"{db_path.name}.malformed-backup-"
     try:
-        found = [p for p in db_path.parent.iterdir() if p.name.startswith(prefix) and not p.name.endswith(_DB_SIDECAR_SUFFIXES)]
+        found = []
+        for p in db_path.parent.iterdir():
+            _check_recovery_deadline("forensic inventory")
+            if p.name.startswith(prefix) and not p.name.endswith(_DB_SIDECAR_SUFFIXES):
+                found.append(p)
+    except TimeoutError:
+        raise  # TimeoutError is an OSError; expiry is not an unreadable directory.
     except OSError:
         return []
     return sorted(found, key=lambda p: p.name, reverse=True)
@@ -446,6 +515,7 @@ def _prune_malformed_backups(db_path: Path, keep: int = _MAX_MALFORMED_BACKUPS) 
     """Delete all but the *keep* newest forensic backups (and sidecars)."""
     for stale in _existing_malformed_backups(db_path)[keep:]:
         for victim in (stale, *_sidecars(stale)):
+            _check_recovery_deadline("optional forensic pruning")
             try:
                 victim.unlink(missing_ok=True)
             except OSError as exc:  # pragma: no cover - best effort
@@ -464,8 +534,18 @@ def _publish_backup_bundle(db_path: Path, staging: Path, backup_path: Path) -> N
     published: "List[Path]" = []
     try:
         for src, staged, _dst in (main, *sidecars):
-            shutil.copy2(src, staged)
+            _check_recovery_deadline("forensic copy admission")
+            if _repair_deadline.get() is None:
+                shutil.copy2(src, staged)
+            else:
+                with open(src, "rb") as source, open(staged, "xb") as destination:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        _check_recovery_deadline("forensic copy")
+                        destination.write(chunk)
+                shutil.copystat(src, staged)
+                _check_recovery_deadline("forensic publication")
         for _src, staged, dst in (*sidecars, main):
+            _check_recovery_deadline("forensic publication")
             os.replace(staged, dst)
             published.append(dst)
     except Exception:
@@ -504,6 +584,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
     for seq in itertools.count(1):  # same-second collision must not overwrite the earlier forensic copy
+        _check_recovery_deadline("forensic filename collision")
         if not backup_path.exists():
             break
         backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}_{seq}")
@@ -513,6 +594,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
         # prefix-matches as a backup, sorts NEWEST and would otherwise survive prune forever.
         for pattern in (f"{db_path.name}.backup-staging-*", f"{db_path.name}.malformed-backup-*.incomplete*"):
             for old in db_path.parent.glob(pattern):
+                _check_recovery_deadline("optional staging debris sweep")
                 with contextlib.suppress(OSError):
                     old.unlink(missing_ok=True)
         with contextlib.suppress(OSError):
@@ -522,6 +604,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                 if src_id is not None and _backup_content_identity(newest[0]) == src_id:
                     logger.info("Reusing existing forensic backup %s (identical to the damaged DB).", newest[0])
                     return newest[0], None
+        _check_recovery_deadline("forensic disk admission")
         if (reason := _backup_free_space_error(db_path)) is not None:
             logger.error("Refusing forensic backup of %s: %s", db_path, reason)
             return None, reason
@@ -589,14 +672,25 @@ def _connect_repair_durable(db_path: Path, *, timeout: float = 5.0) -> sqlite3.C
     """
     from hermes_cli.sqlite_safe_read import connect_tracked
 
-    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None)
+    if _repair_deadline.get() is not None:
+        timeout = 0.0  # no sequential busy-timeout restarts inside application work
+    conn = connect_tracked(db_path, tracking_path=db_path, timeout=timeout, isolation_level=None,
+                           handoff=_repair_handoff.get())
     _reapply_durability_barriers(conn)
+    if (deadline := _repair_deadline.get()) is not None:
+        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     return conn
 
 
+@contextlib.contextmanager
 def _repair_conn(db_path: Path, *, timeout: float = 5.0):
     """A :func:`_connect_repair_durable` connection as a context manager, closed on exit."""
-    return contextlib.closing(_connect_repair_durable(db_path, timeout=timeout))
+    conn = _connect_repair_durable(db_path, timeout=timeout)
+    try:
+        yield conn
+    finally:
+        conn.set_progress_handler(None, 0)
+        conn.close()
 
 
 def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
@@ -627,6 +721,7 @@ def apply_durability_barriers(conn: sqlite3.Connection) -> bool:
 
 def _close_unpinned(conn: sqlite3.Connection) -> None:
     """Leave EXCLUSIVE locking mode (so the file is never left pinned) and close."""
+    conn.set_progress_handler(None, 0)
     with contextlib.suppress(Exception):
         conn.execute("PRAGMA locking_mode=NORMAL")
     conn.close()
@@ -680,6 +775,7 @@ def _copy_database_snapshot(source_path: Path, destination_path: Path, *,
     deadline = time.monotonic() + deadline_seconds
 
     def _check_deadline(_status: int, _remaining: int, _total: int) -> None:
+        _check_recovery_deadline("SQLite snapshot transfer")
         if time.monotonic() >= deadline:
             raise TimeoutError(f"timed out copying SQLite repair snapshot after {deadline_seconds:.0f}s")
 
@@ -700,13 +796,15 @@ def _schema_not_built(exc: BaseException) -> bool:
 # Hermes-owned FTS5 objects: the virtual tables and their shadow b-trees. Full-matched, so a
 # user-created lookalike (``archive_fts_data``) is not swept into the rebuildable set.
 _FTS_OBJECT_RE = re.compile(
-    r"messages_fts(_trigram|_cjk)?(_data|_idx|_content|_docsize|_config|_segdir|_segments)?"
+    r"messages_fts(_trigram|_cjk)?(_data|_idx|_content|_docsize|_config|_segdir|_segments|_src|_insert|_delete|_update)?"
 )
-_INTEGRITY_TREE_RE = re.compile(r"\bTree (\d+)\b")
+# SQLite reports a tree's root id, or the damaged page itself on older runtimes.
+# Page-only diagnostics grant classification only when that page is a known root.
+_INTEGRITY_TREE_RE = re.compile(r"\b(?:Tree|On tree page) (\d+)\b")
 _INTEGRITY_MISSING_INDEX_RE = re.compile(r"missing from index (\S+)")
 
 
-def integrity_damage_is_structural(integrity_lines, master_rows) -> bool:
+def integrity_damage_is_structural(integrity_lines, master_rows, *, owned_fts=()) -> bool:
     """True when any damaged object named by ``PRAGMA integrity_check`` output lies outside
     the FTS shadow set: a ``Tree N`` id mapped through ``sqlite_master.rootpage``, an index in
     ``row N missing from index X``, or the file's own freelist. Unparseable lines are not
@@ -721,10 +819,10 @@ def integrity_damage_is_structural(integrity_lines, master_rows) -> bool:
         tree = _INTEGRITY_TREE_RE.search(text)
         if tree:
             name = name_by_rootpage.get(int(tree.group(1)), "")
-            if name and not _FTS_OBJECT_RE.fullmatch(name):
+            if name and name not in owned_fts:
                 return True
         missing = _INTEGRITY_MISSING_INDEX_RE.search(text)
-        if missing and not _FTS_OBJECT_RE.fullmatch(missing.group(1)):
+        if missing and missing.group(1) not in owned_fts:
             return True
     return False
 
@@ -742,6 +840,10 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
     try:
         master_rows = [tuple(r) for r in conn.execute(
             "SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0").fetchall()]
+        try:
+            owned = _owned_fts_objects(conn)
+        except ValueError:
+            return True
         lines = [str(r[0]) for r in conn.execute("PRAGMA integrity_check").fetchall()]
     except sqlite3.OperationalError:
         return False
@@ -750,7 +852,7 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
     finally:
         conn.close()
     return integrity_damage_is_structural(
-        itertools.chain.from_iterable(line.splitlines() for line in lines), master_rows)
+        itertools.chain.from_iterable(line.splitlines() for line in lines), master_rows, owned_fts=owned)
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
@@ -798,8 +900,8 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                         return f"fts5 read probe failed on {fts_table}: {exc}"
             # FTS write probe: drive a row through the messages_fts* triggers in a transaction that is always
             # rolled back. The trigger INSERT alone only buffers the row in FTS5's in-memory segment; the
-            # ``flush`` command writes that segment to ``<fts>_idx``/``_data`` exactly as a committed append
-            # would, so a stale ``_idx`` row at the next segid (IntegrityError "constraint failed", the #100227
+            # documented ``integrity-check`` command flushes pending data and checks the index.
+            # A stale ``_idx`` row at the next segid (IntegrityError "constraint failed", the #100227
             # class: integrity_check and MATCH both clean, every real append fails) is hit here rather than
             # by the user's next message.
             probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
@@ -811,7 +913,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                              (probe_session_id, "user", "_fts_health_probe", time.time()))
                 for fts_table in _FTS_TABLES:
                     try:
-                        conn.execute(f"INSERT INTO {fts_table}({fts_table}) VALUES('flush')")
+                        conn.execute(f"INSERT INTO {fts_table}({fts_table}) VALUES('integrity-check')")
                     except sqlite3.OperationalError as exc:
                         if not (SessionDB._is_fts5_unavailable_error(exc) or _schema_not_built(exc)):
                             raise
@@ -825,6 +927,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                     return None
                 return f"fts5 write probe failed: {exc}"
             finally:
+                conn.set_progress_handler(None, 0)
                 with contextlib.suppress(sqlite3.Error):
                     conn.execute("ROLLBACK")
             return None
@@ -957,6 +1060,7 @@ def _restore_journal_mode_after_repair(db_path: Path, before_mode: Optional[str]
     """
     from hermes_state_wal import apply_wal_with_fallback
     try:
+        _check_recovery_deadline("optional post-promotion journal policy")
         if conn is None:
             with _repair_conn(db_path) as owned:
                 after = apply_wal_with_fallback(owned, db_label=db_path.name)
@@ -973,6 +1077,7 @@ def _restore_journal_mode_after_repair(db_path: Path, before_mode: Optional[str]
 
 def _repair_state_db_schema_locked(
     db_path: Path, *, backup: bool, report: Dict[str, Any], journal_mode_before: Optional[str] = None,
+    repair_snapshot=None,
 ) -> Dict[str, Any]:
     """Repair strategies for :func:`repair_state_db_schema`; caller holds the cross-process repair lock.
 
@@ -988,11 +1093,12 @@ def _repair_state_db_schema_locked(
     it. Not mutating the original in the first place is the property that holds without a human in the loop.
     """
     scratch = db_path.with_name(f"{db_path.name}.repair-scratch")
+    _check_recovery_deadline("forensic admission")
     if (cleanup_error := _unlink_db_triple(scratch)) is not None:
         return _repair_skip(report, "aborted", f"could not remove a stale repair snapshot before probing state.db: {cleanup_error}")
     # Re-probe under the lock: a process we queued behind may have just repaired the file; redoing surgery
     # would undo it (the repair/re-corrupt cascade).
-    if _db_opens_cleanly(db_path) is None:
+    if repair_snapshot is None and _db_opens_cleanly(db_path) is None:
         report["repaired"], report["strategy"] = True, "already_healthy"
         return report
     if backup:
@@ -1001,6 +1107,7 @@ def _repair_state_db_schema_locked(
         if bpath is None:  # HARD STOP: the forensic image is the recovery path when every strategy fails.
             return _repair_skip(report, "aborted", "pre-repair backup refused; aborting schema repair to avoid "
                                 f"mutating the only copy of the damaged DB: {backup_error}")
+    _check_recovery_deadline("forensic backup")
     # The forensic copy precedes this guard on purpose: its live-holder checks would be poisoned by our own
     # exclusive connection. Everything touching the repair image or live promotion happens under writer exclusion.
     with _exclusive_repair_db_guard(db_path) as (live_guard, guard_error):
@@ -1011,21 +1118,29 @@ def _repair_state_db_schema_locked(
         if (space_error := _repair_scratch_space_error(db_path)) is not None:
             return _repair_skip(report, "aborted", space_error)
         try:
-            # Source = live_guard: it owns the exclusion, and a second connection could be blocked by our own
-            # EXCLUSIVE lock on some SQLite builds.
-            _copy_database_snapshot(db_path, scratch, source_connection=live_guard)
-        except (OSError, sqlite3.Error, TimeoutError) as exc:
-            _unlink_db_triple(scratch)
-            return _repair_skip(report, "aborted", f"could not stage a complete SQLite repair snapshot of {db_path}: {exc}", exc=exc)
-        try:
+            try:
+                # Reuse the continuously exclusive guard, not a second source connection.
+                _copy_database_snapshot(db_path, scratch, source_connection=live_guard)
+                _check_recovery_deadline("snapshot staging")
+            except (OSError, sqlite3.Error, TimeoutError) as exc:
+                return _repair_skip(report, "aborted", f"could not stage a complete SQLite repair snapshot of {db_path}: {exc}", exc=exc)
             # Private marker for the outer wrapper: a strategy failure consumes the persistent budget; a
             # promotion failure is classified separately.
             report["_repair_attempted"] = True
-            _run_repair_strategies(scratch, report)
+            if repair_snapshot is None:
+                _run_repair_strategies(scratch, report)
+            else:
+                try:
+                    repair_snapshot(scratch, live_guard)
+                except (OSError, sqlite3.Error, ValueError) as exc:
+                    report["error"] = str(exc)
+                else:
+                    report.update(repaired=True, strategy="stale_fts_snapshot")
             if report.get("repaired"):
                 # Never ``os.replace`` the live DB: Windows rejects replacement under open handles and POSIX would
                 # leave those handles on the old inode. The guard keeps writer exclusion throughout.
                 try:
+                    _check_recovery_deadline("snapshot promotion")
                     _copy_database_snapshot(scratch, db_path, destination_connection=live_guard)
                 except (OSError, sqlite3.Error, TimeoutError) as exc:
                     report.update(repaired=False, strategy=None,
@@ -1113,14 +1228,114 @@ def _strategy_dedup_schema(conn: sqlite3.Connection) -> None:
     _edit_sqlite_master(conn, _dedup)
 
 
+def _owned_fts_objects(conn: sqlite3.Connection) -> set[str]:
+    """Prove derived ownership from shipped DDL and SQLite-generated shadow layouts.
+
+    Reserved names alone confer no deletion authority. Unknown virtual extensions and
+    orphan/ambiguous shadows refuse rather than guessing how to reconstruct canonical state.
+    """
+    from hermes_state_common import FTS_SQL, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL
+    from hermes_state_fts import FTS_CJK_TABLE_SQL, FTS_CJK_TRIGGER_SQL
+
+    # SQLite supplies its own shadow DDL; these disposable in-memory references never
+    # read or reconstruct user data. Preserve quoted/literal bytes; only whitespace differs.
+    def normalized(sql):
+        return "".join(re.findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[^\s]", sql or ""))
+
+    rows = [tuple(row) for row in conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master")]
+    actual = {(kind, name, table, normalized(sql)) for kind, name, table, sql in rows}
+    allowed = set()
+    scripts = (FTS_SQL, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL, LEGACY_FTS_TRIGRAM_SQL,
+               FTS_CJK_TABLE_SQL + FTS_CJK_TRIGGER_SQL)
+    for script in scripts:
+        with contextlib.closing(sqlite3.connect(":memory:")) as reference:
+            reference.execute("CREATE TABLE messages(id)")
+            # Only the layout is needed, not the optional tokenizer's implementation.
+            reference.executescript(script.replace("tokenize='cjk_unicode61'", "tokenize='unicode61'"))
+            layout = set()
+            for kind, name, table, sql in reference.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master"
+            ):
+                if _FTS_OBJECT_RE.fullmatch(name):
+                    if name == "messages_fts_cjk":
+                        sql = sql.replace("tokenize='unicode61'", "tokenize='cjk_unicode61'")
+                    layout.add((kind, name, table, normalized(sql)))
+            # Select the complete layout by its actual parent, never mix alternatives.
+            if any(row in actual for row in layout if row[1] in _FTS_TABLES):
+                allowed.update(layout)
+    owned = set()
+    for kind, name, table, sql in rows:
+        if _FTS_OBJECT_RE.fullmatch(name):
+            if (kind, name, table, normalized(sql)) not in allowed:
+                raise ValueError(f"cannot establish derived FTS ownership of {name}")
+            owned.add(name)
+        elif kind == "table" and sql and re.match(r"CREATE\s+VIRTUAL\s+TABLE\b", sql, re.I):
+            raise ValueError(f"cannot establish canonical virtual-table preservation for {name}")
+    return owned
+
+
 def _strategy_drop_fts_vacuum(conn: sqlite3.Connection) -> None:
     """Drop all FTS schema and VACUUM; indexes rebuild on the next open. The
     destructive one, and why strategies run on a scratch copy: on a damaged
     schema b-tree VACUUM silently drops every table hanging off the unreadable part."""
-    _edit_sqlite_master(conn, lambda: conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'") or True)
+    names = _owned_fts_objects(conn)
+    _edit_sqlite_master(conn, lambda: conn.executemany("DELETE FROM sqlite_master WHERE name=?", [(n,) for n in names]) or True)
     # The schema parses now, so the barriers can stick — VACUUM rewrites the whole file.
     _reapply_durability_barriers(conn)
     conn.execute("VACUUM")
+
+
+def _validate_fts_snapshot(original: sqlite3.Connection, repaired: sqlite3.Connection) -> None:
+    """Require complete non-FTS schema and row equality, including rowids and sequence high-water.
+
+    Stream sorted rows rather than materializing a store. Unknown/unreadable objects refuse
+    promotion; VACUUM's implicit-rowid renumbering is not acceptable canonical preservation.
+    Only the recovery script's derived state_meta breadcrumbs may change.
+    """
+    from hermes_state_schema import _q
+    _check_recovery_deadline("canonical comparison")
+    marker_keys = ("fts_stale", "fts_rebuild_deferral", "fts_rebuild_high_water",
+                   "fts_rebuild_progress", "fts_tool_full_content_high_water")
+
+    def schema(conn):
+        owned = _owned_fts_objects(conn)
+        return [tuple(row) for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ) if row[1] not in owned]
+
+    before = schema(original)
+    if before != schema(repaired):
+        raise ValueError("FTS repair changed canonical schema")
+    without_rowid = {row[1]: bool(row[4]) for row in original.execute("PRAGMA main.table_list")}
+    for kind, name, _table, ddl in before:
+        if kind != "table":
+            continue
+        if name not in without_rowid:
+            raise ValueError(f"cannot establish canonical rowid semantics for {name}")
+        projection = "*"
+        if not without_rowid[name]:
+            columns = {row[1].lower() for row in original.execute(f"PRAGMA table_xinfo({_q(name)})")}
+            rowid = next((alias for alias in ("rowid", "_rowid_", "oid") if alias not in columns), None)
+            if rowid is None:
+                raise ValueError(f"cannot establish canonical rowids for {name}")
+            projection = rowid + ", *"
+        sql = f"SELECT {projection} FROM {_q(name)}"
+        if name == "state_meta":
+            sql += " WHERE key IS NULL OR key NOT IN (" + ",".join("?" for _ in marker_keys) + ")"
+        args = marker_keys if name == "state_meta" else ()
+        width = len(original.execute(sql + " LIMIT 0", args).description)
+        sql += " ORDER BY " + ",".join(str(i) for i in range(1, width + 1))
+        for left, right in itertools.zip_longest(original.execute(sql, args), repaired.execute(sql, args)):
+            _check_recovery_deadline("canonical comparison")
+            if (
+                left is None
+                or right is None
+                or tuple((type(value), value) for value in left)
+                != tuple((type(value), value) for value in right)
+            ):
+                raise ValueError(f"FTS repair changed canonical rows in {name}")
+    if repaired.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("FTS repair snapshot has foreign-key violations")
 
 
 # (name, body, success log, failure log) in escalation order. failure log None =

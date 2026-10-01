@@ -182,14 +182,14 @@ def _disk_space_preflight(source: Path, work_root: Path, output_parent: Optional
 def _copy_source_bundle(source: Path, snapshot_dir: Path) -> tuple[Path, list[str]]:
     """Copy the source DB bundle aside so SQLite never opens the original.
 
-    The whole copy runs inside ``offline_file_access`` (holds the connection-lifecycle lock). Recovery
+    The whole copy runs inside ``offline_file_access`` (reserves this database bundle). Recovery
     normally runs as its own CLI process against an offline file, so the refusal should never fire; the
     guard keeps this path consistent with ``hermes_state_repair._backup_db_file``.
 
     Checking for a live connection and *then* copying would be a check/use race: a connection could open in
     that window, and the copy's ``close()`` would cancel its POSIX advisory locks -- the failure class
-    ``hermes_cli.sqlite_safe_read`` exists to prevent (see #71724). Holding the lock means no connection can
-    appear mid-copy, across the main file and every sidecar.
+    ``hermes_cli.sqlite_safe_read`` exists to prevent (see #71724). Native opens wait for the reservation
+    to end, across the main file and every sidecar; unrelated databases remain available.
     """
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
     snapshot_source = snapshot_dir / source.name

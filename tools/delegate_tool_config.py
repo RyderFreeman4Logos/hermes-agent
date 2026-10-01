@@ -425,8 +425,9 @@ def _model_pool_errors(pool: Any) -> List[str]:
 
 def _require_pool_provider(
     configured_provider: Optional[str], runtime: dict, *, explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
 ) -> None:
-    """A named route's explicit key never waives resolver-owned identity."""
+    """Validate named identity or an unnamed local alias's hop-owned endpoint/key."""
     if not isinstance(runtime, dict):
         raise ValueError(f"Delegation model_pool provider '{configured_provider}' did not resolve runtime credentials.")
     from hermes_cli.providers import normalize_provider, custom_provider_aliases
@@ -440,6 +441,13 @@ def _require_pool_provider(
     if not named and alias_provider != "custom" and requested != "auto" and resolved != "custom" and _same_registered_provider(resolved, requested):
         return
     if resolved == "custom":
+        # Registry aliases share generic custom routing only when no named
+        # declaration owns the name. Never borrow an endpoint or ambient key.
+        if (not named and requested == "custom" and explicit_base_url
+                and _normalized_runtime_url(explicit_base_url) == _normalized_runtime_url(runtime.get("base_url"))
+                and runtime.get("source") == "direct-alias"
+                and runtime.get("api_key") == (explicit_api_key or "no-key-required")):
+            return
         if named and _normalized_runtime_url(named.get("base_url")) == _normalized_runtime_url(runtime.get("base_url")):
             # Named custom credentials must be declared by that provider, not
             # discovered from a host-gated ambient key or a parent route.

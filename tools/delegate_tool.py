@@ -446,7 +446,9 @@ def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
             if api_key is None and resolved.get("api_key") != "no-key-required":
                 raise ValueError("custom fallback has no hop-owned key")
         else:
-            _require_pool_provider(entry["provider"], resolved, explicit_api_key=api_key)
+            _require_pool_provider(
+                entry["provider"], resolved, explicit_api_key=api_key, explicit_base_url=base_url,
+            )
     except (AuthError, ValueError, OSError, TypeError, RuntimeError) as exc:
         # Resolver messages and even auth codes may contain credential material.
         if isinstance(exc, AuthError):

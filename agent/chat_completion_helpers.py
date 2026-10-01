@@ -2142,15 +2142,6 @@ _FALLBACK_COPY_FIELDS = {
     "_client_kwargs", "request_overrides", "reasoning_config", "runtime_capabilities",
     "_primary_runtime",
 }
-_COMPRESSOR_RUNTIME_FIELDS = (
-    "model", "base_url", "api_key", "provider", "api_mode", "context_length",
-    "_base_threshold_percent", "threshold_percent", "max_tokens", "threshold_tokens",
-    "_tail_token_budget", "max_summary_tokens", "last_prompt_tokens", "last_completion_tokens",
-    "last_total_tokens", "_prellm_skip_count", "_fallback_compression_streak",
-    "_summary_failure_cooldown_until", "_last_summary_error", "_consecutive_timeout_failures",
-    "_cooldown_persist_failed", "_verify_compaction_cleared_threshold",
-    "_last_compression_made_progress",
-)
 
 
 def _snapshot_fallback_runtime(agent) -> dict:
@@ -2167,11 +2158,7 @@ def _snapshot_fallback_runtime(agent) -> dict:
         values[name] = value
     cache = getattr(agent, "_transport_cache", _MISSING)
     cache_contents = dict(cache) if isinstance(cache, dict) else cache
-    compressor = getattr(agent, "context_compressor", None)
-    compressor_values = {
-        name: getattr(compressor, name, _MISSING) for name in _COMPRESSOR_RUNTIME_FIELDS
-    } if compressor is not None else None
-    return {"values": values, "transport_cache": cache_contents, "compressor": compressor_values}
+    return {"values": values, "transport_cache": cache_contents}
 
 
 def _restore_fallback_runtime(agent, snapshot: dict) -> None:
@@ -2188,15 +2175,6 @@ def _restore_fallback_runtime(agent, snapshot: dict) -> None:
     if isinstance(cache, dict) and isinstance(getattr(agent, "_transport_cache", None), dict):
         agent._transport_cache.clear()
         agent._transport_cache.update(cache)
-    compressor_values = snapshot["compressor"]
-    compressor = getattr(agent, "context_compressor", None)
-    if compressor is not None and compressor_values is not None:
-        for name, value in compressor_values.items():
-            if value is _MISSING:
-                with contextlib.suppress(AttributeError):
-                    delattr(compressor, name)
-            else:
-                setattr(compressor, name, value)
 
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_at=None) -> bool:
@@ -2329,7 +2307,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
                 provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
             agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
-            _update_fallback_context_compressor(agent)
             _reresolve_fallback_reasoning_config(agent)
             _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
@@ -2352,6 +2329,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            # Publish compression only after candidate admission. update_model also resets durable
+            # cooldown/strike/runway state, which an agent-field rollback cannot restore.
+            _update_fallback_context_compressor(agent)
             return True
         except Exception as e:
             if runtime_snapshot is not None:

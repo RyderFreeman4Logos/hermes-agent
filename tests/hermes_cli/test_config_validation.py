@@ -193,3 +193,40 @@ class TestQuotedContainerValues:
             "plugins": {"enabled": ["a"]},
         })
         assert not [i for i in issues if "quoted string" in i.message]
+
+
+class TestModelPoolRequiresStandard:
+    def test_nonempty_pool_without_standard_is_error(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "model_pool": {
+                    "fast": {"provider": "custom", "model": "tiny"},
+                    "test": {"provider": "custom", "model": "other"},
+                }
+            }
+        })
+        errors = [i for i in issues if i.severity == "error"]
+        assert any("standard" in i.message for i in errors)
+
+    def test_pool_with_standard_is_ok(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "model_pool": {
+                    "standard": {"provider": "custom", "model": "main", "base_url": "http://127.0.0.1:9/v1", "api_key": "fixture-key"},
+                    "fast": {"provider": "custom", "model": "tiny", "base_url": "http://127.0.0.1:8/v1", "api_key": "fixture-key"},
+                }
+            }
+        })
+        assert not any(
+            i.severity == "error" and "standard" in i.message for i in issues
+        )
+
+    def test_empty_or_absent_pool_is_ok(self):
+        assert not any(
+            i.severity == "error" and "standard" in i.message
+            for i in validate_config_structure({"delegation": {}})
+        )
+        assert not any(
+            i.severity == "error" and "standard" in i.message
+            for i in validate_config_structure({"delegation": {"model_pool": {}}})
+        )

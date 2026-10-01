@@ -1140,11 +1140,22 @@ def drop_thinking_only_and_merge_users(
     return merged
 
 
+def _primary_pool_owner(agent, primary_provider):
+    """The primary's pool identity, or None when its pinned key excludes pools."""
+    if getattr(agent, "_delegation_fixed_api_key", False):
+        return None
+    if primary_provider == "custom":
+        return (agent._primary_runtime or {}).get("requested_provider") or primary_provider
+    return primary_provider
+
+
 def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base_url, matches_primary, load_primary_pool):
     """Reset-aware gate: skip a guaranteed-to-fail restore while the primary pool reports a
     future reset; fails open on any error/None. Returns ``(blocked, prefetched_pool, prefetched)``
     so the rebind step reuses the loaded pool (one auth.json read at most)."""
     prefetched_pool, prefetched = None, False
+    if _primary_pool_owner(agent, primary_provider) is None:
+        return False, prefetched_pool, prefetched
     try:
         pool = getattr(agent, "_credential_pool", None)
         if not matches_primary(pool):
@@ -1181,6 +1192,10 @@ def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matc
     fallback attaches its own pool, which would trip the provider-mismatch guard on the next
     401/429: reload the primary pool, else clear it. The snapshot api_key may be stale after
     rotation; re-select the pool's best entry, keeping the snapshot key when none is usable."""
+    if _primary_pool_owner(agent, primary_provider) is None:
+        agent._credential_pool = None
+        agent._credential_pool_entry_id = None
+        return  # The snapshot's pinned tier key owns the primary route.
     pool = getattr(agent, "_credential_pool", None)
     pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
     if pool is not None and pool_provider and not matches_primary(pool):
@@ -1272,14 +1287,15 @@ def restore_primary_runtime(agent) -> bool:
         # that was never verified and re-fail every turn. Stay on the fallback.
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
+    primary_pool_owner = _primary_pool_owner(agent, primary_provider)
 
     def _matches_primary(candidate) -> bool:
-        return credential_pool_matches_provider(candidate, primary_provider, base_url=primary_runtime_base_url)
+        return credential_pool_matches_provider(candidate, primary_pool_owner, base_url=primary_runtime_base_url)
 
     def _load_primary_pool():
         """Load the primary provider's pool; None when absent or provider-mismatched."""
         from agent.credential_pool import load_pool
-        key = resolve_runtime_pool_key(primary_provider, primary_runtime_base_url)
+        key = resolve_runtime_pool_key(primary_pool_owner, primary_runtime_base_url)
         loaded = load_pool(key) if key else None
         return loaded if loaded is not None and _matches_primary(loaded) else None
     blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(

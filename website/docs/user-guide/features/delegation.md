@@ -289,7 +289,31 @@ delegation:
 
 Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model. Setting `delegation.provider` alongside `delegation.base_url` keeps the explicit endpoint but carries that provider's request overrides and max output tokens into the child. An explicit `delegation.request_overrides` dict is honored on every branch and merges over those runtime-derived values (see [Configuration](#configuration) below).
 
-Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+Without a model pool, the pin is global and every child in a batch uses the configured delegation route. For per-task routing, configure named tiers below.
+
+## Named model tiers and migration
+
+Set `delegation.model_pool` to choose a route with `model_profile` (top-level or per task). A non-empty pool requires `standard`; omission selects it, and unknown names fail before any child is constructed. With a pool configured, global `delegation.model`, `provider`, `base_url`, `api_key`, and `request_overrides` do not supply tier routing.
+
+```yaml
+delegation:
+  model_pool:
+    standard:
+      model: "your-standard-model"
+      provider: "openrouter"  # resolves this provider's own credentials
+    complex:
+      model: "your-stronger-model"
+      base_url: "https://your-gateway.example/v1"
+      api_key: "${TIER_API_KEY}"
+      request_overrides: {}
+      fallback_chain: []
+```
+
+**Migration:** bare model-only tiers and `provider: auto` are no longer accepted, even when parent or ambient credentials are available. Add an explicit provider with independently configured credentials, or an endpoint with an explicit key. Named custom providers must declare their own `api_key`, `key_env`, `key_cmd`, or registered credential pool; an ambient key for the same host is not sufficient. Unkeyed anonymous/custom endpoints are rejected; there is no generic no-auth tier mode.
+
+A tier keeps its endpoint and transport. An explicit tier key stays fixed; derived credentials may rotate through the configured provider's own credential pool, never by reusing the parent's pool. Parent ACP commands and provider filters are cleared. Only overrides from the selected provider/endpoint and the tier's own `request_overrides` are merged; an empty mapping never restores global overrides. An omitted or empty `fallback_chain` disables fallback and stays empty through child construction. An explicit chain is retained as the tier's recovery policy; its entries require explicit provider/model routes, not `auto`. No parent or global fallback list is inherited.
+
+An absent or empty pool retains legacy global delegation routing.
 
 ## The `/review` Command
 

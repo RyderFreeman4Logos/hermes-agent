@@ -1263,6 +1263,13 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                    f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                    f"Move '{key}' under the appropriate section")
 
+    delegation_cfg = config.get("delegation")
+    if isinstance(delegation_cfg, dict):
+        from tools.delegate_tool_config import _model_pool_errors
+        for error in _model_pool_errors(delegation_cfg.get("model_pool")):
+            _issue(issues, "error", error, "Use a mapping of named tiers with complete routes; "
+                   "an absent or empty model_pool retains legacy routing.")
+
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)
     return issues

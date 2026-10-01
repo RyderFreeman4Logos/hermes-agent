@@ -649,7 +649,8 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
             _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
     else:
         run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
-    with session["history_lock"]:
+    # Same lock order as core completion insertion and dying-poller reclaim.
+    with _completion_ownership_lock(session), session["history_lock"]:
         session["_turn_cancel_requested"] = True
         _reclaim_queued_completion_receipts(session)
         session["queued_prompt"] = None

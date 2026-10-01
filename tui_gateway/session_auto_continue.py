@@ -232,7 +232,7 @@ def _ac_set_queue(session: dict, entries: list) -> None:
 
 
 def _reclaim_queued_completion_receipts(session: dict) -> None:
-    """Return uninserted completion envelopes to the session owner before a lifecycle clear."""
+    """Return uninserted envelopes before a lifecycle clear; caller holds ownership then history locks."""
     entries = [entry for entry in [session.get("queued_prompt"), *(session.get("queued_prompts") or [])]
                if isinstance(entry, dict)]
     retained, events = [], []
@@ -517,7 +517,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not use_compute_host:
             accepted = _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
             if not accepted and completion_events and kwargs.get("completion_receipt") is not None:
-                with session["history_lock"]:
+                with _completion_ownership_lock(session), session["history_lock"]:
                     active = session.get("_completion_active_receipt")
                     if active is kwargs["completion_receipt"]:
                         session.pop("_completion_active_receipt", None)
@@ -533,7 +533,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         _notif_log_failure("queued prompt dispatch failed", exc)
         _notif_release_turn(session)
         if completion_events:
-            with session["history_lock"]:
+            with _completion_ownership_lock(session), session["history_lock"]:
                 active = session.get("_completion_active_receipt")
                 if active is kwargs.get("completion_receipt"):
                     session.pop("_completion_active_receipt", None)

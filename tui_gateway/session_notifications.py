@@ -830,7 +830,10 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
-    if evt_type == "completion":
+    # Resolve the owning profile's policy before any completion gains a pending,
+    # transfer or turn owner. OFF still reaches the status-only rendering below.
+    notifications_off = not is_delegation and _background_notifications_off(session)
+    if evt_type == "completion" and not notifications_off:
         with session["history_lock"]:
             if deferred is None:
                 # Live poller: buffer off the shared queue; flush coalesces.
@@ -856,7 +859,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": display_text}),
                             platform="tui", diagnostic=diagnostic_process_event(evt))
         emitted.add(dedup_key)
-    if evt_type != "async_delegation" and _background_notifications_off(session):
+    if notifications_off:
         # The user opted out of process-driven agent wakes: the status row above is the whole
         # delivery. Subagent results are not process notifications and still land.
         return True

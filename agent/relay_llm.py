@@ -37,6 +37,7 @@ class _PhysicalDiagnosticContext:
     scope: dict[str, str] | None = None
     latest_event: Any = None
     ordinals: list[int] = field(default_factory=list)
+    codex_token: Any = None
 
 
 _PHYSICAL_DIAGNOSTICS: contextvars.ContextVar[_PhysicalDiagnosticContext | None] = (
@@ -84,12 +85,32 @@ def _record_attempt(
     request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None,
     physical_send_ordinal: int = 0, scope: dict[str, str] | None = None,
 ) -> Any:
-    """Count one physical send. File recorders are not on this integration."""
-    del name, model_name, metadata, scope
+    """Count one physical send and bind the Codex digest to its final kwargs."""
     context = _PHYSICAL_DIAGNOSTICS.get()
     if context is not None:
         context.ordinals.append(physical_send_ordinal)
-    return None
+    if str((metadata or {}).get("api_mode") or "") != "codex_responses":
+        return None
+    context = _PHYSICAL_DIAGNOSTICS.get()
+    if context is not None and context.codex_token is not None:
+        return context.codex_token
+    try:
+        from agent.cache_prefix_diagnostics import begin_attempt
+        api_id = str((metadata or {}).get("api_request_id") or "")
+        ordinal_text = api_id.rsplit(":api:", 1)[-1] if ":api:" in api_id else ""
+        turn_id = api_id.rsplit(":api:", 1)[0] if ordinal_text else ""
+        role = str((metadata or {}).get("call_role") or "unknown")
+        retry = int((metadata or {}).get("retry_count") or 0)
+        session_id = str((scope or {}).get("session") or "")
+        token = begin_attempt(
+            request, session_id=session_id, turn_id=turn_id, api_id=api_id,
+            ordinal=int(ordinal_text) if ordinal_text.isdecimal() else -1, retry=retry, role=role,
+        )
+        if context is not None:
+            context.codex_token = token
+        return token
+    except Exception:
+        return None
 
 
 @contextlib.contextmanager
@@ -102,20 +123,38 @@ def _diagnostic_scope(context: _PhysicalDiagnosticContext):
 
 
 def physical_send(request: dict[str, Any], callback: Callable[[dict[str, Any]], Any]) -> Any:
-    """Record final public-SDK kwargs exactly once, then perform that physical send."""
+    """Record final public-SDK kwargs once that physical call has finished.
+
+    The Codex digest starts before the call so a stream can finish the same
+    row, but the send counter moves only after success or failure. Returning
+    an awaitable is not completion. A callback that is already
+    ``physical_send`` is not recorded twice. Identity equality only stops
+    same-call reentry; it does not prove a different request was sent.
+    """
     context = _PHYSICAL_DIAGNOSTICS.get()
-    if context is None:
+    if context is None or context.latest_event is request:
         return callback(request)
-    event = _record_attempt(
-        request, name=context.name, model_name=context.model_name, metadata=context.metadata,
-        physical_send_ordinal=context.ordinal, scope=context.scope,
-    )
-    context.ordinal += 1
-    context.latest_event = event
-    try:
-        return callback(request)
-    except BaseException:
-        raise
+
+    def _mark() -> None:
+        _record_attempt(
+            request, name=context.name, model_name=context.model_name,
+            metadata=context.metadata, physical_send_ordinal=context.ordinal,
+            scope=context.scope,
+        )
+        context.ordinal += 1
+        context.latest_event = request
+
+    result = callback(request)
+    if inspect.isawaitable(result):
+        async def finish() -> Any:
+            try:
+                return await result
+            finally:
+                _mark()
+
+        return finish()
+    _mark()
+    return result
 
 
 async def physical_send_async(
@@ -135,9 +174,11 @@ def run_direct(
 ) -> Any:
     """Run a Relay-bypassed facade while its inner SDK adapter records real sends."""
     request = _request_with_cache_scope(request, _current_session_id())
-    diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+    diagnostics = _PhysicalDiagnosticContext(
+        name, model_name, metadata, scope={"session": str(_current_session_id() or "")},
+    )
     with _diagnostic_scope(diagnostics):
-        result = callback(request)
+        result = physical_send(request, callback)
     return result
 
 
@@ -176,7 +217,9 @@ class _ManagedAttempt:
     ) -> None:
         self.runtime, self.session, self.request, self.metadata = runtime, session, request, metadata
         self.name, self.model_name = name, model_name
-        self.diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+        self.diagnostics = _PhysicalDiagnosticContext(
+            name, model_name, metadata, scope={"session": str(session.session_id or "")},
+        )
         self.logical = _logical_parent(runtime, session, parent, metadata)
         self.parent = self.logical[1] if self.logical is not None else parent
         self.body = _relay_request_body(request, metadata)
@@ -230,13 +273,13 @@ class _ManagedAttempt:
         """Provider callback handed to Relay: run ``callback`` on Relay's (possibly rewritten) request."""
         with self._recording_errors():
             final_request = self.provider_request(next_request)
-            raw = self.run_callback(callback, final_request)
+            raw = self.run_callback(physical_send, final_request, callback)
         return self._record(raw)
 
     async def invoke_async(self, callback: Callable[..., Any], next_request: Any) -> Any:
         async def call_provider() -> Any:
             with relay_runtime.managed_callback_guard(), _diagnostic_scope(self.diagnostics):
-                return await callback(final_request)
+                return await physical_send_async(final_request, callback)
 
         with self._recording_errors():
             final_request = self.provider_request(next_request)
@@ -290,9 +333,11 @@ def execute(
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
         request = _request_with_cache_scope(request, session_id or _current_session_id())
-        diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+        diagnostics = _PhysicalDiagnosticContext(
+            name, model_name, metadata, scope={"session": str(session_id or _current_session_id() or "")},
+        )
         with _diagnostic_scope(diagnostics):
-            result = callback(request)
+            result = physical_send(request, callback)
         return result
     try:
         managed = _run_awaitable(attempt.run_managed(
@@ -311,9 +356,11 @@ async def execute_async(
     attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
     if attempt is None:
         request = _request_with_cache_scope(request, session_id or _current_session_id())
-        diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+        diagnostics = _PhysicalDiagnosticContext(
+            name, model_name, metadata, scope={"session": str(session_id or _current_session_id() or "")},
+        )
         with _diagnostic_scope(diagnostics):
-            result = await callback(request)
+            result = await physical_send_async(request, callback)
         return result
     try:
         managed = await attempt.run_managed(attempt.runtime.relay.llm.execute, partial(attempt.invoke_async, callback))
@@ -355,9 +402,11 @@ def stream_current(
     # iterated synchronously on that loop, which asyncio forbids; the outer stream tracks this attempt.
     if session_id is None or _has_running_event_loop():
         request = _request_with_cache_scope(request, session_id)
-        diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+        diagnostics = _PhysicalDiagnosticContext(
+            name, model_name, metadata, scope={"session": str(session_id or "")},
+        )
         with _diagnostic_scope(diagnostics):
-            result = stream_factory(request)
+            result = physical_send(request, stream_factory)
         return result
     managed = stream(
         request, stream_factory, session_id=session_id, name=name, model_name=model_name,
@@ -436,16 +485,17 @@ class ManagedLlmStream(Iterator[Any]):
         attempt = _ManagedAttempt.resolve(session_id, request, metadata, name=name, model_name=model_name)
         if attempt is None:
             request = _request_with_cache_scope(request, session_id)
-            self._diagnostics = _PhysicalDiagnosticContext(name, model_name, metadata)
+            self._diagnostics = _PhysicalDiagnosticContext(
+                name, model_name, metadata, scope={"session": str(session_id or "")},
+            )
             with _diagnostic_scope(self._diagnostics):
-                self._start_unmanaged(request)
+                self._start_unmanaged(physical_send(request, self._stream_factory))
             return
         self._diagnostics = attempt.diagnostics
         self._logical = attempt.logical
         self._start_managed(attempt)
 
-    def _start_unmanaged(self, request: dict[str, Any]) -> None:
-        raw_stream = self._stream_factory(request)
+    def _start_unmanaged(self, raw_stream: Any) -> None:
         predicate = self._completed_response_predicate
         if predicate is not None and predicate(raw_stream):
             self.final_response = raw_stream
@@ -462,7 +512,7 @@ class ManagedLlmStream(Iterator[Any]):
         raw_stream = None
         try:
             with _diagnostic_scope(attempt.diagnostics):
-                raw_stream = run_callback(self._stream_factory, attempt.provider_request(next_request))
+                raw_stream = run_callback(physical_send, attempt.provider_request(next_request), self._stream_factory)
             predicate = self._completed_response_predicate
             if predicate is not None and run_callback(predicate, raw_stream):
                 self.final_response = raw_stream

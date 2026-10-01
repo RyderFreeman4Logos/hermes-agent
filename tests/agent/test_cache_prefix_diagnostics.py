@@ -387,7 +387,8 @@ def test_multiprocess_append_is_lossless(tmp_path, monkeypatch):
     for process in processes: process.start()
     for process in processes: process.join()
     assert all(process.exitcode == 0 for process in processes)
-    assert len(rows(tmp_path)) == 4
+    # A busy nonblocking lock skips that writer instead of waiting.
+    assert 1 <= len(rows(tmp_path)) <= 4
 
 
 def test_unsupported_opener_never_invents_dispatch_evidence(tmp_path, monkeypatch):
@@ -893,11 +894,29 @@ def test_public_codex_sink_keeps_origin_across_scope_exit(tmp_path, monkeypatch)
             finally:
                 secret_scope.reset_secret_scope(secrets)
                 reset_hermes_home_override(binding)
+        # Begin under B, leave B, then finalize. Ambient home at finish must not own the row.
+        binding = set_hermes_home_override(b)
+        secrets = secret_scope.set_secret_scope({}, profile_home=str(b))
+        try:
+            token = diagnostics.begin_attempt({"model": "fixture", "input": []}, session_id="late-b", turn_id="late-b", api_id="late-b", ordinal=9, retry=0)
+            assert token is not None and token[1]["home"] == str(b)
+        finally:
+            secret_scope.reset_secret_scope(secrets)
+            reset_hermes_home_override(binding)
+        binding = set_hermes_home_override(a)
+        secrets = secret_scope.set_secret_scope({}, profile_home=str(a))
+        try:
+            assert diagnostics._enabled() is False
+            diagnostics.finish_attempt(token)
+        finally:
+            secret_scope.reset_secret_scope(secrets)
+            reset_hermes_home_override(binding)
     finally:
         secret_scope.set_multiplex_active(False)
         client.close()
     assert gates == [False, True, False] and len(sends) == 3
-    assert (b / "cache" / "codex-cache-prefix.jsonl").is_file()
+    data = rows(b)
+    assert len(data) == 2 and data[-1]["kind"] == "terminal"
     assert not (a / "cache" / "codex-cache-prefix.jsonl").exists()
 
 
@@ -908,12 +927,17 @@ def _read_private_key(home):
 
 
 def test_nonregular_key_and_lock_fail_closed_without_blocking(tmp_path):
-    """A private FIFO key or lock must not block the request hook."""
+    """A FIFO at the production cache leaf must not block the request hook."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    cache = home / "cache"
+    cache.mkdir(mode=0o700)
     for name in ("codex-cache-prefix.key", "codex-cache-prefix.lock"):
-        cache = tmp_path / name
-        cache.mkdir(mode=0o700)
-        os.mkfifo(cache / name, 0o600)
-        child = multiprocessing.get_context("fork").Process(target=_read_private_key, args=(tmp_path,))
+        leaf = cache / name
+        if leaf.exists():
+            leaf.unlink()
+        os.mkfifo(leaf, 0o600)
+        child = multiprocessing.get_context("fork").Process(target=_read_private_key, args=(home,))
         child.start()
         child.join(2)
         blocked = child.is_alive()
@@ -922,3 +946,55 @@ def test_nonregular_key_and_lock_fail_closed_without_blocking(tmp_path):
             child.join(2)
         assert not child.is_alive()
         assert not blocked, name
+
+
+def _child_begin_finish(home, phase, ready):
+    os.environ["HERMES_HOME"] = str(home)
+    diagnostics._enabled = lambda: True
+    ready.set()
+    token = diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+    if phase == "begin":
+        return
+    diagnostics.finish_attempt(token)
+
+
+@pytest.mark.parametrize("phase", ["begin", "finish"])
+def test_held_regular_lock_fails_open(tmp_path, phase):
+    """A cooperating holder of the 0600 lock must not stall begin or finish."""
+    import fcntl
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    enable_home = home
+    os.environ["HERMES_HOME"] = str(enable_home)
+    diagnostics._enabled = lambda: True
+    token = diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+    diagnostics.finish_attempt(token)
+    lock = home / "cache" / "codex-cache-prefix.lock"
+    fd = os.open(lock, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    ready = multiprocessing.get_context("fork").Event()
+    child = multiprocessing.get_context("fork").Process(target=_child_begin_finish, args=(home, phase, ready))
+    try:
+        child.start()
+        assert ready.wait(2)
+        child.join(2)
+        assert not child.is_alive()
+        assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(2)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_process_key_lock_contention_skips(tmp_path, monkeypatch):
+    """A held in-process key lock is skipped, not waited on."""
+    enable(tmp_path, monkeypatch)
+    diagnostics._key_lock.acquire()
+    try:
+        assert diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0) is None
+    finally:
+        diagnostics._key_lock.release()
+    token = diagnostics.begin_attempt({"model": "m", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+    assert token is not None

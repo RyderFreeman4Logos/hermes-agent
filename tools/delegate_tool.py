@@ -405,8 +405,65 @@ def _normalize_profile_fallback_chain(raw: Any) -> List[Dict[str, Any]]:
         normalized = dict(entry)
         normalized["provider"] = provider
         normalized["model"] = model
+        if not _fallback_hop_admitted(normalized):
+            continue
         chain.append(normalized)
     return chain
+
+
+def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
+    """False when this hop has no credential the child can use.
+
+    An endpoint-less custom hop stays: the child still inherits that refusal.
+    Every other hop must resolve, and the key must be usable, callable, or the
+    keyless-endpoint sentinel. Scoped ``key_env`` is read here; an empty cloud
+    key is not a credential, including a key borrowed from another profile.
+    """
+    from hermes_cli.auth import AuthError, has_usable_secret
+    from hermes_cli.fallback_config import resolve_entry_api_key
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from tools.delegate_tool_config import _require_pool_provider, _normalized_runtime_url
+
+    base_url = str(entry.get("base_url") or "").strip() or None
+    api_key = resolve_entry_api_key(entry)
+    provider = entry["provider"].strip().lower()
+    if provider == "custom" and base_url is None and api_key is None:
+        return True
+    try:
+        resolved = resolve_runtime_provider(
+            requested=entry["provider"],
+            target_model=entry["model"],
+            explicit_base_url=base_url,
+            explicit_api_key=api_key,
+        )
+        if provider == "custom":
+            if str(resolved.get("provider") or "").strip().lower() != "custom":
+                raise ValueError("custom fallback did not resolve its declared route")
+            if base_url and _normalized_runtime_url(resolved.get("base_url")) != _normalized_runtime_url(base_url):
+                raise ValueError("custom fallback resolved another endpoint")
+            if api_key is None and resolved.get("api_key") != "no-key-required":
+                raise ValueError("custom fallback has no hop-owned key")
+        else:
+            # An explicit profile key is owned by this hop; use the shared
+            # strict ownership gate only when the resolver discovers credentials.
+            if api_key is None:
+                _require_pool_provider(entry["provider"], resolved)
+    except (AuthError, ValueError, OSError, TypeError, RuntimeError) as exc:
+        logger.info(
+            "delegate profile fallback skipped %s/%s: %s",
+            entry["provider"], entry["model"], type(exc).__name__,
+        )
+        return False
+    key = api_key if api_key is not None else resolved.get("api_key")
+    if callable(key) or key == "no-key-required" or has_usable_secret(key):
+        if api_key:
+            entry["api_key"] = api_key
+        return True
+    logger.info(
+        "delegate profile fallback skipped %s/%s: resolved without credentials",
+        entry["provider"], entry["model"],
+    )
+    return False
 
 
 def _credentials_for_model_profile(

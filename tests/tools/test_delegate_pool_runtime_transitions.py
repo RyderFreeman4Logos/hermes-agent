@@ -96,7 +96,7 @@ def test_public_fallback_restore_uses_only_primary_owner(tmp_path, direct, fixed
     primary_overrides = {"extra_body": {"route": "primary"}}
     route = {"provider": "owner-b", "model": "fixture-primary-m", "api_mode": "chat_completions",
              "request_overrides": primary_overrides,
-             "fallback_chain": [{"provider": "owner-a", "model": "fixture-fallback-m"}]}
+             "fallback_chain": [{"provider": "owner-a", "model": "fixture-fallback-m", "api_key": "fixture-owner-a"}]}
     if direct:
         route["base_url"] = URL
     if fixed:

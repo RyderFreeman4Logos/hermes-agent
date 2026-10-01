@@ -140,6 +140,9 @@ def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
     parent.request_overrides = {"extra_body": {"parent_only": True}}
     parent._fallback_chain = [{"provider": "openrouter", "model": "parent-backup"}]
     parent._credential_pool = MagicMock()
+    parent._credential_pool.provider = "openrouter"
+    parent._credential_pool.entries.return_value = []
+    owned_pool = SimpleNamespace(provider="openrouter", has_credentials=lambda: True)
     parent.providers_allowed = ["parent-route"]
     homes = [tmp_path / "a", tmp_path / "b"]
     seen = []
@@ -180,7 +183,7 @@ def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
 
     with patch("run_agent.AIAgent", side_effect=constructor), patch(
         "tools.delegate_tool._run_batch", side_effect=_sync_result
-    ), patch("tools.delegate_tool_config._loaded_pool") as pool_lookup:
+    ), patch("tools.delegate_tool_config._loaded_pool", return_value=owned_pool) as pool_lookup:
         for home in (homes[0], homes[1], homes[0]):
             monkeypatch.setenv("HERMES_HOME", str(home))
             # Named custom providers exercise the real resolver. The built-in
@@ -202,10 +205,16 @@ def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
             assert actual["provider"] == {"endpoint": "custom", "provider": "openrouter", "named": "named-tier"}[route_kind]
             assert actual["api_key"] == (f"fixture-tier-{home.name}-key" if route_kind == "endpoint" else f"owned-{home.name}")
             assert actual["base_url"] == ("http://127.0.0.1:9/v1" if route_kind == "endpoint" else runtime["base_url"])
+            if route_kind == "provider":
+                assert parent._active_children[-1]._credential_pool is owned_pool
             assert actual["request_overrides"] == (overrides or {})
             assert actual["fallback_model"] == (fallback or [])
             assert (actual["acp_command"], actual["acp_args"], actual["providers_allowed"]) == (None, [], None)
-        pool_lookup.assert_not_called()
+        if route_kind == "provider":
+            assert pool_lookup.call_count == 3
+            pool_lookup.assert_called_with("openrouter")
+        else:
+            assert all(call.args[0] != "custom" for call in pool_lookup.call_args_list)
     parent._credential_pool.acquire_lease.assert_not_called()
 
 @pytest.mark.parametrize("pool,expected", [
@@ -378,13 +387,17 @@ def test_public_named_shared_endpoint_keeps_explicit_owner_before_dispatch(monke
     seen[0]._swap_credential.assert_not_called()
 
 
-def test_provider_only_fixed_and_derived_keys_stay_owned_before_dispatch():
+@pytest.mark.parametrize("pooled", [False, True])
+def test_provider_only_fixed_and_derived_keys_stay_owned_before_dispatch(pooled):
     url = "http://127.0.0.1:9/v1"
     parent = _parent()
     resolved = {"provider": "custom", "model": "fixture-m", "base_url": url,
                 "api_key": "provider-owned", "api_mode": "chat_completions"}
     pool = MagicMock()
     pool.has_credentials.return_value = True
+    pool.provider = "custom:named-b"
+    if pooled:
+        resolved.update(api_key="pool-owned", source="pool:custom:named-b", credential_pool=pool)
     seen = []
 
     def fake_agent(**kwargs):
@@ -413,9 +426,9 @@ def test_provider_only_fixed_and_derived_keys_stay_owned_before_dispatch():
     assert (seen[0].requested_provider, seen[0].api_key, seen[0]._credential_pool) == (
         "named-b", "tier-owned", None,
     )
-    assert (seen[1].requested_provider, seen[1].api_key) == ("named-b", "provider-owned")
-    assert seen[1]._credential_pool is None
-    key_lookup.assert_not_called()
+    assert (seen[1].requested_provider, seen[1].api_key) == ("named-b", "pool-owned" if pooled else "provider-owned")
+    assert seen[1]._credential_pool is pool
+    assert any(call.kwargs.get("provider_name") == "named-b" for call in key_lookup.call_args_list)
     pool.acquire_lease.assert_not_called()
 
 

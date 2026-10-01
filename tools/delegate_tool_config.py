@@ -234,7 +234,7 @@ def _pool_serves_endpoint(pool: Any, provider: Optional[str], base_url: Optional
 
 def _resolve_child_credential_pool(
     effective_provider: Optional[str], parent_agent, effective_base_url: Optional[str] = None,
-    effective_requested_provider: Optional[str] = None,
+    effective_requested_provider: Optional[str] = None, *, inherit_parent: bool = True,
 ):
     """Credential pool for the child: parent's pool (same provider), that provider's own pool, or None (child keeps
     its fixed credential). Custom endpoints all collapse to ``provider="custom"``, so they are matched by endpoint
@@ -248,11 +248,13 @@ def _resolve_child_credential_pool(
     endpoint identity (the ``custom:<name>`` pool key derived from the base_url) and only share the parent's
     pool when both resolve to the *same* custom endpoint. See #7833.
 
+    Exclusive model tiers skip parent-pool reuse, but still load the configured provider's own pool.
+
     Named custom providers may share one gateway URL with different credentials, so the inherited
     ``requested_provider`` identity takes precedence over URL-only matching (#45763): the child must not
     lease the first pool registered for the shared endpoint.
     """
-    parent_pool = getattr(parent_agent, "_credential_pool", None)
+    parent_pool = getattr(parent_agent, "_credential_pool", None) if inherit_parent else None
     if not effective_provider:
         return parent_pool
     parent_provider = getattr(parent_agent, "provider", None) or ""
@@ -392,7 +394,13 @@ def _require_pool_provider(configured_provider: Optional[str], runtime: dict) ->
         if named and _normalized_runtime_url(named.get("base_url")) == _normalized_runtime_url(runtime.get("base_url")):
             # Named custom credentials must be declared by that provider, not
             # discovered from a host-gated ambient key or a parent route.
+            from agent.credential_pool import get_custom_provider_pool_key
             from hermes_cli.runtime_provider_custom import _key_env_secret
+            pool_key = get_custom_provider_pool_key(named.get("base_url"), provider_name=configured_provider)
+            pool = runtime.get("credential_pool")
+            if (pool_key and runtime.get("source") == f"pool:{pool_key}"
+                    and getattr(pool, "provider", None) == pool_key and runtime.get("api_key")):
+                return
             owned_key = named.get("api_key") or _key_env_secret(named, "delegation model_pool")
             if (owned_key and owned_key == runtime.get("api_key")) or (
                 named.get("key_cmd") and callable(runtime.get("api_key"))

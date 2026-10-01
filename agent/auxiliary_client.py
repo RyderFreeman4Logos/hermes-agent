@@ -1610,6 +1610,10 @@ class _CodexCompletionsAdapter:
         finally:
             guard.finish()
         # Shape the result like chat.completions.
+        from agent import relay_llm
+        context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        if context is not None:
+            relay_llm._finish_diagnostic(context, response=final)
         message = SimpleNamespace(
             role="assistant", content="".join(text_parts).strip() or None,
             tool_calls=tool_calls_raw or None,

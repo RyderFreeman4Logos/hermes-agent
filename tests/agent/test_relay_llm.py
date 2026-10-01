@@ -15,6 +15,84 @@ pytest.importorskip("nemo_relay")
 from agent import relay_llm, relay_runtime
 
 
+def test_async_diagnostic_discovery_cannot_abort_provider():
+    class OpaqueCallback:
+        @property
+        def _client(self):
+            raise RuntimeError("diagnostic-only introspection failed")
+
+        async def __call__(self, request):
+            return request
+
+    context = relay_llm._PhysicalDiagnosticContext("provider", "model", {})
+    request = {"value": "provider-result"}
+    with relay_llm._diagnostic_scope(context):
+        assert asyncio.run(relay_llm.physical_send_async(request, OpaqueCallback())) is request
+    assert context.ordinals == [] and context.bound_clients == set()
+    assert relay_llm._PHYSICAL_DIAGNOSTICS.get() is None
+
+
+def test_unstarted_async_diagnostics_preserve_coroutine_ownership():
+    import inspect
+    import httpx
+
+    async def provider():
+        raise AssertionError("unstarted provider must not run")
+
+    async def run():
+        async with httpx.AsyncClient() as client:
+            inner = provider()
+
+            def callback(_request):
+                assert client.event_hooks["request"] is not None
+                return inner
+
+            context = relay_llm._PhysicalDiagnosticContext("provider", "model", {})
+            with relay_llm._diagnostic_scope(context):
+                returned = relay_llm.physical_send({}, callback)
+                try:
+                    returned.close()
+                    assert inspect.getcoroutinestate(inner) == inspect.CORO_CLOSED
+                    pending = relay_llm.physical_send_async({}, callback)
+                    pending.close()
+                    assert client.event_hooks["request"] == []
+                    assert context.ordinals == [] and context.bound_clients == set()
+                finally:
+                    inner.close()
+                started = asyncio.Event()
+
+                async def blocked(_request):
+                    assert len(client.event_hooks["request"]) == 1
+                    started.set()
+                    await asyncio.Event().wait()
+
+                task = asyncio.create_task(relay_llm.physical_send_async({}, blocked))
+                await asyncio.wait_for(started.wait(), 2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert task.done() and task.cancelled()
+                assert client.event_hooks["request"] == []
+                assert context.ordinals == [] and context.bound_clients == set()
+        assert relay_llm._PHYSICAL_DIAGNOSTICS.get() is None
+
+    asyncio.run(run())
+
+
+def _capture_attempt_diagnostics(monkeypatch):
+    contexts = []
+    real_send = relay_llm.physical_send
+
+    def capture(request, callback):
+        context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        if context is not None and all(existing is not context for existing in contexts):
+            contexts.append(context)
+        return real_send(request, callback)
+
+    monkeypatch.setattr(relay_llm, "physical_send", capture)
+    return contexts
+
+
 @pytest.fixture()
 def relay_turn(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
@@ -37,6 +115,112 @@ def relay_turn(tmp_path, monkeypatch):
         relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
         relay_runtime.SESSION_COORDINATOR.release_conversation(lease)
         relay_runtime._reset_for_tests()
+
+
+def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypatch):
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    def send(request):
+        sends.append(("sync", request))
+        return {"content": "sync"}
+
+    async def send_async(request):
+        sends.append(("async", request))
+        return {"content": "async"}
+
+    def send_stream(request):
+        sends.append(("stream", request))
+        return iter([{"delta": "stream"}])
+
+    common = {
+        "session_id": "",
+        "name": "provider",
+        "model_name": "model",
+        "metadata": {"api_mode": "chat_completions"},
+    }
+    relay_llm.execute(
+        {"model": "model", "messages": []},
+        send,
+        **common,
+    )
+    asyncio.run(relay_llm.execute_async(
+        {"model": "model", "messages": []},
+        send_async,
+        **common,
+    ))
+    stream = relay_llm.stream_current(
+        {"model": "model", "messages": [], "stream": True},
+        send_stream,
+        name="provider",
+        model_name="model",
+        finalizer=dict,
+        metadata={"api_mode": "chat_completions"},
+    )
+    assert list(stream) == [{"delta": "stream"}]
+
+    assert [kind for kind, _request in sends] == ["sync", "async", "stream"]
+    assert [context.ordinals for context in contexts] == [[], [], []]
+
+
+def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
+    relay_turn, monkeypatch
+):
+    del relay_turn
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    relay_llm.execute(
+        {"model": "model", "messages": []},
+        lambda final: sends.append(("sync", final)) or {"content": "sync"},
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        metadata={"api_mode": "chat_completions"},
+    )
+    stream = relay_llm.stream(
+        {"model": "model", "messages": [], "stream": True},
+        lambda final: sends.append(("stream", final)) or iter([{"delta": "stream"}]),
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        finalizer=dict,
+        metadata={"api_mode": "chat_completions"},
+    )
+    assert list(stream) == [{"delta": "stream"}]
+
+    assert [kind for kind, _request in sends] == ["sync", "stream"]
+    assert [context.ordinals for context in contexts] == [[], []]
+
+
+def test_managed_async_retry_records_each_provider_callback(
+    relay_turn, monkeypatch
+):
+    relay, _turn = relay_turn
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    async def retry_once(_name, request, callback, **_kwargs):
+        await callback(request)
+        return await callback(request)
+
+    async def send(request):
+        sends.append(request)
+        return {"content": f"attempt-{len(sends)}"}
+
+    monkeypatch.setattr(relay.llm, "execute", retry_once)
+    result = asyncio.run(relay_llm.execute_async(
+        {"model": "model", "messages": []},
+        send,
+        session_id="session-1",
+        name="provider",
+        model_name="model",
+        metadata={"api_mode": "chat_completions", "retry_count": 1},
+    ))
+
+    assert result == {"content": "attempt-2"}
+    assert [context.ordinals for context in contexts] == [[]]
+    assert len(sends) == 2
 
 
 @pytest.mark.parametrize(
@@ -110,8 +294,7 @@ def test_sync_execution_uses_canonical_relay_operation_name(relay_turn, monkeypa
     assert observed_names == ["openai.chat_completions"]
 
 
-@pytest.mark.asyncio
-async def test_async_execution_uses_canonical_relay_operation_name(
+def test_async_execution_uses_canonical_relay_operation_name(
     relay_turn, monkeypatch
 ):
     relay, _turn = relay_turn
@@ -128,14 +311,14 @@ async def test_async_execution_uses_canonical_relay_operation_name(
     monkeypatch.setattr(relay.llm, "execute", capture_name)
     monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
 
-    result = await relay_llm.execute_async(
+    result = asyncio.run(relay_llm.execute_async(
         {"model": "test-model", "input": "hello"},
         provider,
         session_id="session-1",
         name="custom",
         model_name="test-model",
         metadata={"api_mode": "codex_responses"},
-    )
+    ))
 
     assert result == {"content": "done"}
     assert observed_names == ["openai.responses"]
@@ -566,8 +749,7 @@ def test_jsonable_does_not_probe_dynamic_attributes():
     assert relay_llm._jsonable(DynamicProviderObject()) == "opaque-provider-object"
 
 
-@pytest.mark.asyncio
-async def test_async_provider_callback_preserves_caller_context(relay_turn):
+def test_async_provider_callback_preserves_caller_context(relay_turn):
     del relay_turn
     caller_value = contextvars.ContextVar(
         "async_llm_caller_value",
@@ -579,7 +761,7 @@ async def test_async_provider_callback_preserves_caller_context(relay_turn):
         await asyncio.sleep(0)
         return {"caller_value": caller_value.get()}
 
-    result = await relay_llm.execute_async(
+    result = asyncio.run(relay_llm.execute_async(
         {"model": "test-model", "messages": []},
         provider,
         session_id="session-1",
@@ -589,7 +771,7 @@ async def test_async_provider_callback_preserves_caller_context(relay_turn):
             "api_mode": "custom",
             "api_request_id": "request-async-context",
         },
-    )
+    ))
 
     assert result == {"caller_value": "caller"}
 
@@ -1212,8 +1394,7 @@ def test_anthropic_codec_preserves_tool_history_and_cached_system_blocks(relay_t
     assert observed_body_wire == original_wire
 
 
-@pytest.mark.asyncio
-async def test_async_non_stream_returns_namespaced_interceptor_result(
+def test_async_non_stream_returns_namespaced_interceptor_result(
     relay_turn,
     monkeypatch,
 ):
@@ -1232,14 +1413,14 @@ async def test_async_non_stream_returns_namespaced_interceptor_result(
     async def provider(_request):
         return {"content": "raw"}
 
-    result = await relay_llm.execute_async(
+    result = asyncio.run(relay_llm.execute_async(
         {"model": "test-model", "messages": []},
         provider,
         session_id="session-1",
         name="test-provider",
         model_name="test-model",
         metadata={"api_mode": "custom", "api_request_id": "request-async-post"},
-    )
+    ))
 
     assert result.content == "raw"
     assert result.post_interceptor is True
@@ -1632,3 +1813,97 @@ def test_stream_current_inside_managed_callback_returns_raw(relay_turn):
     assert list(stream) == []
     assert stream.final_response is not None
     assert stream.final_response.choices[0].message.content == "done"
+
+
+def test_production_callbacks_record_each_physical_send(relay_turn, monkeypatch):
+    del relay_turn
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    sends = []
+
+    def send(request):
+        sends.append(request)
+        return {"content": "sync"}
+
+    def send_stream(request):
+        sends.append(request)
+        return iter([{"delta": "stream"}])
+
+    async def send_async(request):
+        sends.append(request)
+        return {"content": "async"}
+
+    relay_llm.execute(
+        {"model": "model", "messages": [{"role": "user", "content": "before"}]},
+        send, session_id="session-1", name="provider", model_name="model",
+        metadata={"api_mode": "chat_completions"},
+    )
+    stream = relay_llm.stream(
+        {"model": "model", "messages": [], "stream": True}, send_stream,
+        session_id="session-1", name="provider", model_name="model", finalizer=dict,
+        metadata={"api_mode": "chat_completions"},
+    )
+    assert list(stream) == [{"delta": "stream"}]
+    asyncio.run(relay_llm.execute_async(
+        {"model": "model", "messages": []}, send_async,
+        session_id="", name="provider", model_name="model",
+        metadata={"api_mode": "chat_completions"},
+    ))
+    assert len(sends) == 3
+    assert [context.ordinals for context in contexts] == [[], [], []]
+
+
+def test_managed_retry_records_rewritten_wire_only(relay_turn, monkeypatch):
+    relay, _turn = relay_turn
+    contexts = _capture_attempt_diagnostics(monkeypatch)
+    seen = []
+
+    async def retry_rewritten(_name, request, callback, **_kwargs):
+        first = SimpleNamespace(content=dict(request.content), headers={})
+        second = SimpleNamespace(
+            content={**dict(request.content), "messages": [{"role": "user", "content": "after"}]},
+            headers={},
+        )
+        await callback(first)
+        return await callback(second)
+
+    def send(request):
+        seen.append(request["messages"])
+        return {"content": "ok"}
+
+    async def send_async(request):
+        seen.append(request["messages"])
+        return {"content": "ok"}
+
+    monkeypatch.setattr(relay.llm, "execute", retry_rewritten)
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+    result = asyncio.run(relay_llm.execute_async(
+        {"model": "model", "messages": [{"role": "user", "content": "before"}]},
+        send_async, session_id="session-1", name="provider", model_name="model",
+        metadata={"api_mode": "chat_completions"},
+    ))
+    assert result["content"] == "ok"
+    assert seen == [
+        [{"role": "user", "content": "before"}],
+        [{"role": "user", "content": "after"}],
+    ]
+    assert [context.ordinals for context in contexts] == [[]]
+
+
+def test_physical_send_does_not_mark_a_plain_callback():
+    context = relay_llm._PhysicalDiagnosticContext("provider", "model", {"api_mode": "chat_completions"})
+
+    def boom(_request):
+        raise RuntimeError("sdk call failed")
+
+    async def unfinished(_request):
+        raise RuntimeError("awaitable failed")
+
+    with relay_llm._diagnostic_scope(context):
+        with pytest.raises(RuntimeError, match="sdk call failed"):
+            relay_llm.physical_send({"n": 1}, boom)
+        assert context.ordinals == []
+        pending = relay_llm.physical_send({"n": 2}, unfinished)
+        assert context.ordinals == []
+        with pytest.raises(RuntimeError, match="awaitable failed"):
+            asyncio.run(pending)
+    assert context.ordinals == []

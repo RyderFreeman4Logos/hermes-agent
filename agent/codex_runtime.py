@@ -1057,6 +1057,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # claims the sink supersedes this token; that only silences OUR live callbacks — consumption continues,
     # because stopping here handed the gateway a "completed" response missing its tail (#69486).
     writer_token = {"value": None, "raw_stream": None, "superseded_logged": False}
+    diagnostic_context = None
+
+    def _finish_diagnostic(response=None, error=None):
+        if diagnostic_context is not None:
+            relay_llm._finish_diagnostic(diagnostic_context, response=response, error=error)
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -1119,6 +1124,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         return bool(agent._interrupt_requested)
 
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+        nonlocal diagnostic_context
         from hermes_cli.providers import is_actual_route
 
         if is_actual_route(
@@ -1130,7 +1136,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        final_kwargs = bypass_sdk_request_transform(stream_kwargs)
+        diagnostic_context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        remove = (relay_llm._arm_dispatch(active_client, diagnostic_context)
+                  if diagnostic_context is not None else lambda: None)
+        try:
+            return active_client.responses.create(**final_kwargs)
+        finally:
+            remove()
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
@@ -1151,32 +1164,36 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         logger.debug("Codex stream opened (attempt=%s/%s, model=%s)",
             attempt + 1, max_stream_retries + 1, model)
 
-    def _drain_for_finalizer(event_stream: Any) -> None:
+    def _drain_for_finalizer(event_stream: Any) -> BaseException | None:
         # ``final`` is already assembled; draining only lets Relay run its finalizer. A transport error
-        # here must NOT discard the completed, already-billed response.
+        # here must NOT discard the completed, already-billed response, but it does belong in diagnostics.
         budget = _stream_drain_timeout()
         if budget <= 0:
             return  # the ``finally`` below closes the stream
         drained = threading.Event()
+        drain_error: BaseException | None = None
 
         def _drain() -> None:
+            nonlocal drain_error
             try:
                 for _ignored in event_stream:
                     pass
             except (*transport_errors, _APIConnectionError) as exc:
+                drain_error = exc
                 if not isinstance(exc, transport_errors):
                     _log_failure(exc)
                 logger.warning("Codex Responses stream transport finalization failed after a terminal response was already "
                                "received; returning the completed response instead of retrying. %s error=%s",
                                agent._client_log_context(), exc)
-            except Exception:
+            except BaseException as exc:
+                drain_error = exc
                 logger.debug("Codex Responses stream finalization failed after a terminal response", exc_info=True)
             finally:
                 drained.set()
 
         threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True).start()
         if drained.wait(budget):
-            return
+            return drain_error
         logger.warning(
             "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
             "closing it and returning the completed response instead of retrying. %s",
@@ -1188,6 +1205,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if raw_stream is not None and raw_stream is not event_stream:
             _close_event_stream(raw_stream)
         _close_event_stream(event_stream)
+        return TimeoutError("Codex Responses stream drain did not complete after a terminal response")
 
     def _close_event_stream(event_stream: Any) -> None:
         close_fn = getattr(event_stream, "close", None)  # None while connect never succeeded
@@ -1243,6 +1261,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
+                _finish_diagnostic(error=exc)
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1257,15 +1276,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             except RuntimeError:
                 # "No terminal response"; Relay may still hold a finalizer-assembled response.
                 if event_stream is not None and event_stream.final_response is not None:
+                    _finish_diagnostic(response=event_stream.final_response)
                     return event_stream.final_response
+                _finish_diagnostic(error=RuntimeError("stream did not produce a terminal response"))
                 raise
             except _APIConnectionError as exc:
-                # The SDK wraps every connect/receive failure (``raise APIConnectionError from err``), so the
-                # raw ``transport_errors`` branch above never sees a pre-stream failure. Before the stream
-                # opened nothing is billed, so one fresh physical request is safe (#103673); once the writer
-                # token is claimed the inference may already be billed, so mid-stream failures still raise.
+                _finish_diagnostic(error=exc)
+                # Preserve the pre-stream transport retry policy (#103673), except WriteError:
+                # a partial write may already have reached the provider. Neither opening a stream
+                # nor a diagnostic request hook establishes completed writes or server acceptance.
                 if (attempt < max_stream_retries and writer_token["value"] is None
-                        and isinstance(exc.__cause__, _httpx.TransportError)):
+                        and isinstance(exc.__cause__, _httpx.TransportError)
+                        and not isinstance(exc.__cause__, _httpx.WriteError)):
                     logger.debug(
                         "Codex Responses pre-stream connect failed (attempt %s/%s); retrying. %s error=%s",
                         attempt + 1, max_stream_retries + 1, agent._client_log_context(), exc,
@@ -1273,8 +1295,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     continue
                 _log_failure(exc)
                 raise
+            except BaseException as exc:
+                _finish_diagnostic(error=exc)
+                raise
             if not agent._interrupt_requested:
-                _drain_for_finalizer(event_stream)
+                drain_error = _drain_for_finalizer(event_stream)
+            else:
+                drain_error = None
+            _finish_diagnostic(response=final, error=drain_error)
             if final.status in {"incomplete", "failed"}:
                 logger.warning("Codex Responses stream terminal status=%s "
                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",

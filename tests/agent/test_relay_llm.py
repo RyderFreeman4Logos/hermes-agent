@@ -15,13 +15,77 @@ pytest.importorskip("nemo_relay")
 from agent import relay_llm, relay_runtime
 
 
+def test_async_diagnostic_discovery_cannot_abort_provider():
+    class OpaqueCallback:
+        @property
+        def _client(self):
+            raise RuntimeError("diagnostic-only introspection failed")
+
+        async def __call__(self, request):
+            return request
+
+    context = relay_llm._PhysicalDiagnosticContext("provider", "model", {})
+    request = {"value": "provider-result"}
+    with relay_llm._diagnostic_scope(context):
+        assert asyncio.run(relay_llm.physical_send_async(request, OpaqueCallback())) is request
+    assert context.ordinals == [] and context.bound_clients == set()
+    assert relay_llm._PHYSICAL_DIAGNOSTICS.get() is None
+
+
+def test_unstarted_async_diagnostics_preserve_coroutine_ownership():
+    import inspect
+    import httpx
+
+    async def provider():
+        raise AssertionError("unstarted provider must not run")
+
+    async def run():
+        async with httpx.AsyncClient() as client:
+            inner = provider()
+
+            def callback(_request):
+                assert client.event_hooks["request"] is not None
+                return inner
+
+            context = relay_llm._PhysicalDiagnosticContext("provider", "model", {})
+            with relay_llm._diagnostic_scope(context):
+                returned = relay_llm.physical_send({}, callback)
+                try:
+                    returned.close()
+                    assert inspect.getcoroutinestate(inner) == inspect.CORO_CLOSED
+                    pending = relay_llm.physical_send_async({}, callback)
+                    pending.close()
+                    assert client.event_hooks["request"] == []
+                    assert context.ordinals == [] and context.bound_clients == set()
+                finally:
+                    inner.close()
+                started = asyncio.Event()
+
+                async def blocked(_request):
+                    assert len(client.event_hooks["request"]) == 1
+                    started.set()
+                    await asyncio.Event().wait()
+
+                task = asyncio.create_task(relay_llm.physical_send_async({}, blocked))
+                await asyncio.wait_for(started.wait(), 2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert task.done() and task.cancelled()
+                assert client.event_hooks["request"] == []
+                assert context.ordinals == [] and context.bound_clients == set()
+        assert relay_llm._PHYSICAL_DIAGNOSTICS.get() is None
+
+    asyncio.run(run())
+
+
 def _capture_attempt_diagnostics(monkeypatch):
     contexts = []
     real_send = relay_llm.physical_send
 
     def capture(request, callback):
         context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
-        if context is not None and context not in contexts:
+        if context is not None and all(existing is not context for existing in contexts):
             contexts.append(context)
         return real_send(request, callback)
 
@@ -96,7 +160,7 @@ def test_unmanaged_attempt_diagnostics_follow_each_physical_send(monkeypatch):
     assert list(stream) == [{"delta": "stream"}]
 
     assert [kind for kind, _request in sends] == ["sync", "async", "stream"]
-    assert [context.ordinals for context in contexts] == [[0], [0], [0]]
+    assert [context.ordinals for context in contexts] == [[], [], []]
 
 
 def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
@@ -126,7 +190,7 @@ def test_managed_sync_and_stream_diagnostics_follow_each_physical_send(
     assert list(stream) == [{"delta": "stream"}]
 
     assert [kind for kind, _request in sends] == ["sync", "stream"]
-    assert [context.ordinals for context in contexts] == [[0], [0]]
+    assert [context.ordinals for context in contexts] == [[], []]
 
 
 def test_managed_async_retry_records_each_provider_callback(
@@ -155,7 +219,7 @@ def test_managed_async_retry_records_each_provider_callback(
     ))
 
     assert result == {"content": "attempt-2"}
-    assert [context.ordinals for context in contexts] == [[0, 1]]
+    assert [context.ordinals for context in contexts] == [[]]
     assert len(sends) == 2
 
 
@@ -1785,7 +1849,7 @@ def test_production_callbacks_record_each_physical_send(relay_turn, monkeypatch)
         metadata={"api_mode": "chat_completions"},
     ))
     assert len(sends) == 3
-    assert [context.ordinals for context in contexts] == [[0], [0], [0]]
+    assert [context.ordinals for context in contexts] == [[], [], []]
 
 
 def test_managed_retry_records_rewritten_wire_only(relay_turn, monkeypatch):
@@ -1822,10 +1886,10 @@ def test_managed_retry_records_rewritten_wire_only(relay_turn, monkeypatch):
         [{"role": "user", "content": "before"}],
         [{"role": "user", "content": "after"}],
     ]
-    assert [context.ordinals for context in contexts] == [[0, 1]]
+    assert [context.ordinals for context in contexts] == [[]]
 
 
-def test_physical_send_marks_after_return_or_raise():
+def test_physical_send_does_not_mark_a_plain_callback():
     context = relay_llm._PhysicalDiagnosticContext("provider", "model", {"api_mode": "chat_completions"})
 
     def boom(_request):
@@ -1837,10 +1901,9 @@ def test_physical_send_marks_after_return_or_raise():
     with relay_llm._diagnostic_scope(context):
         with pytest.raises(RuntimeError, match="sdk call failed"):
             relay_llm.physical_send({"n": 1}, boom)
-        assert context.ordinals == [0]
+        assert context.ordinals == []
         pending = relay_llm.physical_send({"n": 2}, unfinished)
-        assert context.ordinals == [0]
+        assert context.ordinals == []
         with pytest.raises(RuntimeError, match="awaitable failed"):
             asyncio.run(pending)
-    assert context.ordinals == [0, 1]
-    assert context.latest_event == {"n": 2}
+    assert context.ordinals == []

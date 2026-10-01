@@ -38,6 +38,7 @@ class _PhysicalDiagnosticContext:
     latest_event: Any = None
     ordinals: list[int] = field(default_factory=list)
     codex_token: Any = None
+    bound_clients: set[int] = field(default_factory=set)
 
 
 _PHYSICAL_DIAGNOSTICS: contextvars.ContextVar[_PhysicalDiagnosticContext | None] = (
@@ -81,14 +82,114 @@ def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
         return None, ""
 
 
+def _http_clients(callback: Callable[..., Any]) -> list[Any]:
+    """Find existing httpx clients through SDK resources and callback bindings."""
+    import httpx
+
+    found: list[Any] = []
+    seen: set[int] = set()
+
+    def consider(value: Any) -> None:
+        if value is None or id(value) in seen or len(seen) >= 64:
+            return
+        seen.add(id(value))
+        if isinstance(value, (httpx.Client, httpx.AsyncClient)):
+            found.append(value)
+            return
+        for child in (
+            getattr(value, "_client", None), getattr(value, "_real_client", None),
+            getattr(value, "__self__", None),
+            getattr(value, "func", None), *(getattr(value, "args", None) or ()),
+            *(cell.cell_contents for cell in (getattr(value, "__closure__", None) or ())),
+            *(getattr(value, "__defaults__", None) or ()),
+            getattr(value, "responses", None), getattr(value, "chat", None),
+            getattr(value, "completions", None), getattr(value, "create", None),
+        ):
+            consider(child)
+
+    consider(callback)
+    return found
+
+
+def _finish_diagnostic(context: _PhysicalDiagnosticContext, response: Any = None,
+                       error: BaseException | None = None) -> None:
+    from agent.cache_prefix_diagnostics import finish_attempt
+
+    token, context.codex_token = context.codex_token, None
+    finish_attempt(token, response=response, error=error)
+
+
+def _note_dispatch(context: _PhysicalDiagnosticContext, http_request: Any) -> None:
+    """Observe dispatch, never completed writes or server acceptance.
+
+    Only a transient, built JSON body enters the existing HMAC projection;
+    no request object, URL, headers or plaintext component is retained.
+    """
+    if _PHYSICAL_DIAGNOSTICS.get() is not context:
+        return
+    ordinal = context.ordinal
+    context.ordinals.append(ordinal)
+    context.ordinal += 1
+    try:
+        _finish_diagnostic(context, error=RuntimeError("dispatch superseded; outcome unknown"))
+        if _api_mode(context.metadata) != "codex_responses":
+            return
+        from agent.cache_prefix_diagnostics import _enabled
+        if not _enabled():
+            return
+        request = json.loads(http_request.content)
+        if not isinstance(request, dict):
+            return
+        context.codex_token = _record_attempt(
+            request, name=context.name, model_name=context.model_name,
+            metadata=context.metadata, scope=context.scope,
+            physical_send_ordinal=ordinal,
+        )
+    except Exception:
+        # Diagnostics must not change provider behavior, including unsupported bodies.
+        return
+
+
+def _arm_dispatch(callback: Callable[..., Any], context: _PhysicalDiagnosticContext) -> Callable[[], None]:
+    """One hook per client/context, fenced against concurrent shared-client calls."""
+    import httpx
+
+    owned = []
+    try:
+        clients = _http_clients(callback)
+    except Exception:
+        clients = []
+    for client in clients:
+        if id(client) in context.bound_clients:
+            continue
+        def hook(request: Any) -> None:
+            _note_dispatch(context, request)
+
+        async def async_hook(request: Any) -> None:
+            _note_dispatch(context, request)
+
+        installed = async_hook if isinstance(client, httpx.AsyncClient) else hook
+        client.event_hooks["request"].append(installed)
+        context.bound_clients.add(id(client))
+        owned.append((client, installed))
+
+    def remove() -> None:
+        for client, hook in owned:
+            hooks = client.event_hooks["request"]
+            if hook in hooks:
+                hooks.remove(hook)
+            context.bound_clients.discard(id(client))
+
+    return remove
+
+
 def _record_attempt(
     request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None,
     physical_send_ordinal: int = 0, scope: dict[str, str] | None = None, count: bool = True,
 ) -> Any:
-    """Count one physical send and bind the Codex digest to its final kwargs."""
+    """Bind the Codex digest to the final kwargs. The ordinal is a dispatch hook, not this call."""
+    del count
     context = _PHYSICAL_DIAGNOSTICS.get()
-    if context is not None and count:
-        context.ordinals.append(physical_send_ordinal)
     if str((metadata or {}).get("api_mode") or "") != "codex_responses":
         return None
     context = _PHYSICAL_DIAGNOSTICS.get()
@@ -106,6 +207,8 @@ def _record_attempt(
             request, session_id=session_id, turn_id=turn_id, api_id=api_id,
             ordinal=int(ordinal_text) if ordinal_text.isdecimal() else -1, retry=retry, role=role,
         )
+        if token is not None:
+            token[1]["dispatch_ordinal"] = physical_send_ordinal
         if context is not None:
             context.codex_token = token
         return token
@@ -123,56 +226,52 @@ def _diagnostic_scope(context: _PhysicalDiagnosticContext):
 
 
 def physical_send(request: dict[str, Any], callback: Callable[[dict[str, Any]], Any]) -> Any:
-    """Record one finished public-SDK call, not a proven wire send.
+    """Count stock httpx request events, not SDK returns or completed writes.
 
-    The Codex digest starts before the call so a stream can finish the same
-    row. The counter moves after the callback returns or raises, and after an
-    awaitable finishes, including cancel. It does not move when the callback
-    only returns an unfinished awaitable, and it cannot tell an SDK build
-    error from a write that then raised. Primary and aux builders default
-    ``max_retries`` to 0; a client built without that default can still retry
-    inside this one call. A callback that is already ``physical_send`` is not
-    recorded twice. Identity equality only stops same-call reentry.
+    Construction errors and unstarted/cancelled awaits without a request event
+    count zero. Each SDK retry has its own event. Unsupported clients remain
+    unobserved. Stream terminals are owned by their consuming adapter.
     """
     context = _PHYSICAL_DIAGNOSTICS.get()
     if context is None or context.latest_event is request:
         return callback(request)
-
-    def _mark() -> None:
-        _record_attempt(
-            request, name=context.name, model_name=context.model_name,
-            metadata=context.metadata, physical_send_ordinal=context.ordinal,
-            scope=context.scope,
-        )
-        context.ordinal += 1
-        context.latest_event = request
-
+    previous, context.latest_event = context.latest_event, request
+    remove = _arm_dispatch(callback, context)
     try:
         result = callback(request)
-    except BaseException:
-        _mark()
+    except BaseException as exc:
+        _finish_diagnostic(context, error=exc)
         raise
+    finally:
+        remove()
+        context.latest_event = previous
+    # Preserve the caller's awaitable ownership; the async entry point keeps
+    # its hook scope alive through awaiting, without an unstarted wrapper.
     if inspect.isawaitable(result):
-        async def finish() -> Any:
-            try:
-                return await result
-            finally:
-                _mark()
-
-        return finish()
-    _mark()
+        return result
+    if not hasattr(result, "__iter__") or hasattr(result, "choices"):
+        _finish_diagnostic(context, response=result)
     return result
 
 
 async def physical_send_async(
     request: dict[str, Any], callback: Callable[[dict[str, Any]], Any]
 ) -> Any:
-    """Async counterpart to :func:`physical_send`."""
-    result = physical_send(request, callback)
+    """Own dispatch hooks through the await, creating no unstarted inner coroutine."""
+    context = _PHYSICAL_DIAGNOSTICS.get()
+    remove = _arm_dispatch(callback, context) if context is not None else lambda: None
     try:
-        return await result if inspect.isawaitable(result) else result
-    except BaseException:
+        result = physical_send(request, callback)
+        value = await result if inspect.isawaitable(result) else result
+    except BaseException as exc:
+        if context is not None:
+            _finish_diagnostic(context, error=exc)
         raise
+    finally:
+        remove()
+    if context is not None and (not hasattr(value, "__iter__") or hasattr(value, "choices")):
+        _finish_diagnostic(context, response=value)
+    return value
 
 
 def run_direct(

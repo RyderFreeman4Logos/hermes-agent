@@ -88,6 +88,44 @@ def _sync_result(_batch, _background):
     return json.dumps({"ok": True})
 
 
+@pytest.mark.parametrize("runtime_key,should_refuse", [
+    ("different-provider-key", True),
+    ("named-tier-owned-key", False),
+])
+def test_exclusive_explicit_endpoint_enforces_named_provider_identity(runtime_key, should_refuse):
+    url = "https://shared.invalid/v1"
+    cfg = {"max_iterations": 4, "model_pool": {"standard": {
+        "provider": "named-tier", "model": "tier-model", "base_url": url,
+        "api_key": "fixture-tier-owned-key",
+    }}}
+    parent, captured = _parent(), []
+    runtime = {
+        "provider": "custom", "requested_provider": "different-provider",
+        "model": "tier-model", "base_url": url, "api_key": runtime_key,
+        "api_mode": "chat_completions", "source": "local-runtime",
+    }
+    with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime,
+    ), patch(
+        "hermes_cli.runtime_provider_custom._get_named_custom_provider",
+        return_value={"name": "named-tier", "base_url": url, "api_key": "named-tier-owned-key"},
+    ), patch(
+        "tools.delegate_tool._build_child_preserving_parent_tools",
+        side_effect=_fake_child(parent, captured),
+    ), patch("tools.delegate_tool._run_batch", side_effect=_sync_result):
+        result = json.loads(delegate_task(goal="offline identity regression", parent_agent=parent))
+
+    if should_refuse:
+        assert "error" in result, result
+        assert "did not resolve its own provider credentials" in result["error"]
+        assert not captured
+    else:
+        assert result == {"ok": True}, result
+        assert captured[0]["override_api_key"] == "fixture-tier-owned-key"
+        assert captured[0]["override_provider"] == "custom"
+        assert captured[0]["override_requested_provider"] == "named-tier"
+
+
 @pytest.mark.parametrize("route,runtime,error", [
     ({"model": "tier-model"}, {}, "provider or base_url"),
     ({"model": "tier-model", "provider": "auto"}, {}, "auto"),

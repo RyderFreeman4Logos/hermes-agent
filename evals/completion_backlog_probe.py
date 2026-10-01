@@ -152,6 +152,8 @@ def probe(surface, scenario, directory):
                 poller.join(10)
                 assert not poller.is_alive()
             texts = [item['text'] for item in received]
+            payload_delivery_counts = [sum(text.count(payload) for text in texts) for payload in expected]
+            turn_payload_indices = [[index for index, payload in enumerate(expected) if payload in text] for text in texts]
             delegation_delivered = None
             if delegation:
                 with ad._transaction() as conn:
@@ -162,6 +164,8 @@ def probe(surface, scenario, directory):
                     'wire_turns': len(texts), 'texts': texts,
                     'delegation_delivered_once': delegation_delivered,
                     'payload_order': [next((i for i, turn in enumerate(texts) if payload in turn), -1) for payload in expected],
+                    'payload_delivery_counts': payload_delivery_counts,
+                    'turn_payload_indices': turn_payload_indices,
                     'all_payloads_preserved': all(any(text in turn for turn in texts) for text in expected),
                     'single_exact': texts == expected if count == 1 else None,
                     'queue_remaining': registry.completion_queue.qsize(),

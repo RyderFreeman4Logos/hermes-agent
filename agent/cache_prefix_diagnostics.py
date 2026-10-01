@@ -12,6 +12,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from hermes_constants import get_hermes_home
+
 _MAX_BYTES = 4 * 1024 * 1024
 _MAX_HISTORY = 64
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -27,9 +29,9 @@ def _enabled() -> bool:
         return False
 
 
-def _paths() -> tuple[Path, Path, Path, Path]:
-    home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-    directory = home / "cache"
+def _paths(home: Path | None = None) -> tuple[Path, Path, Path, Path]:
+    root = home if home is not None else get_hermes_home()
+    directory = root / "cache"
     return directory, directory / "codex-cache-prefix.jsonl", directory / "codex-cache-prefix.jsonl.1", directory / "codex-cache-prefix.lock"
 
 
@@ -88,10 +90,8 @@ def _private_dir(path: Path) -> None:
 def _key(directory: Path) -> bytes:
     path = directory / "codex-cache-prefix.key"
     with _key_lock:
-        lock_fd = os.open(directory / "codex-cache-prefix.lock", os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
+        lock_fd = _open_private(directory / "codex-cache-prefix.lock", os.O_RDWR | os.O_CREAT)
         try:
-            if stat.S_IMODE(os.fstat(lock_fd).st_mode) != 0o600:
-                raise OSError("diagnostic lock is unsafe")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             return _key_locked(path)
         finally:
@@ -103,25 +103,56 @@ def _key(directory: Path) -> bytes:
 
 
 def _key_locked(path: Path) -> bytes:
+    try:
+        value = _read_private(path, 64)
+    except FileNotFoundError:
+        fd = _open_private(path, os.O_WRONLY | os.O_CREAT)
         try:
-            fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
-        except FileNotFoundError:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
-            try:
-                value = secrets.token_bytes(32)
-                os.write(fd, value)
-                os.fchmod(fd, 0o600)
-                return value
-            finally:
-                os.close(fd)
-        try:
-            mode = os.fstat(fd)
-            value = os.read(fd, 64)
-            if stat.S_IMODE(mode.st_mode) != 0o600 or len(value) != 32:
-                raise OSError("diagnostic key is unsafe")
+            value = secrets.token_bytes(32)
+            os.write(fd, value)
             return value
         finally:
             os.close(fd)
+    if len(value) != 32:
+        raise OSError("diagnostic key is unsafe")
+    return value
+
+
+def _regular(fd: int) -> os.stat_result:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise OSError("diagnostic file is unsafe")
+    uid_getter = getattr(os, "getuid", None)
+    if uid_getter is not None and info.st_uid != uid_getter():
+        raise OSError("diagnostic file has the wrong owner")
+    return info
+
+
+def _open_private(path: Path, flags: int) -> int:
+    """Open a private regular file. Callers must not pass a blocking read of an existing FIFO."""
+    if flags & os.O_CREAT:
+        try:
+            fd = os.open(path, flags | os.O_EXCL | _NOFOLLOW, 0o600)
+        except FileExistsError:
+            fd = os.open(path, (flags & ~os.O_CREAT) | os.O_NONBLOCK | _NOFOLLOW)
+    else:
+        fd = os.open(path, flags | os.O_NONBLOCK | _NOFOLLOW)
+    try:
+        _regular(fd)
+        if flags & os.O_NONBLOCK == 0:
+            os.set_blocking(fd, True)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _read_private(path: Path, limit: int) -> bytes:
+    fd = _open_private(path, os.O_RDONLY)
+    try:
+        return os.read(fd, limit)
+    finally:
+        os.close(fd)
 
 
 def _encoded(value: Any) -> bytes:
@@ -164,47 +195,41 @@ def _usage(response: Any) -> dict[str, int | None]:
     return {"cache_read": cached, "uncached_input": total - cached if total is not None and cached is not None and cached <= total else None}
 
 
-def _append(row: dict[str, Any]) -> None:
-    directory, output, rotated, lock_path = _paths()
+def _append(row: dict[str, Any], *, home: Path | None = None) -> None:
+    directory, output, rotated, lock_path = _paths(home)
     _private_dir(directory)
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
+    lock_fd = _open_private(lock_path, os.O_RDWR | os.O_CREAT)
     try:
-        if stat.S_IMODE(os.fstat(lock_fd).st_mode) != 0o600:
-            raise OSError("diagnostic lock is unsafe")
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         last_sequence = -1
         for path in (output, rotated):
             try:
-                info = path.lstat()
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                    raise OSError("diagnostic sequence file is unsafe")
-                with path.open("rb") as stream:
-                    data = stream.read(_MAX_BYTES + 8192)
-                    if data:
-                        last_sequence = int(json.loads(data.splitlines()[-1])["sequence"])
-                        break
+                data = _read_private(path, _MAX_BYTES + 8192)
             except FileNotFoundError:
                 continue
+            if data:
+                last_sequence = int(json.loads(data.splitlines()[-1])["sequence"])
+                break
         row["sequence"] = last_sequence + 1
         payload = _encoded(row) + b"\n"
         try:
-            info = output.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise OSError("diagnostic output is unsafe")
-            size = info.st_size
+            size_fd = _open_private(output, os.O_RDONLY)
         except FileNotFoundError:
             size = 0
+        else:
+            try:
+                size = _regular(size_fd).st_size
+            finally:
+                os.close(size_fd)
         if size and size + len(payload) > _MAX_BYTES:
-            if rotated.exists() or rotated.is_symlink():
-                info = rotated.lstat()
-                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
-                    raise OSError("diagnostic rotated output is unsafe")
+            try:
+                _read_private(rotated, 0)
                 rotated.unlink()
+            except FileNotFoundError:
+                pass
             os.replace(output, rotated)
-        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_APPEND | _NOFOLLOW, 0o600)
+        fd = _open_private(output, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
         try:
-            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
-                raise OSError("diagnostic output permissions are unsafe")
             view = memoryview(payload)
             while view:
                 view = view[os.write(fd, view):]
@@ -223,7 +248,7 @@ def begin_attempt(request: dict[str, Any], *, session_id: str, turn_id: str, api
         _private_dir(directory)
         key = _key(directory)
         correlation = {name: hmac.new(key, str(value).encode(), hashlib.sha256).hexdigest() for name, value in (("session", session_id), ("turn", turn_id), ("api", api_id))}
-        metadata = {"correlation": correlation, "ordinal": int(ordinal), "retry": int(retry), "role": role if role in {"primary", "fallback", "delegated"} else "unknown", "route": route if route == "codex_responses" else "unknown", "components": _components(request, key)}
+        metadata = {"correlation": correlation, "ordinal": int(ordinal), "retry": int(retry), "role": role if role in {"primary", "fallback", "delegated"} else "unknown", "route": route if route == "codex_responses" else "unknown", "components": _components(request, key), "home": str(directory.parent)}
         return key, metadata
     except Exception:
         return None
@@ -235,9 +260,10 @@ def finish_attempt(token: tuple[bytes, dict[str, Any]] | None, response: Any = N
     try:
         _key_bytes, metadata = token
         row = dict(metadata)
+        home = Path(str(row.pop("home")))
         row["kind"] = "error" if error is not None else "terminal"
         row["usage"] = {"cache_read": None, "uncached_input": None} if error is not None else _usage(response)
-        _append(row)
+        _append(row, home=home)
     except Exception:
         return
 

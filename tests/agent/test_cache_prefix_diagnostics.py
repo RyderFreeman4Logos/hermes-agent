@@ -221,9 +221,9 @@ def test_delayed_trailing_drain_error_is_recorded_after_iterator_error(tmp_path,
     release_thread = threading.Thread(target=release_drain, daemon=True)
     release_thread.start()
 
-    def record_append(row):
+    def record_append(row, **kwargs):
         phases.append(f"diagnostic:{row['kind']}")
-        return append(row)
+        return append(row, **kwargs)
 
     monkeypatch.setattr(diagnostics, "_append", record_append)
 
@@ -827,3 +827,98 @@ def test_public_auxiliary_call_observes_actual_dispatch(tmp_path, monkeypatch, a
             assert result.usage.prompt_tokens == 12 and result.usage.total_tokens == 13
     finally:
         client.close()
+
+
+def test_profile_config_and_sink_share_owner(tmp_path, monkeypatch):
+    """Enabled profile B must not write its key or rows into disabled launch profile A."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    for home, enabled in ((a, False), (b, True)):
+        home.mkdir(mode=0o700)
+        (home / "config.yaml").write_text(json.dumps({"agent": {"codex_cache_diagnostics": {"enabled": enabled}}}))
+    monkeypatch.setenv("HERMES_HOME", str(a))
+    observed = []
+    for home in (a, b, a):
+        binding = set_hermes_home_override(home)
+        try:
+            enabled = diagnostics._enabled()
+            token = diagnostics.begin_attempt({"model": "fixture", "input": []}, session_id="s", turn_id="t", api_id="a", ordinal=0, retry=0)
+            diagnostics.finish_attempt(token)
+            observed.append({"profile": home.name, "enabled": enabled, "recorded": token is not None})
+        finally:
+            reset_hermes_home_override(binding)
+    assert observed == [
+        {"profile": "a", "enabled": False, "recorded": False},
+        {"profile": "b", "enabled": True, "recorded": True},
+        {"profile": "a", "enabled": False, "recorded": False},
+    ]
+    assert (b / "cache" / "codex-cache-prefix.jsonl").is_file()
+    assert not (a / "cache" / "codex-cache-prefix.jsonl").exists()
+    assert not (a / "cache" / "codex-cache-prefix.key").exists()
+
+
+def test_public_codex_sink_keeps_origin_across_scope_exit(tmp_path, monkeypatch):
+    """A→B→A public Codex stream persists only while B is enabled, including after scope reset."""
+    import httpx
+    from agent import secret_scope
+    from agent.codex_runtime import run_codex_stream
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    for home, enabled in ((a, False), (b, True)):
+        home.mkdir(mode=0o700)
+        (home / "config.yaml").write_text(json.dumps({"agent": {"codex_cache_diagnostics": {"enabled": enabled}}}))
+    monkeypatch.setenv("HERMES_HOME", str(a))
+    sends = []
+
+    def handler(request):
+        del request
+        sends.append(1)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=b'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"input_tokens_details":{"cached_tokens":1}}}}\n\n',
+        )
+
+    client = _real_codex_client(httpx.MockTransport(handler), max_retries=0)
+    secret_scope.set_multiplex_active(True)
+    gates = []
+    try:
+        for home in (a, b, a):
+            binding = set_hermes_home_override(home)
+            secrets = secret_scope.set_secret_scope({}, profile_home=str(home))
+            try:
+                gates.append(diagnostics._enabled())
+                assert run_codex_stream(_codex_agent(), {"model": "fixture", "input": []}, client=client).status == "completed"
+            finally:
+                secret_scope.reset_secret_scope(secrets)
+                reset_hermes_home_override(binding)
+    finally:
+        secret_scope.set_multiplex_active(False)
+        client.close()
+    assert gates == [False, True, False] and len(sends) == 3
+    assert (b / "cache" / "codex-cache-prefix.jsonl").is_file()
+    assert not (a / "cache" / "codex-cache-prefix.jsonl").exists()
+
+
+def _read_private_key(home):
+    os.environ["HERMES_HOME"] = str(home)
+    diagnostics._enabled = lambda: True
+    diagnostics.begin_attempt({}, session_id="", turn_id="", api_id="", ordinal=0, retry=0)
+
+
+def test_nonregular_key_and_lock_fail_closed_without_blocking(tmp_path):
+    """A private FIFO key or lock must not block the request hook."""
+    for name in ("codex-cache-prefix.key", "codex-cache-prefix.lock"):
+        cache = tmp_path / name
+        cache.mkdir(mode=0o700)
+        os.mkfifo(cache / name, 0o600)
+        child = multiprocessing.get_context("fork").Process(target=_read_private_key, args=(tmp_path,))
+        child.start()
+        child.join(2)
+        blocked = child.is_alive()
+        if blocked:
+            child.terminate()
+            child.join(2)
+        assert not child.is_alive()
+        assert not blocked, name

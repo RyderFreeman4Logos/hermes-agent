@@ -415,17 +415,24 @@ def _payload(
         steer = agent._drain_pending_steer() or ""
         _inject_steer_after_newest_tool_result(agent, messages, steer)
         return "\n".join(str(row.get("content", "")) for row in messages if row.get("role") == "user")
+    reserved_texts = []
     if boundary is not None:
         enqueue = getattr(server, "_enqueue_prompt")
 
         def gated_enqueue(*args, **kwargs):
-            enqueue(*args, **kwargs)
+            envelope = enqueue(*args, **kwargs)
+            if isinstance(envelope, dict):
+                # Observe insertion before teardown can legitimately reclaim the queue.
+                reserved_texts.append(str(envelope.get("text", "")))
             boundary.hit()
+            return envelope
 
         monkeypatch.setattr(server, "_enqueue_prompt", gated_enqueue)
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_a, **_k: False)
     leftover = agent._drain_pending_steer()
     server._run_post_turn_followups("rid", "owner-ui", session, {"pending_steer": leftover}, None)
+    if boundary is not None:
+        return "\n".join(reserved_texts)
     queued = [session.get("queued_prompt"), *(session.get("queued_prompts") or [])]
     return "\n".join(str(entry.get("text", "")) for entry in queued if isinstance(entry, dict))
 
@@ -448,6 +455,15 @@ def test_ingest_and_reclaim_have_one_winner(monkeypatch, consumer: str, winner: 
             payloads: list[str] = []
             errors: list[BaseException] = []
             reclaim_started = threading.Event()
+            reclaim_finished = threading.Event()
+            if consumer == "post_turn" and winner == "ingest":
+                followups = server._run_post_turn_followups
+
+                def reclaim_before_observation(*args, **kwargs):
+                    followups(*args, **kwargs)
+                    assert reclaim_finished.wait(2), "reclaim did not finish"
+
+                monkeypatch.setattr(server, "_run_post_turn_followups", reclaim_before_observation)
 
             def ingest():
                 try:
@@ -459,6 +475,7 @@ def test_ingest_and_reclaim_have_one_winner(monkeypatch, consumer: str, winner: 
                 try:
                     reclaim_started.set()
                     _reclaim("owner-ui", session)
+                    reclaim_finished.set()
                 except BaseException as exc:
                     errors.append(exc)
 

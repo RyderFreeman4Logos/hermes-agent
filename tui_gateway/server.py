@@ -1253,16 +1253,13 @@ def _load_cfg_raw() -> dict:
     """The active profile's config.yaml EXACTLY as written — the write-back primitive, ONLY for
     read→mutate→``_save_cfg`` round-trips and raw inspection (defaults / managed overlay / ``${VAR}``
     expansion applied here would be persisted on the next save). Behavioral reads use :func:`_load_cfg`.
-    Cache keyed on the resolved path so profiles don't clobber."""
+    Always reread the file: raw write-back must preserve external edits even when stat fields match."""
     global _cfg_cache, _cfg_sig, _cfg_path
     from hermes_cli.config import read_user_config_raw
     from hermes_cli.config_read_errors import FailedConfigRead
     try:
         p = _active_config_path()
         sig = file_signature(p.stat()) if p.exists() else None
-        with _cfg_lock:
-            if _cfg_cache is not None and _cfg_sig == sig and _cfg_path == p:
-                return copy.deepcopy(_cfg_cache)
         data = read_user_config_raw(p) if p.exists() else {}
     except Exception as exc:
         return FailedConfigRead(error=exc)  # readable as {}, refused by _save_cfg

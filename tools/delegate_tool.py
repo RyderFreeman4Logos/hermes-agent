@@ -459,16 +459,11 @@ def _credentials_for_model_profile(
         merged["request_overrides"] = profile["request_overrides"]
     if overlay["base_url"] and not overlay["api_key"]:
         # A named provider may own a credential for this exact endpoint; never borrow the parent's.
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        try:
-            runtime = resolve_runtime_provider(requested=overlay["provider"], target_model=overlay["model"])
-        except Exception as exc:
-            raise ValueError(f"{name!r} cannot resolve endpoint credentials: {exc}") from exc
-        from tools.delegate_tool_config import _normalized_runtime_url, _require_pool_provider
+        from tools.delegate_tool_config import _normalized_runtime_url, _resolve_pool_runtime
+        runtime = _resolve_pool_runtime(overlay["provider"], overlay["model"])
         if (_normalized_runtime_url(runtime.get("base_url")) != _normalized_runtime_url(overlay["base_url"])
                 or not runtime.get("api_key")):
             raise ValueError(f"{name!r} requires an api_key for its endpoint.")
-        _require_pool_provider(overlay["provider"], runtime)
         merged["api_key"] = runtime["api_key"]
     creds = _resolve_delegation_credentials(merged, parent_agent, exclusive=True)
     # Explicit keys stay fixed; derived credentials may use only their own provider pool.

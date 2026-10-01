@@ -342,7 +342,7 @@ def test_named_pool_provider_can_resolve_its_own_endpoint_credential(same_endpoi
         assert captured[0]["override_api_key"] == "provider-key"
         assert captured[0]["override_api_key"] != parent.api_key
     else:
-        assert "api_key" in result["error"]
+        assert "provider credentials" in result["error"]
         assert captured == []
 
 
@@ -379,8 +379,16 @@ def test_direct_endpoint_keeps_canonical_custom_identity_through_lease():
     assert captured[0]["override_api_key"] == "fixture-fixture-model-key"
 
 
-def test_public_named_shared_endpoint_keeps_explicit_owner_before_dispatch(monkeypatch):
+def test_public_named_shared_endpoint_keeps_explicit_owner_before_dispatch(tmp_path, monkeypatch):
+    import yaml
+
     url = "http://127.0.0.1:9/v1"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Shared endpoint, separate independently owned provider identities/credentials.
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"providers": {
+        "named-a": {"base_url": url, "api_key": "provider-owned-a"},
+        "named-b": {"base_url": url, "api_key": "provider-owned-b"},
+    }}))
     cfg = {"model_pool": {
         "standard": {"provider": "named-a", "model": "fixture-m", "base_url": url, "api_key": "fixed-a"},
         "other": {"provider": "named-b", "model": "fixture-m", "base_url": url, "api_key": "fixed-b"},

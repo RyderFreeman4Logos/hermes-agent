@@ -416,6 +416,21 @@ def _require_pool_provider(configured_provider: Optional[str], runtime: dict) ->
     raise ValueError(f"Delegation model_pool provider '{configured_provider}' did not resolve its own provider credentials.")
 
 
+def _resolve_pool_runtime(provider: Optional[str], model: Optional[str]) -> dict:
+    """Resolve and revalidate owned identity before any runtime dereference."""
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    try:
+        runtime = resolve_runtime_provider(requested=provider, target_model=model)
+        _require_pool_provider(provider, runtime)
+    except (RuntimeError, ValueError, TypeError, OSError) as exc:
+        # Resolver/config errors may contain credentials; only the safe contract is public.
+        raise ValueError(
+            f"Cannot resolve delegation provider '{provider}': "
+            "did not resolve its own provider credentials for this exclusive model-pool route."
+        ) from exc
+    return runtime
+
+
 def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusive: bool = False) -> dict:
     """``delegation.base_url`` branch: provider/api_mode from URL heuristics."""
     # Shared URL-based api_mode detector so Anthropic-compatible direct endpoints (/anthropic suffix: Azure AI
@@ -441,23 +456,23 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusi
 
     # Preserve the configured provider's request personality on an explicit endpoint.
     request_overrides = None
-    if v["provider"]:
+    # Anonymous/generic custom endpoints already own the complete route; they
+    # have no named provider personality or identity to resolve from ambient config.
+    if v["provider"] and not (exclusive and v["provider"] == "custom"):
         try:
             from hermes_cli.runtime_provider import resolve_runtime_provider
-            runtime = resolve_runtime_provider(requested=v["provider"], target_model=v["model"])
+            runtime = (
+                _resolve_pool_runtime(v["provider"], v["model"]) if exclusive
+                else resolve_runtime_provider(requested=v["provider"], target_model=v["model"])
+            )
         except Exception as exc:
             if exclusive:
-                raise ValueError(
-                    f"Cannot resolve delegation provider '{v['provider']}': {exc}. "
-                    "Cannot safely validate its credentials for this exclusive model-pool route."
-                ) from exc
+                raise  # the shared owned-resolution boundary already supplied a safe ValueError
             logger.debug(
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",
                 v["provider"], exc,
             )
         else:
-            if exclusive:
-                _require_pool_provider(v["provider"], runtime)
             if not exclusive or _normalized_runtime_url(runtime.get("base_url")) == _normalized_runtime_url(v["base_url"]):
                 request_overrides = dict(runtime.get("request_overrides") or {}) or None
     # api_key None → inherited from parent in _build_child_agent
@@ -469,19 +484,19 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusi
 def _runtime_provider_credentials(v: dict, explicit_request_overrides, *, exclusive: bool = False) -> dict:
     """``delegation.provider`` branch: full bundle via the runtime provider system."""
     configured_provider = v["provider"]
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
-    except Exception as exc:
-        raise ValueError(
-            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
-            f"Check that the provider is configured (API key set, valid provider name), "
-            f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
-            f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
-        ) from exc
-
     if exclusive:
-        _require_pool_provider(configured_provider, runtime)
+        runtime = _resolve_pool_runtime(configured_provider, v["model"])
+    else:
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
+                f"Check that the provider is configured (API key set, valid provider name), "
+                f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
+                f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
+            ) from exc
     api_key = v["api_key"] or runtime.get("api_key", "")
     if not api_key:
         raise ValueError(

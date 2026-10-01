@@ -18,12 +18,24 @@ from tools.delegate_tool import (
     _build_dynamic_schema_overrides,
     delegate_task,
 )
+import pytest
+import yaml
+
 from tools.registry import registry
+
+
+@pytest.fixture(autouse=True)
+def owned_named_provider(tmp_path, monkeypatch):
+    """The tier's named identity is independently declared, not borrowed from its key."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"providers": {"fixture-opencode-go": {
+        "base_url": "http://127.0.0.1:9/v1", "api_key": "fixture-opencode-owned-key",
+    }}}))
 
 
 STANDARD_POOL = {
     "standard": {
-        "provider": "opencode-go",
+        "provider": "fixture-opencode-go",
         "model": "deepseek-v4-flash",
         "base_url": "http://127.0.0.1:9/v1",
         "api_key": "profile-key",
@@ -496,7 +508,7 @@ class TestLiveConfigReread:
                 "provider": "openai-codex",
                 "model_pool": {
                     "standard": {
-                        "provider": "opencode-go",
+                        "provider": "fixture-opencode-go",
                         "model": "deepseek-v4-flash",
                         "base_url": "http://127.0.0.1:9/v1",
                         "api_key": "profile-key",

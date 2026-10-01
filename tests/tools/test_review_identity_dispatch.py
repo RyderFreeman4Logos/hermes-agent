@@ -80,7 +80,7 @@ def test_different_named_url_keeps_explicit_endpoint_key_not_provider_key():
 def test_exclusive_direct_endpoint_fails_closed_if_provider_resolution_throws():
     captured = []
     result = _dispatch(_pool_profile(), RuntimeError("resolver unavailable"), _named(), captured)
-    assert "error" in result and "resolver unavailable" in result["error"]
+    assert "error" in result and "Cannot resolve delegation provider" in result["error"]
     assert not captured
 
 

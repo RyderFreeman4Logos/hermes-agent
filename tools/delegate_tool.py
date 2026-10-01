@@ -179,6 +179,7 @@ def _build_child_agent(
     override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
     override_requested_provider: Optional[str] = None,
     override_fixed_api_key: bool = False,
+    override_exclusive_route: bool = False,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -286,6 +287,7 @@ def _build_child_agent(
         child._credential_pool = None
     child_pool = None if override_fixed_api_key else _resolve_child_credential_pool(
         rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),
+        inherit_parent=not override_exclusive_route,
     )
     if child_pool is not None:
         child._credential_pool = child_pool
@@ -469,8 +471,9 @@ def _credentials_for_model_profile(
         _require_pool_provider(overlay["provider"], runtime)
         merged["api_key"] = runtime["api_key"]
     creds = _resolve_delegation_credentials(merged, parent_agent, exclusive=True)
-    # Keep the admitted credential; a shared/parent pool must not replace it.
-    creds["fixed_api_key"] = True
+    # Explicit keys stay fixed; derived credentials may use only their own provider pool.
+    creds["fixed_api_key"] = bool(overlay["api_key"])
+    creds["exclusive_route"] = True
     if overlay["provider"] and overlay["base_url"]:
         creds["requested_provider"] = overlay["provider"]
     if not creds.get("api_key"):
@@ -546,6 +549,7 @@ def _build_children(
             "override_fallback_chain": creds.get("fallback_chain"),
             "override_requested_provider": creds.get("requested_provider"),
             "override_fixed_api_key": creds.get("fixed_api_key", False),
+            "override_exclusive_route": creds.get("exclusive_route", False),
         }
         try:
             child = _build_child_preserving_parent_tools(

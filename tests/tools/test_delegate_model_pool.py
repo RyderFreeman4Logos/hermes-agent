@@ -135,12 +135,12 @@ class TestModelProfileResolution:
         ]
         assert all(e["model"] != "gpt-5.6-terra" for e in chain)
 
-    def test_profile_fallback_presence_keeps_owner_policy_without_parent_inheritance(self):
+    def test_profile_fallback_presence_excludes_global_policy_and_keeps_owned_chain(self):
         route = {key: value for key, value in STANDARD_POOL["standard"].items()
                  if key != "fallback_chain"}
         declared = [{"provider": "openrouter", "model": "owner-backup"}]
         for profile_chain, owner_chain, expected in (
-            (None, declared, ["owner-backup"]),
+            (None, declared, []),
             (None, None, []),
             ([], declared, []),
             ([{"provider": "openrouter", "model": "profile-backup"}], declared, ["profile-backup"]),

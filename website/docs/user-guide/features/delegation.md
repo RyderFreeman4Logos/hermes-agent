@@ -309,9 +309,9 @@ delegation:
       fallback_chain: []
 ```
 
-**Migration:** bare model-only tiers and `provider: auto` are no longer accepted, even when parent or ambient credentials are available. Add an explicit provider with independently configured credentials, or an endpoint with an explicit key. Named custom providers must declare their own `api_key`, `key_env`, or `key_cmd`; an ambient key for the same host is not sufficient. Unkeyed anonymous/custom endpoints are rejected; there is no generic no-auth tier mode.
+**Migration:** bare model-only tiers and `provider: auto` are no longer accepted, even when parent or ambient credentials are available. Add an explicit provider with independently configured credentials, or an endpoint with an explicit key. Named custom providers must declare their own `api_key`, `key_env`, `key_cmd`, or registered credential pool; an ambient key for the same host is not sufficient. Unkeyed anonymous/custom endpoints are rejected; there is no generic no-auth tier mode.
 
-A tier keeps its admitted key (or provider-owned token source), endpoint, and transport, rather than joining a parent/shared credential pool. Parent ACP commands and provider filters are cleared. Only overrides from the selected provider/endpoint and the tier's own `request_overrides` are merged; an empty mapping never restores global overrides. An omitted or empty `fallback_chain` disables fallback and stays empty through child construction. An explicit chain is retained as the tier's recovery policy; its entries require explicit provider/model routes, not `auto`. No parent or global fallback list is inherited.
+A tier keeps its endpoint and transport. An explicit tier key stays fixed; derived credentials may rotate through the configured provider's own credential pool, never by reusing the parent's pool. Parent ACP commands and provider filters are cleared. Only overrides from the selected provider/endpoint and the tier's own `request_overrides` are merged; an empty mapping never restores global overrides. An omitted or empty `fallback_chain` disables fallback and stays empty through child construction. An explicit chain is retained as the tier's recovery policy; its entries require explicit provider/model routes, not `auto`. No parent or global fallback list is inherited.
 
 An absent or empty pool retains legacy global delegation routing.
 

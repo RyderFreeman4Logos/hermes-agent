@@ -27,7 +27,8 @@ def _parent():
     parent.base_url = "https://parent.invalid/v1"
     parent.api_key = "fixture-parent-key"
     parent.provider = "openrouter"
-    parent.api_mode = "chat_completions"
+    parent.api_mode, parent.request_overrides = "chat_completions", None
+    parent.requested_provider, parent.acp_command, parent.acp_args = "openrouter", None, []
     parent.model = "parent-model"
     parent.platform = "cli"
     parent.providers_allowed = None
@@ -46,7 +47,6 @@ def _parent():
     parent.disabled_toolsets = []
     parent.session_id = "fixture-parent-session"
     return parent
-
 
 def _route(model: str, *, provider: str = "custom", port: int = 9, **extra):
     return {
@@ -102,7 +102,7 @@ def test_exclusive_explicit_endpoint_enforces_named_provider_identity(runtime_ke
     runtime = {
         "provider": "custom", "requested_provider": "different-provider",
         "model": "tier-model", "base_url": url, "api_key": runtime_key,
-        "api_mode": "chat_completions", "source": "local-runtime",
+        "api_mode": "chat_completions", "source": f"custom_provider:{'named-tier' if not should_refuse else 'different-provider'}",
     }
     with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
         "hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime,
@@ -438,7 +438,7 @@ def test_provider_only_fixed_and_derived_keys_stay_owned_before_dispatch(pooled)
     url = "http://127.0.0.1:9/v1"
     parent = _parent()
     resolved = {"provider": "custom", "model": "fixture-m", "base_url": url,
-                "api_key": "provider-owned", "api_mode": "chat_completions"}
+                "api_key": "provider-owned", "api_mode": "chat_completions", "source": "custom_provider:named-b"}
     pool = MagicMock()
     pool.has_credentials.return_value = True
     pool.provider = "custom:named-b"

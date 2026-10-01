@@ -17,6 +17,8 @@ so transport-side mutation cannot leak back into config.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     _merge_request_overrides,
     _resolve_delegation_credentials,
@@ -36,6 +38,9 @@ def _cfg(**overrides):
 def _parent(**attrs):
     parent = MagicMock()
     parent._delegate_depth = 0
+    parent.model, parent.provider, parent.requested_provider = None, None, None
+    parent.base_url, parent.api_key, parent.api_mode = None, None, None
+    parent.acp_command, parent.acp_args = None, []
     # MagicMock attributes are MagicMocks (non-dict) by default; set real
     # values for the ones the resolution path inspects.
     parent.request_overrides = attrs.pop("request_overrides", None)
@@ -68,13 +73,11 @@ def test_direct_branch_absent_request_overrides_stays_none():
     assert creds["request_overrides"] is None
 
 
-def test_direct_branch_non_dict_request_overrides_stays_none():
-    """Garbage in config (string/list) must not crash or forward junk."""
+def test_direct_branch_non_dict_request_overrides_refuses():
+    """Malformed outer personality is a safe refusal, not silent omission."""
     for bad in ("throughput", ["extra_body"], 42):
-        creds = _resolve_delegation_credentials(
-            _cfg(request_overrides=bad), parent_agent=None
-        )
-        assert creds["request_overrides"] is None
+        with pytest.raises(ValueError, match="request_overrides"):
+            _resolve_delegation_credentials(_cfg(request_overrides=bad), parent_agent=None)
 
 
 def test_direct_branch_deep_copies_nested_extra_body():
@@ -226,7 +229,8 @@ def test_inherit_branch_deep_copies_parent_overrides():
 def test_merge_helper_both_none():
     assert _merge_request_overrides(None, None) is None
     assert _merge_request_overrides({}, {}) is None
-    assert _merge_request_overrides("junk", 42) is None
+    with pytest.raises(ValueError, match="request_overrides"):
+        _merge_request_overrides("junk", 42)
 
 
 

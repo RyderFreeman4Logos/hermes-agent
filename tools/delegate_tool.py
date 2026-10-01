@@ -429,6 +429,7 @@ def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
     provider = entry["provider"].strip().lower()
     if provider == "custom" and base_url is None and api_key is None:
         return True
+    reason = "runtime resolution failed; check provider configuration"
     try:
         resolved = resolve_runtime_provider(
             requested=entry["provider"],
@@ -436,6 +437,7 @@ def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
             explicit_base_url=base_url,
             explicit_api_key=api_key,
         )
+        reason = "provider ownership mismatch; check provider name, endpoint and credentials"
         if provider == "custom":
             if str(resolved.get("provider") or "").strip().lower() != "custom":
                 raise ValueError("custom fallback did not resolve its declared route")
@@ -444,14 +446,14 @@ def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
             if api_key is None and resolved.get("api_key") != "no-key-required":
                 raise ValueError("custom fallback has no hop-owned key")
         else:
-            # An explicit profile key is owned by this hop; use the shared
-            # strict ownership gate only when the resolver discovers credentials.
-            if api_key is None:
-                _require_pool_provider(entry["provider"], resolved)
+            _require_pool_provider(entry["provider"], resolved, explicit_api_key=api_key)
     except (AuthError, ValueError, OSError, TypeError, RuntimeError) as exc:
+        # Resolver messages and even auth codes may contain credential material.
+        if isinstance(exc, AuthError):
+            reason = "authentication failed; configure credentials or run hermes auth"
         logger.info(
-            "delegate profile fallback skipped %s/%s: %s",
-            entry["provider"], entry["model"], type(exc).__name__,
+            "delegate profile fallback skipped %s/%s: %s (%s)",
+            entry["provider"], entry["model"], reason, type(exc).__name__,
         )
         return False
     key = api_key if api_key is not None else resolved.get("api_key")

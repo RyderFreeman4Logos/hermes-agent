@@ -260,6 +260,8 @@ def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> b
 def _custom_provider_extra_body_for_agent(
     *, provider: str, model: str, base_url: str, custom_providers: List[Dict[str, Any]]
 ) -> Optional[Dict[str, Any]]:
+    from agent.agent_runtime_helpers import _copy_request_overrides
+
     provider_norm = (provider or "").strip().lower()
     if provider_norm != "custom" and not provider_norm.startswith("custom:"):
         return None
@@ -285,9 +287,9 @@ def _custom_provider_extra_body_for_agent(
             continue
         if str(entry.get("model", "") or "").strip():
             if _custom_provider_model_matches(model, entry):
-                return dict(extra_body)
+                return _copy_request_overrides(extra_body)
         elif fallback is None:
-            fallback = dict(extra_body)
+            fallback = _copy_request_overrides(extra_body)
     return fallback
 
 
@@ -2454,7 +2456,8 @@ def init_agent(
 
     # reasoning_content echo opt-in; switch_model / fallback / restore keep it in sync.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
-    agent.request_overrides = dict(request_overrides or {})
+    from agent.agent_runtime_helpers import _copy_request_overrides
+    agent.request_overrides = _copy_request_overrides(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     # Every (provider, model) that rejected image content this session. build_api_request strips

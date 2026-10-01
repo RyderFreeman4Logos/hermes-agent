@@ -115,6 +115,74 @@ def test_real_sdk_boundary_stream_terminal_and_error(tmp_path, monkeypatch):
     assert "raw sentinel" not in json.dumps(rows(tmp_path))
 
 
+def test_managed_rewrite_digest_matches_sdk_kwargs(tmp_path, monkeypatch):
+    from agent import relay_llm, relay_runtime
+    from agent.codex_runtime import run_codex_stream
+
+    enable(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    relay_runtime._reset_for_tests()
+    lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
+        profile_key=relay_runtime.current_profile_key(), session_id="session-managed", platform="cli",
+    )
+    turn = relay_runtime.SESSION_COORDINATOR.begin_turn(lease, turn_id="turn-1", task_id="task-1")
+    lease.host.retain_managed_execution("test.cache_prefix")
+    seen = []
+
+    class Agent:
+        provider = "openai-codex"
+        session_id = "session-managed"
+        _current_api_request_id = "turn-1:api:0"
+        _interrupt_requested = False
+        _fallback_index = 0
+        model = "model"
+        def _is_codex_backend(self): return True
+        def _fire_stream_delta(self, text): pass
+        def _fire_reasoning_delta(self, text): pass
+        def _touch_activity(self, text): pass
+
+    pre_wire = {}
+    original_execute = lease.host.relay.llm.stream_execute
+
+    async def rewrite_once(name, request, callback, *args, **kwargs):
+        content = dict(request.content)
+        pre_wire["instructions"] = content.get("instructions")
+        pre_wire["prompt_cache_key"] = content.get("prompt_cache_key")
+        content["instructions"] = "rewritten instructions"
+        content["prompt_cache_key"] = "rewritten scope"
+        from nemo_relay import LLMRequest
+        rewritten = LLMRequest(getattr(request, "headers", {}) or {}, content)
+        return await original_execute(name, rewritten, callback, *args, **kwargs)
+
+    monkeypatch.setattr(lease.host.relay.llm, "stream_execute", rewrite_once)
+
+    def create(**kwargs):
+        seen.append(kwargs)
+        return iter([{"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 2, "input_tokens_details": {"cached_tokens": 0}}}}])
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create), base_url="https://chatgpt.com/backend-api/codex")
+    try:
+        result = run_codex_stream(Agent(), request(), client=client)
+    finally:
+        lease.host.release_managed_execution("test.cache_prefix")
+        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
+        relay_runtime.SESSION_COORDINATOR.release_conversation(lease)
+        relay_runtime._reset_for_tests()
+    assert result is not None and result.status == "completed" and len(seen) == 1
+    sent = seen[0]
+    assert sent["instructions"] == "rewritten instructions"
+    assert pre_wire["instructions"] == "system secret"
+    key = (tmp_path / "cache" / "codex-cache-prefix.key").read_bytes()
+    expected = diagnostics._components(sent, key)
+    stale = diagnostics._components({**sent, "instructions": pre_wire["instructions"], "prompt_cache_key": pre_wire["prompt_cache_key"]}, key)
+    recorded = {item["key"]: item for item in rows(tmp_path)[0]["components"]}
+    assert recorded["system"]["hmac"] == expected[0]["hmac"]
+    assert recorded["system"]["hmac"] != stale[0]["hmac"]
+    assert recorded["scope"]["hmac"] == expected[2]["hmac"]
+    text = (tmp_path / "cache" / "codex-cache-prefix.jsonl").read_text()
+    assert "rewritten instructions" not in text and "system secret" not in text
+
+
 def test_delayed_trailing_drain_error_is_recorded_after_iterator_error(tmp_path, monkeypatch):
     from agent.codex_runtime import run_codex_stream
     import httpx

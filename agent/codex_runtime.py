@@ -1182,19 +1182,16 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        from agent.cache_prefix_diagnostics import begin_attempt
         final_kwargs = bypass_sdk_request_transform(stream_kwargs)
-        api_id = str(getattr(agent, "_current_api_request_id", "") or "")
-        ordinal_text = api_id.rsplit(":api:", 1)[-1] if ":api:" in api_id else ""
-        diagnostic_token = begin_attempt(
-            final_kwargs,
-            session_id=str(getattr(agent, "session_id", "") or ""),
-            turn_id=api_id.rsplit(":api:", 1)[0] if ordinal_text else "",
-            api_id=api_id,
-            ordinal=int(ordinal_text) if ordinal_text.isdecimal() else -1,
-            retry=attempt,
-            role=call_role,
-        )
+        context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        if context is not None and context.codex_token is None:
+            context.codex_token = relay_llm._record_attempt(
+                final_kwargs, name=str(getattr(agent, "provider", "") or "codex"),
+                model_name=str(model or ""), metadata=context.metadata,
+                physical_send_ordinal=context.ordinal, scope=context.scope,
+            )
+        if context is not None:
+            diagnostic_token = context.codex_token
         return active_client.responses.create(**final_kwargs)
 
     def _log_failure(exc: BaseException) -> None:

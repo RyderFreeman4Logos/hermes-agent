@@ -36,7 +36,8 @@ def _make_mock_parent(depth=0):
     parent.base_url = "https://openrouter.ai/api/v1"
     parent.api_key="***"
     parent.provider = "openrouter"
-    parent.api_mode = "chat_completions"
+    parent.api_mode, parent.request_overrides = "chat_completions", None
+    parent.requested_provider, parent.acp_command, parent.acp_args = "openrouter", None, []
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"
     parent.providers_allowed = None
@@ -51,7 +52,6 @@ def _make_mock_parent(depth=0):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
-
 
 
 

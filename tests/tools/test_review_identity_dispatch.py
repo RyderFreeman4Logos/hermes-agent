@@ -37,7 +37,7 @@ def _runtime(*, url=URL, key="named-tier-owned-key", provider="named-tier", over
     return {
         "provider": "custom", "requested_provider": provider, "model": "tier-model",
         "base_url": url, "api_key": key, "api_mode": "chat_completions",
-        "source": "local-runtime", "request_overrides": overrides or {},
+        "source": f"custom_provider:{provider}", "request_overrides": overrides or {},
     }
 
 

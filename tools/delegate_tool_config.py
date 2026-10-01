@@ -286,14 +286,55 @@ def _resolve_child_credential_pool(
             logger.debug("Could not load credential pool for child provider '%s': %s", effective_provider, exc)
     return None
 
+def _route_shape_error(route: Any, *, runtime: bool = False) -> Optional[str]:
+    """Validate only fields consumed by delegation, before coercion or construction."""
+    if not isinstance(route, dict):
+        return "expected a runtime mapping" if runtime else "expected a route mapping"
+    fields = ("model", "provider", "base_url", "api_mode")
+    if runtime:
+        fields += ("requested_provider", "command", "source")
+    for field in fields:
+        value = route.get(field)
+        if value is not None and not isinstance(value, str):
+            return f"invalid {field}; expected a string"
+    key = route.get("api_key")
+    # Named key_cmd credentials are per-request callables, including when a
+    # derived endpoint route carries the already resolved key through config.
+    if key is not None and not isinstance(key, str) and not callable(key):
+        return "invalid api_key; expected a string or token callable"
+    overrides = route.get("request_overrides")
+    if overrides is not None and not isinstance(overrides, dict):
+        return "invalid request_overrides; expected a mapping"
+    if runtime:
+        args = route.get("args")
+        if args is not None and (not isinstance(args, list) or any(not isinstance(arg, str) for arg in args)):
+            return "invalid args; expected a list of strings"
+        pool = route.get("credential_pool")
+        if pool is not None and (
+            not isinstance(getattr(pool, "provider", None), str)
+            or not callable(getattr(pool, "has_credentials", None))
+        ):
+            return "invalid credential_pool; expected a provider credential pool"
+    return None
+
+
+def _validate_delegation_runtime(runtime: Any) -> dict:
+    error = _route_shape_error(runtime, runtime=True)
+    if error:
+        raise ValueError(f"Cannot resolve delegation runtime: {error}.")
+    return runtime
+
+
 def _merge_request_overrides(runtime_overrides, explicit_overrides):
     """Merge explicit ``delegation.request_overrides`` OVER runtime-derived ones. Explicit top-level keys win;
     ``extra_body`` is deep-merged ONE level so provider personality (e.g. ``thinking: {type: disabled}``) survives
     unless the explicit dict redefines that exact key. Both sides are deep-copied so transport-side mutation can't
     leak into the config/runtime cache. None when both are empty."""
     import copy as _copy
-    runtime_overrides = runtime_overrides if isinstance(runtime_overrides, dict) else None
-    explicit_overrides = explicit_overrides if isinstance(explicit_overrides, dict) else None
+    for overrides in (runtime_overrides, explicit_overrides):
+        error = _route_shape_error({"request_overrides": overrides})
+        if error:
+            raise ValueError(f"Invalid delegation personality: {error}.")
     if not runtime_overrides and not explicit_overrides:
         return None
     merged = _copy.deepcopy(runtime_overrides) if runtime_overrides else {}
@@ -335,6 +376,9 @@ def _pool_route_error(name: str, profile: Any) -> Optional[str]:
         value = profile.get(field)
         if value is not None and (not isinstance(value, str) or (value and not value.strip())):
             return f"{name!r} has an invalid {field}; expected a string."
+    error = _route_shape_error(profile)
+    if error:
+        return f"{name!r} has an {error}."
     mode = profile.get("api_mode")
     if mode is not None and mode != "":
         from hermes_cli.runtime_provider import _parse_api_mode
@@ -383,32 +427,34 @@ def _require_pool_provider(configured_provider: Optional[str], runtime: dict) ->
     """A named tier may not use the general resolver's ambient fallback."""
     if not isinstance(runtime, dict):
         raise ValueError(f"Delegation model_pool provider '{configured_provider}' did not resolve runtime credentials.")
-    from hermes_cli.providers import normalize_provider
+    from hermes_cli.providers import normalize_provider, custom_provider_aliases
     from hermes_cli.runtime_provider import _same_registered_provider
     from hermes_cli.runtime_provider_custom import _get_named_custom_provider, expand_direct_api_alias
 
     requested = normalize_provider(configured_provider or "")
     resolved = normalize_provider(str(runtime.get("provider") or ""))
-    if requested != "auto" and resolved != "custom" and _same_registered_provider(resolved, requested):
+    alias_provider, alias_url = expand_direct_api_alias(configured_provider or "", None)
+    named = _get_named_custom_provider(configured_provider or "")
+    if not named and alias_provider != "custom" and requested != "auto" and resolved != "custom" and _same_registered_provider(resolved, requested):
         return
     if resolved == "custom":
-        named = _get_named_custom_provider(configured_provider or "")
         if named and _normalized_runtime_url(named.get("base_url")) == _normalized_runtime_url(runtime.get("base_url")):
             # Named custom credentials must be declared by that provider, not
             # discovered from a host-gated ambient key or a parent route.
-            from agent.credential_pool import get_custom_provider_pool_key
             from hermes_cli.runtime_provider_custom import _key_env_secret
-            pool_key = get_custom_provider_pool_key(named.get("base_url"), provider_name=configured_provider)
             pool = runtime.get("credential_pool")
-            if (pool_key and runtime.get("source") == f"pool:{pool_key}"
-                    and getattr(pool, "provider", None) == pool_key and runtime.get("api_key")):
+            pool_key = getattr(pool, "provider", None)
+            if (pool_key in custom_provider_aliases(named.get("name") or "", named.get("provider_key") or "")
+                    and runtime.get("source") == f"pool:{pool_key}" and runtime.get("api_key")):
                 return
             owned_key = named.get("api_key") or _key_env_secret(named, "delegation model_pool")
-            if (owned_key and owned_key == runtime.get("api_key")) or (
+            # The resolver-owned rung identifies the declaration. Its request
+            # tag may have been overwritten; equal endpoints/keys are not identity.
+            owns_identity = runtime.get("source") == f"custom_provider:{named.get('name')}"
+            if owns_identity and ((owned_key and owned_key == runtime.get("api_key")) or (
                 named.get("key_cmd") and callable(runtime.get("api_key"))
-            ):
+            )):
                 return
-        alias_provider, alias_url = expand_direct_api_alias(requested, None)
         if (alias_provider == "custom" and alias_url
                 and _normalized_runtime_url(alias_url) == _normalized_runtime_url(runtime.get("base_url"))
                 and runtime.get("source") == "direct-alias" and runtime.get("api_key")):
@@ -420,7 +466,7 @@ def _resolve_pool_runtime(provider: Optional[str], model: Optional[str]) -> dict
     """Resolve and revalidate owned identity before any runtime dereference."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
-        runtime = resolve_runtime_provider(requested=provider, target_model=model)
+        runtime = _validate_delegation_runtime(resolve_runtime_provider(requested=provider, target_model=model))
         _require_pool_provider(provider, runtime)
     except (RuntimeError, ValueError, TypeError, OSError) as exc:
         # Resolver/config errors may contain credentials; only the safe contract is public.
@@ -473,6 +519,7 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusi
                 v["provider"], exc,
             )
         else:
+            runtime = _validate_delegation_runtime(runtime)
             if not exclusive or _normalized_runtime_url(runtime.get("base_url")) == _normalized_runtime_url(v["base_url"]):
                 request_overrides = dict(runtime.get("request_overrides") or {}) or None
     # api_key None → inherited from parent in _build_child_agent
@@ -492,11 +539,12 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides, *, exclus
             runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
         except Exception as exc:
             raise ValueError(
-                f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
+                f"Cannot resolve delegation provider '{configured_provider}'. "
                 f"Check that the provider is configured (API key set, valid provider name), "
                 f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
                 f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
             ) from exc
+    runtime = _validate_delegation_runtime(runtime)
     api_key = v["api_key"] or runtime.get("api_key", "")
     if not api_key:
         raise ValueError(
@@ -515,7 +563,7 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides, *, exclus
     # carry its own endpoint. ACP transports are addressed by command and native-SDK providers by their SDK,
     # so neither needs a URL; anything else without one would otherwise be built with no endpoint at all.
     if (not runtime.get("base_url") and not pinned_command
-            and configured_provider.strip().lower() not in _NATIVE_SDK_PROVIDERS):
+            and str(runtime.get("provider") or "").lower() not in _NATIVE_SDK_PROVIDERS):
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved without a base_url. "
             f"Refusing to build a subagent with an incomplete credential bundle — check the provider's "
@@ -544,14 +592,24 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent, *, exclusive: bool 
     ``provider`` set → full bundle via the runtime provider system (same path as CLI/gateway startup); neither →
     None values, child inherits everything. ``request_overrides`` is honored on every branch. Raises ValueError
     with a user-facing message."""
-    values = {k: str(cfg.get(k) or "").strip() or None for k in ("model", "provider", "base_url", "api_key")}
-    values["api_mode"] = str(cfg.get("api_mode") or "").strip().lower() or None
-    explicit_request_overrides = cfg.get("request_overrides") if isinstance(cfg.get("request_overrides"), dict) else None
+    error = _route_shape_error(cfg)
+    if error:
+        raise ValueError(f"Invalid delegation route: {error}.")
+    values = {k: (cfg.get(k) or "").strip() or None for k in ("model", "provider", "base_url")}
+    raw_key = cfg.get("api_key")
+    values["api_key"] = raw_key if callable(raw_key) else (raw_key or "").strip() or None
+    values["api_mode"] = (cfg.get("api_mode") or "").strip().lower() or None
+    explicit_request_overrides = cfg.get("request_overrides")
     is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
 
     if values["base_url"] and not is_native_sdk_provider:
         return _direct_endpoint_credentials(values, explicit_request_overrides, exclusive=exclusive)
     if not values["provider"]:
+        inherited = {field: getattr(parent_agent, field, None) for field in (
+            "model", "provider", "requested_provider", "base_url", "api_key", "api_mode", "request_overrides"
+        )}
+        inherited.update(command=getattr(parent_agent, "acp_command", None), args=getattr(parent_agent, "acp_args", None))
+        _validate_delegation_runtime(inherited)
         # Pure inherit; explicit request_overrides still merge OVER the parent's.
         return _credential_bundle(
             values["model"], None, None, None, None,

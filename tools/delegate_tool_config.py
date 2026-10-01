@@ -341,6 +341,8 @@ def _pool_route_error(name: str, profile: Any) -> Optional[str]:
     if not (profile.get("model") or "").strip():
         return f"{name!r} requires a model."
     provider = (profile.get("provider") or "").strip()
+    if provider.lower() == "auto":
+        return f"{name!r} requires an explicit provider; auto uses ambient routing."
     endpoint = (profile.get("base_url") or "").strip()
     if not provider and not endpoint:
         return f"{name!r} requires a provider or base_url."
@@ -352,7 +354,7 @@ def _pool_route_error(name: str, profile: Any) -> Optional[str]:
             not isinstance(entry, dict) or any(
                 not isinstance(entry.get(field), str) or not entry[field].strip()
                 for field in ("provider", "model")
-            ) for entry in chain
+            ) or entry.get("provider", "").strip().lower() == "auto" for entry in chain
         ):
             return f"{name!r} has an invalid fallback_chain; expected a list of provider/model routes."
     return None
@@ -375,7 +377,36 @@ def _model_pool_errors(pool: Any) -> List[str]:
         errors.append("delegation.model_pool is non-empty but has no 'standard' profile")
     return errors
 
-def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
+def _require_pool_provider(configured_provider: Optional[str], runtime: dict) -> None:
+    """A named tier may not use the general resolver's ambient fallback."""
+    from hermes_cli.providers import normalize_provider
+    from hermes_cli.runtime_provider import _same_registered_provider
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider, expand_direct_api_alias
+
+    requested = normalize_provider(configured_provider or "")
+    resolved = normalize_provider(str(runtime.get("provider") or ""))
+    if requested != "auto" and resolved != "custom" and _same_registered_provider(resolved, requested):
+        return
+    if resolved == "custom":
+        named = _get_named_custom_provider(configured_provider or "")
+        if named and _normalized_runtime_url(named.get("base_url")) == _normalized_runtime_url(runtime.get("base_url")):
+            # Named custom credentials must be declared by that provider, not
+            # discovered from a host-gated ambient key or a parent route.
+            from hermes_cli.runtime_provider_custom import _key_env_secret
+            owned_key = named.get("api_key") or _key_env_secret(named, "delegation model_pool")
+            if (owned_key and owned_key == runtime.get("api_key")) or (
+                named.get("key_cmd") and callable(runtime.get("api_key"))
+            ):
+                return
+        alias_provider, alias_url = expand_direct_api_alias(requested, None)
+        if (alias_provider == "custom" and alias_url
+                and _normalized_runtime_url(alias_url) == _normalized_runtime_url(runtime.get("base_url"))
+                and runtime.get("source") == "direct-alias" and runtime.get("api_key")):
+            return
+    raise ValueError(f"Delegation model_pool provider '{configured_provider}' did not resolve its own provider credentials.")
+
+
+def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusive: bool = False) -> dict:
     """``delegation.base_url`` branch: provider/api_mode from URL heuristics."""
     # Shared URL-based api_mode detector so Anthropic-compatible direct endpoints (/anthropic suffix: Azure AI
     # Foundry, MiniMax, Zhipu, LiteLLM) get the Messages transport instead of 404ing on chat_completions.
@@ -404,6 +435,10 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         try:
             from hermes_cli.runtime_provider import resolve_runtime_provider
             runtime = resolve_runtime_provider(requested=v["provider"], target_model=v["model"])
+            if exclusive:
+                _require_pool_provider(v["provider"], runtime)
+                if _normalized_runtime_url(runtime.get("base_url")) != _normalized_runtime_url(v["base_url"]):
+                    raise ValueError("Provider request overrides belong to another endpoint.")
             request_overrides = dict(runtime.get("request_overrides") or {}) or None
 
         except Exception as exc:
@@ -417,7 +452,7 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         _merge_request_overrides(request_overrides, explicit_request_overrides),
     )
 
-def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
+def _runtime_provider_credentials(v: dict, explicit_request_overrides, *, exclusive: bool = False) -> dict:
     """``delegation.provider`` branch: full bundle via the runtime provider system."""
     configured_provider = v["provider"]
     try:
@@ -431,6 +466,8 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
             f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
         ) from exc
 
+    if exclusive:
+        _require_pool_provider(configured_provider, runtime)
     api_key = v["api_key"] or runtime.get("api_key", "")
     if not api_key:
         raise ValueError(
@@ -472,7 +509,7 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         command=pinned_command, args=list(runtime.get("args") or []),
     )
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(cfg: dict, parent_agent, *, exclusive: bool = False) -> dict:
     """Child credential bundle from the ``delegation`` config section. Three branches: ``base_url`` set → direct
     endpoint (``api_key`` None means inherit the parent's key, so providers keyed outside OPENAI_API_KEY work);
     ``provider`` set → full bundle via the runtime provider system (same path as CLI/gateway startup); neither →
@@ -484,14 +521,14 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
 
     if values["base_url"] and not is_native_sdk_provider:
-        return _direct_endpoint_credentials(values, explicit_request_overrides)
+        return _direct_endpoint_credentials(values, explicit_request_overrides, exclusive=exclusive)
     if not values["provider"]:
         # Pure inherit; explicit request_overrides still merge OVER the parent's.
         return _credential_bundle(
             values["model"], None, None, None, None,
             _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
         )
-    return _runtime_provider_credentials(values, explicit_request_overrides)
+    return _runtime_provider_credentials(values, explicit_request_overrides, exclusive=exclusive)
 
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
@@ -644,7 +681,7 @@ def _resolve_child_runtime(
         # Profile fallback_chain wins when provided. Else the official routing owner
         # (auxiliary.review vs delegation) still owns recovery policy.
         "fallback_model": (
-            (override_fallback_chain or None) if override_fallback_chain is not None
+            override_fallback_chain if override_fallback_chain is not None
             else _resolve_child_fallback_chain(
                 parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
                 pinned=bool(override_provider or override_base_url or model))

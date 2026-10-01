@@ -448,11 +448,13 @@ def _credentials_for_model_profile(
     }
     # A non-empty pool is the only routing source; ignore global delegation
     # route keys so a global pin cannot override a selected tier.
-    global_route_keys = {"model", "provider", "base_url", "api_key", "api_mode"}
+    global_route_keys = {"model", "provider", "base_url", "api_key", "api_mode", "request_overrides"}
     merged = {k: v for k, v in cfg.items() if k not in global_route_keys}
     for key, value in overlay.items():
         if value:
             merged[key] = value
+    if "request_overrides" in profile:
+        merged["request_overrides"] = profile["request_overrides"]
     if overlay["base_url"] and not overlay["api_key"]:
         # A named provider may own a credential for this exact endpoint; never borrow the parent's.
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -460,13 +462,15 @@ def _credentials_for_model_profile(
             runtime = resolve_runtime_provider(requested=overlay["provider"], target_model=overlay["model"])
         except Exception as exc:
             raise ValueError(f"{name!r} cannot resolve endpoint credentials: {exc}") from exc
-        from tools.delegate_tool_config import _normalized_runtime_url
+        from tools.delegate_tool_config import _normalized_runtime_url, _require_pool_provider
         if (_normalized_runtime_url(runtime.get("base_url")) != _normalized_runtime_url(overlay["base_url"])
                 or not runtime.get("api_key")):
             raise ValueError(f"{name!r} requires an api_key for its endpoint.")
+        _require_pool_provider(overlay["provider"], runtime)
         merged["api_key"] = runtime["api_key"]
-    creds = _resolve_delegation_credentials(merged, parent_agent)
-    creds["fixed_api_key"] = bool(overlay["api_key"])
+    creds = _resolve_delegation_credentials(merged, parent_agent, exclusive=True)
+    # Keep the admitted credential; a shared/parent pool must not replace it.
+    creds["fixed_api_key"] = True
     if overlay["provider"] and overlay["base_url"]:
         creds["requested_provider"] = overlay["provider"]
     if not creds.get("api_key"):
@@ -475,7 +479,7 @@ def _credentials_for_model_profile(
         creds["model"] = overlay["model"]
     creds["fallback_chain"] = (
         _normalize_profile_fallback_chain(profile["fallback_chain"])
-        if "fallback_chain" in profile else None
+        if "fallback_chain" in profile else []
     )
     return creds
 

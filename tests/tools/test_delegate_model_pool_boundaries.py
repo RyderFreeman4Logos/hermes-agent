@@ -87,6 +87,127 @@ def _fake_child(parent, captured):
 def _sync_result(_batch, _background):
     return json.dumps({"ok": True})
 
+
+@pytest.mark.parametrize("route,runtime,error", [
+    ({"model": "tier-model"}, {}, "provider or base_url"),
+    ({"model": "tier-model", "provider": "auto"}, {}, "auto"),
+    ({**_route("tier-model"), "provider": "AUTO"}, {}, "auto"),
+    ({"model": "tier-model", "base_url": "http://127.0.0.1:9/v1"}, {}, "api_key"),
+    ({"model": "tier-model", "provider": "minimax"},
+     {"provider": "openrouter", "requested_provider": "minimax", "api_key": "ambient-key",
+      "base_url": "https://ambient.invalid/v1"}, "provider"),
+    ({"model": "tier-model", "provider": "named-tier"},
+     {"provider": "custom", "requested_provider": "named-tier", "api_key": "ambient-key",
+      "base_url": "https://ambient.invalid/v1", "source": "local-runtime"}, "provider"),
+    ({"model": "tier-model", "provider": "minimax", "base_url": "http://127.0.0.1:9/v1"},
+     {"provider": "openrouter", "requested_provider": "minimax", "api_key": "ambient-key",
+      "base_url": "http://127.0.0.1:9/v1"}, "provider"),
+    ({**_route("tier-model"), "fallback_chain": [{"provider": "auto", "model": "backup"}]},
+     {}, "fallback_chain"),
+])
+def test_exclusive_pool_refuses_ambient_routes_before_registry_child_construction(
+    tmp_path, monkeypatch, route, runtime, error,
+):
+    from tools.registry import registry
+    import yaml
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "ambient-key")
+    cfg = {"delegation": {**_route("global-model"), "model_pool": {"standard": route}}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(cfg))
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime), patch(
+        "run_agent.AIAgent"
+    ) as constructor, patch("tools.delegation_live_log.create_live_transcripts") as transcripts:
+        raw = registry.dispatch("delegate_task", {"goal": "offline"}, parent_agent=_parent())
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    assert error in result["error"].lower(), result
+    constructor.assert_not_called()
+    transcripts.assert_not_called()
+
+
+@pytest.mark.parametrize("route_kind", ["endpoint", "provider", "named"])
+@pytest.mark.parametrize("fallback", [None, [], [{"provider": "minimax", "model": "owned-backup"}]])
+@pytest.mark.parametrize("overrides", [None, {}, {"extra_body": {"tier_only": True}}])
+def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
+    tmp_path, monkeypatch, route_kind, fallback, overrides,
+):
+    from tools.registry import registry
+    import yaml
+
+    parent = _parent()
+    parent.acp_command = "parent-acp"
+    parent.acp_args = ["parent-arg"]
+    parent.request_overrides = {"extra_body": {"parent_only": True}}
+    parent._fallback_chain = [{"provider": "openrouter", "model": "parent-backup"}]
+    parent._credential_pool = MagicMock()
+    parent.providers_allowed = ["parent-route"]
+    homes = [tmp_path / "a", tmp_path / "b"]
+    seen = []
+
+    def constructor(**kwargs):
+        seen.append(kwargs)
+        child = MagicMock()
+        child.provider = kwargs["provider"]
+        child.requested_provider = kwargs["requested_provider"]
+        child.base_url = kwargs["base_url"]
+        child.api_key = kwargs["api_key"]
+        child._credential_pool = None
+        return child
+
+    for home in homes:
+        home.mkdir()
+        owner = home.name
+        route = {"provider": "openrouter", "model": f"tier-{owner}"}
+        if route_kind == "endpoint":
+            route = _route(f"tier-{owner}")
+        elif route_kind == "named":
+            route["provider"] = "named-tier"
+        if fallback is not None:
+            route["fallback_chain"] = fallback
+        if overrides is not None:
+            route["request_overrides"] = overrides
+        cfg = {"model": {"provider": "openrouter", "default": "ambient-model"}, "delegation": {
+            **_route("global-model"), "max_iterations": 4,
+            "request_overrides": {"extra_body": {"global_only": True}},
+            "fallback_providers": [{"provider": "openrouter", "model": "global-backup"}],
+            "model_pool": {"standard": route},
+        }}
+        if route_kind == "named":
+            cfg["providers"] = {"named-tier": {
+                "base_url": f"https://tier-{owner}.invalid/v1", "api_key": f"owned-{owner}",
+            }}
+        (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+
+    with patch("run_agent.AIAgent", side_effect=constructor), patch(
+        "tools.delegate_tool._run_batch", side_effect=_sync_result
+    ), patch("tools.delegate_tool_config._loaded_pool") as pool_lookup:
+        for home in (homes[0], homes[1], homes[0]):
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            # Named custom providers exercise the real resolver. The built-in
+            # provider's credential discovery is the only mocked auth boundary.
+            runtime = {"provider": "openrouter", "base_url": f"https://tier-{home.name}.invalid/v1",
+                       "api_key": f"owned-{home.name}", "api_mode": "chat_completions"}
+            resolver = patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime)
+            if route_kind == "provider":
+                resolver.start()
+            try:
+                raw = registry.dispatch("delegate_task", {"goal": "offline"}, parent_agent=parent)
+                result = json.loads(raw) if isinstance(raw, str) else raw
+            finally:
+                if route_kind == "provider":
+                    resolver.stop()
+            assert result == {"ok": True}, result
+            actual = seen[-1]
+            assert actual["model"] == f"tier-{home.name}"
+            assert actual["provider"] == {"endpoint": "custom", "provider": "openrouter", "named": "named-tier"}[route_kind]
+            assert actual["api_key"] == (f"fixture-tier-{home.name}-key" if route_kind == "endpoint" else f"owned-{home.name}")
+            assert actual["base_url"] == ("http://127.0.0.1:9/v1" if route_kind == "endpoint" else runtime["base_url"])
+            assert actual["request_overrides"] == (overrides or {})
+            assert actual["fallback_model"] == (fallback or [])
+            assert (actual["acp_command"], actual["acp_args"], actual["providers_allowed"]) == (None, [], None)
+        pool_lookup.assert_not_called()
+    parent._credential_pool.acquire_lease.assert_not_called()
+
 @pytest.mark.parametrize("pool,expected", [
     ("oops", "mapping"), ([], "mapping"), (["standard"], "mapping"),
     (0, "mapping"), (False, "mapping"), ("", "mapping"),
@@ -164,7 +285,8 @@ def test_named_pool_provider_can_resolve_its_own_endpoint_credential(same_endpoi
     with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
         return_value={"provider": "custom", "model": "pool-model", "base_url": route["base_url"] if same_endpoint else "http://127.0.0.1:8/v1", "api_key": "provider-key"},
-    ), patch("tools.delegate_tool._build_child_preserving_parent_tools", side_effect=_fake_child(parent, captured)), patch(
+    ), patch("hermes_cli.runtime_provider_custom._get_named_custom_provider",
+             return_value={"name": "named-provider", "base_url": route["base_url"], "api_key": "provider-key"}), patch("tools.delegate_tool._build_child_preserving_parent_tools", side_effect=_fake_child(parent, captured)), patch(
         "tools.delegate_tool._run_batch", side_effect=_sync_result
     ):
         result = json.loads(delegate_task(goal="check route", parent_agent=parent))
@@ -256,7 +378,7 @@ def test_public_named_shared_endpoint_keeps_explicit_owner_before_dispatch(monke
     seen[0]._swap_credential.assert_not_called()
 
 
-def test_provider_only_fixed_key_and_derived_named_pool_before_dispatch():
+def test_provider_only_fixed_and_derived_keys_stay_owned_before_dispatch():
     url = "http://127.0.0.1:9/v1"
     parent = _parent()
     resolved = {"provider": "custom", "model": "fixture-m", "base_url": url,
@@ -278,6 +400,9 @@ def test_provider_only_fixed_key_and_derived_named_pool_before_dispatch():
     fixed = {"provider": "named-b", "model": "fixture-m", "api_key": "tier-owned"}
     derived = {"provider": "named-b", "model": "fixture-m", "base_url": url}
     with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=resolved), patch(
+        "hermes_cli.runtime_provider_custom._get_named_custom_provider",
+        return_value={"name": "named-b", "base_url": url, "api_key": "provider-owned"},
+    ), patch(
         "agent.credential_pool.get_custom_provider_pool_key", return_value="custom:named-b"
     ) as key_lookup, patch("agent.credential_pool.load_pool", return_value=pool), patch(
         "tools.delegate_tool._run_batch", side_effect=lambda *_: json.dumps({"ok": True})
@@ -289,8 +414,9 @@ def test_provider_only_fixed_key_and_derived_named_pool_before_dispatch():
         "named-b", "tier-owned", None,
     )
     assert (seen[1].requested_provider, seen[1].api_key) == ("named-b", "provider-owned")
-    assert seen[1]._credential_pool is pool
-    assert any(call.kwargs.get("provider_name") == "named-b" for call in key_lookup.call_args_list)
+    assert seen[1]._credential_pool is None
+    key_lookup.assert_not_called()
+    pool.acquire_lease.assert_not_called()
 
 
 def test_explicit_pool_mode_must_be_supported_before_public_dispatch():
@@ -383,7 +509,8 @@ def test_all_fast_tasks_do_not_resolve_unused_standard_but_standard_is_required(
     captured = []
     resolved = []
 
-    def _resolve(route_cfg, _parent_agent):
+    def _resolve(route_cfg, _parent_agent, *, exclusive=False):
+        assert exclusive
         resolved.append(route_cfg.get("provider"))
         if route_cfg.get("provider") == "minimax":
             raise ValueError("unused MiniMax credentials unavailable")

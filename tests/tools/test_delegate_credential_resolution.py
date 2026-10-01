@@ -117,6 +117,15 @@ def test_native_sdk_resolver_branch_refuses_incomplete_and_wrong_owner(with_url,
     assert not captured
 
 
+@pytest.mark.parametrize(("configured_provider", "resolved_provider"), [("google", "gemini"), ("gemini", "google")])
+def test_native_sdk_registered_aliases_share_canonical_identity(configured_provider, resolved_provider):
+    config = {'model_pool': {'standard': {'model': 'fixture-native', 'provider': configured_provider}}}
+    captured = []
+    runtime = {'provider': resolved_provider, 'base_url': URL, 'api_key': 'fixture-owned', 'api_mode': 'google_genai', 'request_overrides': {}}
+    assert _dispatch(config, runtime, None, captured) == {'ok': True}
+    assert captured[0]['override_provider'] == resolved_provider
+
+
 @pytest.mark.parametrize('with_url', [False, True])
 def test_native_sdk_resolver_matching_owner_is_preserved(with_url):
     config = {'model_pool': {'standard': {'model': 'fixture-native', 'provider': 'google'}}}

@@ -562,9 +562,11 @@ def _rebuild_session_agent(sid: str, session: dict, **kwargs):
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
+    with _completion_ownership_lock(session), session["history_lock"]:
+        _reclaim_queued_completion_receipts(session)
+        session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     updates = dict(
         attached_images=[], queued_prompt=None,
-        _queued_prompt_generation=int(session.get("_queued_prompt_generation", 0)) + 1,
         edit_snapshots={}, image_counter=0, running=False, show_reasoning=_load_show_reasoning(),
         tool_progress_mode=_load_tool_progress_mode(), tool_started_at={})
     tokens = _set_session_context(session["session_key"])

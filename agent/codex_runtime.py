@@ -1057,14 +1057,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # claims the sink supersedes this token; that only silences OUR live callbacks — consumption continues,
     # because stopping here handed the gateway a "completed" response missing its tail (#69486).
     writer_token = {"value": None, "raw_stream": None, "superseded_logged": False}
-    diagnostic_token = None
+    diagnostic_context = None
 
     def _finish_diagnostic(response=None, error=None):
-        nonlocal diagnostic_token
-        if diagnostic_token is not None:
-            from agent.cache_prefix_diagnostics import finish_attempt
-            finish_attempt(diagnostic_token, response=response, error=error)
-            diagnostic_token = None
+        if diagnostic_context is not None:
+            relay_llm._finish_diagnostic(diagnostic_context, response=response, error=error)
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -1127,7 +1124,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         return bool(agent._interrupt_requested)
 
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
-        nonlocal diagnostic_token
+        nonlocal diagnostic_context
         from hermes_cli.providers import is_actual_route
 
         if is_actual_route(
@@ -1140,23 +1137,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
         final_kwargs = bypass_sdk_request_transform(stream_kwargs)
-        context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
-
-        def create(request: dict[str, Any]):
-            nonlocal diagnostic_token
-            if context is not None and context.codex_token is None:
-                context.codex_token = relay_llm._record_attempt(
-                    request, name=str(getattr(agent, "provider", "") or "codex"),
-                    model_name=str(model or ""), metadata=context.metadata,
-                    physical_send_ordinal=context.ordinal, scope=context.scope, count=False,
-                )
-            try:
-                return active_client.responses.create(**request)
-            finally:
-                if context is not None:
-                    diagnostic_token = context.codex_token
-
-        return create(final_kwargs)
+        diagnostic_context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        remove = (relay_llm._arm_dispatch(active_client, diagnostic_context)
+                  if diagnostic_context is not None else lambda: None)
+        try:
+            return active_client.responses.create(**final_kwargs)
+        finally:
+            remove()
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
@@ -1295,12 +1282,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 raise
             except _APIConnectionError as exc:
                 _finish_diagnostic(error=exc)
-                # The SDK wraps every connect/receive failure (``raise APIConnectionError from err``), so the
-                # raw ``transport_errors`` branch above never sees a pre-stream failure. Before the stream
-                # opened nothing is billed, so one fresh physical request is safe (#103673); once the writer
-                # token is claimed the inference may already be billed, so mid-stream failures still raise.
+                # Preserve the pre-stream transport retry policy (#103673), except WriteError:
+                # a partial write may already have reached the provider. Neither opening a stream
+                # nor a diagnostic request hook establishes completed writes or server acceptance.
                 if (attempt < max_stream_retries and writer_token["value"] is None
-                        and isinstance(exc.__cause__, _httpx.TransportError)):
+                        and isinstance(exc.__cause__, _httpx.TransportError)
+                        and not isinstance(exc.__cause__, _httpx.WriteError)):
                     logger.debug(
                         "Codex Responses pre-stream connect failed (attempt %s/%s); retrying. %s error=%s",
                         attempt + 1, max_stream_retries + 1, agent._client_log_context(), exc,

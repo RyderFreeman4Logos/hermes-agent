@@ -89,6 +89,25 @@ def test_component_change_changes_only_component_digest(tmp_path, monkeypatch):
     assert first["components"][0] == second["components"][0]
 
 
+def _sdk_sse_client(create):
+    """Exercise the production SDK and httpx hook; only the network is replaced."""
+    import httpx
+
+    class Events(httpx.SyncByteStream):
+        def __init__(self, events):
+            self.events = events
+
+        def __iter__(self):
+            for event in self.events:
+                yield ("data: " + json.dumps(event) + "\n\n").encode()
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=Events(create(**json.loads(request.content))))
+
+    return _real_codex_client(httpx.MockTransport(handler), max_retries=0)
+
+
 def test_real_sdk_boundary_stream_terminal_and_error(tmp_path, monkeypatch):
     from agent.codex_runtime import run_codex_stream
     enable(tmp_path, monkeypatch)
@@ -109,7 +128,7 @@ def test_real_sdk_boundary_stream_terminal_and_error(tmp_path, monkeypatch):
         seen.append(kwargs)
         assert len(rows(tmp_path)) == 0 if (tmp_path / "cache" / "codex-cache-prefix.jsonl").exists() else True
         return iter([{"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 4, "input_tokens_details": {"cached_tokens": 0}}}}])
-    client = SimpleNamespace(responses=SimpleNamespace(create=create), base_url="https://chatgpt.com/backend-api/codex")
+    client = _sdk_sse_client(create)
     result = run_codex_stream(agent, request(), client=client)
     assert result.status == "completed"
     assert seen and rows(tmp_path)[0]["ordinal"] == 2
@@ -162,7 +181,7 @@ def test_managed_rewrite_digest_matches_sdk_kwargs(tmp_path, monkeypatch):
         seen.append(kwargs)
         return iter([{"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 2, "input_tokens_details": {"cached_tokens": 0}}}}])
 
-    client = SimpleNamespace(responses=SimpleNamespace(create=create), base_url="https://chatgpt.com/backend-api/codex")
+    client = _sdk_sse_client(create)
     try:
         result = run_codex_stream(Agent(), request(), client=client)
     finally:
@@ -252,7 +271,7 @@ def test_delayed_trailing_drain_error_is_recorded_after_iterator_error(tmp_path,
         calls.append(kwargs)
         return DelayedTrailingFailure()
 
-    client = SimpleNamespace(responses=SimpleNamespace(create=create), base_url="https://chatgpt.com/backend-api/codex")
+    client = _sdk_sse_client(create)
     result = run_codex_stream(Agent(), request(), client=client)
     release_thread.join(2)
 
@@ -341,7 +360,7 @@ def test_insecure_existing_home_does_not_disrupt_provider(tmp_path, monkeypatch)
         seen.append(kwargs)
         return iter([{"type": "response.completed", "response": {"status": "completed"}}])
 
-    client = SimpleNamespace(responses=SimpleNamespace(create=create), base_url="https://chatgpt.com/backend-api/codex")
+    client = _sdk_sse_client(create)
     result = run_codex_stream(Agent(), request(), client=client)
     assert result.status == "completed"
     assert seen
@@ -371,25 +390,20 @@ def test_multiprocess_append_is_lossless(tmp_path, monkeypatch):
     assert len(rows(tmp_path)) == 4
 
 
-def test_codex_opener_counts_a_finished_create_not_its_start(tmp_path, monkeypatch):
+def test_unsupported_opener_never_invents_dispatch_evidence(tmp_path, monkeypatch):
     from agent import relay_llm
     from agent.codex_runtime import run_codex_stream
     import httpx
 
     enable(tmp_path, monkeypatch)
     contexts = []
-    real_send = relay_llm.physical_send
+    real_scope = relay_llm._diagnostic_scope
 
-    def capture(request, callback):
-        def wrapped(final):
-            context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
-            if context is not None and context not in contexts:
-                contexts.append(context)
-            return callback(final)
+    def capture(context):
+        contexts.append(context)
+        return real_scope(context)
 
-        return real_send(request, wrapped)
-
-    monkeypatch.setattr(relay_llm, "physical_send", capture)
+    monkeypatch.setattr(relay_llm, "_diagnostic_scope", capture)
 
     class Agent:
         provider = "openai-codex"
@@ -411,9 +425,8 @@ def test_codex_opener_counts_a_finished_create_not_its_start(tmp_path, monkeypat
     client = SimpleNamespace(responses=SimpleNamespace(create=refusing), base_url="https://chatgpt.com/backend-api/codex")
     with pytest.raises(TypeError, match="sdk build rejected"):
         run_codex_stream(Agent(), request(), client=client)
-    assert [context.ordinals for context in contexts] == [[0]]
-    row = rows(tmp_path)[0]
-    assert row["kind"] == "error" and "sdk build rejected" not in json.dumps(row)
+    assert [context.ordinals for context in contexts] == [[]]
+    assert not (tmp_path / "cache" / "codex-cache-prefix.jsonl").exists()
 
     contexts.clear()
 
@@ -427,9 +440,8 @@ def test_codex_opener_counts_a_finished_create_not_its_start(tmp_path, monkeypat
     client = SimpleNamespace(responses=SimpleNamespace(create=wrote), base_url="https://chatgpt.com/backend-api/codex")
     with pytest.raises(httpx.WriteError):
         run_codex_stream(Agent(), request(), client=client)
-    assert [context.ordinals for context in contexts] == [[0]]
-    row = rows(tmp_path)[1]
-    assert row["kind"] == "error" and "body reached" not in json.dumps(row)
+    assert [context.ordinals for context in contexts] == [[]]
+    assert not (tmp_path / "cache" / "codex-cache-prefix.jsonl").exists()
 
     contexts.clear()
     seen = []
@@ -441,7 +453,219 @@ def test_codex_opener_counts_a_finished_create_not_its_start(tmp_path, monkeypat
     client = SimpleNamespace(responses=SimpleNamespace(create=opened), base_url="https://chatgpt.com/backend-api/codex")
     result = run_codex_stream(Agent(), request(), client=client)
     assert result.status == "completed" and seen == [[]]
-    assert [context.ordinals for context in contexts] == [[0]]
+    assert [context.ordinals for context in contexts] == [[]]
+
+
+def _codex_agent():
+    class Agent:
+        provider = "openai-codex"
+        session_id = "session"
+        _current_api_request_id = "session:task:turn:api:0"
+        _interrupt_requested = False
+        _fallback_index = 0
+        model = "model"
+
+        def _is_codex_backend(self):
+            return True
+
+        def _fire_stream_delta(self, text):
+            pass
+
+        def _fire_reasoning_delta(self, text):
+            pass
+
+        def _touch_activity(self, text):
+            pass
+
+        def _client_log_context(self):
+            return "test"
+
+        def _buffer_diagnostic_status(self, text):
+            pass
+
+    return Agent()
+
+
+def _real_codex_client(transport, *, max_retries):
+    import httpx
+    from openai import OpenAI
+
+    http_client = httpx.Client(transport=transport)
+    return OpenAI(
+        api_key="test-key",
+        base_url="https://chatgpt.com/backend-api/codex",
+        http_client=http_client,
+        max_retries=max_retries,
+    )
+
+
+def test_real_client_prebuild_is_not_a_dispatch(tmp_path, monkeypatch):
+    """A TypeError before the SDK builds a request never reaches the httpx request hook."""
+    from agent import relay_llm
+    from agent.codex_runtime import run_codex_stream
+    import httpx
+
+    enable(tmp_path, monkeypatch)
+    contexts = []
+    real_scope = relay_llm._diagnostic_scope
+
+    def capture(context):
+        contexts.append(context)
+        return real_scope(context)
+
+    monkeypatch.setattr(relay_llm, "_diagnostic_scope", capture)
+    dispatches = []
+
+    def handler(request):
+        dispatches.append(request)
+        return httpx.Response(200, json={"id": "resp", "output": [], "status": "completed"})
+
+    client = _real_codex_client(httpx.MockTransport(handler), max_retries=0)
+    with pytest.raises(TypeError):
+        run_codex_stream(_codex_agent(), {"model": "model", "input": object()}, client=client)
+    assert dispatches == []
+    assert [context.ordinals for context in contexts] == [[]]
+    assert not (tmp_path / "cache").exists()
+
+
+def test_real_client_write_error_is_one_dispatch(tmp_path, monkeypatch):
+    """A WriteError after the request hook is one dispatch, not a later SDK return."""
+    from agent import relay_llm
+    from agent.codex_runtime import run_codex_stream
+    import httpx
+
+    enable(tmp_path, monkeypatch)
+    contexts = []
+    real_scope = relay_llm._diagnostic_scope
+
+    def capture(context):
+        contexts.append(context)
+        return real_scope(context)
+
+    monkeypatch.setattr(relay_llm, "_diagnostic_scope", capture)
+    dispatches = []
+
+    def handler(request):
+        dispatches.append(1)
+        raise httpx.WriteError("body reached the transport", request=request)
+
+    from openai import APIConnectionError
+
+    client = _real_codex_client(httpx.MockTransport(handler), max_retries=0)
+    try:
+        with pytest.raises(APIConnectionError) as raised:
+            run_codex_stream(_codex_agent(), request(), client=client)
+        assert isinstance(raised.value.__cause__, httpx.WriteError)
+        assert dispatches == [1]
+        assert [context.ordinals for context in contexts] == [[0]]
+        assert client._client.event_hooks["request"] == []
+        data = rows(tmp_path)
+        assert len(data) == 1 and data[0]["kind"] == "error"
+        assert data[0]["usage"]["cache_read"] is None
+        text = (tmp_path / "cache" / "codex-cache-prefix.jsonl").read_text()
+        assert "body reached" not in text
+        assert "chatgpt.com" not in text
+    finally:
+        client.close()
+
+
+def test_real_client_sdk_retries_are_distinct_dispatches(tmp_path, monkeypatch):
+    """Default SDK retries are separate hook fires inside one responses.create."""
+    from agent import relay_llm
+    from agent.codex_runtime import run_codex_stream
+    import httpx
+
+    enable(tmp_path, monkeypatch)
+    contexts = []
+    real_scope = relay_llm._diagnostic_scope
+
+    def capture(context):
+        contexts.append(context)
+        return real_scope(context)
+
+    monkeypatch.setattr(relay_llm, "_diagnostic_scope", capture)
+    dispatches = []
+
+    def handler(request):
+        dispatches.append(1)
+        if len(dispatches) < 3:
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"type":"response.completed","response":{"id":"resp","status":"completed",'
+                b'"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0}}}}\n\n'
+            ),
+        )
+
+    client = _real_codex_client(httpx.MockTransport(handler), max_retries=2)
+    result = run_codex_stream(_codex_agent(), request(), client=client)
+    assert result.status == "completed"
+    assert dispatches == [1, 1, 1]
+    assert [context.ordinals for context in contexts] == [[0, 1, 2]]
+    data = rows(tmp_path)
+    assert [row["dispatch_ordinal"] for row in data] == [0, 1, 2]
+    assert [row["kind"] for row in data] == ["error", "error", "terminal"]
+    assert all(row["usage"]["cache_read"] is None for row in data[:2])
+
+
+def test_cancelled_await_and_unfinished_future_are_not_dispatches():
+    """Cancel after the await starts, and a returned unfinished coroutine, never reach httpx."""
+    import asyncio
+    from agent import relay_llm
+
+    context = relay_llm._PhysicalDiagnosticContext("provider", "model", {"api_mode": "codex_responses"})
+
+    async def cancelled(_request):
+        raise asyncio.CancelledError
+
+    async def unfinished(_request):
+        raise AssertionError("a returned coroutine must not run")
+
+    with relay_llm._diagnostic_scope(context):
+        pending = relay_llm.physical_send({"n": 1}, cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(pending)
+        assert context.ordinals == []
+        returned = relay_llm.physical_send({"n": 2}, unfinished)
+        assert context.ordinals == []
+        returned.close()
+
+
+def test_dispatch_context_does_not_cross_calls():
+    """A hook armed for one client must not count a later call on another client."""
+    import httpx
+    from agent import relay_llm
+
+    first_hits = []
+    second_hits = []
+
+    def first_handler(request):
+        first_hits.append(1)
+        return httpx.Response(200, json={"ok": True})
+
+    def second_handler(request):
+        second_hits.append(1)
+        return httpx.Response(200, json={"ok": True})
+
+    first = httpx.Client(transport=httpx.MockTransport(first_handler))
+    second = httpx.Client(transport=httpx.MockTransport(second_handler))
+    context = relay_llm._PhysicalDiagnosticContext("provider", "model", {"api_mode": "chat_completions"})
+
+    def send(client):
+        def callback(_request, _client=client):
+            return _client.request("POST", "https://example.invalid/v1")
+        return callback
+
+    with relay_llm._diagnostic_scope(context):
+        relay_llm.physical_send({"n": 1}, send(first))
+        assert context.ordinals == [0]
+        relay_llm.physical_send({"n": 2}, send(second))
+    assert context.ordinals == [0, 1]
+    assert first_hits == [1] and second_hits == [1]
+    first.close()
+    second.close()
 
 
 def test_history_overflow_digest_distinguishes_same_count_suffix(tmp_path, monkeypatch):
@@ -459,3 +683,147 @@ def test_history_overflow_digest_distinguishes_same_count_suffix(tmp_path, monke
     assert first_overflow["key"] == second_overflow["key"] == "history:overflow"
     assert first_overflow["hmac"] != second_overflow["hmac"]
     assert first_overflow["bytes"] == len(diagnostics._encoded(first["input"][diagnostics._MAX_HISTORY:]))
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_transport_stage_digest_and_default_off(tmp_path, monkeypatch, enabled):
+    import httpx
+    from agent.codex_runtime import run_codex_stream
+
+    enable(tmp_path, monkeypatch)
+    monkeypatch.setattr(diagnostics, "_enabled", lambda: enabled)
+    sent = []
+    sentinel = "transport-stage-private-sentinel"
+
+    class Rewrite(httpx.Auth):
+        def auth_flow(self, built):
+            body = json.loads(built.content)
+            body["instructions"] = sentinel
+            yield httpx.Request(built.method, built.url, json=body)
+
+    def handler(built):
+        sent.append(json.loads(built.content))
+        return httpx.Response(200, headers={"content-type":"text/event-stream"},
+                             content=b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n')
+
+    client = _real_codex_client(httpx.MockTransport(handler), max_retries=0)
+    client._client.auth = Rewrite()
+    try:
+        assert run_codex_stream(_codex_agent(), request(), client=client).status == "completed"
+        assert len(sent) == 1
+        assert client._client.event_hooks["request"] == []
+        if not enabled:
+            assert not (tmp_path / "cache").exists()
+            return
+        data = rows(tmp_path)
+        assert len(data) == 1 and data[0]["dispatch_ordinal"] == 0
+        key = (tmp_path / "cache" / "codex-cache-prefix.key").read_bytes()
+        assert data[0]["components"] == diagnostics._components(sent[0], key)
+        assert sentinel not in json.dumps(data)
+        assert all(len(x["hmac"]) == 64 and isinstance(x["bytes"], int) for x in data[0]["components"])
+        for name in ("codex-cache-prefix.key", "codex-cache-prefix.jsonl"):
+            assert (tmp_path / "cache" / name).stat().st_mode & 0o777 == 0o600
+    finally:
+        client.close()
+
+
+def test_real_async_shared_client_dispatch_contexts(monkeypatch):
+    import asyncio
+    import httpx
+    from openai import AsyncOpenAI
+    from agent import relay_llm
+
+    contexts = []
+    scope = relay_llm._diagnostic_scope
+
+    def capture(context):
+        if all(existing is not context for existing in contexts):
+            contexts.append(context)
+        return scope(context)
+
+    monkeypatch.setattr(relay_llm, "_diagnostic_scope", capture)
+
+    async def run():
+        entered = 0
+        together = asyncio.Event()
+
+        async def handler(built):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                together.set()
+            await asyncio.wait_for(together.wait(), 2)
+            return httpx.Response(200, json={"id":"fixture", "object":"chat.completion", "created":0,
+                "model":"model", "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = AsyncOpenAI(api_key="fixture", base_url="https://example.invalid/v1", http_client=http, max_retries=0)
+
+            async def callback(request):
+                return await client.chat.completions.create(**request)
+
+            results = await asyncio.gather(*(relay_llm.execute_async(
+                {"model":"model", "messages":[{"role":"user","content":"fixture"}]}, callback,
+                name="provider", model_name="model", metadata={"api_mode":"chat_completions"},
+            ) for _ in range(2)))
+            assert len(results) == entered == 2
+            assert http.event_hooks["request"] == []
+
+    asyncio.run(run())
+    assert [context.ordinals for context in contexts] == [[0], [0]]
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_responses"])
+def test_public_auxiliary_call_observes_actual_dispatch(tmp_path, monkeypatch, api_mode):
+    import httpx
+    from agent import auxiliary_client, relay_llm
+
+    enable(tmp_path, monkeypatch)
+    contexts, sent = [], []
+    scope = relay_llm._diagnostic_scope
+
+    def capture(context):
+        if all(existing is not context for existing in contexts):
+            contexts.append(context)
+        return scope(context)
+
+    monkeypatch.setattr(relay_llm, "_diagnostic_scope", capture)
+
+    def handler(built):
+        sent.append(json.loads(built.content))
+        if api_mode == "chat_completions":
+            return httpx.Response(200, json={"id":"fixture", "object":"chat.completion", "created":0,
+                "model":"model", "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]})
+        item = {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]}
+        events = [
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+            {"type": "response.completed", "response": {
+                "status": "completed", "output": [item],
+                "usage": {"input_tokens": 12, "output_tokens": 1, "total_tokens": 13,
+                          "input_tokens_details": {"cached_tokens": 8}},
+            }},
+        ]
+        return httpx.Response(200, headers={"content-type":"text/event-stream"},
+                              content="".join("data: " + json.dumps(event) + "\n\n" for event in events).encode())
+
+    client = _real_codex_client(httpx.MockTransport(handler), max_retries=0)
+    # Replace network construction only; resolution, conversion, aux hooks and Relay run for real.
+    monkeypatch.setattr(auxiliary_client, "_create_openai_client", lambda **kwargs: client)
+    try:
+        result = auxiliary_client.call_llm(task="fixture", provider="custom", model="model",
+            base_url="https://example.invalid/v1", api_key="fixture", api_mode=api_mode,
+            messages=[{"role":"user", "content":"auxiliary-private-sentinel"}], timeout=5)
+        assert result.choices[0].message.content == "ok"
+        assert len(sent) == 1
+        assert [context.ordinals for context in contexts] == [[0]]
+        assert client._client.event_hooks["request"] == []
+        if api_mode == "codex_responses":
+            data = rows(tmp_path)
+            assert len(data) == 1 and data[0]["kind"] == "terminal"
+            key = (tmp_path / "cache" / "codex-cache-prefix.key").read_bytes()
+            assert data[0]["components"] == diagnostics._components(sent[0], key)
+            assert "auxiliary-private-sentinel" not in json.dumps(data)
+            assert data[0]["usage"]["cache_read"] == 8
+            assert result.usage.prompt_tokens == 12 and result.usage.total_tokens == 13
+    finally:
+        client.close()

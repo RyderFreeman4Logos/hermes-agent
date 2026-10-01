@@ -164,7 +164,7 @@ def test_exclusive_pool_refuses_ambient_routes_before_registry_child_constructio
 
 
 @pytest.mark.parametrize("route_kind", ["endpoint", "provider", "named"])
-@pytest.mark.parametrize("fallback", [None, [], [{"provider": "minimax", "model": "owned-backup"}]])
+@pytest.mark.parametrize("fallback", [None, [], [{"provider": "minimax", "model": "owned-backup", "api_key": "mm-owned"}]])
 @pytest.mark.parametrize("overrides", [None, {}, {"extra_body": {"tier_only": True}}])
 def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
     tmp_path, monkeypatch, route_kind, fallback, overrides,

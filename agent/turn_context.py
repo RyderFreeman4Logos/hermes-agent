@@ -999,6 +999,10 @@ def build_turn_context(
     compression."""
     from agent.turn_context_compaction import run_turn_start_compaction
 
+    # Keep this turn's receipt even if Stop/reset clears the live agent hook
+    # while prompt preparation is blocked. A cancelled input cannot become human input.
+    completion_ingest = getattr(agent, "_completion_queue_ingest", None)
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -1064,14 +1068,13 @@ def build_turn_context(
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)
-    # Append the user message now that close persistence is safe.
-    append_message(messages, user_msg)
-    # A queued structured completion is still only reserved until this real core
-    # row exists.  Queue publication, turn admission and context preparation are
-    # deliberately earlier boundaries and must not settle its process receipt.
-    completion_ingest = getattr(agent, "_completion_queue_ingest", None)
+    # Completion ownership must cover the actual append, not just its later ACK:
+    # Stop/reset may reclaim the receipt while this worker prepares its input.
     if callable(completion_ingest):
-        completion_ingest()
+        if not completion_ingest(lambda: append_message(messages, user_msg)):
+            raise InterruptedError("Completion input was reclaimed before insertion")
+    else:
+        append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 

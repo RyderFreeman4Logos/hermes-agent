@@ -1556,6 +1556,13 @@ def _run_conversation_turn(
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
+    except InterruptedError:
+        # A reclaimed completion never inserted a row; finish as cancellation,
+        # without a crash frame, provider call or turn-end persistence.
+        from agent.agent_runtime_helpers import note_turn_persisted
+        note_turn_persisted(agent)
+        return _partial_turn_result("", list(conversation_history or []), 0, interrupted=True,
+                                    turn_exit_reason="input_admission_interrupted")
 
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not

@@ -529,7 +529,7 @@ def test_receipt_callback_binds_to_agent_selected_by_preparation(monkeypatch):
         return "completion", "completion", 80, None
 
     def invoke(_sid, _session, st, *_args):
-        consumed.append(st.agent._completion_queue_ingest())
+        consumed.append(st.agent._completion_queue_ingest(lambda: None))
         st.result = {"final_response": "done", "messages": []}
 
     monkeypatch.setattr(server, "_prepare_turn_input", prepare)

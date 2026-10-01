@@ -1147,11 +1147,15 @@ def _run_prompt_submit(
             else:
                 prompt, run_message, cols, streamer = prepared
                 if completion_receipt:
-                    def commit_completion_receipt() -> bool:
+                    def commit_completion_receipt(insert) -> bool:
                         with _completion_ownership_lock(session):
                             active = session.get("_completion_active_receipt")
-                            if active is not completion_receipt:
+                            if (active is not completion_receipt
+                                    or session.get("_closing") or session.get("_finalized")
+                                    or int(session.get("_queued_prompt_generation", 0)) != int(
+                                        completion_receipt.get("generation", 0))):
                                 return False
+                            insert()
                             events = list(active.get("events") or [])
                             session.pop("_completion_active_receipt", None)
                             _mark_completion_events_consumed(events)

@@ -443,17 +443,16 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusi
         try:
             from hermes_cli.runtime_provider import resolve_runtime_provider
             runtime = resolve_runtime_provider(requested=v["provider"], target_model=v["model"])
-            if exclusive:
-                _require_pool_provider(v["provider"], runtime)
-                if _normalized_runtime_url(runtime.get("base_url")) != _normalized_runtime_url(v["base_url"]):
-                    raise ValueError("Provider request overrides belong to another endpoint.")
-            request_overrides = dict(runtime.get("request_overrides") or {}) or None
-
         except Exception as exc:
             logger.debug(
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",
                 v["provider"], exc,
             )
+        else:
+            if exclusive:
+                _require_pool_provider(v["provider"], runtime)
+            if not exclusive or _normalized_runtime_url(runtime.get("base_url")) == _normalized_runtime_url(v["base_url"]):
+                request_overrides = dict(runtime.get("request_overrides") or {}) or None
     # api_key None → inherited from parent in _build_child_agent
     return _credential_bundle(
         v["model"], provider, v["base_url"], v["api_key"], api_mode,

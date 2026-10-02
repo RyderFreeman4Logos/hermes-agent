@@ -221,6 +221,77 @@ def test_compressor_publication_failure_respects_commit(runtime, tmp_path, entry
         db.close()
 
 
+@pytest.mark.parametrize("boundary", ["complete", "durable_prefix"])
+def test_committed_fallback_refreshes_existing_feasibility(runtime, tmp_path, boundary):
+    from agent.conversation_compression import (
+        ensure_compression_feasibility_checked, revalidate_compression_feasibility,
+    )
+
+    agent = runtime({"extra_body": {"caller": {"items": ["kept"]}}})
+    cc = agent.context_compressor
+    agent._aux_compression_context_length_config = aux_context = 70000
+    revalidate_compression_feasibility(agent)
+    assert agent._compression_feasibility_checked is True
+    assert cc._aux_context_ceiling == cc.threshold_tokens == aux_context
+    agent._cached_system_prompt = "Model: gpt-4o\nProvider: custom:a"
+    agent._pending_fallback_notice = ["original notice"]
+    agent._consecutive_stale_streams = 4
+    primary = copy.deepcopy(agent._primary_runtime)
+    db = SessionDB(db_path=tmp_path / "feasibility.db")
+    try:
+        db.create_session("feasibility", source="cli")
+        cc.bind_session_state(db, "feasibility")
+        cc._record_ineffective_compression_verdict(2)
+        cc._fallback_compression_streak = 3
+        cc._persist_fallback_compression_streak()
+        cc._record_compression_failure_cooldown(300, "primary fault")
+        durable = db.get_session("feasibility")
+        update, clear = cc.update_model, cc._clear_compression_failure_cooldown
+
+        def completed_then_fail_b(**kwargs):
+            update(**kwargs)
+            if cc.provider == "custom:b":
+                raise RuntimeError("B-only completed publication fault")
+
+        def prefix_then_fail_b():
+            if cc.provider == "custom:b":
+                raise RuntimeError("B-only durable prefix fault")
+            clear()
+
+        fault = (patch.object(cc, "update_model", side_effect=completed_then_fail_b)
+                 if boundary == "complete" else patch.object(
+                     cc, "_clear_compression_failure_cooldown", side_effect=prefix_then_fail_b))
+        with fault:
+            assert agent._try_activate_fallback()
+        assert agent.provider == cc.provider == "custom:b"
+        assert agent.api_key == cc.api_key == "b-test-key"
+        assert str(agent.client.base_url).rstrip("/") == cc.base_url.rstrip("/")
+        assert agent._fallback_activated and agent._provider_fallback_active
+        assert agent._primary_runtime == primary
+        assert agent._pending_fallback_notice[0] == "original notice"
+        assert "custom:b" in agent._pending_fallback_notice[-1]
+        assert "custom:b" in agent._cached_system_prompt
+        assert agent._consecutive_stale_streams == 0
+        assert _request_body(agent) == {"b_only": {"items": ["b"]}, "caller": {"items": ["kept"]}}
+        assert db.get_compression_ineffective_count("feasibility") == 0
+        assert db.get_compression_fallback_streak("feasibility") == 0
+        if boundary == "durable_prefix":
+            expected = dict(durable, compression_ineffective_count=0, compression_fallback_streak=0)
+            assert db.get_session("feasibility") == expected
+        else:
+            assert db.get_compression_failure_cooldown("feasibility") is None
+        assert cc._aux_context_ceiling == cc.threshold_tokens == aux_context
+        ensure_compression_feasibility_checked(agent, 100000)
+        assert cc.threshold_tokens <= aux_context
+        assert agent._compression_feasibility_checked is True
+        assert agent._restore_primary_runtime()
+        assert agent.provider == cc.provider == "custom:a"
+        assert cc._aux_context_ceiling == cc.threshold_tokens == aux_context
+        assert agent.request_overrides == primary["request_overrides"]
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("overrides", [None, {}, {"extra_body": {"caller": {"items": ["kept"]}}}])
 def test_constructor_and_switch_own_override_graphs(runtime, overrides):
     caller_before = copy.deepcopy(overrides)

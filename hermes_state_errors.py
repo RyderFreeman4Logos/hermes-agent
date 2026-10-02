@@ -24,7 +24,7 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     )
 
 
-# SQLITE_IOERR as a substring (wrapped strings still classify).
+# Legacy code-less SQLITE_IOERR messages start with this engine phrase.
 _DISK_IO_ERROR_MARKER = "disk i/o error"
 
 # "Store BUSY, not gone" — HTTP callers map these to 503 instead of 500. Corruption
@@ -62,15 +62,22 @@ def _is_no_more_rows(exc: sqlite3.Error) -> bool:
     return "no more rows available" in str(exc).lower()
 
 
-def is_transient_sqlite_error(exc: BaseException) -> bool:
-    """HTTP busy/unavailable classification; known codes outrank message text.
-    IOERR is unavailable too, but is not permission to replay a write callback."""
+def is_sqlite_io_error(exc: BaseException) -> bool:
+    """IOERR availability/read-retry signal, never permission to replay a started write."""
     if not isinstance(exc, sqlite3.OperationalError):
         return False
     code = _sqlite_primary_code(exc)
     if code is not None:
-        return code in (*_SQLITE_LOCK_CODES, sqlite3.SQLITE_IOERR)
-    return is_sqlite_lock_error(exc) or str(exc).lower().startswith(_DISK_IO_ERROR_MARKER)
+        return code == sqlite3.SQLITE_IOERR
+    return str(exc).lower().startswith(_DISK_IO_ERROR_MARKER)
+
+
+def is_transient_sqlite_error(exc: BaseException) -> bool:
+    """HTTP busy/unavailable classification; known codes outrank message text.
+    IOERR is unavailable too, but is not permission to replay a write callback."""
+    return isinstance(exc, sqlite3.OperationalError) and (
+        is_sqlite_lock_error(exc) or is_sqlite_io_error(exc)
+    )
 
 
 def is_malformed_schema_error(exc: BaseException) -> bool:

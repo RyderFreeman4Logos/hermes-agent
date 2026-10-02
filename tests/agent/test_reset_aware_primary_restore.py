@@ -325,20 +325,22 @@ def _codex_runtime(agent, model, provider="openai-codex"):
     }
 
 
-class _ProbePool(_FakePool):
-    """Attached pool whose early-reopen probe is a stub, never a network call."""
+class _ProbePool(_FakePool, CredentialPool):
+    """Real selection/reclaim, with only the quota probe and reset clock stubbed."""
 
     def __init__(self, provider, next_at, *, probe):
-        super().__init__(provider, next_at=next_at)
+        _FakePool.__init__(self, provider, next_at=next_at)
+        self._current = _entry(provider=provider)
+        CredentialPool.__init__(self, provider, [self._current])
+        self._current_id = self._current.id
         self._probe = probe
         self.probed = []
-        self._current = object()
 
     def current(self):
-        return self._current
+        return CredentialPool.current(self)
 
-    def select(self, **_kwargs):
-        return self._current if self._probe is True else None
+    def select(self, **kwargs):
+        return CredentialPool.select(self, **kwargs) if self._probe is True else None
 
     def _codex_quota_restored_upstream(self, entry):
         self.probed.append(entry)

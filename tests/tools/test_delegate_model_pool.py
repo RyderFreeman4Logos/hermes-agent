@@ -149,6 +149,8 @@ class TestModelProfileResolution:
 
     def test_profile_fallback_drops_unauthenticated_cloud_hop(self, monkeypatch):
         """A hop cannot borrow another provider's ambient key; its scoped key is accepted."""
+        from hermes_cli.fallback_config import resolve_entry_api_key
+
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-owned-by-openrouter")
         profile = dict(STANDARD_POOL["standard"])
@@ -174,7 +176,9 @@ class TestModelProfileResolution:
         assert "error" not in payload
         chain = captured["fallback_model"]
         assert [entry["model"] for entry in chain] == ["or-scoped"]
-        assert chain[0]["api_key"] == "sk-or-profile-owned"
+        assert chain[0]["key_env"] == "PROFILE_OR_KEY"
+        assert "api_key" not in chain[0]
+        assert resolve_entry_api_key(chain[0]) == "sk-or-profile-owned"
 
     def test_profile_fallback_presence_excludes_global_policy_and_keeps_owned_chain(self):
         route = {key: value for key, value in STANDARD_POOL["standard"].items()

@@ -490,3 +490,66 @@ def test_model_bench_blocks_current_entry_reopen(monkeypatch):
     assert agent.api_key == "fallback-key"
     assert agent._credential_pool_entry_id is None
     assert pool.next_available_at(model="gpt-5.5") == next_before
+
+
+def test_future_restore_keeps_the_one_selected_entry(monkeypatch, tmp_path):
+    """The gate's selected credential is the one restore publishes. One selection."""
+    from agent.credential_pool import CredentialPool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    future = time.time() + 6 * 86400
+    pool = CredentialPool("openai-codex", [
+        _codex_entry("first", _EXPIRED, status="exhausted", reset_at=future),
+        _codex_entry("second", "fixture-second", status="exhausted", reset_at=future),
+    ])
+    pool._current_id = "first"
+    pool._strategy = "round_robin"
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    chosen = []
+    original = pool.select
+
+    def observe(**kwargs):
+        entry = original(**kwargs)
+        chosen.append(None if entry is None else entry.id)
+        return entry
+
+    pool.select = observe
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is True
+    assert chosen == ["first"]
+    assert agent._credential_pool_entry_id == "first"
+    assert agent.api_key == agent.client.api_key == _FRESH
+    assert pool.current().id == "first"
+    assert next(item for item in pool.entries() if item.id == "first").request_count == 1
+
+
+def test_revoked_future_admission_does_not_publish_snapshot(monkeypatch, tmp_path):
+    """A peer bench during rebuild stops publication and leaves fallback in place."""
+    from agent.credential_pool import CredentialPool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    entry = _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=time.time() + 6 * 86400)
+    pool = CredentialPool("openai-codex", [entry])
+    pool._current_id = entry.id
+    _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    agent = _exhausted_codex_agent(pool)
+    original = agent._create_openai_client
+
+    def peer_bench(kwargs, *, reason, shared):
+        if reason == "restore_primary":
+            live = pool.current()
+            rotated = pool.mark_exhausted_and_rotate(
+                status_code=400, failure_reason="model_entitlement", model="gpt-5.5",
+                credential_id=live.id, api_key_hint=live.access_token,
+            )
+            assert rotated is None
+        return original(kwargs, reason=reason, shared=shared)
+
+    agent._create_openai_client = peer_bench
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert agent.api_key == "fallback-key"
+    assert agent._credential_pool_entry_id is None
+    assert pool.has_available(model="gpt-5.5") is False

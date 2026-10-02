@@ -152,6 +152,8 @@ class TestRestorePrimaryPoolReselect:
 _CODEX_URL = "https://chatgpt.com/backend-api/codex"
 _STALE = "fixture-stale-snapshot"
 _FRESH = "fixture-refreshed-approved"
+# Expired synthetic JWT so the real pre-probe refresh helper rotates it. Not a secret.
+_EXPIRED = "e30.eyJleHAiOjF9.e"
 
 
 def _codex_entry(entry_id, token, *, status="ok", reset_at=None, refresh="fixture-refresh"):
@@ -233,9 +235,9 @@ def _exhausted_codex_agent(pool, *, snapshot_token=_STALE):
     return agent
 
 
-def _patch_probe(monkeypatch, *, fresh=None, open_=True):
+def _patch_probe(monkeypatch, *, fresh=None, open_=True, persist=True, force_expiring=False):
     """Stub only the auth-refresh and quota-transport boundaries. Tokens are fixtures."""
-    calls = {"refresh": 0, "probe": 0}
+    calls = {"refresh": 0, "probe": 0, "open": open_}
 
     def _pure(token, refresh_token, **_kwargs):
         calls["refresh"] += 1
@@ -246,16 +248,19 @@ def _patch_probe(monkeypatch, *, fresh=None, open_=True):
     def _probe(token, *, base_url=None):
         calls["probe"] += 1
         calls["probed_token"] = token
-        return open_
+        return calls["open"]
 
     monkeypatch.setattr("hermes_cli.auth_codex.refresh_codex_oauth_pure", _pure)
     monkeypatch.setattr("hermes_cli.auth._probe_codex_quota_restored", _probe)
-    monkeypatch.setattr("hermes_cli.auth_codex._codex_access_token_is_expiring", lambda token, skew: fresh is not None)
+    if force_expiring:
+        # Non-JWT fixture tokens cannot satisfy the real expiry check.
+        monkeypatch.setattr("hermes_cli.auth_codex._codex_access_token_is_expiring", lambda token, skew: True)
     monkeypatch.setattr(
         "agent.credential_pool.CredentialPool._sync_device_code_entry_to_auth_store",
         lambda self, entry: None,
     )
-    monkeypatch.setattr("agent.credential_pool.CredentialPool._persist", lambda self, **k: None)
+    if not persist:
+        monkeypatch.setattr("agent.credential_pool.CredentialPool._persist", lambda self, **k: None)
     monkeypatch.setattr("agent.credential_pool.CredentialPool._sync_entry_from_auth_store", lambda self, entry: entry)
     monkeypatch.setattr("agent.credential_pool.CredentialPool._resync_stale_entry", lambda self, entry: entry)
     return calls
@@ -269,7 +274,7 @@ def test_refresh_before_probe_restores_the_approved_entry(monkeypatch):
     entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=future)
     pool = CredentialPool("openai-codex", [entry])
     pool._current_id = entry.id
-    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
     agent = _exhausted_codex_agent(pool)
 
     assert agent._restore_primary_runtime() is True
@@ -302,7 +307,7 @@ def test_ordinary_post_429_reopen_adopts_the_approved_entry(monkeypatch):
     )
     assert rotated is None
     assert pool.current() is None
-    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
     agent = _exhausted_codex_agent(pool)
 
     assert agent._restore_primary_runtime() is True
@@ -322,7 +327,7 @@ def test_closed_probe_after_refresh_does_not_restore(monkeypatch):
     entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=future)
     pool = CredentialPool("openai-codex", [entry])
     pool._current_id = entry.id
-    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=False)
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=False, force_expiring=True)
     agent = _exhausted_codex_agent(pool)
 
     assert agent._restore_primary_runtime() is False
@@ -338,7 +343,7 @@ def test_wrong_provider_pool_is_not_probed(monkeypatch):
 
     entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=time.time() + 86400)
     pool = CredentialPool("openrouter", [entry])
-    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
     agent = _exhausted_codex_agent(pool)
 
     assert agent._restore_primary_runtime() is True
@@ -353,7 +358,7 @@ def test_delegated_fixed_key_does_not_adopt_pool(monkeypatch):
     entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=time.time() + 86400)
     pool = CredentialPool("openai-codex", [entry])
     pool._current_id = entry.id
-    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
     agent = _exhausted_codex_agent(pool)
     agent._delegation_fixed_api_key = True
 
@@ -372,7 +377,7 @@ def test_prefetched_pool_is_loaded_once_then_adopts_refreshed_entry(monkeypatch)
     entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=future)
     primary = CredentialPool("openai-codex", [entry])
     attached = CredentialPool("openrouter", [_codex_entry("other", "fixture-other")])
-    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
     loads = {"n": 0}
 
     def _load(key):
@@ -390,3 +395,98 @@ def test_prefetched_pool_is_loaded_once_then_adopts_refreshed_entry(monkeypatch)
     assert agent._credential_pool_entry_id == "owned-1"
     assert agent._credential_pool is primary
     assert load_pool is not None
+
+
+def test_reexhaustion_after_reopen_stays_blocked(monkeypatch):
+    """One reopening authorizes that admission only. A later 429 bench must stick."""
+    from agent.credential_pool import CredentialPool
+
+    future = time.time() + 86400
+    entry = _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=future)
+    pool = CredentialPool("openai-codex", [entry])
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False)
+    assert pool.select(model="gpt-5.5") is not None
+    assert calls["probe"] == 1
+    calls["probe"] = 0
+    calls["open"] = False
+
+    def _closed(token, *, base_url=None):
+        calls["probe"] += 1
+        calls["probed_token"] = token
+        return False
+
+    monkeypatch.setattr("hermes_cli.auth._probe_codex_quota_restored", _closed)
+    rotated = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"reason": "usage_limit_reached", "message": "quota", "reset_at": time.time() + 86400},
+        credential_id="owned-1",
+        api_key_hint=pool.current().access_token,
+    )
+    assert rotated is None
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert pool.current() is None
+    assert pool.entries()[0].last_status == "exhausted"
+    assert pool.has_available(model="gpt-5.5") is False
+
+
+def test_later_persisted_generation_is_not_overwritten(monkeypatch):
+    """A peer's newer access/refresh pair stays the selected credential."""
+    from dataclasses import replace
+
+    from agent.credential_pool import CredentialPool
+    from hermes_cli.auth import write_credential_pool
+
+    entry = _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=time.time() + 86400)
+    pool = CredentialPool("openai-codex", [entry])
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    selected = pool.select(model="gpt-5.5")
+    assert selected is not None and selected.access_token == _FRESH
+    newer = replace(
+        pool.current(),
+        access_token="fixture-newer-access",
+        refresh_token="fixture-newer-refresh",
+    )
+    write_credential_pool("openai-codex", [newer.to_dict()])
+    pool._persist()
+    assert pool.current().access_token == "fixture-newer-access"
+    assert pool.current().refresh_token == "fixture-newer-refresh"
+    calls["probe"] = 0
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is True
+    assert calls["probe"] == 0
+    assert agent.client.api_key == "fixture-newer-access"
+    assert agent.api_key == "fixture-newer-access"
+    live = pool.current()
+    assert live.access_token == "fixture-newer-access"
+    assert live.refresh_token == "fixture-newer-refresh"
+
+
+def test_model_bench_blocks_current_entry_reopen(monkeypatch):
+    """Account quota reopening does not publish a still-benched primary model."""
+    from dataclasses import replace
+
+    from agent.credential_pool import CredentialPool
+
+    future = time.time() + 86400
+    entry = replace(
+        _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=future),
+        model_cooldowns={"gpt-5.5": future},
+    )
+    pool = CredentialPool("openai-codex", [entry])
+    pool._current_id = entry.id
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
+    agent = _exhausted_codex_agent(pool, snapshot_token=_STALE)
+    next_before = pool.next_available_at(model="gpt-5.5")
+
+    assert agent._restore_primary_runtime() is False
+    assert calls["probe"] >= 1
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert agent.api_key == "fallback-key"
+    assert agent._credential_pool_entry_id is None
+    assert pool.next_available_at(model="gpt-5.5") == next_before

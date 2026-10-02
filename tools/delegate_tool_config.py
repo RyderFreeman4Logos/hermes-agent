@@ -423,8 +423,11 @@ def _model_pool_errors(pool: Any) -> List[str]:
         errors.append("delegation.model_pool is non-empty but has no 'standard' profile")
     return errors
 
-def _require_pool_provider(configured_provider: Optional[str], runtime: dict) -> None:
-    """A named tier may not use the general resolver's ambient fallback."""
+def _require_pool_provider(
+    configured_provider: Optional[str], runtime: dict, *, explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> None:
+    """Validate named identity or an unnamed local alias's hop-owned endpoint/key."""
     if not isinstance(runtime, dict):
         raise ValueError(f"Delegation model_pool provider '{configured_provider}' did not resolve runtime credentials.")
     from hermes_cli.providers import normalize_provider, custom_provider_aliases
@@ -438,6 +441,13 @@ def _require_pool_provider(configured_provider: Optional[str], runtime: dict) ->
     if not named and alias_provider != "custom" and requested != "auto" and resolved != "custom" and _same_registered_provider(resolved, requested):
         return
     if resolved == "custom":
+        # Registry aliases share generic custom routing only when no named
+        # declaration owns the name. Never borrow an endpoint or ambient key.
+        if (not named and requested == "custom" and explicit_base_url
+                and _normalized_runtime_url(explicit_base_url) == _normalized_runtime_url(runtime.get("base_url"))
+                and runtime.get("source") == "direct-alias"
+                and runtime.get("api_key") == (explicit_api_key or "no-key-required")):
+            return
         if named and _normalized_runtime_url(named.get("base_url")) == _normalized_runtime_url(runtime.get("base_url")):
             # Named custom credentials must be declared by that provider, not
             # discovered from a host-gated ambient key or a parent route.
@@ -447,7 +457,7 @@ def _require_pool_provider(configured_provider: Optional[str], runtime: dict) ->
             if (pool_key in custom_provider_aliases(named.get("name") or "", named.get("provider_key") or "")
                     and runtime.get("source") == f"pool:{pool_key}" and runtime.get("api_key")):
                 return
-            owned_key = named.get("api_key") or _key_env_secret(named, "delegation model_pool")
+            owned_key = explicit_api_key or named.get("api_key") or _key_env_secret(named, "delegation model_pool")
             # The resolver-owned rung identifies the declaration. Its request
             # tag may have been overwritten; equal endpoints/keys are not identity.
             owns_identity = runtime.get("source") == f"custom_provider:{named.get('provider_key') or named.get('name')}"

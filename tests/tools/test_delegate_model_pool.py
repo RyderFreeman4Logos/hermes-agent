@@ -40,10 +40,10 @@ STANDARD_POOL = {
         "base_url": "http://127.0.0.1:9/v1",
         "api_key": "profile-key",
         "fallback_chain": [
-            {"provider": "openrouter", "model": "fb-one"},
-            {"provider": "openrouter", "model": "fb-two"},
-            {"provider": "openrouter", "model": "fb-three"},
-            {"provider": "openrouter", "model": "fb-four"},
+            {"provider": "openrouter", "model": "fb-one", "api_key": "sk-or-test"},
+            {"provider": "openrouter", "model": "fb-two", "api_key": "sk-or-test"},
+            {"provider": "openrouter", "model": "fb-three", "api_key": "sk-or-test"},
+            {"provider": "openrouter", "model": "fb-four", "api_key": "sk-or-test"},
         ],
     },
     "test": {
@@ -147,6 +147,39 @@ class TestModelProfileResolution:
         ]
         assert all(e["model"] != "gpt-5.6-terra" for e in chain)
 
+    def test_profile_fallback_drops_unauthenticated_cloud_hop(self, monkeypatch):
+        """A hop cannot borrow another provider's ambient key; its scoped key is accepted."""
+        from hermes_cli.fallback_config import resolve_entry_api_key
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-owned-by-openrouter")
+        profile = dict(STANDARD_POOL["standard"])
+        profile["fallback_chain"] = [
+            {"provider": "xai", "model": "grok-unauth"},
+            {"provider": "openrouter", "model": "or-scoped", "key_env": "PROFILE_OR_KEY"},
+        ]
+        monkeypatch.setenv("PROFILE_OR_KEY", "sk-or-profile-owned")
+        cfg = dict(PINNED_CFG)
+        cfg["model_pool"] = {"standard": profile, "test": STANDARD_POOL["test"]}
+        parent = _parent()
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            child = MagicMock()
+            child.run_conversation.return_value = {"final_response": "ok", "completed": True, "api_calls": 1}
+            return child
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch("run_agent.AIAgent", side_effect=capture):
+            raw = delegate_task(goal="do work", parent_agent=parent, model_profile="standard")
+        payload = json.loads(raw)
+        assert "error" not in payload
+        chain = captured["fallback_model"]
+        assert [entry["model"] for entry in chain] == ["or-scoped"]
+        assert chain[0]["key_env"] == "PROFILE_OR_KEY"
+        assert "api_key" not in chain[0]
+        assert resolve_entry_api_key(chain[0]) == "sk-or-profile-owned"
+
     def test_profile_fallback_presence_excludes_global_policy_and_keeps_owned_chain(self):
         route = {key: value for key, value in STANDARD_POOL["standard"].items()
                  if key != "fallback_chain"}
@@ -155,7 +188,7 @@ class TestModelProfileResolution:
             (None, declared, []),
             (None, None, []),
             ([], declared, []),
-            ([{"provider": "openrouter", "model": "profile-backup"}], declared, ["profile-backup"]),
+            ([{"provider": "openrouter", "model": "profile-backup", "api_key": "sk-or-test"}], declared, ["profile-backup"]),
         ):
             profile = dict(route)
             if profile_chain is not None:
@@ -265,7 +298,7 @@ class TestModelProfileResolution:
 class TestBuildChildOverrideChain:
     def test_override_fallback_chain_beats_parent_inherit(self):
         parent = _parent()
-        profile_chain = [{"provider": "openrouter", "model": "fb-one"}]
+        profile_chain = [{"provider": "openrouter", "model": "fb-one", "api_key": "sk-or-test"}]
         with patch("run_agent.AIAgent") as mock_agent:
             mock_agent.return_value = MagicMock()
             _build_child_agent(
@@ -513,7 +546,7 @@ class TestLiveConfigReread:
                         "base_url": "http://127.0.0.1:9/v1",
                         "api_key": "profile-key",
                         "fallback_chain": [
-                            {"provider": "openrouter", "model": "new-fb"}
+                            {"provider": "openrouter", "model": "new-fb", "api_key": "sk-or-test"}
                         ],
                     }
                 },

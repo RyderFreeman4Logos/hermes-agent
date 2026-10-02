@@ -15,19 +15,26 @@ def _normalized_base_url(value: Any) -> str:
 def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
     """API key for one fallback entry: inline ``api_key``, else ``key_env``.
 
-    Mirrors the custom-provider convention (``api_key_env`` accepted as alias); None when neither
-    yields a value so ``resolve_runtime_provider`` falls through to standard credential resolution.
-    ``key_env`` goes through ``agent.secret_scope.get_secret``, not raw ``os.getenv``: in a
-    multiplexed gateway a bare env read ignores the active profile's scope and can return another
-    profile's credential.
+    ``api_key_env`` is an alias. A winning inline key ignores env references; otherwise every
+    present reference must be a nonblank string (including when the other alias is valid).
+    Null/blank references and missing/invalid scoped secrets raise fixed-message ValueError,
+    never permission to borrow provider defaults. Only absent references return None.
+    References are read through ``agent.secret_scope.get_secret`` on every call, so rotation
+    and profile scope remain live rather than pinning admission-time credentials.
     """
     if not isinstance(entry, dict):
         return None
     if inline := str(entry.get("api_key") or "").strip():
         return inline
-    if key_env := str(entry.get("key_env") or entry.get("api_key_env") or "").strip():
+    references = [entry[field] for field in ("key_env", "api_key_env") if field in entry]
+    if any(not isinstance(value, str) or not value.strip() for value in references):
+        raise ValueError("Invalid fallback credential reference")
+    if references:
         from agent.secret_scope import get_secret
-        return (get_secret(key_env) or "").strip() or None
+        key = get_secret(references[0].strip())
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("Fallback entry's configured credential is unavailable")
+        return key.strip()
     return None
 
 

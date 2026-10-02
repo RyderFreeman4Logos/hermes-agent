@@ -164,12 +164,13 @@ def test_exclusive_pool_refuses_ambient_routes_before_registry_child_constructio
 
 
 @pytest.mark.parametrize("route_kind", ["endpoint", "provider", "named"])
-@pytest.mark.parametrize("fallback", [None, [], [{"provider": "minimax", "model": "owned-backup"}]])
+@pytest.mark.parametrize("fallback", [None, [], [{"provider": "minimax", "model": "owned-backup", "api_key": "mm-owned"}]])
 @pytest.mark.parametrize("overrides", [None, {}, {"extra_body": {"tier_only": True}}])
 def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
     tmp_path, monkeypatch, route_kind, fallback, overrides,
 ):
     from tools.registry import registry
+    from hermes_cli.runtime_provider import resolve_runtime_provider
     import yaml
 
     parent = _parent()
@@ -228,7 +229,10 @@ def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
             # provider's credential discovery is the only mocked auth boundary.
             runtime = {"provider": "openrouter", "base_url": f"https://tier-{home.name}.invalid/v1",
                        "api_key": f"owned-{home.name}", "api_mode": "chat_completions"}
-            resolver = patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime)
+            resolver = patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=lambda **kw: runtime if kw.get("requested") == "openrouter" else resolve_runtime_provider(**kw),
+            )
             if route_kind == "provider":
                 resolver.start()
             try:

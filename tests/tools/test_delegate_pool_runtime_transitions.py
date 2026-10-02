@@ -96,7 +96,7 @@ def test_public_fallback_restore_uses_only_primary_owner(tmp_path, direct, fixed
     primary_overrides = {"extra_body": {"route": "primary"}}
     route = {"provider": "owner-b", "model": "fixture-primary-m", "api_mode": "chat_completions",
              "request_overrides": primary_overrides,
-             "fallback_chain": [{"provider": "owner-a", "model": "fixture-fallback-m"}]}
+             "fallback_chain": [{"provider": "owner-a", "model": "fixture-fallback-m", "api_key": "fixture-owner-a"}]}
     if direct:
         route["base_url"] = URL
     if fixed:
@@ -162,3 +162,134 @@ def test_public_fallback_restore_uses_only_primary_owner(tmp_path, direct, fixed
                 load.assert_called_once_with("owner-b")
         finally:
             child.close()
+
+
+@pytest.mark.parametrize("credential", ["inline", "key_env", "provider", "callable"])
+@pytest.mark.parametrize("owner", ["owner-b", "owner-a"])
+@pytest.mark.parametrize("pool_enabled", [True, False])
+def test_public_fallback_ownership_across_scopes(tmp_path, monkeypatch, credential, owner, pool_enabled):
+    """Explicit hop keys cannot waive identity, even on equal-URL named routes."""
+    import hermes_yaml as yaml
+    from hermes_cli.fallback_config import resolve_entry_api_key
+    from agent.secret_scope import (
+        is_multiplex_active, reset_secret_scope, set_multiplex_active, set_secret_scope,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from tools.registry import registry
+
+    monkeypatch.setenv("FALLBACK_TEST_KEY", "fixture-launch-profile")
+    previous_mode = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        for scope in ("a", "b", "a"):
+            home = tmp_path / scope
+            home.mkdir(exist_ok=True)
+            expected_key = f"fixture-hop-{scope}"
+            hop = {"provider": "owner-b", "model": "bare-model"}
+            if credential == "inline":
+                hop["api_key"] = expected_key
+            elif credential == "key_env":
+                hop["key_env"] = "FALLBACK_TEST_KEY"
+            providers = {name: {"base_url": URL, "api_key": f"fixture-{name}-{scope}"}
+                         for name in ("owner-a", "owner-b")}
+            if credential == "callable":
+                for value in providers.values():
+                    value.pop("api_key")
+                    value["key_cmd"] = "fixture-command-not-executed"
+            (home / "config.yaml").write_text(yaml.safe_dump({
+                "providers": providers,
+                "delegation": {"model_pool": {"standard": {
+                    "provider": "custom", "model": "primary-model",
+                    "base_url": "http://127.0.0.1:9/v1", "api_key": "fixture-primary",
+                    "fallback_chain": [hop],
+                }}},
+            }))
+            home_token = set_hermes_home_override(home)
+            secret_token = set_secret_scope({"FALLBACK_TEST_KEY": expected_key}, profile_home=str(home))
+            captured, runtimes = [], []
+            token_provider = MagicMock(return_value="fixture-token-not-requested")
+
+            def resolve(**kwargs):
+                # Resolve a real named declaration, then simulate a resolver identity fault.
+                runtime = resolve_runtime_provider(**{**kwargs, "requested": owner})
+                runtime["requested_provider"] = kwargs["requested"]
+                runtimes.append(runtime)
+                return runtime
+
+            def build(**kwargs):
+                captured.append(kwargs)
+                return SimpleNamespace(**kwargs, _credential_pool=None, session_id="offline-child")
+
+            try:
+                with ExitStack() as stack:
+                    if not pool_enabled:
+                        stack.enter_context(patch("hermes_cli.runtime_provider._try_resolve_from_custom_pool", return_value=None))
+                    stack.enter_context(patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=resolve))
+                    stack.enter_context(patch("agent.command_token_source.build_command_token_provider", return_value=token_provider))
+                    stack.enter_context(patch("run_agent.AIAgent", side_effect=build))
+                    stack.enter_context(patch("tools.delegate_tool._run_batch", return_value='{"offline":true}'))
+                    raw = registry.dispatch("delegate_task", {"goal": "owned fallback"}, parent_agent=parent())
+                    result = json.loads(raw) if isinstance(raw, str) else raw
+                assert result == {"offline": True}
+                assert captured[0]["model"] == "primary-model"
+                chain = captured[0]["fallback_model"]
+                assert bool(chain) is (owner == "owner-b")
+                assert runtimes[0]["source"] in {f"custom_provider:{owner}", f"pool:custom:{owner}"}
+                if owner == "owner-b":
+                    assert chain[0]["provider"] == "owner-b"
+                    if credential in {"inline", "key_env"}:
+                        assert resolve_entry_api_key(chain[0]) == expected_key
+                        if credential == "key_env":
+                            assert chain[0]["key_env"] == "FALLBACK_TEST_KEY"
+                            assert "api_key" not in chain[0]
+                    elif credential == "callable":
+                        assert runtimes[0]["api_key"] is token_provider
+                    else:
+                        assert runtimes[0]["api_key"] == f"fixture-owner-b-{scope}"
+                token_provider.assert_not_called()
+                assert all(entry.get("api_key") != "fixture-launch-profile" for entry in chain)
+            finally:
+                reset_secret_scope(secret_token)
+                reset_hermes_home_override(home_token)
+    finally:
+        set_multiplex_active(previous_mode)
+
+
+@pytest.mark.parametrize("failure", ["auth", "resolver", "identity"])
+def test_public_fallback_diagnostic_is_actionable_without_error_payload(tmp_path, caplog, failure):
+    from hermes_cli.auth import AuthError
+    from tools.registry import registry
+
+    canary = "opaque-secret-canary"
+    install_config(tmp_path, {
+        "provider": "custom", "model": "primary-model", "base_url": "http://127.0.0.1:9/v1",
+        "api_key": "fixture-primary", "fallback_chain": [{"provider": "owner-b", "model": "bare-model"}],
+    })
+    captured = []
+
+    def build(**kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(**kwargs, _credential_pool=None, session_id="offline-child")
+
+    fault = {
+        "auth": {"side_effect": AuthError(f"Bearer {canary} https://user:{canary}@private.invalid", code=canary)},
+        "resolver": {"side_effect": OSError(canary)},
+        "identity": {"return_value": {"provider": "custom", "base_url": URL, "api_key": canary,
+                                       "source": "custom_provider:owner-a"}},
+    }[failure]
+    with caplog.at_level("INFO", logger="tools.delegate_tool"), \
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", **fault), \
+            patch("run_agent.AIAgent", side_effect=build), \
+            patch("tools.delegate_tool._run_batch", return_value='{"offline":true}'):
+        raw = registry.dispatch("delegate_task", {"goal": "safe reason"}, parent_agent=parent())
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    assert result == {"offline": True}
+    assert captured[0]["fallback_model"] == []
+    assert canary not in caplog.text
+    assert "private.invalid" not in caplog.text
+    assert {
+        "auth": "authentication failed; configure credentials or run hermes auth",
+        "resolver": "runtime resolution failed; check provider configuration",
+        "identity": "provider ownership mismatch; check provider name, endpoint and credentials",
+    }[failure] in caplog.text

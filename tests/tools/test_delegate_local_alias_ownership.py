@@ -134,3 +134,81 @@ def test_alias_admission_preserves_named_and_endpoint_fences(tmp_path, monkeypat
             if case.startswith("foreign-"):
                 assert calls[0]["source"] in {"pool:custom:foreign", "custom_provider:foreign"}
             token_provider.assert_not_called()
+
+
+@pytest.mark.parametrize("credential", ["inline", "key_env", "api_key_env", "callable"])
+def test_credential_freshness_at_activation(tmp_path, monkeypatch, credential):
+    """Admission validates env keys but must not pin them for the same child's recovery."""
+    from agent.secret_scope import (
+        get_secret, is_multiplex_active, reset_secret_scope, set_multiplex_active, set_secret_scope,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv("ROTATION_KEY", "fixture-launch")
+    previous_mode = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        for scope in ("a", "b", "a"):
+            home = tmp_path / scope
+            home.mkdir(exist_ok=True)
+            before, after = f"fixture-before-{scope}", f"fixture-after-{scope}"
+            hop = {"provider": "rotation-owner", "model": "bare-backup"}
+            provider = {"base_url": "https://rotation.invalid/v1", "api_key": "fixture-provider"}
+            if credential == "inline":
+                hop.update(api_key="fixture-inline", key_env="ROTATION_KEY")
+            elif credential == "callable":
+                provider = {"base_url": "https://rotation.invalid/v1", "key_cmd": "fixture-not-executed"}
+            else:
+                hop[credential] = "ROTATION_KEY"
+            home_token = set_hermes_home_override(home)
+            secret_token = set_secret_scope({"ROTATION_KEY": before}, profile_home=str(home))
+            try:
+                with patch("agent.command_token_source._mint", side_effect=lambda *args: (get_secret("ROTATION_KEY"), 120)) as mint:
+                    with dispatched_child(home, hop, {"rotation-owner": provider}) as (child, clients):
+                        assert child._fallback_chain
+                        mint.assert_not_called()
+                        rotated = set_secret_scope({"ROTATION_KEY": after}, profile_home=str(home))
+                        try:
+                            assert child._try_activate_fallback()
+                            mint.assert_not_called()
+                            key = clients[-1]["api_key"]
+                            assert (key() if callable(key) else key) == ("fixture-inline" if credential == "inline" else after)
+                            assert len(clients) == 2
+                        finally:
+                            reset_secret_scope(rotated)
+            finally:
+                reset_secret_scope(secret_token)
+                reset_hermes_home_override(home_token)
+    finally:
+        set_multiplex_active(previous_mode)
+
+
+@pytest.mark.parametrize("key_field", ["key_env", "api_key_env"])
+@pytest.mark.parametrize("replacement", [{}, {"ROTATION_KEY": "   "}, None], ids=["removed", "empty", "unscoped"])
+def test_credential_freshness_missing_key_refuses_ambient(tmp_path, monkeypatch, key_field, replacement):
+    from agent.secret_scope import (
+        is_multiplex_active, reset_secret_scope, set_multiplex_active, set_secret_scope,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv("ROTATION_KEY", "fixture-launch")
+    previous_mode = is_multiplex_active()
+    set_multiplex_active(True)
+    home_token = set_hermes_home_override(tmp_path)
+    secret_token = set_secret_scope({"ROTATION_KEY": "fixture-before"}, profile_home=str(tmp_path))
+    hop = {"provider": "rotation-owner", "model": "bare-backup", key_field: "ROTATION_KEY"}
+    providers = {"rotation-owner": {"base_url": "https://rotation.invalid/v1", "api_key": "fixture-provider"}}
+    try:
+        with dispatched_child(tmp_path, hop, providers) as (child, clients):
+            assert child._fallback_chain
+            expired = set_secret_scope(replacement, profile_home=str(tmp_path))
+            try:
+                assert child._try_activate_fallback() is False
+                assert (child.model, child.api_key) == ("primary-model", "fixture-primary")
+                assert len(clients) == 1
+            finally:
+                reset_secret_scope(expired)
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+        set_multiplex_active(previous_mode)

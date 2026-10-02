@@ -52,7 +52,9 @@ def db(tmp_path: Path):
 
 def test_execute_write_keeps_official_patience_api() -> None:
     params = inspect.signature(SessionDB._execute_write).parameters
-    assert list(params) == ["self", "fn", "patience_s"]
+    assert list(params) == ["self", "fn", "patience_s", "deadline"]
+    assert params["deadline"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["deadline"].default is None
     src = inspect.getsource(SessionDB._execute_write)
     assert "_session_db_advisory_write_lock" in src
     assert "max_retries" not in src

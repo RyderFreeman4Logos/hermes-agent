@@ -1446,9 +1446,11 @@ _RELAY_EVENTS: dict[str, tuple[str, str | None, dict[str, str]]] = {
 def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
     """Single construction point for ``MoAClient``: a bare ``MoAClient(preset)`` would
     drop the ``reference_callback`` relay and silence display events for the session.
-    The relay reads ``agent.tool_progress_callback`` at emit time."""
+    Runtime staging supplies configuration; callbacks and interrupts retain the live owner."""
+    owner = vars(agent).get("_client_owner", agent)
+
     def _moa_reference_relay(event: str, **kwargs: Any) -> None:
-        cb = getattr(agent, "tool_progress_callback", None)
+        cb = getattr(owner, "tool_progress_callback", None)
         spec = _RELAY_EVENTS.get(event)
         if cb is None or spec is None:
             return
@@ -1471,8 +1473,8 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
             resolved_preset = moa_cfg.get("default_preset") or "default"
     except Exception:
         resolved_preset = "default"
-    # ``agent`` lets the fan-out wait be aborted on a user interrupt.
-    return MoAClient(resolved_preset, reference_callback=_moa_reference_relay, agent=agent)
+    # The live owner lets the fan-out observe later user interrupts.
+    return MoAClient(resolved_preset, reference_callback=_moa_reference_relay, agent=owner)
 
 
 def bind_moa_runtime(agent, preset_name: Any, api_key: Any = None) -> None:

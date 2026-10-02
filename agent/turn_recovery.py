@@ -1700,7 +1700,8 @@ def _eager_fallback_status(classified: Any, is_upstream: bool, is_transport_fail
         return "⚠️ Billing or credits exhausted — switching to fallback provider..."
     if is_transport_failure:
         return "⚠️ Provider unreachable — switching to fallback provider..."
-    return "⚠️ Rate limited — switching to fallback provider..."
+    reason = "Provider error" if classified.reason == FailoverReason.server_error else "Rate limited"
+    return f"⚠️ {reason} — switching to fallback provider..."
 
 
 def activate_codex_app_server_fallback(agent: Any, result: Dict[str, Any]) -> bool:

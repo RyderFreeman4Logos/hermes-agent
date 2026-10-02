@@ -6,6 +6,8 @@ denials stay terminal, and a real identity change does not recover first.
 """
 
 import unittest
+
+import pytest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -130,6 +132,21 @@ class TestStandardChildRecoveryOrder(unittest.TestCase):
         self.assertEqual(seen, ["same-route"])
         self.assertEqual(verdict.action, "fallthrough")
         self.assertEqual(agent.model, "std-model")
+
+
+@pytest.mark.parametrize("reason,expected", [
+    (FailoverReason.server_error, "Provider error"),
+    (FailoverReason.rate_limit, "Rate limited"),
+])
+def test_eager_recovery_status_names_failure(reason, expected, capsys):
+    agent = _child()
+    agent._buffer_diagnostic_status = print
+    with patch("agent.turn_recovery.recover_after_classification", return_value=(False, False)):
+        _route(agent, reason)
+    output = capsys.readouterr().out
+    assert expected in output
+    if reason == FailoverReason.server_error:
+        assert "Rate limited" not in output
 
 
 if __name__ == "__main__":

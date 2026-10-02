@@ -703,13 +703,20 @@ def handle_content_policy_refusal(
     api_request_id: Any, api_start_time: float, retry_count: int, max_retries: int,
 ) -> RefusalVerdict:
     """HTTP-200 refusal (``finish_reason`` ``content_filter`` / ``guardrail_intervened``).
-    Deterministic for the unchanged prompt — never retried: one configured-fallback try,
-    else surface the refusal (explanation may live only in the reasoning channel)."""
-    from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
+    Standard children stop; other callers try one configured fallback, else surface the
+    refusal (explanation may live only in the reasoning channel)."""
+    from agent.conversation_loop import (
+        _arm_fallback_restart, _content_policy_blocked_result, _standard_child_can_fallback,
+    )
 
-    _refusal_result = normalize_response_for_agent(agent, response)
-    _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
-    if not _refusal_text:
+    # A Responses soft failure has no normalizable output; retain its typed denial.
+    from agent.turn_recovery import classify_codex_soft_failure, _codex_soft_failure_error
+
+    soft, _ = classify_codex_soft_failure(agent, response)
+    _refusal_result = None if soft is not None else normalize_response_for_agent(agent, response)
+    _refusal_text = ((_codex_soft_failure_error(response).get("message") if soft is not None
+                      else getattr(_refusal_result, "content", None)) or "").strip()
+    if not _refusal_text and _refusal_result is not None:
         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
     # Anthropic stop_reason=refusal carries its reason on stop_details (category + optional explanation),
     # not in a content block — without it a classifier halt reads as "(no text)" (#113689).
@@ -729,11 +736,12 @@ def handle_content_policy_refusal(
     )
     stop_thinking_spinner(agent, thinking_spinner)
 
-    if agent._has_pending_fallback():
-        agent._buffer_diagnostic_status("⚠️ Model declined to respond (safety refusal) — trying fallback...")
-    if agent._try_activate_fallback():
-        active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
-        return RefusalVerdict("break", None, active_system_prompt)
+    if _standard_child_can_fallback(agent, reason=FailoverReason.content_policy_blocked):
+        if agent._has_pending_fallback():
+            agent._buffer_diagnostic_status("⚠️ Model declined to respond (safety refusal) — trying fallback...")
+        if agent._try_activate_fallback():
+            active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+            return RefusalVerdict("break", None, active_system_prompt)
 
     agent._flush_status_buffer()
     _refusal_log = _refusal_text[:500] + "..." if len(_refusal_text) > 500 else _refusal_text

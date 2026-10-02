@@ -53,7 +53,7 @@ def is_sqlite_lock_error(exc_or_str) -> bool:
     if code is not None:
         return code in _SQLITE_LOCK_CODES
     text = str(exc_or_str).lower()
-    return any(text.startswith(marker) for marker in _SQLITE_LOCK_MARKERS)
+    return any(marker in text for marker in _SQLITE_LOCK_MARKERS)
 
 
 def _is_no_more_rows(exc: sqlite3.Error) -> bool:

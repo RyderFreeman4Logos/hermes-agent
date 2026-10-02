@@ -39,3 +39,14 @@ def test_known_codes_and_narrow_codeless_fallback(code, text, transient, lock):
         exc.sqlite_errorcode = code
     assert is_transient_sqlite_error(exc) is transient
     assert is_sqlite_lock_error(exc) is lock
+
+
+@pytest.mark.parametrize("code", [None, sqlite3.SQLITE_ERROR])
+def test_wrapped_journal_mode_lock_keeps_narrow_fallback(code):
+    from hermes_state_wal import _CANNOT_VERIFY_DELETE_MSG
+
+    exc = sqlite3.OperationalError(_CANNOT_VERIFY_DELETE_MSG)
+    if code is not None:
+        exc.sqlite_errorcode = code
+    assert is_sqlite_lock_error(exc) is (code is None)
+    assert is_transient_sqlite_error(exc) is (code is None)

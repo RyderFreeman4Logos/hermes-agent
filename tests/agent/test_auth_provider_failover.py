@@ -14,7 +14,6 @@ fell through to "switch providers manually" advice and never called
   2. ``_try_activate_fallback`` advances the chain on an auth reason.
 """
 
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -22,10 +21,8 @@ from openai import APIStatusError
 
 from run_agent import AIAgent
 from agent.error_classifier import classify_api_error, FailoverReason
-from agent.turn_api_error import handle_api_error
-from agent.turn_retry_state import TurnRetryState
 
-def _make_agent(fallback_model=None):
+def _make_agent(fallback_model=None, base_url="https://openrouter.ai/api/v1", **runtime):
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
         patch("model_tools.check_toolset_requirements", return_value={}),
@@ -33,11 +30,12 @@ def _make_agent(fallback_model=None):
     ):
         agent = AIAgent(
             api_key="test-key",
-            base_url="https://openrouter.ai/api/v1",
+            base_url=base_url,
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
             fallback_model=fallback_model,
+            **runtime,
         )
         agent.client = MagicMock()
         return agent
@@ -60,19 +58,19 @@ def _sdk_status(status, message, body=None):
     err.status_code = status
     return err
 
-def _handler(agent, api_error):
-    agent._recover_with_credential_pool = MagicMock(return_value=(False, False))
-    retry = TurnRetryState()
-    verdict = handle_api_error(
-        agent, api_error=api_error, _retry=retry, thinking_spinner=None,
-        messages=[{"role": "user", "content": "hello"}],
-        api_messages=[{"role": "user", "content": "hello"}], api_kwargs={},
-        system_message=None, active_system_prompt=None, conversation_history=[],
-        approx_tokens=10, retry_count=0, max_retries=10, compression_attempts=0,
-        max_compression_attempts=1, api_call_count=1, api_request_id="req",
-        api_start_time=time.time(), effective_task_id=None, turn_id="turn",
-    )
-    return verdict, retry
+def _conversation(agent):
+    agent._cached_system_prompt = "You are helpful."
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    # model.streaming=false: isolate recovery from the separate streaming-5xx probe.
+    agent._disable_streaming = True
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.turn_api_error.interruptible_backoff_sleep", side_effect=AssertionError("same-route retry")),
+    ):
+        return agent.run_conversation("hello")
 
 class TestAuthErrorClassification:
     def test_401_is_auth(self):
@@ -110,35 +108,57 @@ class TestAuthFailoverActivation:
         assert overflow.reason == FailoverReason.context_overflow and overflow.is_auth is False
         other = classify_api_error(_sdk_status(529, "auth_unavailable: no auth available"), provider="xai")
         assert other.reason == FailoverReason.overloaded and other.is_auth is False
+        mixed = classify_api_error(_sdk_status(
+            503, "maximum context length exceeded; auth_unavailable: no auth available",
+        ), provider="xai")
+        assert mixed.reason == FailoverReason.context_overflow and mixed.should_compress
+        assert mixed.is_auth is False and mixed.should_rotate_credential is False
         spend = _sdk_status(403, "spending limit", {"error": {
             "code": "personal-team-blocked:spending-limit", "message": "spending limit",
         }})
         billing = classify_api_error(spend, provider="xai-oauth")
         assert billing.reason == FailoverReason.billing and billing.is_auth is False
+        policy = classify_api_error(_sdk_status(503, "content_filter: no auth available"), provider="xai")
+        assert policy.reason == FailoverReason.content_policy_blocked and policy.is_auth is False
 
-        agent = _make_agent(fallback_model=[{"provider": "openai", "model": "gpt-4o"}])
-        agent.provider, agent.model = "xai", "grok-4.6"
-        client = _mock_client("https://api.openai.com/v1")
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(client, "gpt-4o")) as resolve:
-            verdict, retry = _handler(agent, _sdk_status(
-                503, "auth_unavailable: no auth available (providers=xai, model=grok-4.6)",
-            ))
-        assert verdict.action == "break" and retry.restart_with_rebuilt_messages is True
-        assert verdict.retry_count == 0 and resolve.call_count == 1
-        assert agent.provider == "openai" and agent.model == "gpt-4o" and agent.api_key == "fb-key"
-        client.chat.completions.create.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="accepted"))],
-        )
-        reply = client.chat.completions.create(model=agent.model, messages=verdict.messages)
-        assert reply.choices[0].message.content == "accepted"
+        for marker in ("auth_unavailable", "no auth available"):
+            for available in (True, False):
+                agent = _make_agent(
+                    provider="xai", model="grok-4.6", base_url="https://api.x.ai/v1", api_mode="chat_completions",
+                    fallback_model=[{"provider": "openai", "model": "gpt-4o", "api_mode": "chat_completions"}],
+                )
+                primary = agent.client
+                fallback = _mock_client("https://api.openai.com/v1")
+                fallback._custom_headers = fallback.default_headers = None
+                calls = []
 
-        agent = _make_agent(fallback_model=[{"provider": "openai", "model": "gpt-4o"}])
-        agent.provider, agent.model = "xai", "grok-4.6"
-        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)) as resolve:
-            verdict, retry = _handler(agent, _sdk_status(503, "no auth available"))
-        assert resolve.call_count == 1 and agent.provider == "xai" and agent.model == "grok-4.6"
-        assert agent.api_key == "test-key" and verdict.retry_count == 1
-        assert verdict.action == "return" and retry.restart_with_rebuilt_messages is False
+                def send(**kwargs):
+                    calls.append((agent.provider, kwargs["model"], agent.api_mode))
+                    if agent.client is primary:
+                        raise _sdk_status(503, marker)
+                    assert agent.client is fallback
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content="accepted", tool_calls=None), finish_reason="stop")],
+                        model="gpt-4o", usage=None,
+                    )
+
+                primary.chat.completions.create.side_effect = send
+                fallback.chat.completions.create.side_effect = send
+                with patch("agent.auxiliary_client.resolve_provider_client", return_value=(fallback, "gpt-4o") if available else (None, None)) as resolve:
+                    result = _conversation(agent)
+                assert resolve.call_count == 1
+                assert resolve.call_args.kwargs["explicit_api_key"] is None
+                assert primary.chat.completions.create.call_count == 1
+                assert calls[0] == ("xai", "grok-4.6", "chat_completions")
+                if available:
+                    assert result["completed"] is True and result["final_response"] == "accepted"
+                    assert calls == [("xai", "grok-4.6", "chat_completions"), ("openai", "gpt-4o", "chat_completions")]
+                    assert agent.client is fallback and agent.api_key == "fb-key"
+                    assert fallback.chat.completions.create.call_count == 1
+                else:
+                    assert result["failed"] is True and result["completed"] is False
+                    assert len(calls) == 1 and fallback.chat.completions.create.call_count == 0
+                    assert (agent.provider, agent.model, agent.api_key) == ("xai", "grok-4.6", "test-key")
 
     def test_no_failover_without_chain(self):
         """A user with no fallback configured (the common case for the

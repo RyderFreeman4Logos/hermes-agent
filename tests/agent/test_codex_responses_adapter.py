@@ -932,6 +932,22 @@ def test_normalize_codex_response_keeps_legitimate_cmd_json_answer(text):
     assert assistant_message.codex_message_items
 
 
+def test_normalize_codex_response_keeps_refusal_part_type():
+    """A sole refusal part stays typed refusal so policy provenance survives normalization."""
+    response = SimpleNamespace(
+        status="completed", incomplete_details=None, output_text="no",
+        output=[SimpleNamespace(
+            type="message", role="assistant", status="completed", id="msg_r",
+            content=[SimpleNamespace(type="refusal", refusal="no")],
+        )],
+    )
+    assistant, finish = _normalize_codex_response(response, issuer_kind="custom")
+    assert finish == "stop"
+    assert assistant.content == "no"
+    part = assistant.codex_message_items[0]["content"][0]
+    assert part == {"type": "refusal", "refusal": "no"}
+
+
 def test_normalize_codex_response_failed_includes_code_in_error():
     """Regression: response_status == 'failed' should surface the error
     code, not just the message. Used to leak a bare 'Slow down' string

@@ -844,6 +844,9 @@ class _CodexResponseAssembler:
         # back in stream order.
         self.output_indexes, self.output_sequences = [], []
         self.text_deltas, self.commentary_text_deltas = [], []
+        # Refusal deltas stay out of text_deltas so a sole refusal is not later
+        # synthesized as ordinary output_text.
+        self.refusal_deltas: List[str] = []
         # pending_function_calls: announced-but-unconfirmed function calls keyed by item id. announced_output_order:
         # first-observed (sequence, output_index) per announced item id so a later .done keeps its announced position.
         self.pending_function_calls: Dict[str, Dict[str, Any]] = {}
@@ -902,7 +905,7 @@ class _CodexResponseAssembler:
         # part is read by the normalizer; the deltas cover backends that omit the done item.
         refusal_text = _event_field(event, "delta", "")
         if isinstance(refusal_text, str) and refusal_text:
-            self.text_deltas.append(refusal_text)
+            self.refusal_deltas.append(refusal_text)
 
     def _on_function_call(self, event: Any, event_type: str) -> None:
         self.has_tool_calls = True
@@ -1008,9 +1011,17 @@ class _CodexResponseAssembler:
     def result(self) -> SimpleNamespace:
         # With only plain text deltas (no tool calls), synthesize one message item.
         output: List[Any] = list(self.output_items)
-        if not output and self.text_deltas and not self.has_tool_calls:
-            content = [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
-            output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
+        if not output and not self.has_tool_calls:
+            text = "".join(self.text_deltas)
+            refusal = "".join(self.refusal_deltas)
+            if text and not refusal:
+                content = [SimpleNamespace(type="output_text", text=text)]
+            elif refusal and not text:
+                content = [SimpleNamespace(type="refusal", refusal=refusal)]
+            else:
+                content = []
+            if content:
+                output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
         # Done items stay authoritative; settlement only fills the gap left by backends that omit
         # per-item done events on a successful completion.
         if self.pending_function_calls and self.saw_response_completed:
@@ -1019,7 +1030,7 @@ class _CodexResponseAssembler:
         if not self.saw_terminal and not output:
             raise RuntimeError("Codex Responses stream did not emit a terminal response")
         return SimpleNamespace(
-            output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
+            output=output, output_text="".join(self.text_deltas) or "".join(self.refusal_deltas), usage=self.terminal_usage, status=self.terminal_status,
             id=self.terminal_response_id, model=self.model, incomplete_details=self.terminal_incomplete_details,
             error=self.terminal_error)
 

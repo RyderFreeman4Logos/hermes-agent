@@ -29,7 +29,7 @@ def test_public_child_policy_terminal(tmp_path, monkeypatch, profile, status, bo
 @pytest.mark.parametrize("case,streaming", [
     ("chat_filter", False), ("chat_filter", True), ("chat_refusal", False),
     ("responses_failed", True), ("responses_failed_output", True), ("responses_filter", True),
-    ("chat_partial", True), ("responses_refusal", True),
+    ("chat_partial", True), ("responses_refusal", True), ("responses_refusal_delta", True),
     ("chat_plain", False), ("responses_plain", True), ("chat_mixed", False),
     ("chat_empty", False), ("chat_length", False), ("chat_malformed", False),
     ("responses_mixed", True),
@@ -47,6 +47,9 @@ def _response(request, payload, case):
         content = [{"type": "output_text", "text": text, "annotations": []}]
         if case == "responses_refusal":
             content = [{"type": "refusal", "refusal": "fixture safety refusal"}]
+        elif case == "responses_refusal_delta":
+            # Compatible backends stream the refusal and omit output_item.done.
+            content = [{"type": "refusal", "refusal": "fixture safety refusal"}]
         elif case == "responses_filter":
             status, content, incomplete = "incomplete", [], {"reason": "content_filter"}
         elif case in {"responses_failed", "responses_failed_output"}:
@@ -59,7 +62,12 @@ def _response(request, payload, case):
         response = {"id": "resp_fixture", "object": "response", "created_at": 0, "model": payload["model"],
                     "status": status, "output": [item] if content else [], "error": error,
                     "incomplete_details": incomplete, "usage": {"input_tokens": 8, "output_tokens": 3, "total_tokens": 11}}
-        events = [{"type": "response.output_item.done", "output_index": 0, "item": item}] if content else []
+        events = []
+        if case == "responses_refusal_delta":
+            events.append({"type": "response.refusal.delta", "item_id": "msg_fixture", "output_index": 0,
+                           "content_index": 0, "delta": "fixture safety refusal", "sequence_number": 1})
+        elif content:
+            events.append({"type": "response.output_item.done", "output_index": 0, "item": item})
         events.append({"type": "response." + status, "response": response})
         wire = "".join("event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n" for e in events)
         return httpx.Response(200, request=request, headers={"content-type": "text/event-stream"}, content=wire.encode())
@@ -210,7 +218,7 @@ def _public_child(tmp_path, monkeypatch, profile, status, body, entry, case="err
         assert verdicts[0].result["failure_reason"] == "content_policy_blocked"
         assert verdicts[0].result["failure_retryable"] is False
         assert verdicts[0].result["completed"] is False
-    elif case in {"chat_plain", "responses_plain", "chat_mixed", "responses_refusal", "responses_mixed"}:
+    elif case in {"chat_plain", "responses_plain", "chat_mixed", "responses_refusal", "responses_refusal_delta", "responses_mixed"}:
         assert len(attempts) == 1
         assert not fallbacks
         assert result["results"][0]["status"] == "completed", result

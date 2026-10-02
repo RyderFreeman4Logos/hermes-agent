@@ -1143,6 +1143,7 @@ class SessionDB(
         # settlement unknown and must propagate — this helper owns non-idempotent transcript/counter
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
+        last_retry_error: Optional[BaseException] = None
         while True:
             self._raise_if_db_corrupt(storage=True)
             # NOTE: the replaced/generation live probe runs INSIDE the lock below,
@@ -1167,7 +1168,7 @@ class SessionDB(
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
-            except SessionCompressionInProgressError:
+            except SessionCompressionInProgressError as exc:
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.
                 # A live foreign compression lock is transient: the compressor publishes in a couple of
                 # seconds. Without any wait, a steer that lands mid-compression aborts the user's turn as
@@ -1182,16 +1183,24 @@ class SessionDB(
                 if self._sleep_before_write_retry(
                     compression_deadline, self._COMPRESSION_BUSY_WAIT_S
                 ):
+                    last_retry_error = exc
                     continue
                 raise
             except sqlite3.Error as exc:
+                # Admission may expire after backoff but before the next callback.
+                # Do not replace the owner's last engine/lease failure with that fence.
+                if (not fn_started and last_retry_error is not None
+                        and is_sqlite_lock_error(exc) and time.monotonic() >= deadline):
+                    raise last_retry_error from exc
                 # 'no more rows' is a transient engine error on contended WAL appends (some builds
                 # raise it as InterfaceError, a sibling of DatabaseError): retry like locked/busy.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    last_retry_error = exc
                     continue
                 if isinstance(exc, sqlite3.OperationalError):
                     if is_sqlite_lock_error(exc):
                         if self._sleep_before_write_retry(deadline, patience_s):
+                            last_retry_error = exc
                             continue
                         # Say what actually happened, not disk/permission damage. The holder goes to
                         # the log, not the message: classify_persistence_error() buckets by phrase and
@@ -1211,6 +1220,7 @@ class SessionDB(
                         # Retry on the SAME connection: close()+reopen would cancel this process's
                         # POSIX locks for every sibling (howtocorrupt §2.2).
                         ioerr_begin_retried = True
+                        last_retry_error = exc
                         continue
                     raise  # non-lock error, callback already ran, or patience exhausted
                 if isinstance(exc, sqlite3.DatabaseError):

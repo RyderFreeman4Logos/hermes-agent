@@ -225,8 +225,14 @@ def test_transaction_settlement_restores_connection(database, clock, monkeypatch
     assert not conn.in_transaction
 
 
-@pytest.mark.parametrize("compression", [False, True])
-def test_retry_admission_does_not_renew_any_owner_budget(database, clock, monkeypatch, compression):
+@pytest.mark.parametrize("kind", ["lock", "compression", "no-more-rows"])
+def test_retry_admission_does_not_renew_any_owner_budget(database, clock, monkeypatch, kind):
+    compression = kind == "compression"
+    error = {
+        "lock": sqlite3.OperationalError("database is locked"),
+        "compression": SessionCompressionInProgressError("being compressed"),
+        "no-more-rows": sqlite3.InterfaceError("no more rows available"),
+    }[kind]
     calls, begun = [], []
     original = database._conn.execute
     def execute(sql, *args, **kwargs):
@@ -247,15 +253,14 @@ def test_retry_admission_does_not_renew_any_owner_budget(database, clock, monkey
         calls.append(clock.now)
         c.execute("INSERT INTO witness VALUES(1)")
         if len(calls) == 1:
-            if compression:
-                raise SessionCompressionInProgressError("being compressed")
-            raise sqlite3.OperationalError("database is locked")
+            raise error
     clock.sleep = sleep
     database._COMPRESSION_BUSY_WAIT_S = 2
     monkeypatch.setattr(hermes_state.random, "uniform", lambda *_args: 0.25)
     monkeypatch.setattr(database._conn, "execute", execute)
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(type(error)) as caught:
         database._execute_write(callback, deadline=20)
+    assert caught.value is error
     assert calls == [0]
     assert begun == [0, 0.25]
     assert database._conn.execute("SELECT count(*) FROM witness").fetchone()[0] == 0

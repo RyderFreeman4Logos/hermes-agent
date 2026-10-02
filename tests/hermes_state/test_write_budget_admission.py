@@ -312,6 +312,62 @@ def _sqlite(message, code):
     return error
 
 
+@pytest.mark.parametrize("seam", ["begin", "commit", "rollback"])
+@pytest.mark.parametrize("kind", ["cancel", "exit", "io", "sql"])
+def test_admission_restore_keeps_primary(database, monkeypatch, seam, kind):
+    """A failed busy-timeout restore must not replace the attempt's own error."""
+    conn = database._conn
+    conn.execute("PRAGMA busy_timeout=731")
+    primary = {
+        "cancel": KeyboardInterrupt("admission-primary"),
+        "exit": SystemExit("admission-primary"),
+        "io": _sqlite("disk I/O error", sqlite3.SQLITE_IOERR_READ),
+        "sql": _sqlite("admission SQL failure", sqlite3.SQLITE_ERROR),
+    }[kind]
+    secondary = sqlite3.OperationalError("timeout restore failure")
+    original = conn.execute
+    original_commit = conn.commit
+    begun, restores, calls = [], [], []
+
+    def execute(sql, *args, **kwargs):
+        if sql == "BEGIN IMMEDIATE":
+            begun.append(1)
+            if seam == "begin":
+                raise primary
+        if sql == "PRAGMA busy_timeout=731" and begun and not restores:
+            restores.append(1)
+            raise secondary
+        return original(sql, *args, **kwargs)
+
+    def commit():
+        original_commit()
+        if seam == "commit":
+            raise primary
+
+    def callback(c):
+        calls.append(1)
+        if seam == "rollback":
+            raise primary
+
+    monkeypatch.setattr(conn, "execute", execute)
+    if seam == "commit":
+        monkeypatch.setattr(conn, "commit", commit)
+    caught = None
+    try:
+        database._execute_write(callback, patience_s=0)
+    except BaseException as exc:
+        caught = exc
+    finally:
+        original("PRAGMA busy_timeout=731")
+    assert begun == [1] and restores == [1] and calls == ([] if seam == "begin" else [1])
+    assert not conn.in_transaction
+    assert original("SELECT count(*) FROM witness").fetchone()[0] == 0
+    assert caught is primary
+    assert getattr(caught, "sqlite_errorcode", None) == getattr(primary, "sqlite_errorcode", None)
+    notes = _notes(primary)
+    assert str(secondary) in notes
+
+
 @pytest.mark.parametrize("seam", ["rollback", "restore"])
 @pytest.mark.parametrize("kind", ["cancel", "exit", "io", "sql"])
 def test_cleanup_keeps_primary_identity_and_records_cleanup(database, monkeypatch, seam, kind):

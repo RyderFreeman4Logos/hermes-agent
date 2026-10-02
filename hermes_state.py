@@ -1095,10 +1095,10 @@ class SessionDB(
                 previous_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
                 primary: Optional[BaseException] = None
                 try:
-                    remaining = self._remaining_write_budget(deadline, immediate=immediate)
-                    conn.execute(f"PRAGMA busy_timeout={min(previous_ms, int(remaining * 1000))}")
-                    conn.execute("BEGIN IMMEDIATE")
                     try:
+                        remaining = self._remaining_write_budget(deadline, immediate=immediate)
+                        conn.execute(f"PRAGMA busy_timeout={min(previous_ms, int(remaining * 1000))}")
+                        conn.execute("BEGIN IMMEDIATE")
                         self._remaining_write_budget(deadline, immediate=immediate)
                         yield conn
                         # No new waiting budget at COMMIT, but a healthy late commit is allowed.
@@ -1107,19 +1107,20 @@ class SessionDB(
                         conn.commit()
                     except BaseException as caught:
                         primary = caught
-                        rollback_error = None
-                        try:
-                            conn.rollback()
-                        except Exception as rollback_exc:
-                            if conn.in_transaction:
-                                primary.add_note(
-                                    "state.db rollback failed; write settlement is unknown: "
-                                    + str(rollback_exc)
-                                )
-                                raise primary
-                            rollback_error = rollback_exc
-                        if rollback_error is not None:
-                            primary.add_note("state.db cleanup failed after rollback: " + str(rollback_error))
+                        if conn.in_transaction:
+                            rollback_error = None
+                            try:
+                                conn.rollback()
+                            except Exception as rollback_exc:
+                                if conn.in_transaction:
+                                    primary.add_note(
+                                        "state.db rollback failed; write settlement is unknown: "
+                                        + str(rollback_exc)
+                                    )
+                                    raise primary
+                                rollback_error = rollback_exc
+                            if rollback_error is not None:
+                                primary.add_note("state.db cleanup failed after rollback: " + str(rollback_error))
                         raise
                     primary = None
                 finally:

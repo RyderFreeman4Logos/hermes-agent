@@ -985,8 +985,7 @@ class ClientLifecycleMixin:
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
-        self._replace_primary_openai_client(reason="credential_rotation")
-        return True
+        return self._replace_primary_openai_client(reason="credential_rotation")
 
     def _reapply_route_client_config(self, *, route_changed: bool) -> None:
         """Recompute route-derived client kwargs (TLS material, default headers) for ``self.base_url``.

@@ -11,6 +11,8 @@ exhausting remaining entries and falling through to cross-provider fallback.
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
 
 from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
@@ -222,14 +224,10 @@ def _exhausted_codex_agent(pool, *, snapshot_token=_STALE):
         client = MagicMock()
         client.api_key = kwargs["api_key"]
         built.append(kwargs["api_key"])
-        agent.client = client
         return client
 
     agent._create_openai_client = _build
     agent._built_client_tokens = built
-    from agent.client_lifecycle import ClientLifecycleMixin
-    agent._swap_credential = ClientLifecycleMixin._swap_credential.__get__(agent)
-    agent._replace_primary_openai_client = lambda **k: (_build(agent._client_kwargs, reason="credential_rotation", shared=True) or True)
     agent._apply_client_headers_for_base_url = lambda *a, **k: None
     agent._reapply_route_client_config = lambda *a, **k: None
     return agent
@@ -553,3 +551,111 @@ def test_revoked_future_admission_does_not_publish_snapshot(monkeypatch, tmp_pat
     assert agent.api_key == "fallback-key"
     assert agent._credential_pool_entry_id is None
     assert pool.has_available(model="gpt-5.5") is False
+
+
+@pytest.mark.parametrize("strategy", ["round_robin", "least_used"])
+@pytest.mark.parametrize("boundary", ["restore_primary", "credential_rotation"])
+@pytest.mark.parametrize("change", ["bench", "peer_bench", "peer", "raise", "none"])
+def test_restore_publication_preserves_owned_generation_and_fallback(
+    monkeypatch, tmp_path, strategy, boundary, change,
+):
+    """Real constructors may invalidate admission, never partially publish a runtime."""
+    from dataclasses import replace
+
+    import httpx
+    from openai import OpenAI
+    from agent.context_compressor import ContextCompressor
+    from agent.credential_pool import CredentialPool, model_cooldown_until
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.auth._probe_codex_quota_restored", lambda *a, **kw: True)
+    entries = [replace(_codex_entry(name, "fixture-" + name, status="exhausted",
+                                   reset_at=time.time() + 6 * 86400), source="manual")
+               for name in ("first", "second")]
+    pool = CredentialPool("openai-codex", entries)
+    pool._strategy = strategy
+    pool._current_id = "first"
+    pool._persist()
+    agent = _exhausted_codex_agent(pool)
+    # Remove the older fixture's mutator doubles: exercise actual swap/header/client code.
+    for name in ("_apply_client_headers_for_base_url", "_reapply_route_client_config"):
+        delattr(agent, name)
+    agent.model = "fallback"
+    agent.runtime_capabilities = {"fallback_only": True}
+    agent.request_overrides = {"fallback_only": 1}
+    agent._reasoning_echo_flag = True
+    agent._transport_cache = {"fallback": object()}
+    agent._primary_runtime.update(runtime_capabilities={"primary_only": True},
+                                  request_overrides={"primary_only": 1},
+                                  reasoning_echo_flag=False, use_prompt_caching=True,
+                                  use_native_cache_layout=True)
+    compressor = agent.context_compressor = ContextCompressor(
+        "fallback", provider="openrouter", api_key="fallback-key", base_url=agent.base_url,
+        api_mode="chat_completions", config_context_length=64000, quiet_mode=True,
+    )
+    compressor.update_model("fallback", 64000, provider="openrouter", api_key="fallback-key",
+                            base_url=agent.base_url, api_mode="chat_completions")
+    compressor.last_prompt_tokens, compressor.last_completion_tokens, compressor.last_total_tokens = 12345, 123, 12468
+    compressor._aux_context_ceiling = 50000
+    compressor._ineffective_compression_count, compressor._fallback_compression_streak = 2, 3
+    clients, events = [], []
+
+    def no_send(request):
+        raise AssertionError("model send forbidden")
+
+    def construct(kwargs, *, reason, shared):
+        if reason == boundary:
+            events.append(reason)
+            live = next(e for e in pool.entries() if e.id == "first")
+            if change.startswith("peer"):
+                newer = replace(live, access_token="new-generation", refresh_token="new-refresh")
+                write_credential_pool("openai-codex", [newer.to_dict(), *[
+                    e.to_dict() for e in pool.entries() if e.id != live.id]])
+                pool._persist()
+                live = next(e for e in pool.entries() if e.id == "first")
+            if "bench" in change:
+                pool.mark_exhausted_and_rotate(status_code=400, failure_reason="model_entitlement",
+                                              model="gpt-5.5", credential_id=live.id,
+                                              api_key_hint=live.access_token)
+            if change == "raise":
+                raise RuntimeError("constructor rejected")
+        client = OpenAI(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(no_send)))
+        clients.append(client)
+        return client
+
+    agent._create_openai_client = construct
+    agent.client = construct(agent._client_kwargs, reason="initial", shared=True)
+    fields = ("model", "provider", "base_url", "api_mode", "api_key", "client",
+              "_client_kwargs", "_credential_pool", "_credential_pool_entry_id",
+              "_fallback_activated", "_fallback_index", "_use_prompt_caching",
+              "_use_native_cache_layout", "runtime_capabilities", "request_overrides",
+              "_reasoning_echo_flag", "_transport_cache")
+    before = {name: getattr(agent, name) for name in fields}
+    before["_transport_cache"] = dict(agent._transport_cache)
+    compressor_before = dict(compressor.__dict__)
+    try:
+        restored = agent._restore_primary_runtime()
+        assert events == [boundary]
+        refused = change in ("bench", "peer_bench", "raise") or (change == "peer" and boundary == "credential_rotation")
+        assert restored is not refused
+        if refused:
+            assert {name: getattr(agent, name) for name in fields} == before
+            assert compressor.__dict__ == compressor_before
+            assert all(c is agent.client or c.is_closed() for c in clients)
+        else:
+            live = next(e for e in pool.entries() if e.id == "first")
+            assert agent.api_key == agent.client.api_key == compressor.api_key == live.runtime_api_key
+            assert agent._credential_pool_entry_id == pool.current().id == "first"
+            assert sum(e.request_count for e in pool.entries()) == 1
+        if change.startswith("peer"):
+            live = next(e for e in pool.entries() if e.id == "first")
+            disk = next(e for e in read_credential_pool("openai-codex") if e["id"] == "first")
+            assert (live.access_token, live.refresh_token) == ("new-generation", "new-refresh")
+            assert (disk["access_token"], disk["refresh_token"]) == ("new-generation", "new-refresh")
+        if "bench" in change:
+            assert model_cooldown_until(next(e for e in pool.entries() if e.id == "first"), "gpt-5.5")
+            assert pool.has_available(model="gpt-5.5")
+    finally:
+        for client in clients:
+            client.close()

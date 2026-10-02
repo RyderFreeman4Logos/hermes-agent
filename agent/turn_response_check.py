@@ -89,6 +89,31 @@ def _derive_finish_reason(agent: Any, response: Any, messages: Any) -> str:
     return finish_reason
 
 
+def _response_policy_blocked(agent: Any, response: Any, response_invalid: bool) -> bool:
+    """Read provider policy metadata before shape/truncation recovery can erase it."""
+    from agent.turn_recovery import classify_codex_soft_failure
+
+    if getattr(response, "_content_filter_terminated", False) is True:
+        return True
+    soft, _ = classify_codex_soft_failure(agent, response)
+    if soft is not None:
+        return soft.reason == FailoverReason.content_policy_blocked
+    if response_invalid:
+        return False
+    normalized = agent._get_transport().normalize_response(response)
+    if normalized.finish_reason == "content_filter":
+        return True
+    if agent.api_mode == "codex_responses" and not normalized.tool_calls:
+        from agent.codex_responses_adapter import _field
+
+        # Only explicit, sole refusal parts count; ordinary assistant prose never does.
+        parts = [part for item in (getattr(response, "output", None) or [])
+                 if _field(item, "type") == "message"
+                 for part in (_field(item, "content") or [])]
+        return bool(parts) and all(_field(part, "type") == "refusal" for part in parts)
+    return False
+
+
 def check_api_response(
     agent: Any, *, response: Any, _retry: Any, thinking_spinner: Any, messages: Any,
     api_messages: Any, api_kwargs: Any, active_system_prompt: Any, conversation_history: Any,
@@ -130,6 +155,23 @@ def check_api_response(
         logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
 
     response_invalid, error_details = validate_response_shape(agent, response)
+    from agent.conversation_loop import _standard_child_can_fallback
+
+    # All response lanes meet here before malformed/partial responses can resend.
+    if (not _standard_child_can_fallback(agent, reason=FailoverReason.content_policy_blocked)
+            and _response_policy_blocked(agent, response, response_invalid)):
+        from agent.turn_recovery import settle_delivered_partial
+
+        settle_delivered_partial(agent, messages, current_turn_user_idx)
+        refusal = handle_content_policy_refusal(
+            agent, response, _retry, thinking_spinner=thinking_spinner, messages=messages,
+            api_messages=api_messages, api_kwargs=api_kwargs,
+            active_system_prompt=active_system_prompt, conversation_history=conversation_history,
+            api_call_count=api_call_count, effective_task_id=effective_task_id, turn_id=turn_id,
+            api_request_id=api_request_id, api_start_time=api_start_time, retry_count=retry_count,
+            max_retries=max_retries,
+        )
+        return _verdict("return", refusal.result)
     if response_invalid:
         _iv = retry_invalid_response(
             agent, response=response, error_details=error_details, _retry=_retry,

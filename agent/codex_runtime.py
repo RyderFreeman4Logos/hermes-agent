@@ -844,6 +844,8 @@ class _CodexResponseAssembler:
         # back in stream order.
         self.output_indexes, self.output_sequences = [], []
         self.text_deltas, self.commentary_text_deltas = [], []
+        # Keep one ordered text buffer; only sole refusal streams need a different raw type.
+        self.has_output_text_deltas = False
         # pending_function_calls: announced-but-unconfirmed function calls keyed by item id. announced_output_order:
         # first-observed (sequence, output_index) per announced item id so a later .done keeps its announced position.
         self.pending_function_calls: Dict[str, Dict[str, Any]] = {}
@@ -887,6 +889,7 @@ class _CodexResponseAssembler:
         elif self.active_message_phase == "analysis":
             self._safe(self.on_reasoning_delta, "on_reasoning_delta", delta_text)
         else:
+            self.has_output_text_deltas = True
             self.text_deltas.append(delta_text)
             if self.has_tool_calls:
                 return
@@ -1006,11 +1009,13 @@ class _CodexResponseAssembler:
         return [entry[2] for entry in indexed]
 
     def result(self) -> SimpleNamespace:
-        # With only plain text deltas (no tool calls), synthesize one message item.
+        # Without done items or tools, preserve all delta text in stream order.
         output: List[Any] = list(self.output_items)
         if not output and self.text_deltas and not self.has_tool_calls:
-            content = [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
-            output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
+            text = "".join(self.text_deltas)
+            part = (SimpleNamespace(type="output_text", text=text) if self.has_output_text_deltas
+                    else SimpleNamespace(type="refusal", refusal=text))
+            output = [SimpleNamespace(type="message", role="assistant", status="completed", content=[part])]
         # Done items stay authoritative; settlement only fills the gap left by backends that omit
         # per-item done events on a successful completion.
         if self.pending_function_calls and self.saw_response_completed:

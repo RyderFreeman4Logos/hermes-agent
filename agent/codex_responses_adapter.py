@@ -1133,6 +1133,7 @@ class _OutputScan:
         # to the reasoning channel; the exact item is still preserved for replay/cache.
         (self.reasoning_parts if is_commentary_phase else self.content_parts).append(message_text)
         item_id = getattr(item, "id", None)
+        # Replay/display sidecars are text-only; policy checks read the unchanged raw response.
         self.message_items_raw.append(_message_item(
             [{"type": "output_text", "text": message_text}], status=_normalize_responses_message_status(item_status),
             item_id=item_id if isinstance(item_id, str) else None, phase=normalized_phase,

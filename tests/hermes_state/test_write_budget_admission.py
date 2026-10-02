@@ -211,7 +211,7 @@ def test_transaction_settlement_restores_connection(database, clock, monkeypatch
     if phase == "healthy":
         database._execute_write(callback, deadline=20)
     else:
-        expected = RuntimeError if phase == "rollback" else type(error)
+        expected = type(error)
         caught = None
         try:
             database._execute_write(callback, deadline=20)
@@ -284,22 +284,155 @@ def test_timeout_restoration_failure_never_replays_a_committed_write(database, m
     conn.execute("PRAGMA busy_timeout=731")
     original = conn.execute
     calls, failed = [], []
+    secondary = sqlite3.OperationalError("restore secondary")
     def execute(sql, *args, **kwargs):
         if sql == "PRAGMA busy_timeout=731" and calls and not conn.in_transaction and not failed:
             failed.append(True)
-            raise sqlite3.OperationalError("database is locked")
+            raise secondary
         return original(sql, *args, **kwargs)
     def callback(c):
         calls.append(1)
         c.execute("INSERT INTO witness VALUES(7)")
     monkeypatch.setattr(conn, "execute", execute)
-    try:
+    with pytest.raises(RuntimeError) as caught:
         database._execute_write(callback)
-    except RuntimeError:
-        pass
+    assert caught.value.__cause__ is secondary
     assert failed == [True]
     assert calls == [1]
     assert original("SELECT count(*) FROM witness").fetchone()[0] == 1
     assert not conn.in_transaction
     # The injected failure left the setting unchanged; restore for the next owner.
     original("PRAGMA busy_timeout=731")
+
+
+def _sqlite(message, code):
+    error = sqlite3.OperationalError(message)
+    error.sqlite_errorcode = code
+    error.sqlite_errorname = "SQLITE_IOERR" if code == sqlite3.SQLITE_IOERR else "SQLITE_ERROR"
+    return error
+
+
+@pytest.mark.parametrize("seam", ["rollback", "restore"])
+@pytest.mark.parametrize("kind", ["cancel", "exit", "io", "sql"])
+def test_cleanup_keeps_primary_identity_and_records_cleanup(database, monkeypatch, seam, kind):
+    conn = database._conn
+    conn.execute("PRAGMA busy_timeout=731")
+    primary = {
+        "cancel": KeyboardInterrupt("cancel-primary"),
+        "exit": SystemExit("exit-primary"),
+        "io": _sqlite("disk I/O error", sqlite3.SQLITE_IOERR),
+        "sql": _sqlite("no such column: original", sqlite3.SQLITE_ERROR),
+    }[kind]
+    secondary = sqlite3.OperationalError("cleanup secondary")
+    original_rollback, original_execute = conn.rollback, conn.execute
+    calls, faults = [], []
+
+    def rollback():
+        original_rollback()
+        faults.append("rollback")
+        raise secondary
+
+    def execute(sql, *args, **kwargs):
+        if seam == "restore" and sql == "PRAGMA busy_timeout=731" and calls and not conn.in_transaction:
+            faults.append("restore")
+            raise secondary
+        return original_execute(sql, *args, **kwargs)
+
+    def callback(c):
+        calls.append(1)
+        c.execute("INSERT INTO witness VALUES(1)")
+        raise primary
+
+    monkeypatch.setattr(conn, "rollback", rollback if seam == "rollback" else original_rollback)
+    monkeypatch.setattr(conn, "execute", execute)
+    caught = None
+    try:
+        database._execute_write(callback)
+    except BaseException as exc:
+        caught = exc
+    finally:
+        original_execute("PRAGMA busy_timeout=731")
+    assert calls == [1] and faults == [seam]
+    assert not conn.in_transaction
+    assert original_execute("SELECT count(*) FROM witness").fetchone()[0] == 0
+    assert caught is primary
+    notes = " ".join(getattr(note, "message", str(note)) for note in getattr(primary, "__notes__", ()))
+    assert "cleanup" in notes or "restoration" in notes
+    assert str(secondary) in notes
+
+
+def test_uncertain_rollback_is_never_retried(database, monkeypatch):
+    conn = database._conn
+    original_rollback = conn.rollback
+    calls = []
+    primary = _sqlite("disk I/O error", sqlite3.SQLITE_IOERR)
+    secondary = sqlite3.OperationalError("rollback secondary")
+
+    def rollback():
+        original_rollback()
+        calls.append("rollback")
+        raise secondary
+
+    def callback(c):
+        calls.append("callback")
+        c.execute("INSERT INTO witness VALUES(1)")
+        raise primary
+
+    monkeypatch.setattr(conn, "rollback", rollback)
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        database._execute_write(callback)
+    assert caught.value is primary
+    notes = " ".join(getattr(note, "message", str(note)) for note in primary.__notes__)
+    assert str(secondary) in notes
+    assert calls == ["callback", "rollback"]
+    assert not conn.in_transaction
+    assert conn.execute("SELECT count(*) FROM witness").fetchone()[0] == 0
+
+
+def test_successful_fts_recovery_keeps_current_owner_after_expiry(database, clock, monkeypatch):
+    conn = database._conn
+    original_commit = conn.commit
+    calls, commits = [], []
+    current = sqlite3.DatabaseError('fts5: corrupt structure record for table "messages_fts"')
+
+    def commit():
+        original_commit()
+        commits.append(clock.now)
+        if commits:
+            clock.now = 21
+
+    def callback(c):
+        calls.append(clock.now)
+        c.execute("INSERT INTO witness VALUES(1)")
+        raise current
+
+    monkeypatch.setattr(conn, "commit", commit)
+    with pytest.raises(sqlite3.DatabaseError) as caught:
+        database._execute_write(callback, deadline=20)
+    assert caught.value is current
+    assert calls == [0] and commits == [0]
+    assert clock.now == 21
+    assert not conn.in_transaction
+    assert conn.execute("SELECT count(*) FROM witness").fetchone()[0] == 0
+
+
+def test_expired_fts_owner_has_no_further_side_effect(database, clock, monkeypatch):
+    before = triggers(database)
+    calls, commits = [], []
+    original_commit = database._conn.commit
+
+    def commit():
+        commits.append(clock.now)
+        original_commit()
+
+    def callback(c):
+        calls.append(clock.now)
+        raise fts_error()
+
+    clock.now = 21
+    monkeypatch.setattr(database._conn, "commit", commit)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        database._execute_write(callback, deadline=20)
+    assert calls == [] and commits == []
+    assert triggers(database) == before
+    assert not database._fts_stale

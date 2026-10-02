@@ -1104,18 +1104,28 @@ class SessionDB(
                         remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
                         conn.execute(f"PRAGMA busy_timeout={min(previous_ms, remaining_ms)}")
                         conn.commit()
-                    except BaseException:
+                    except BaseException as primary:
+                        rollback_error = None
                         try:
                             conn.rollback()
                         except Exception as rollback_exc:
-                            raise RuntimeError("state.db rollback failed; write settlement is unknown") from rollback_exc
+                            if conn.in_transaction:
+                                raise RuntimeError("state.db rollback failed; write settlement is unknown") from rollback_exc
+                            rollback_error = rollback_exc
+                        if rollback_error is not None:
+                            primary.add_note("state.db cleanup failed after rollback: " + str(rollback_error))
                         raise
                 finally:
+                    pending = sys.exc_info()[1]
                     try:
                         conn.execute(f"PRAGMA busy_timeout={int(previous_ms)}")
                     except sqlite3.Error as restore_exc:
-                        # This can follow a successful COMMIT; never enter SQLite retry.
-                        raise RuntimeError("state.db busy timeout restoration failed") from restore_exc
+                        if pending is None:
+                            # This can follow a successful COMMIT; never enter SQLite retry.
+                            raise RuntimeError("state.db busy timeout restoration failed") from restore_exc
+                        pending.add_note("state.db busy timeout restoration failed: " + str(restore_exc))
+                    if pending is not None:
+                        raise pending
             finally:
                 self._lock.release()
 
@@ -1187,11 +1197,6 @@ class SessionDB(
                     continue
                 raise
             except sqlite3.Error as exc:
-                # Admission may expire after backoff but before the next callback.
-                # Do not replace the owner's last engine/lease failure with that fence.
-                if (not fn_started and last_retry_error is not None
-                        and is_sqlite_lock_error(exc) and time.monotonic() >= deadline):
-                    raise last_retry_error from exc
                 # 'no more rows' is a transient engine error on contended WAL appends (some builds
                 # raise it as InterfaceError, a sibling of DatabaseError): retry like locked/busy.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
@@ -1202,6 +1207,8 @@ class SessionDB(
                         if self._sleep_before_write_retry(deadline, patience_s):
                             last_retry_error = exc
                             continue
+                        if not fn_started and last_retry_error is not None:
+                            raise last_retry_error from exc
                         # Say what actually happened, not disk/permission damage. The holder goes to
                         # the log, not the message: classify_persistence_error() buckets by phrase and
                         # a holder's argv (a worktree named fix-corrupt-db) would flip the bucket.
@@ -1227,6 +1234,7 @@ class SessionDB(
                     # Corrupt FTS shadow tables fail every write via the sync triggers while canonical
                     # rows are intact: detach the derived indexes atomically and retry (never rebuild here).
                     if self._enter_fts_fail_open(exc, deadline=deadline, patience_s=patience_s):
+                        last_retry_error = exc
                         continue
                     # What survives both checks is structural damage: quarantine.
                     if self._is_structural_corruption_error(exc):

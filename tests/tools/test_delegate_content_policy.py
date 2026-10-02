@@ -33,6 +33,8 @@ def test_public_child_policy_terminal(tmp_path, monkeypatch, profile, status, bo
     ("chat_plain", False), ("responses_plain", True), ("chat_mixed", False),
     ("chat_empty", False), ("chat_length", False), ("chat_malformed", False),
     ("responses_mixed", True),
+    *[("responses_mixed_" + order + ending, True)
+      for order in ("forward", "reverse") for ending in ("", "_unterminated")],
 ])
 def test_public_child_response_policy(tmp_path, monkeypatch, profile, case, streaming):
     _public_child(tmp_path, monkeypatch, profile, 200, "", "direct", case, streaming)
@@ -56,7 +58,7 @@ def _response(request, payload, case):
             status = "failed"
             content = content if case.endswith("output") else []
             error = {"code": "content_filter", "message": "Request rejected: content_filter"}
-        if case == "responses_mixed":
+        if case.startswith("responses_mixed"):
             content.append({"type": "refusal", "refusal": "fixture safety refusal"})
         item = {"type": "message", "id": "msg_fixture", "role": "assistant", "status": "completed", "content": content}
         response = {"id": "resp_fixture", "object": "response", "created_at": 0, "model": payload["model"],
@@ -66,9 +68,18 @@ def _response(request, payload, case):
         if case == "responses_refusal_delta":
             events.append({"type": "response.refusal.delta", "item_id": "msg_fixture", "output_index": 0,
                            "content_index": 0, "delta": "fixture safety refusal", "sequence_number": 1})
+        elif case.startswith("responses_mixed_"):
+            if "reverse" in case:
+                content.reverse()
+            for index, part in enumerate(content):
+                kind = part["type"]
+                events.append({"type": "response." + kind + ".delta", "item_id": "msg_fixture",
+                               "output_index": 0, "content_index": index, "sequence_number": index + 1,
+                               "delta": part["refusal" if kind == "refusal" else "text"]})
         elif content:
             events.append({"type": "response.output_item.done", "output_index": 0, "item": item})
-        events.append({"type": "response." + status, "response": response})
+        if not case.endswith("_unterminated"):
+            events.append({"type": "response." + status, "response": response})
         wire = "".join("event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n" for e in events)
         return httpx.Response(200, request=request, headers={"content-type": "text/event-stream"}, content=wire.encode())
     content, refusal, reason = text, None, "stop"
@@ -204,7 +215,7 @@ def _public_child(tmp_path, monkeypatch, profile, status, body, entry, case="err
     child = children[0]
     assert child._delegate_model_profile == profile
     assert attempts[0] == (route["model"], "Bearer " + route["api_key"])
-    policy = case not in {"chat_plain", "responses_plain", "chat_mixed", "chat_empty", "chat_length", "chat_malformed", "responses_mixed"}
+    policy = not case.startswith("responses_mixed") and case not in {"chat_plain", "responses_plain", "chat_mixed", "chat_empty", "chat_length", "chat_malformed", "responses_mixed"}
     if profile == "standard" and policy:
         assert len(attempts) == 1, attempts
         assert len(verdicts) == 1
@@ -218,10 +229,15 @@ def _public_child(tmp_path, monkeypatch, profile, status, body, entry, case="err
         assert verdicts[0].result["failure_reason"] == "content_policy_blocked"
         assert verdicts[0].result["failure_retryable"] is False
         assert verdicts[0].result["completed"] is False
-    elif case in {"chat_plain", "responses_plain", "chat_mixed", "responses_refusal", "responses_refusal_delta", "responses_mixed"}:
+    elif case.startswith("responses_mixed") or case in {"chat_plain", "responses_plain", "chat_mixed", "responses_refusal", "responses_refusal_delta"}:
         assert len(attempts) == 1
         assert not fallbacks
         assert result["results"][0]["status"] == "completed", result
+        if case.startswith("responses_mixed"):
+            parts = ["PUBLIC_PROBE_OK", "fixture safety refusal"]
+            assert result["results"][0]["summary"] == "".join(reversed(parts) if "reverse" in case else parts)
+        elif case in {"responses_refusal", "responses_refusal_delta"}:
+            assert result["results"][0]["summary"] == "fixture safety refusal"
     elif case in {"chat_empty", "chat_length", "responses_failed_output"}:
         assert attempts == [(route["model"], "Bearer fixture-accepted-key")] * 2
         assert not fallbacks

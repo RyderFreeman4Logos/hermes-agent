@@ -1007,18 +1007,6 @@ def _text_chunks(parts: Any, types: Optional[set] = None) -> List[str]:
     return [text for text in (getattr(part, "text", None) for part in selected) if _nonempty_str(text)]
 
 
-def _responses_message_parts(item: Any) -> List[Dict[str, Any]]:
-    """Replay parts. Refusal stays ``type=refusal``; ordinary text stays ``output_text``."""
-    parts: List[Dict[str, Any]] = []
-    for part in _as_list(_field(item, "content")):
-        ptype = _field(part, "type")
-        if ptype == "refusal" and _nonempty_str(text := _field(part, "refusal")):
-            parts.append({"type": "refusal", "refusal": text})
-        elif ptype in _OUTPUT_TEXT_TYPES and _nonempty_str(text := _field(part, "text")):
-            parts.append({"type": "output_text", "text": text})
-    return parts
-
-
 def _extract_responses_message_text(item: Any) -> str:
     """Assistant text from a Responses message output item. A ``refusal`` part carries the
     model's explanation in ``refusal`` instead of ``text``; it is message text too, otherwise a
@@ -1145,8 +1133,9 @@ class _OutputScan:
         # to the reasoning channel; the exact item is still preserved for replay/cache.
         (self.reasoning_parts if is_commentary_phase else self.content_parts).append(message_text)
         item_id = getattr(item, "id", None)
+        # Replay/display sidecars are text-only; policy checks read the unchanged raw response.
         self.message_items_raw.append(_message_item(
-            _responses_message_parts(item), status=_normalize_responses_message_status(item_status),
+            [{"type": "output_text", "text": message_text}], status=_normalize_responses_message_status(item_status),
             item_id=item_id if isinstance(item_id, str) else None, phase=normalized_phase,
         ))
 

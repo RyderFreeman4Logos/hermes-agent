@@ -658,10 +658,16 @@ class TestSwitchModelRequestOverridesSnapshot:
     so a post-switch transport recovery or fallback restore reinstates the
     switched-to identity's overrides, not a stale or empty set."""
 
-    def _switch(self, agent, **kwargs):
+    def _switch(self, agent, *, extra_body, **kwargs):
         from agent.agent_runtime_helpers import switch_model
 
         with (
+            patch("hermes_cli.config.load_config", return_value={
+                "custom_providers": [{
+                    "name": "switch-target", "model": kwargs["new_model"],
+                    "base_url": kwargs["base_url"], "extra_body": extra_body,
+                }],
+            }),
             patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
             patch(
                 "agent.model_metadata.get_model_context_length",
@@ -679,11 +685,12 @@ class TestSwitchModelRequestOverridesSnapshot:
 
     def test_switch_then_recover_restores_current_overrides(self):
         """After /model switch, a transport recovery must reinstate the
-        overrides that were live at switch time — not drop them."""
+        destination config overrides, not the pre-switch caller overrides."""
         overrides = {"extra_body": {"reasoning": {"effort": "high"}}}
-        agent = _make_agent(provider="custom", request_overrides=overrides)
+        agent = _make_agent(provider="custom", request_overrides={"extra_body": {"old_only": True}})
         self._switch(
             agent,
+            extra_body=overrides["extra_body"],
             new_model="local-model",
             new_provider="custom",
             base_url="https://my-llm.example.com/v1",
@@ -702,9 +709,10 @@ class TestSwitchModelRequestOverridesSnapshot:
 
     def test_switch_then_restore_restores_current_overrides(self):
         overrides = {"extra_body": {"reasoning": {"effort": "high"}}}
-        agent = _make_agent(provider="custom", request_overrides=overrides)
+        agent = _make_agent(provider="custom", request_overrides={"extra_body": {"old_only": True}})
         self._switch(
             agent,
+            extra_body=overrides["extra_body"],
             new_model="local-model",
             new_provider="custom",
             base_url="https://my-llm.example.com/v1",

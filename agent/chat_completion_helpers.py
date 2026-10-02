@@ -2014,6 +2014,11 @@ def _update_fallback_context_compressor(agent) -> None:
         model=agent.model, context_length=fb_context_length, base_url=agent.base_url,
         api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
     )
+    _finalize_fallback_compression_feasibility(agent)
+
+
+def _finalize_fallback_compression_feasibility(agent) -> None:
+    """Refresh a prior verdict after publication, including an interrupted durable reset."""
     # Fallback activation is an error path: refresh an EXISTING verdict eagerly (the ceiling was voided by
     # update_model()), but a session that never probed keeps its lazy compaction-time probe rather than
     # resolving an auxiliary client while the primary route is failing (#114707).
@@ -2071,6 +2076,55 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
+_FALLBACK_SNAPSHOT_FIELDS = (
+    "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
+    "_client_kwargs", "request_overrides", "_fallback_activated", "_reasoning_echo_flag",
+    "_config_context_length", "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url",
+    "_is_anthropic_oauth", "_credential_pool", "_credential_pool_entry_id",
+    "_use_prompt_caching", "_use_native_cache_layout", "reasoning_config", "runtime_capabilities",
+    "_provider_fallback_active", "_provider_fallback_route", "_cached_system_prompt",
+    "_pending_fallback_notice", "_retry_status_buffer", "_consecutive_stale_streams",
+    "_primary_runtime",
+)
+_FALLBACK_COPY_FIELDS = {
+    "_client_kwargs", "request_overrides", "reasoning_config", "runtime_capabilities",
+    "_primary_runtime",
+}
+
+
+def _snapshot_fallback_runtime(agent) -> dict:
+    """Capture the finite runtime owners mutated by one fallback activation."""
+    from agent.agent_runtime_helpers import _MISSING, _copy_request_overrides
+
+    values = {}
+    for name in _FALLBACK_SNAPSHOT_FIELDS:
+        value = getattr(agent, name, _MISSING)
+        if name in _FALLBACK_COPY_FIELDS and value is not _MISSING and value is not None:
+            value = _copy_request_overrides(value)
+        elif name in {"_pending_fallback_notice", "_retry_status_buffer"} and isinstance(value, list):
+            value = list(value)
+        values[name] = value
+    cache = getattr(agent, "_transport_cache", _MISSING)
+    cache_contents = dict(cache) if isinstance(cache, dict) else cache
+    return {"values": values, "transport_cache": cache_contents}
+
+
+def _restore_fallback_runtime(agent, snapshot: dict) -> None:
+    """Restore a rejected candidate before the loop considers its successor."""
+    from agent.agent_runtime_helpers import _MISSING
+
+    for name, value in snapshot["values"].items():
+        if value is _MISSING:
+            with contextlib.suppress(AttributeError):
+                delattr(agent, name)
+        else:
+            setattr(agent, name, value)
+    cache = snapshot["transport_cache"]
+    if isinstance(cache, dict) and isinstance(getattr(agent, "_transport_cache", None), dict):
+        agent._transport_cache.clear()
+        agent._transport_cache.update(cache)
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_at=None) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
@@ -2093,6 +2147,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
 
+        runtime_snapshot = None
+        compressor = getattr(agent, "context_compressor", None)
+        compressor_update_token = getattr(compressor, "_model_update_token", None)
         try:
             from agent.auxiliary_client import resolve_provider_client
             from hermes_cli.fallback_config import resolve_entry_api_key
@@ -2137,6 +2194,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                     fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+            from agent.agent_runtime_helpers import _copy_request_overrides
+            live_overrides = getattr(agent, "request_overrides", {}) or {}
+            runtime_snapshot = _snapshot_fallback_runtime(agent)
+            if not getattr(agent, "_fallback_activated", False):
+                primary_runtime = getattr(agent, "_primary_runtime", None)
+                if isinstance(primary_runtime, dict):
+                    # First fallback must freeze the pre-rescope graph so restore_primary_runtime
+                    # cannot pick up extra_body mutated by _rescope_fallback_extra_body.
+                    primary_runtime["request_overrides"] = _copy_request_overrides(live_overrides)
 
             # Clear the per-config context_length override so the fallback model's own context
             # window is resolved instead of the previous model's stale value.
@@ -2164,7 +2230,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
                 provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
             agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
-            _update_fallback_context_compressor(agent)
             _reresolve_fallback_reasoning_config(agent)
             _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
@@ -2187,8 +2252,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            # Publish compression only after candidate admission. update_model also resets durable
+            # cooldown/strike/runway state, which an agent-field rollback cannot restore.
+            _update_fallback_context_compressor(agent)
             return True
         except Exception as e:
+            if getattr(compressor, "_model_update_token", None) is not compressor_update_token:
+                # The publisher committed: durable resets cannot be undone by restoring agent fields.
+                logger.warning("Fallback %s is active; post-publication compression update failed: %s", fb_model, e)
+                _finalize_fallback_compression_feasibility(agent)
+                return True
+            if runtime_snapshot is not None:
+                with contextlib.suppress(Exception):
+                    _restore_fallback_runtime(agent, runtime_snapshot)
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)

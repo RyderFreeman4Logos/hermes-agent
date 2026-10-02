@@ -19,10 +19,10 @@ def test_nonlock_operational_error_stops_optimize(tmp_path, monkeypatch):
     orig = db._execute_write
     calls = {"n": 0}
 
-    def _raise(_do, patience_s=None):
+    def _raise(_do, patience_s=None, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return orig(_do, patience_s=patience_s)
+            return orig(_do, patience_s=patience_s, **kwargs)
         raise sqlite3.OperationalError("no such column: missing")
 
     try:
@@ -41,11 +41,11 @@ def test_lock_error_retries_then_succeeds(tmp_path, monkeypatch):
     orig = db._execute_write
     calls = {"n": 0}
 
-    def _locked_once(_do, patience_s=None):
+    def _locked_once(_do, patience_s=None, **kwargs):
         calls["n"] += 1
         if calls["n"] == 2:
             raise sqlite3.OperationalError("database is locked")
-        return orig(_do, patience_s=patience_s)
+        return orig(_do, patience_s=patience_s, **kwargs)
 
     try:
         _pending(db, monkeypatch)
@@ -63,10 +63,10 @@ def test_repeated_lock_error_stops_at_write_patience(tmp_path, monkeypatch):
     orig = db._execute_write
     calls = {"n": 0}
 
-    def _always_locked(_do, patience_s=None):
+    def _always_locked(_do, patience_s=None, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return orig(_do, patience_s=patience_s)
+            return orig(_do, patience_s=patience_s, **kwargs)
         raise sqlite3.OperationalError("database is locked")
 
     try:

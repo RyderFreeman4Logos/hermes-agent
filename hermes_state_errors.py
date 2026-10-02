@@ -29,8 +29,8 @@ _DISK_IO_ERROR_MARKER = "disk i/o error"
 
 # "Store BUSY, not gone" — HTTP callers map these to 503 instead of 500. Corruption
 # is deliberately absent: a malformed store must surface, not be retried into a timeout.
-_TRANSIENT_SQLITE_MARKERS = (
-    _DISK_IO_ERROR_MARKER, "database is locked", "database table is locked", "busy",
+_SQLITE_LOCK_MARKERS = (
+    "database is locked", "database table is locked", "database schema is locked", "database is busy",
 )
 
 
@@ -53,7 +53,7 @@ def is_sqlite_lock_error(exc_or_str) -> bool:
     if code is not None:
         return code in _SQLITE_LOCK_CODES
     text = str(exc_or_str).lower()
-    return "locked" in text or "busy" in text
+    return any(text.startswith(marker) for marker in _SQLITE_LOCK_MARKERS)
 
 
 def _is_no_more_rows(exc: sqlite3.Error) -> bool:
@@ -63,11 +63,14 @@ def _is_no_more_rows(exc: sqlite3.Error) -> bool:
 
 
 def is_transient_sqlite_error(exc: BaseException) -> bool:
-    """"Busy right now", not "damaged": one predicate so retry and the HTTP
-    503-vs-500 split cannot drift apart."""
-    return isinstance(exc, sqlite3.OperationalError) and (
-        is_sqlite_lock_error(exc) or any(marker in str(exc).lower() for marker in _TRANSIENT_SQLITE_MARKERS)
-    )
+    """HTTP busy/unavailable classification; known codes outrank message text.
+    IOERR is unavailable too, but is not permission to replay a write callback."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = _sqlite_primary_code(exc)
+    if code is not None:
+        return code in (*_SQLITE_LOCK_CODES, sqlite3.SQLITE_IOERR)
+    return is_sqlite_lock_error(exc) or str(exc).lower().startswith(_DISK_IO_ERROR_MARKER)
 
 
 def is_malformed_schema_error(exc: BaseException) -> bool:

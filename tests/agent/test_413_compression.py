@@ -115,39 +115,97 @@ def agent():
 # ---------------------------------------------------------------------------
 
 
-def test_current_user_turn_is_persisted_before_provider_call(agent):
-    """The inbound user turn is flushed before provider/tool work can crash."""
+@pytest.mark.parametrize("timing_enabled", [True, False])
+def test_current_user_turn_is_persisted_before_provider_call(
+    agent, tmp_path, monkeypatch, timing_enabled,
+):
+    """Clean display text and the exact wire graph commit before provider work."""
+    from copy import deepcopy
+    from datetime import datetime, timezone
+
+    from agent import loop_timing
+    from hermes_constants import get_hermes_home
+
+    (get_hermes_home() / "config.yaml").write_text(
+        f"agent:\n  loop_timing_context: {str(timing_enabled).lower()}\n"
+    )
+    started = datetime(2026, 9, 15, 10, tzinfo=timezone.utc)
+    previous_stop = "2026-09-15T09:59:00+00:00"
+    monkeypatch.setattr(loop_timing, "_now", lambda: started)
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *_a, **_k: None)
+    user_text = "new message that must survive a crash"
+    wire_text = user_text
+    if timing_enabled:
+        wire_text += (
+            "\n\n[Agent loop timing]\n"
+            f"Current loop started: {started.isoformat(timespec='seconds')}\n"
+            f"Previous loop ended: {previous_stop}"
+        )
+    history = [
+        {"role": "user", "content": "old message"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+    expected_wire = [
+        {"role": "system", "content": agent._cached_system_prompt},
+        *history,
+        {"role": "user", "content": wire_text},
+    ]
+    db = SessionDB(db_path=tmp_path / "turn-start.db")
+    agent._session_db = db
     observed = []
+    persist = agent._persist_session
 
     def _record_persist(messages, conversation_history):
-        observed.append(("persist", list(messages), list(conversation_history or [])))
+        persist(messages, conversation_history)
+        observed.append(("persist", deepcopy(messages)))
 
-    def _provider_crash(*_args, **_kwargs):
-        observed.append(("provider", [], []))
+    def _provider_crash(*_args, **kwargs):
+        # A separate connection proves the row committed, not just an in-memory flush.
+        reader = SessionDB(db_path=tmp_path / "turn-start.db")
+        try:
+            session = reader.get_session(agent.session_id)
+            assert session is not None
+            observed.append(("provider", deepcopy(kwargs["messages"]),
+                             reader.get_messages(agent.session_id), session["system_prompt"]))
+        finally:
+            reader.close()
         raise RuntimeError("provider died after turn-start persistence")
 
     agent.client.chat.completions.create.side_effect = _provider_crash
+    try:
+        agent._ensure_db_session()
+        db.patch_session_model_config(agent.session_id, {loop_timing.LOOP_STOP_KEY: previous_stop})
+        db.append_messages_batch(agent.session_id, deepcopy(history))
+        with (
+            patch.object(agent, "_persist_session", side_effect=_record_persist),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                user_text, conversation_history=db.get_messages_as_conversation(agent.session_id),
+            )
 
-    with (
-        patch.object(agent, "_persist_session", side_effect=_record_persist),
-        patch.object(agent, "_save_trajectory"),
-        patch.object(agent, "_cleanup_task_resources"),
-    ):
-        result = agent.run_conversation(
-            "new message that must survive a crash",
-            conversation_history=[{"role": "user", "content": "old message"}],
-        )
-
-    assert result.get("failed") is True
-    assert observed[0][0] == "persist"
-    assert observed[1][0] == "provider"
-    persisted_messages = observed[0][1]
-    assert persisted_messages[-1]["role"] == "user"
-    assert (
-        persisted_messages[-1]["content"]
-        == "new message that must survive a crash"
-    )
-    assert isinstance(persisted_messages[-1]["timestamp"], float)
+        assert result.get("failed") is True
+        assert [event[0] for event in observed[:2]] == ["persist", "provider"]
+        persisted_messages = observed[0][1]
+        assert persisted_messages[-1]["role"] == "user"
+        assert persisted_messages[-1]["content"] == wire_text
+        assert isinstance(persisted_messages[-1]["timestamp"], float)
+        for _, request, rows, system_prompt in (event for event in observed if event[0] == "provider"):
+            assert request == expected_wire
+            assert [{"role": row["role"], "content": row["content"]} for row in rows] == [
+                *history, {"role": "user", "content": user_text},
+            ]
+            assert rows[-1]["api_content"] == (wire_text if timing_enabled else None)
+            assert rows[-1]["timestamp"] == persisted_messages[-1]["timestamp"]
+            stored_wire = [{"role": "system", "content": system_prompt}] + [
+                {"role": row["role"], "content": row["api_content"] or row["content"]}
+                for row in rows
+            ]
+            assert stored_wire == request
+        assert db.get_session_model_config_value(agent.session_id, loop_timing.LOOP_STOP_KEY) == previous_stop
+    finally:
+        db.close()
 
 
 class TestHTTP413Compression:

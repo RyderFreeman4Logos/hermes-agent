@@ -2100,9 +2100,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             # of falling through to OpenRouter defaults.
             fb_base_url_hint = (fb.get("base_url") or "").strip() or None
             fb_api_key_hint = resolve_entry_api_key(fb)
-            # A revoked explicit env credential must not fall through to provider/default keys.
-            if fb_api_key_hint is None and str(fb.get("key_env") or fb.get("api_key_env") or "").strip():
-                raise ValueError("Fallback entry's configured credential is unavailable")
             fb_api_mode_explicit, fb_api_mode = _fallback_api_mode_hint(fb, fb_provider, fb_base_url_hint)
             # Ollama Cloud: OLLAMA_API_KEY from env when the entry has no key. Host match, not
             # substring — GHSA-76xc-57q6-vm5m.

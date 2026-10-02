@@ -2143,6 +2143,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             continue
 
         runtime_snapshot = None
+        compressor = getattr(agent, "context_compressor", None)
+        compressor_update_token = getattr(compressor, "_model_update_token", None)
         try:
             from agent.auxiliary_client import resolve_provider_client
             from hermes_cli.fallback_config import resolve_entry_api_key
@@ -2250,6 +2252,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             _update_fallback_context_compressor(agent)
             return True
         except Exception as e:
+            if getattr(compressor, "_model_update_token", None) is not compressor_update_token:
+                # The publisher committed: durable resets cannot be undone by restoring agent fields.
+                logger.warning("Fallback %s is active; post-publication compression update failed: %s", fb_model, e)
+                return True
             if runtime_snapshot is not None:
                 with contextlib.suppress(Exception):
                     _restore_fallback_runtime(agent, runtime_snapshot)

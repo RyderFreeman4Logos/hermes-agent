@@ -2260,7 +2260,7 @@ def _resolve_switch_context_length(agent, snapshot):
 
 
 def _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot) -> None:
-    """Point the context compressor at the new model (rolls back the switch on failure)."""
+    """Point compression at the new model; only pre-publication failures reject the switch."""
     from agent.model_metadata import get_model_context_length
     if custom_providers is None:
         try:
@@ -2271,6 +2271,7 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
     # agent.api_key may be a callable (Azure Foundry Entra ID); get_model_context_length expects a
     # string for live probes, so coerce defensively.
     ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+    compressor_update_token = getattr(agent.context_compressor, "_model_update_token", None)
     try:
         new_context_length = get_model_context_length(
             agent.model, base_url=agent.base_url, api_key=ctx_api_key, provider=agent.provider,
@@ -2284,9 +2285,11 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
-    except Exception:
-        _restore_switch_snapshot(agent, snapshot)
-        raise
+    except Exception as exc:
+        if getattr(agent.context_compressor, "_model_update_token", None) is compressor_update_token:
+            _restore_switch_snapshot(agent, snapshot)
+            raise
+        logger.warning("Model switch is active; post-publication compression update failed: %s", exc)
     # Outside the rollback guard: a probe hiccup must not undo a good switch. Eager, so the aux
     # clamp lands before the first compaction on the new window, not after it (#114707).
     from agent.conversation_compression import revalidate_compression_feasibility

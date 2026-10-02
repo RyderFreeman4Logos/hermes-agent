@@ -1052,15 +1052,20 @@ class SessionDB(
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        *, deadline: Optional[float] = None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
         immediately; on locked/busy the Python lock is released, a jitter slept,
-        and the WHOLE callback retried — *fn* must stay idempotent under retry."""
+        and the WHOLE callback retried — *fn* must stay idempotent under retry.
+        An optional absolute deadline caps (never renews) the caller's remaining
+        patience. Zero patience without a deadline still permits one immediate attempt."""
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
-        deadline = time.monotonic() + patience_s
+        immediate = deadline is None and patience_s <= 0
+        own_deadline = time.monotonic() + patience_s
+        deadline = min(deadline, own_deadline) if deadline is not None else own_deadline
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -1090,6 +1095,8 @@ class SessionDB(
                         self._raise_if_db_replaced()
                         if self._conn is None:  # close() raced this writer
                             self._reopen_after_close_locked(context="write")
+                        if not immediate and time.monotonic() >= deadline:
+                            raise sqlite3.OperationalError("database is locked (write retry deadline expired)")
                         self._conn.execute("BEGIN IMMEDIATE")
                         try:
                             fn_started = True
@@ -1506,8 +1513,8 @@ class SessionDB(
             (self._WRITE_RETRY_SLOW_MIN_S, self._WRITE_RETRY_SLOW_MAX_S) if slow
             else (self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S)
         ))
-        time.sleep(min(jitter, max(deadline - now, 0.001)))
-        return True
+        time.sleep(min(jitter, deadline - now))
+        return time.monotonic() < deadline
 
     def _foreign_state_db_holders(self) -> List[Tuple[int, str]]:
         """Foreign processes holding this DB or its WAL sidecars (see hermes_state_holders)."""

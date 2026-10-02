@@ -9,7 +9,7 @@ import logging
 import re
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
@@ -18,7 +18,7 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _FTS_CJK_TRIGGERS,
     escape_like as _escape_like, fts_rebuild_admission, fts_trigram_session_sql, routed_sessions_setting,
 )
-from hermes_state_errors import is_transient_sqlite_error
+from hermes_state_errors import is_sqlite_lock_error
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -314,8 +314,8 @@ class SessionSearchMixin:
             _delete_meta(conn, f"{prefix}_high_water", f"{prefix}_progress")
         self._execute_write(_do)
 
-    def fts_rebuild_step(self) -> bool:
-        """Backfill one chunk of the deferred FTS rebuild; True while work remains. Chunks are
+    def fts_rebuild_step(self, *, deadline: Optional[float] = None) -> bool | Literal["retry"]:
+        """Backfill a chunk: True = committed progress, False = done, "retry" = busy. Chunks are
         claimed atomically inside the write transaction, so concurrent processes interleave
         instead of duplicating rows."""
         if not self._fts_enabled:
@@ -324,18 +324,18 @@ class SessionSearchMixin:
         if self._trigram_available:
             inserts.append(self._TRIGRAM_CHUNK_INSERT_SQL)
         return self._rebuild_step("fts_rebuild", inserts, fail_msg="FTS rebuild chunk failed (will retry): %s",
-                                  finish=self._fts_rebuild_finish, finish_when_empty=True)
+                                  finish=self._fts_rebuild_finish, finish_when_empty=True, deadline=deadline)
 
-    def fts_cjk_rebuild_step(self) -> bool:
-        """Backfill one chunk of the CJK index. True while work remains."""
+    def fts_cjk_rebuild_step(self, *, deadline: Optional[float] = None) -> bool | Literal["retry"]:
+        """Backfill CJK; same progress/done/retry outcomes as :meth:`fts_rebuild_step`."""
         if not self._fts_enabled or not self._fts_cjk_loaded:
             return False
         insert = self._CHUNK_INSERT_SQL.format(table="messages_fts_cjk", extra=" AND role <> 'tool'")
         return self._rebuild_step("fts_cjk_rebuild", [insert], finish=self._fts_cjk_rebuild_finish,
-                                  fail_msg="CJK FTS rebuild chunk failed (will retry): %s")
+                                  fail_msg="CJK FTS rebuild chunk failed (will retry): %s", deadline=deadline)
 
     def _rebuild_step(self, prefix: str, insert_sqls: List[str], *, fail_msg: str, finish,
-                      finish_when_empty: bool = False) -> bool:
+                      finish_when_empty: bool = False, deadline: Optional[float] = None) -> bool | Literal["retry"]:
         """Shared chunk engine for the base and CJK deferred backfills. ``finish_when_empty``
         finalizes a high_water <= 0 marker (empty messages table) instead of leaving it pending."""
         high_water_raw = self.get_meta(f"{prefix}_high_water")
@@ -362,7 +362,7 @@ class SessionSearchMixin:
             return upper < high_water
 
         try:
-            more = self._execute_write(_do)
+            more = self._execute_write(_do, deadline=deadline)
         except sqlite3.OperationalError as exc:
             return self._fts_chunk_error(exc, fail_msg)
         if more is False:
@@ -370,21 +370,22 @@ class SessionSearchMixin:
             if (finish_when_empty and high_water <= 0) or (
                 status is not None and status["indexed"] >= status["total"]
             ):
+                # The chunk committed; finalization is a new write, not a retry.
                 finish()
             return False
         return bool(more)
 
-    def _fts_chunk_error(self, exc: sqlite3.OperationalError, fail_msg: str) -> bool:
-        """True only for lock/busy (the driver bounds those). Anything else stops the phase."""
-        if is_transient_sqlite_error(exc) and "disk i/o error" not in str(exc).lower():
+    def _fts_chunk_error(self, exc: sqlite3.OperationalError, fail_msg: str) -> Literal["retry"]:
+        """Only lock/busy may retry; never confuse it with committed progress."""
+        if is_sqlite_lock_error(exc) and "disk i/o error" not in str(exc).lower():
             logger.debug(fail_msg, exc)
-            return True
+            return "retry"
         logger.warning(fail_msg, exc)
         raise exc
 
-    def _fts_teardown_trash_step(self) -> bool:
+    def _fts_teardown_trash_step(self, *, deadline: Optional[float] = None) -> bool | Literal["retry"]:
         """Tear down one chunk of a demoted v22 FTS shadow table (a PLAIN table now); True while
-        work remains. INTEGER single-column-key tables drain with a high-water marker so
+        work remains, "retry" on contention. INTEGER single-column-key tables drain with a high-water marker so
         each chunk's scan is bounded (restarting the scan was O(n²)); compound-key tables
         keep the chunked ``LIMIT`` delete — they are small by construction.
 
@@ -441,7 +442,7 @@ class SessionSearchMixin:
             return True
 
         try:
-            return bool(self._execute_write(_do))
+            return bool(self._execute_write(_do, deadline=deadline))
         except sqlite3.OperationalError as exc:
             return self._fts_chunk_error(exc, "FTS trash teardown chunk failed (will retry): %s")
 
@@ -700,22 +701,31 @@ class SessionSearchMixin:
             lock/busy retries share ``_WRITE_PATIENCE_S`` (the same monotonic budget
             ``_execute_write`` uses for one write).
             """
-            deadline = time.monotonic() + self._WRITE_PATIENCE_S
+            deadline = None
             while True:
                 _t0 = time.monotonic()
+                if deadline is None:
+                    deadline = _t0 + self._WRITE_PATIENCE_S
+                elif _t0 >= deadline:
+                    return "fts_error"
                 try:
-                    if not step():
+                    outcome = step(deadline=deadline)
+                    if outcome is False:
                         return None
                 except sqlite3.OperationalError:
-                    return "fts_error"
-                if time.monotonic() >= deadline:
                     return "fts_error"
                 _emit(phase)
                 pause = max(
                     self._FTS_REBUILD_MIN_PAUSE,
                     (time.monotonic() - _t0) * self._FTS_REBUILD_DUTY_FACTOR,
                 )
-                time.sleep(min(pause, max(0.0, deadline - time.monotonic())))
+                if outcome is True:
+                    # Only a committed chunk earns fresh patience. Healthy work
+                    # and its deliberate duty-cycle pause have no phase deadline.
+                    deadline = None
+                else:
+                    pause = min(pause, max(0.0, deadline - time.monotonic()))
+                time.sleep(pause)
 
         # Phase 1: base backfill; 1b: CJK-bigram backfill (own marker pair).
         _emit("backfill")

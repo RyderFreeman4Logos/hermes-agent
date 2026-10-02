@@ -2014,6 +2014,11 @@ def _update_fallback_context_compressor(agent) -> None:
         model=agent.model, context_length=fb_context_length, base_url=agent.base_url,
         api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
     )
+    _finalize_fallback_compression_feasibility(agent)
+
+
+def _finalize_fallback_compression_feasibility(agent) -> None:
+    """Refresh a prior verdict after publication, including an interrupted durable reset."""
     # Fallback activation is an error path: refresh an EXISTING verdict eagerly (the ceiling was voided by
     # update_model()), but a session that never probed keeps its lazy compaction-time probe rather than
     # resolving an auxiliary client while the primary route is failing (#114707).
@@ -2255,6 +2260,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             if getattr(compressor, "_model_update_token", None) is not compressor_update_token:
                 # The publisher committed: durable resets cannot be undone by restoring agent fields.
                 logger.warning("Fallback %s is active; post-publication compression update failed: %s", fb_model, e)
+                _finalize_fallback_compression_feasibility(agent)
                 return True
             if runtime_snapshot is not None:
                 with contextlib.suppress(Exception):

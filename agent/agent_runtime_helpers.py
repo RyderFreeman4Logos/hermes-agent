@@ -1239,14 +1239,19 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
                     if not reopened and entry is None:
                         # Ordinary 429 rotation clears the cursor. select() is the path
                         # that probes and clears a future stamp; has_available() does not.
-                        reopened = pool.select(model=primary_model or None) is not None
-                    # A current-entry probe clears the account stamp only. The requested
-                    # model can still be benched; publish nothing until selection yields it.
+                        entry = pool.select(model=primary_model or None)
+                        reopened = entry is not None
+                    elif reopened and entry is not None and pool is not None:
+                        # The probe admitted this entry without select(). One select()
+                        # records that same entry. A second select() rotates it away.
+                        entry = pool.select(model=primary_model or None)
+                        reopened = entry is not None
                     if reopened and entry is not None:
-                        reopened = pool.select(model=primary_model or None) is not None
+                        agent._restore_selected_entry_id = getattr(entry, "id", None)
             except Exception:
                 logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
                 reopened = False
+                agent._restore_selected_entry_id = None
             if probe is not None and reopened:
                 return False, prefetched_pool, prefetched
             if not getattr(agent, "_restore_wait_logged", False):
@@ -1272,6 +1277,42 @@ def _restore_runtime_capabilities(agent, rt: Dict[str, Any]) -> None:
         logger.warning("Ignoring malformed runtime capabilities snapshot")
 
 
+def _ensure_primary_pool(agent, matches_primary, load_primary_pool, prefetched_pool, prefetched):
+    """Attach the primary pool when fallback left a different provider's pool."""
+    pool = getattr(agent, "_credential_pool", None)
+    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
+    if pool is not None and pool_provider and not matches_primary(pool):
+        agent._credential_pool = None
+        agent._credential_pool_entry_id = None
+        try:
+            # Reuse the pool the reset-aware gate already loaded (one auth.json read).
+            agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
+        except Exception as exc:
+            logger.warning(
+                "Restore could not reload primary credential pool: %s", exc
+            )
+        pool = getattr(agent, "_credential_pool", None)
+    return pool
+
+
+def _owned_restore_entry(agent, primary_model):
+    """The gate's admitted entry if that id is still eligible, else None.
+
+    Does not clear the handoff and does not call select()."""
+    owned_id = getattr(agent, "_restore_selected_entry_id", None)
+    if owned_id is None:
+        return None
+    pool = getattr(agent, "_credential_pool", None)
+    entry = None
+    if pool is not None:
+        entry = next((item for item in pool.entries() if getattr(item, "id", None) == owned_id), None)
+    if entry is None or pool is None or not pool.has_available(model=primary_model or None):
+        return None
+    if not (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")):
+        return None
+    return entry
+
+
 def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched) -> None:
     """Rebind and re-select the primary credential pool after a fallback turn. A cross-provider
     fallback attaches its own pool, which would trip the provider-mismatch guard on the next
@@ -1281,21 +1322,19 @@ def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matc
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
         return  # The snapshot's pinned tier key owns the primary route.
-    pool = getattr(agent, "_credential_pool", None)
-    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
-    if pool is not None and pool_provider and not matches_primary(pool):
-        agent._credential_pool = None
-        agent._credential_pool_entry_id = None
-        try:
-            # Reuse the pool the reset-aware gate already loaded (avoids a second auth.json read).
-            agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
-        except Exception as exc:
-            logger.warning(
-                "Restore could not reload primary credential pool for %s: %s", primary_provider, exc
-            )
+    pool = _ensure_primary_pool(agent, matches_primary, load_primary_pool, prefetched_pool, prefetched)
     agent._credential_pool_entry_id = None
-    pool = getattr(agent, "_credential_pool", None)
-    entry = pool.select(model=primary_model or None) if pool is not None and pool.has_available(model=primary_model or None) else None
+    # The reset gate already admitted one entry. Selecting again advances
+    # round-robin / least_used. Publish that id; do not rotate.
+    owned_id = getattr(agent, "_restore_selected_entry_id", None)
+    if owned_id is not None:
+        entry = _owned_restore_entry(agent, primary_model)
+        agent._restore_selected_entry_id = None
+        if entry is None:
+            agent._restore_selected_entry_id = owned_id
+            return
+    else:
+        entry = pool.select(model=primary_model or None) if pool is not None and pool.has_available(model=primary_model or None) else None
     if entry is None or not (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")):
         return
     if matches_primary(entry):
@@ -1395,6 +1434,20 @@ def restore_primary_runtime(agent) -> bool:
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
     previous_model, previous_provider = (str(v or "unknown") for v in fallback_route)
     provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
+    # Attach the primary pool first. Refuse an owned admission that is no
+    # longer eligible before the snapshot client or compressor is published.
+    # A still-eligible owned entry is swapped after the snapshot apply, so
+    # the snapshot key cannot overwrite it.
+    _ensure_primary_pool(agent, _matches_primary, _load_primary_pool, prefetched_pool, prefetched)
+    if getattr(agent, "_restore_selected_entry_id", None) is not None:
+        if _owned_restore_entry(agent, primary_model) is None:
+            agent._restore_selected_entry_id = None
+            return False
+    held = {name: getattr(agent, name, None) for name in (
+        "model", "provider", "requested_provider", "base_url", "api_mode", "api_key",
+        "_client_kwargs", "client", "_credential_pool_entry_id",
+    )}
+    compressor_before = getattr(getattr(agent, "context_compressor", None), "values", None)
     try:
         _apply_primary_runtime_fields(agent, rt)
         _restore_runtime_capabilities(agent, rt)
@@ -1421,6 +1474,14 @@ def restore_primary_runtime(agent) -> bool:
         _rebind_primary_credential_pool(
             agent, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched
         )
+        if getattr(agent, "_restore_selected_entry_id", None) is not None:
+            # Eligible at the pre-check, revoked before publication.
+            agent._restore_selected_entry_id = None
+            for name, value in held.items():
+                setattr(agent, name, value)
+            if compressor_before is not None:
+                agent.context_compressor.values = compressor_before
+            return False
         # Older snapshots have no reasoning_config; keep the current value.
         saved_reasoning = rt.get("reasoning_config")
         if saved_reasoning is not None:

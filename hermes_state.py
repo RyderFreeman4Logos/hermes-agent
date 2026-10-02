@@ -1093,6 +1093,7 @@ class SessionDB(
                     self._reopen_after_close_locked(context="write", timeout=0.0)
                 conn = cast(sqlite3.Connection, self._conn)
                 previous_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                primary: Optional[BaseException] = None
                 try:
                     remaining = self._remaining_write_budget(deadline, immediate=immediate)
                     conn.execute(f"PRAGMA busy_timeout={min(previous_ms, int(remaining * 1000))}")
@@ -1104,28 +1105,33 @@ class SessionDB(
                         remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
                         conn.execute(f"PRAGMA busy_timeout={min(previous_ms, remaining_ms)}")
                         conn.commit()
-                    except BaseException as primary:
+                    except BaseException as caught:
+                        primary = caught
                         rollback_error = None
                         try:
                             conn.rollback()
                         except Exception as rollback_exc:
                             if conn.in_transaction:
-                                raise RuntimeError("state.db rollback failed; write settlement is unknown") from rollback_exc
+                                primary.add_note(
+                                    "state.db rollback failed; write settlement is unknown: "
+                                    + str(rollback_exc)
+                                )
+                                raise primary
                             rollback_error = rollback_exc
                         if rollback_error is not None:
                             primary.add_note("state.db cleanup failed after rollback: " + str(rollback_error))
                         raise
+                    primary = None
                 finally:
-                    pending = sys.exc_info()[1]
                     try:
                         conn.execute(f"PRAGMA busy_timeout={int(previous_ms)}")
                     except sqlite3.Error as restore_exc:
-                        if pending is None:
+                        if primary is None:
                             # This can follow a successful COMMIT; never enter SQLite retry.
                             raise RuntimeError("state.db busy timeout restoration failed") from restore_exc
-                        pending.add_note("state.db busy timeout restoration failed: " + str(restore_exc))
-                    if pending is not None:
-                        raise pending
+                        primary.add_note("state.db busy timeout restoration failed: " + str(restore_exc))
+                    if primary is not None:
+                        raise primary
             finally:
                 self._lock.release()
 

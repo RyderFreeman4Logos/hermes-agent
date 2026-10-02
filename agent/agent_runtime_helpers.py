@@ -1222,6 +1222,18 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
         primary_model = str(rt.get("model") or "").strip()
         next_at = getattr(pool, "next_available_at", lambda **_kwargs: None)(model=primary_model or None)
         if next_at is not None and next_at > time.time():
+            # next_available_at does not run the early Codex quota probe select()
+            # uses, so a weekly stamp can outlive an already-open window.
+            if primary_provider == "openai-codex" and pool is not None:
+                entry = pool.current()
+                probe = getattr(pool, "_codex_quota_restored_upstream", None)
+                try:
+                    reopened = bool(probe(entry)) if probe is not None else False
+                except Exception:
+                    logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
+                    reopened = False
+                if reopened:
+                    return False, prefetched_pool, prefetched
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(

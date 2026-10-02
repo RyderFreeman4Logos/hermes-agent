@@ -425,12 +425,13 @@ def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
     from tools.delegate_tool_config import _require_pool_provider, _normalized_runtime_url
 
     base_url = str(entry.get("base_url") or "").strip() or None
-    api_key = resolve_entry_api_key(entry)
     provider = entry["provider"].strip().lower()
-    if provider == "custom" and base_url is None and api_key is None:
-        return True
-    reason = "runtime resolution failed; check provider configuration"
+    reason = "invalid or unavailable fallback credential; check inline key and env references"
     try:
+        api_key = resolve_entry_api_key(entry)
+        if provider == "custom" and base_url is None and api_key is None:
+            return True
+        reason = "runtime resolution failed; check provider configuration"
         resolved = resolve_runtime_provider(
             requested=entry["provider"],
             target_model=entry["model"],

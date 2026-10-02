@@ -361,6 +361,157 @@ def test_cleanup_keeps_primary_identity_and_records_cleanup(database, monkeypatc
     assert str(secondary) in notes
 
 
+def _notes(error):
+    return " ".join(getattr(note, "message", str(note)) for note in getattr(error, "__notes__", ()))
+
+
+def test_handled_ambient_exception_does_not_fail_a_committed_write(database):
+    ambient = ValueError("already handled")
+    calls = []
+
+    def callback(conn):
+        calls.append(1)
+        conn.execute("INSERT INTO witness VALUES(7)")
+        return 7
+
+    try:
+        raise ambient
+    except ValueError:
+        result = database._execute_write(callback)
+    conn = database._conn
+    assert result == 7 and calls == [1]
+    assert conn.execute("SELECT count(*) FROM witness").fetchone()[0] == 1
+    assert database._write_count == 2
+    assert not conn.in_transaction
+
+
+def test_handled_ambient_busy_is_not_replayed(database, monkeypatch):
+    ambient = sqlite3.OperationalError("database is locked")
+    ambient.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    calls = []
+
+    def callback(conn):
+        calls.append(1)
+        conn.execute("INSERT INTO witness VALUES(7)")
+        return 7
+
+    monkeypatch.setattr(hermes_state.random, "uniform", lambda *_args: 0.0)
+    monkeypatch.setattr(hermes_state.time, "sleep", lambda _delay: None)
+    try:
+        raise ambient
+    except sqlite3.OperationalError:
+        result = database._execute_write(callback, patience_s=0.5)
+    conn = database._conn
+    assert result == 7 and calls == [1]
+    assert conn.execute("SELECT count(*) FROM witness").fetchone()[0] == 1
+    assert database._write_count == 2
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("kind", ["cancel", "io", "sql", "commit"])
+def test_open_transaction_rollback_keeps_primary_and_blocks_replay(database, monkeypatch, kind):
+    conn = database._conn
+    primary = {
+        "cancel": KeyboardInterrupt("cancel-primary"),
+        "io": _sqlite("disk I/O error", sqlite3.SQLITE_IOERR),
+        "sql": _sqlite("near primary: syntax error", sqlite3.SQLITE_ERROR),
+        "commit": _sqlite("disk I/O error", sqlite3.SQLITE_IOERR),
+    }[kind]
+    secondary = sqlite3.OperationalError("rollback still open")
+    calls = []
+
+    def rollback():
+        raise secondary
+
+    def callback(c):
+        calls.append(1)
+        c.execute("INSERT INTO witness VALUES(3)")
+        if kind != "commit":
+            raise primary
+
+    monkeypatch.setattr(conn, "rollback", rollback)
+    if kind == "commit":
+        monkeypatch.setattr(conn, "commit", lambda: (_ for _ in ()).throw(primary))
+    caught = None
+    try:
+        try:
+            database._execute_write(callback)
+        except BaseException as exc:
+            caught = exc
+        assert calls == [1]
+        assert caught is primary
+        assert conn.in_transaction
+        assert "unknown" in _notes(primary) and str(secondary) in _notes(primary)
+        with pytest.raises(sqlite3.OperationalError):
+            database._execute_write(lambda c: calls.append(2))
+        assert calls == [1]
+    finally:
+        if conn.in_transaction:
+            sqlite3.Connection.rollback(conn)
+
+
+def test_successful_fts_detach_publishes_and_retries_once(database, clock, monkeypatch):
+    conn = database._conn
+    before = len(triggers(database))
+    assert before
+    calls = []
+    current = fts_error()
+    prior = _sqlite("database is locked", sqlite3.SQLITE_BUSY)
+
+    def callback(c):
+        calls.append(clock.now)
+        c.execute("INSERT INTO witness VALUES(?)", (len(calls),))
+        if len(calls) == 1:
+            raise prior
+        if len(calls) == 2:
+            raise current
+        return 7
+
+    monkeypatch.setattr(hermes_state.random, "uniform", lambda *_args: 0.25)
+    result = database._execute_write(callback, deadline=20)
+    assert result == 7 and calls == [0, 0.25, 0.25]
+    assert database._fts_stale and not database._fts_enabled
+    assert triggers(database) == []
+    stale = conn.execute("SELECT value FROM state_meta WHERE key = 'fts_stale'").fetchone()
+    assert stale is not None and stale[0] == "1"
+    assert [row[0] for row in conn.execute("SELECT value FROM witness ORDER BY value")] == [3]
+    assert database._write_count == 2
+    assert not conn.in_transaction
+
+
+def test_expired_recovery_keeps_latest_owner_without_republish(database, clock, monkeypatch):
+    before = triggers(database)
+    calls, commits = [], []
+    prior = _sqlite("database is locked", sqlite3.SQLITE_BUSY)
+    current = fts_error()
+    original_commit = database._conn.commit
+
+    def commit():
+        commits.append(clock.now)
+        original_commit()
+        if len(commits) == 1:
+            clock.now = 21
+
+    def callback(c):
+        calls.append(clock.now)
+        if len(calls) == 1:
+            raise prior
+        raise current
+
+    monkeypatch.setattr(hermes_state.random, "uniform", lambda *_args: 0.25)
+    monkeypatch.setattr(database._conn, "commit", commit)
+    with pytest.raises(sqlite3.DatabaseError) as caught:
+        database._execute_write(callback, deadline=20)
+    assert caught.value is current
+    assert calls == [0, 0.25]
+    assert commits == [0.25]
+    assert triggers(database) == []
+    assert database._fts_stale and not database._fts_enabled
+    assert database._conn.execute("SELECT count(*) FROM witness").fetchone()[0] == 0
+    assert not database._conn.in_transaction
+    assert clock.now == 21
+
+
 def test_uncertain_rollback_is_never_retried(database, monkeypatch):
     conn = database._conn
     original_rollback = conn.rollback
@@ -407,6 +558,7 @@ def test_successful_fts_recovery_keeps_current_owner_after_expiry(database, cloc
         raise current
 
     monkeypatch.setattr(conn, "commit", commit)
+    before = triggers(database)
     with pytest.raises(sqlite3.DatabaseError) as caught:
         database._execute_write(callback, deadline=20)
     assert caught.value is current
@@ -414,6 +566,11 @@ def test_successful_fts_recovery_keeps_current_owner_after_expiry(database, cloc
     assert clock.now == 21
     assert not conn.in_transaction
     assert conn.execute("SELECT count(*) FROM witness").fetchone()[0] == 0
+    assert triggers(database) == []
+    assert database._fts_stale and not database._fts_enabled
+    stale = conn.execute("SELECT value FROM state_meta WHERE key = 'fts_stale'").fetchone()
+    assert stale is not None and stale[0] == "1"
+    assert before
 
 
 def test_expired_fts_owner_has_no_further_side_effect(database, clock, monkeypatch):

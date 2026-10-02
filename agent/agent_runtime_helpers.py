@@ -1405,9 +1405,9 @@ def restore_primary_runtime(agent) -> bool:
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
     previous_model, previous_provider = (str(v or "unknown") for v in fallback_route)
     provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
-    # Prepare on a shallow runtime copy: builders and swaps must not mutate the
-    # fallback. The compressor and authoritative pool are never copied or rolled back.
+    # Stage runtime writes, but bind retained client callbacks to the live session.
     staged = copy.copy(agent)
+    staged._client_owner = agent
     staged.client = staged._anthropic_client = None
     staged._transport_cache = {}
     prepared = []
@@ -2096,7 +2096,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     client = process_bootstrap.OpenAI(**client_kwargs)
     # Routing proxies name the deployment they served in a response header (#54864).
     from agent.served_model import install_served_model_capture
-    install_served_model_capture(agent, client)
+    install_served_model_capture(vars(agent).get("_client_owner", agent), client)
     _ra().logger.info("OpenAI client created (%s, shared=%s) %s", reason, shared, agent._client_log_context())
     return client
 

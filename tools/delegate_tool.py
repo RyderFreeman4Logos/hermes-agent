@@ -460,8 +460,7 @@ def _fallback_hop_admitted(entry: Dict[str, Any]) -> bool:
         return False
     key = api_key if api_key is not None else resolved.get("api_key")
     if callable(key) or key == "no-key-required" or has_usable_secret(key):
-        if api_key:
-            entry["api_key"] = api_key
+        # Keep env references live for activation; only declared inline keys are pins.
         return True
     logger.info(
         "delegate profile fallback skipped %s/%s: resolved without credentials",

@@ -932,8 +932,8 @@ def test_normalize_codex_response_keeps_legitimate_cmd_json_answer(text):
     assert assistant_message.codex_message_items
 
 
-def test_normalize_codex_response_keeps_refusal_part_type():
-    """A sole refusal part stays typed refusal so policy provenance survives normalization."""
+def test_normalize_codex_response_keeps_raw_refusal_and_replay_text():
+    """Policy reads raw refusal provenance; replay consumes the existing text-only sidecar."""
     response = SimpleNamespace(
         status="completed", incomplete_details=None, output_text="no",
         output=[SimpleNamespace(
@@ -944,8 +944,13 @@ def test_normalize_codex_response_keeps_refusal_part_type():
     assistant, finish = _normalize_codex_response(response, issuer_kind="custom")
     assert finish == "stop"
     assert assistant.content == "no"
-    part = assistant.codex_message_items[0]["content"][0]
-    assert part == {"type": "refusal", "refusal": "no"}
+    part = response.output[0].content[0]
+    assert part.type == "refusal" and part.refusal == "no"
+    wire = _chat_messages_to_responses_input([{
+        "role": "assistant", "content": assistant.content,
+        "codex_message_items": assistant.codex_message_items,
+    }])
+    assert wire[0]["content"] == [{"type": "output_text", "text": "no"}]
 
 
 def test_normalize_codex_response_failed_includes_code_in_error():

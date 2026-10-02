@@ -73,6 +73,59 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     )
 
 
+def test_transfer_ownership_persists_new_owner_after_releasing_lock(registry, tmp_path, monkeypatch):
+    """Success persists the new owner exactly once, after the registry lock is free.
+
+    An unknown id writes nothing. The checkpoint body is the real writer; only
+    its entry is counted, so a stub cannot satisfy the assertion.
+    """
+    import tools.process_registry as process_registry_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    session = _make_session(sid="proc_handoff", task_id="child")
+    session.owner_task_id = "child"
+    registry._running[session.id] = session
+
+    calls = []
+    real_write = registry._write_checkpoint
+
+    def counted_write(*args, **kwargs):
+        calls.append(registry._lock.locked())
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_write_checkpoint", counted_write)
+
+    assert registry.transfer_ownership(
+        "missing", from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="nope",
+    ) is None
+    assert calls == []
+    assert not checkpoint.exists()
+    assert session.owner_task_id == "child"
+
+    session.exited = True
+    assert registry.transfer_ownership(
+        session.id, from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="late",
+    ) is None
+    assert calls == []
+    assert not checkpoint.exists()
+    session.exited = False
+
+    moved = registry.transfer_ownership(
+        session.id, from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="handoff",
+    )
+    assert moved is session
+    assert calls == [False]
+    assert session.owner_task_id == "parent"
+    assert not registry._lock.locked()
+    stored = json.loads(checkpoint.read_text())
+    assert stored[0]["session_id"] == session.id
+    assert stored[0]["owner_task_id"] == "parent"
+
+
 def test_reader_start_failure_rolls_back_exact_registration(registry, monkeypatch):
     session = _make_session(sid="failed-reader")
     other = _make_session(sid="unrelated")

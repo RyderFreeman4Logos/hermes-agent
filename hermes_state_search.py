@@ -18,7 +18,7 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS, SCHEMA_VERSION, _FTS_CJK_TRIGGERS,
     escape_like as _escape_like, fts_rebuild_admission, fts_trigram_session_sql, routed_sessions_setting,
 )
-from hermes_state_errors import is_sqlite_lock_error
+from hermes_state_errors import is_sqlite_io_error, is_sqlite_lock_error
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -377,7 +377,7 @@ class SessionSearchMixin:
 
     def _fts_chunk_error(self, exc: sqlite3.OperationalError, fail_msg: str) -> Literal["retry"]:
         """Only lock/busy may retry; never confuse it with committed progress."""
-        if is_sqlite_lock_error(exc) and "disk i/o error" not in str(exc).lower():
+        if is_sqlite_lock_error(exc) and not is_sqlite_io_error(exc):
             logger.debug(fail_msg, exc)
             return "retry"
         logger.warning(fail_msg, exc)

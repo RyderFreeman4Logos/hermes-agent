@@ -1224,11 +1224,20 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
         if next_at is not None and next_at > time.time():
             # next_available_at does not run the early Codex quota probe select()
             # uses, so a weekly stamp can outlive an already-open window.
-            if primary_provider == "openai-codex" and pool is not None:
-                entry = pool.current()
-                probe = getattr(pool, "_codex_quota_restored_upstream", None)
+            # Optional probe: a pool that only has next_available_at must stay blocked.
+            # current() is inside the probe try so a missing method is a negative answer,
+            # not an unrelated gate error that fails the restore open.
+            probe = getattr(pool, "_codex_quota_restored_upstream", None) if (
+                primary_provider == "openai-codex" and pool is not None
+            ) else None
+            if probe is not None:
                 try:
-                    reopened = bool(probe(entry)) if probe is not None else False
+                    entry = pool.current()
+                    reopened = bool(probe(entry)) if entry is not None else False
+                    if not reopened and entry is None:
+                        # Ordinary 429 rotation clears the cursor. select() is the path
+                        # that probes and clears a future stamp; has_available() does not.
+                        reopened = pool.select(model=primary_model or None) is not None
                 except Exception:
                     logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
                     reopened = False

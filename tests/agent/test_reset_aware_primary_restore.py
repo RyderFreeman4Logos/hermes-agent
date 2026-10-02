@@ -401,3 +401,32 @@ def test_probe_exception_keeps_the_future_stamp_block():
     assert agent._restore_primary_runtime() is False
     assert agent._fallback_activated is True
     assert agent.provider == "openrouter"
+
+
+def test_missing_current_and_probe_keeps_the_future_stamp_block():
+    """A pool that only speaks next_available_at/has_available/select must stay blocked.
+
+    Discovering optional Codex probe support by calling current() first raises into the
+    gate's unrelated fail-open handler and restores despite a known future reset.
+    """
+    agent = _make_agent(fallback_model=TestCodexWeeklyRestoreProbe.FB)
+    _codex_runtime(agent, "gpt-6-sol")
+    _activate_fallback(agent)
+    agent._rate_limited_until = 0
+    pool = _FakePool("openai-codex", next_at=time.time() + 6 * 86400)
+    agent._credential_pool = pool
+    assert not hasattr(pool, "current")
+    assert not hasattr(pool, "_codex_quota_restored_upstream")
+
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert agent._credential_pool_entry_id is None
+
+
+def test_missing_probe_with_current_keeps_the_future_stamp_block():
+    agent, pool = _fallen_back_codex(probe=True)
+    pool._codex_quota_restored_upstream = None
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"

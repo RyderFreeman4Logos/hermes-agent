@@ -2160,15 +2160,19 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     @property
     def tail_token_budget(self) -> int:
         if self._tail_token_budget is None:
-            if getattr(self, "tail_mode", "lean") == "lean":
-                # Lean mode: tail is a small clamped recency window; the summary carries continuity.
-                budget = max(LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(self.context_length * 0.025)))
-            else:
-                budget = int(self.threshold_tokens * self.summary_target_ratio)
-            if self.context_length > 0:
-                budget = min(budget, int(self.context_length * TAIL_MAX_CONTEXT_FRACTION))
-            self._tail_token_budget = max(1, budget)
+            self._tail_token_budget = self._compute_tail_token_budget(
+                self.context_length, self.threshold_tokens if getattr(self, "tail_mode", "lean") != "lean" else 0)
         return self._tail_token_budget
+
+    def _compute_tail_token_budget(self, context_length: int, threshold_tokens: int) -> int:
+        if getattr(self, "tail_mode", "lean") == "lean":
+            # Lean mode: tail is a small clamped recency window; the summary carries continuity.
+            budget = max(LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(context_length * 0.025)))
+        else:
+            budget = int(threshold_tokens * self.summary_target_ratio)
+        if context_length > 0:
+            budget = min(budget, int(context_length * TAIL_MAX_CONTEXT_FRACTION))
+        return max(1, budget)
 
     @tail_token_budget.setter
     def tail_token_budget(self, value: int) -> None:
@@ -2574,7 +2578,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             logger.debug("compression cancellation check failed", exc_info=True)
             return False
 
-    def _derive_trigger(self, model: str, context_length: int, provider: str) -> tuple[float, float, int]:
+    def _derive_trigger(self, model: str, context_length: int, provider: str, max_tokens: int | None) -> tuple[float, float, int]:
         """``(base_percent, effective_percent, threshold_tokens)`` for a model/window, from the raw config
         value so a switch away from an overridden model falls back correctly. Pure: the one place the
         trigger math lives, shared by ``update_model`` and the switch guard's preview so the number the
@@ -2582,7 +2586,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         ceiling, which the feasibility probe re-derives per runtime."""
         base_percent = resolve_model_threshold(model, self.model_thresholds, self._config_threshold_percent, provider)
         effective_percent = self._effective_threshold_percent(context_length, base_percent)
-        threshold = self._compute_threshold_tokens(context_length, effective_percent, self.max_tokens)
+        threshold = self._compute_threshold_tokens(context_length, effective_percent, max_tokens)
         cap = self._effective_threshold_cap(context_length)
         if cap is not None:
             threshold = min(threshold, cap)
@@ -2595,32 +2599,41 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     def preview_threshold_tokens(self, model: str, context_length: int, provider: str = "") -> int:
         """The trigger ``update_model`` would install, without mutating state."""
-        return self._derive_trigger(model, context_length, provider)[2]
+        return self._derive_trigger(model, context_length, provider, self.max_tokens)[2]
 
     def update_model(
         self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "",
         api_mode: str = "", max_tokens: int | None = None,
     ) -> None:
-        """Update model info after a model switch or fallback activation."""
+        """Validate limits before publication; subsequent reset failures do not reject the runtime.
+
+        ``_model_update_token`` changes at the commit point, before any durable reset.
+        Callers rolling back agent fields must retain this runtime if that token changed.
+        Durable bookkeeping remains best-effort, not a reversible transaction.
+        """
         runtime_changed = (model, provider, base_url, api_mode) != (self.model, self.provider, self.base_url, self.api_mode)
-        self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
-        self.context_length = context_length
         # max_tokens=None means "unspecified": keep the existing output reservation.
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
-        if max_tokens is not None:
-            self.max_tokens = self._coerce_max_tokens(max_tokens)
+        output_reservation = self.max_tokens if max_tokens is None else self._coerce_max_tokens(max_tokens)
+        base_percent, percent, threshold = self._derive_trigger(model, context_length, provider, output_reservation)
+        aux_ceiling = None if runtime_changed else self._aux_context_ceiling
+        if isinstance(aux_ceiling, int) and 0 < aux_ceiling < threshold:
+            threshold = aux_ceiling
+        tail_budget = self._compute_tail_token_budget(context_length, threshold)
+        summary_budget = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+
+        self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        # Install the already-derived budgets directly: context_length's lazy setter would
+        # recompute/log against the previous threshold before the commit point.
+        self._resolved_context_length, self.max_tokens = context_length, output_reservation
         if runtime_changed:
             # The aux ceiling was probed against the previous main runtime (an "auto" aux route follows the
             # main model); the caller re-runs the feasibility probe. A same-runtime recompute (overflow-reported
             # window, grown local window, tier cap) keeps it: the summariser did not change (#114707).
             self._aux_context_ceiling = None
-        self._base_threshold_percent, self.threshold_percent, self.threshold_tokens = self._derive_trigger(
-            model, context_length, provider)
-        self._apply_threshold_tokens_cap()
-        # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
-        self._tail_token_budget = None
-        _ = self.tail_token_budget  # eager recompute, same timing as before
-        self.max_summary_tokens = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+        self._base_threshold_percent, self.threshold_percent, self.threshold_tokens = base_percent, percent, threshold
+        self._tail_token_budget, self.max_summary_tokens = tail_budget, summary_budget
+        self._model_update_token = object()
         # Old usage cannot price a new model. Clear it without arming the post-compaction
         # latch: the next response supplies usage or enables the usage-less fallback.
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
@@ -2639,6 +2652,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Runway was computed against the previous model's trigger; clear the durable copy too.
         self._reset_proactive_prune_rearm()
         self._clear_durable_proactive_prune_rearm()
+        self._emit_init_summary_once()
 
     # When the MINIMUM_CONTEXT_LENGTH floor binds on a small window, trigger near the top instead.
     _MIN_CTX_TRIGGER_RATIO = 0.85

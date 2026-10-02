@@ -170,6 +170,7 @@ def test_public_fallback_restore_uses_only_primary_owner(tmp_path, direct, fixed
 def test_public_fallback_ownership_across_scopes(tmp_path, monkeypatch, credential, owner, pool_enabled):
     """Explicit hop keys cannot waive identity, even on equal-URL named routes."""
     import hermes_yaml as yaml
+    from hermes_cli.fallback_config import resolve_entry_api_key
     from agent.secret_scope import (
         is_multiplex_active, reset_secret_scope, set_multiplex_active, set_secret_scope,
     )
@@ -238,7 +239,10 @@ def test_public_fallback_ownership_across_scopes(tmp_path, monkeypatch, credenti
                 if owner == "owner-b":
                     assert chain[0]["provider"] == "owner-b"
                     if credential in {"inline", "key_env"}:
-                        assert chain[0]["api_key"] == expected_key
+                        assert resolve_entry_api_key(chain[0]) == expected_key
+                        if credential == "key_env":
+                            assert chain[0]["key_env"] == "FALLBACK_TEST_KEY"
+                            assert "api_key" not in chain[0]
                     elif credential == "callable":
                         assert runtimes[0]["api_key"] is token_provider
                     else:

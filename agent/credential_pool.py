@@ -1962,9 +1962,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             # callers must adopt. Leaving the future stamp keeps has_available()
             # false, so restore rebinds the stale snapshot instead.
             if restored:
-                approved = getattr(self, "_codex_reopened_tokens", {})
-                approved[entry.id] = token
-                self._codex_reopened_tokens = approved
                 self._adopt(entry, access_token=token, **_MARK_OK)
                 self._current_id = entry.id
             return restored
@@ -2100,25 +2097,19 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
-                # select() holds this lock. A probe that already admitted this
-                # entry must not be called again from inside it.
-                approved = getattr(self, "_codex_reopened_tokens", {}).get(entry.id)
-                if approved:
-                    if clear_expired and entry.access_token != approved:
-                        entry = self._adopt(entry, persist=False, access_token=approved, **_MARK_OK)
-                        cleared_any = True
-                    elif clear_expired and entry.last_status != STATUS_OK:
-                        entry = self._adopt(entry, persist=False, **_MARK_OK)
-                        cleared_any = True
-                elif (
+                if (
                     exhausted_until is not None
                     and now < exhausted_until
                     and not (clear_expired and self._codex_quota_restored_upstream(entry))
                 ):
                     continue
                 elif clear_expired:
-                    entry = self._adopt(entry, persist=False, **_MARK_OK)
-                    cleared_any = True
+                    # The probe adopts a rotated pair on the pool row. Keep that
+                    # object: the pre-probe local still holds the consumed pair.
+                    entry = self._find(lambda candidate: candidate.id == entry.id) or entry
+                    if entry.last_status != STATUS_OK:
+                        entry = self._adopt(entry, persist=False, **_MARK_OK)
+                        cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
                 if self.provider in _TOKENS_SINGLETON_PROVIDERS:
                     pending_refresh.append(entry)
@@ -2185,9 +2176,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             self._persist()
             entry = self._find(lambda candidate: candidate.id == entry.id) or entry
         self._current_id = entry.id
-        approved = getattr(self, "_codex_reopened_tokens", {}).get(entry.id)
-        if approved and entry.access_token != approved:
-            entry = self._adopt(entry, persist=False, access_token=approved)
         return entry, pending_refresh
 
     def peek(self) -> Optional[PooledCredential]:

@@ -1225,24 +1225,30 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
             # next_available_at does not run the early Codex quota probe select()
             # uses, so a weekly stamp can outlive an already-open window.
             # Optional probe: a pool that only has next_available_at must stay blocked.
-            # current() is inside the probe try so a missing method is a negative answer,
-            # not an unrelated gate error that fails the restore open.
-            probe = getattr(pool, "_codex_quota_restored_upstream", None) if (
-                primary_provider == "openai-codex" and pool is not None
-            ) else None
-            if probe is not None:
-                try:
+            # Lookup, current(), and the probe share one negative-answer boundary.
+            # A raising descriptor is not an unrelated gate error.
+            probe = None
+            try:
+                if primary_provider == "openai-codex" and pool is not None:
+                    probe = getattr(pool, "_codex_quota_restored_upstream", None)
+                reopened = False
+                if probe is not None:
                     entry = pool.current()
-                    reopened = bool(probe(entry)) if entry is not None else False
+                    if entry is not None:
+                        reopened = bool(probe(entry))
                     if not reopened and entry is None:
                         # Ordinary 429 rotation clears the cursor. select() is the path
                         # that probes and clears a future stamp; has_available() does not.
                         reopened = pool.select(model=primary_model or None) is not None
-                except Exception:
-                    logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
-                    reopened = False
-                if reopened:
-                    return False, prefetched_pool, prefetched
+                    # A current-entry probe clears the account stamp only. The requested
+                    # model can still be benched; publish nothing until selection yields it.
+                    if reopened and entry is not None:
+                        reopened = pool.select(model=primary_model or None) is not None
+            except Exception:
+                logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
+                reopened = False
+            if probe is not None and reopened:
+                return False, prefetched_pool, prefetched
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(

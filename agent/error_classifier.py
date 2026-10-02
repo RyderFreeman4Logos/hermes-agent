@@ -1087,9 +1087,12 @@ def _status_5xx(c: _Ctx) -> Verdict:
 
 
 def _status_503(c: _Ctx) -> Verdict:
+    overflow = _first_match(c.msg, _OVERFLOW_AS_5XX_RULES)
+    if overflow is not None:
+        return overflow
     if any(pattern in c.msg for pattern in _AUTH_UNAVAILABLE_PATTERNS):
         return _V_AUTH_ROTATE
-    return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED
+    return _V_OVERLOADED
 
 
 def _classify_402(error_msg: str, result_fn: Callable[..., Any]) -> Any:

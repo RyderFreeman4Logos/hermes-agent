@@ -939,8 +939,8 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         try:
             api_key = _fallback_entry_api_key(entry)
         except Exception:
-            logger.debug("compression fallback_chain[%d] api key resolution failed", index, exc_info=True)
-            api_key = None
+            logger.debug("compression fallback_chain[%d] api key resolution failed; skipping entry", index)
+            continue
         from agent.auxiliary_client import _coerce_positive_timeout
         timeout = _coerce_positive_timeout(entry.get("timeout"))
         return {

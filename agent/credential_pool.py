@@ -1164,8 +1164,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         self._replace_entry(entry, updated)
         if persist:
             self._persist()
-            # _persist may have swapped in a peer's newer token generation; hand callers
-            # the live entry so they don't rebind the client to the stale pair.
             return self._find(lambda e: e.id == updated.id) or updated
         return updated
 
@@ -1958,8 +1956,15 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 token = entry.access_token or token
             # The row keeps the canonical URL; a gateway key belongs to its route host (#121486).
             from hermes_cli.auth_codex import _codex_pool_route_base_url
-            return bool(auth_mod._probe_codex_quota_restored(
+            restored = bool(auth_mod._probe_codex_quota_restored(
                 token, base_url=_codex_pool_route_base_url(entry.base_url)))
+            # A true answer is an admission: the refreshed pair is the credential
+            # callers must adopt. Leaving the future stamp keeps has_available()
+            # false, so restore rebinds the stale snapshot instead.
+            if restored:
+                self._adopt(entry, access_token=token, **_MARK_OK)
+                self._current_id = entry.id
+            return restored
         except Exception:
             logger.debug("Codex quota-restored probe failed", exc_info=True)
             return False
@@ -2092,17 +2097,19 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
-                # Codex quota windows can reopen EARLY; a throttled live probe
-                # lifts a stale cooldown (issue #43747).
                 if (
                     exhausted_until is not None
                     and now < exhausted_until
                     and not (clear_expired and self._codex_quota_restored_upstream(entry))
                 ):
                     continue
-                if clear_expired:
-                    entry = self._adopt(entry, persist=False, **_MARK_OK)
-                    cleared_any = True
+                elif clear_expired:
+                    # The probe adopts a rotated pair on the pool row. Keep that
+                    # object: the pre-probe local still holds the consumed pair.
+                    entry = self._find(lambda candidate: candidate.id == entry.id) or entry
+                    if entry.last_status != STATUS_OK:
+                        entry = self._adopt(entry, persist=False, **_MARK_OK)
+                        cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
                 if self.provider in _TOKENS_SINGLETON_PROVIDERS:
                     pending_refresh.append(entry)

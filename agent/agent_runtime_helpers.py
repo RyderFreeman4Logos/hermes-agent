@@ -1222,6 +1222,38 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
         primary_model = str(rt.get("model") or "").strip()
         next_at = getattr(pool, "next_available_at", lambda **_kwargs: None)(model=primary_model or None)
         if next_at is not None and next_at > time.time():
+            # next_available_at does not run the early Codex quota probe select()
+            # uses, so a weekly stamp can outlive an already-open window.
+            # Optional probe: a pool that only has next_available_at must stay blocked.
+            # Lookup, current(), and the probe share one negative-answer boundary.
+            # A raising descriptor is not an unrelated gate error.
+            probe = None
+            try:
+                if primary_provider == "openai-codex" and pool is not None:
+                    probe = getattr(pool, "_codex_quota_restored_upstream", None)
+                reopened = False
+                if probe is not None:
+                    entry = pool.current()
+                    if entry is not None:
+                        reopened = bool(probe(entry))
+                    if not reopened and entry is None:
+                        # Ordinary 429 rotation clears the cursor. select() is the path
+                        # that probes and clears a future stamp; has_available() does not.
+                        entry = pool.select(model=primary_model or None)
+                        reopened = entry is not None
+                    elif reopened and entry is not None and pool is not None:
+                        # The probe admitted this entry without select(). One select()
+                        # records that same entry. A second select() rotates it away.
+                        entry = pool.select(model=primary_model or None)
+                        reopened = entry is not None
+                    if reopened and entry is not None:
+                        agent._restore_selected_entry_id = getattr(entry, "id", None)
+            except Exception:
+                logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
+                reopened = False
+                agent._restore_selected_entry_id = None
+            if probe is not None and reopened:
+                return False, prefetched_pool, prefetched
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(
@@ -1245,48 +1277,53 @@ def _restore_runtime_capabilities(agent, rt: Dict[str, Any]) -> None:
         logger.warning("Ignoring malformed runtime capabilities snapshot")
 
 
-def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched) -> None:
-    """Rebind and re-select the primary credential pool after a fallback turn. A cross-provider
-    fallback attaches its own pool, which would trip the provider-mismatch guard on the next
-    401/429: reload the primary pool, else clear it. The snapshot api_key may be stale after
-    rotation; re-select the pool's best entry, keeping the snapshot key when none is usable."""
-    if _primary_pool_owner(agent, primary_provider) is None:
-        agent._credential_pool = None
-        agent._credential_pool_entry_id = None
-        return  # The snapshot's pinned tier key owns the primary route.
+def _ensure_primary_pool(agent, matches_primary, load_primary_pool, prefetched_pool, prefetched):
+    """Attach the primary pool when fallback left a different provider's pool."""
     pool = getattr(agent, "_credential_pool", None)
     pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
     if pool is not None and pool_provider and not matches_primary(pool):
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
         try:
-            # Reuse the pool the reset-aware gate already loaded (avoids a second auth.json read).
+            # Reuse the pool the reset-aware gate already loaded (one auth.json read).
             agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
         except Exception as exc:
             logger.warning(
-                "Restore could not reload primary credential pool for %s: %s", primary_provider, exc
+                "Restore could not reload primary credential pool: %s", exc
             )
-    agent._credential_pool_entry_id = None
+        pool = getattr(agent, "_credential_pool", None)
+    return pool
+
+
+def _owned_restore_entry(agent, primary_model):
+    """The gate's admitted entry if that id is still eligible, else None.
+
+    Does not clear the handoff and does not call select()."""
+    owned_id = getattr(agent, "_restore_selected_entry_id", None)
+    if owned_id is None:
+        return None
     pool = getattr(agent, "_credential_pool", None)
-    entry = pool.select(model=primary_model or None) if pool is not None and pool.has_available(model=primary_model or None) else None
-    if entry is None or not (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")):
-        return
-    if matches_primary(entry):
-        # _swap_credential rebuilds the client and reapplies base-url-scoped headers.
-        # ``_swap_credential`` rebuilds the OpenAI/Anthropic client, reapplies base-url-scoped headers, and
-        # carries the accumulated base_url / OAuth-detection fixes (#33163).
-        agent._swap_credential(entry)
-        logger.info(
-            "Restore re-selected pool entry %s (%s)",
-            getattr(entry, "id", "?"), getattr(entry, "label", "?"),
-        )
+    return pool.reclaim(owned_id, model=primary_model or None) if pool is not None else None
+
+
+def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched):
+    """Prepare the admitted row; None means no pool route, False means refusal."""
+    if _primary_pool_owner(agent, primary_provider) is None:
+        agent._credential_pool = None
+        agent._credential_pool_entry_id = None
+        return None  # The snapshot's pinned tier key owns the primary route.
+    pool = _ensure_primary_pool(agent, matches_primary, load_primary_pool, prefetched_pool, prefetched)
+    agent._credential_pool_entry_id = None
+    if getattr(agent, "_restore_selected_entry_id", None) is not None:
+        entry = _owned_restore_entry(agent, primary_model)
+        if entry is None:
+            return False
     else:
-        logger.info(
-            "Restore skipped pool entry %s (%s): provider %s does not match primary provider %s",
-            getattr(entry, "id", "?"), getattr(entry, "label", "?"),
-            str(getattr(entry, "provider", "") or "").strip().lower() or "?",
-            primary_provider or "?",
-        )
+        entry = pool.select(model=primary_model or None) if pool is not None else None
+        if entry is None:
+            return None  # No pool credential: retain the configured snapshot route.
+        agent._restore_selected_entry_id = entry.id
+    return entry if matches_primary(entry) else False
 
 
 def _revert_credential_rotation(agent) -> None:
@@ -1368,8 +1405,48 @@ def restore_primary_runtime(agent) -> bool:
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
     previous_model, previous_provider = (str(v or "unknown") for v in fallback_route)
     provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
+    # Stage runtime writes, but bind retained client callbacks to the live session.
+    staged = copy.copy(agent)
+    staged._client_owner = agent
+    staged.client = staged._anthropic_client = None
+    staged._transport_cache = {}
+    prepared = []
     try:
-        _apply_primary_runtime_fields(agent, rt)
+        selected = _rebind_primary_credential_pool(
+            staged, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched
+        )
+        if selected is False:
+            return False
+        build_rt = dict(rt)
+        if selected is not None:
+            build_rt["api_key"] = selected.runtime_api_key
+            build_rt["client_kwargs"] = {**rt["client_kwargs"], "api_key": selected.runtime_api_key}
+        _apply_primary_runtime_fields(staged, build_rt)
+        _rebuild_primary_client(staged, build_rt, reason="restore_primary")
+        prepared.extend((staged.client, staged._anthropic_client))
+        if selected is not None:
+            selected = _owned_restore_entry(staged, primary_model)
+            if selected is None or not _matches_primary(selected) or staged._swap_credential(selected) is False:
+                return False
+        # Reclaim may refresh outside the pool lock. Fence its returned live object
+        # under that lock through publication; a concurrent replace/bench invalidates it.
+        pool = getattr(staged, "_credential_pool", None)
+        owned = _owned_restore_entry(staged, primary_model)
+        with agent._openai_client_lock(), pool._lock if selected is not None and pool is not None else contextlib.nullcontext():
+            if selected is not None and (
+                pool is None or owned is not selected or pool.current() is not owned
+                or owned.runtime_api_key != staged.api_key
+            ):
+                return False
+            _apply_primary_runtime_fields(agent, {
+                **rt, "api_key": staged.api_key, "base_url": staged.base_url,
+                "api_mode": staged.api_mode, "client_kwargs": staged._client_kwargs,
+            })
+            for name in ("client", "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url",
+                         "_is_anthropic_oauth", "_bedrock_region", "_bedrock_guardrail_config",
+                         "_credential_pool", "_credential_pool_entry_id"):
+                if hasattr(staged, name):
+                    setattr(agent, name, getattr(staged, name))
         _restore_runtime_capabilities(agent, rt)
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout for snapshots predating the native-vs-proxy split.
@@ -1381,19 +1458,15 @@ def restore_primary_runtime(agent) -> bool:
         if getattr(agent, "_cache_disabled", False):
             agent._use_prompt_caching = False
             agent._use_native_cache_layout = False
-        _rebuild_primary_client(agent, rt, reason="restore_primary")
         agent.context_compressor.update_model(
             model=rt["compressor_model"], context_length=rt["compressor_context_length"],
-            base_url=rt["compressor_base_url"], api_key=rt["compressor_api_key"],
+            base_url=agent.base_url, api_key=agent.api_key,
             provider=rt["compressor_provider"], api_mode=rt.get("compressor_api_mode", ""),
         )
         # Same rule as fallback activation: refresh an existing verdict only; never-probed sessions stay lazy.
         if getattr(agent, "_compression_feasibility_checked", False) is True:
             from agent.conversation_compression import revalidate_compression_feasibility
             revalidate_compression_feasibility(agent)
-        _rebind_primary_credential_pool(
-            agent, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched
-        )
         # Older snapshots have no reasoning_config; keep the current value.
         saved_reasoning = rt.get("reasoning_config")
         if saved_reasoning is not None:
@@ -1421,6 +1494,13 @@ def restore_primary_runtime(agent) -> bool:
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
+    finally:
+        agent._restore_selected_entry_id = None
+        # Only unpublished clients are ours to close. Never close fallback borrowers.
+        for client in (*prepared, staged.client, staged._anthropic_client):
+            if client is not None and client is not getattr(agent, "client", None) and client is not getattr(agent, "_anthropic_client", None):
+                with contextlib.suppress(Exception):
+                    client.close()
 
 
 # Transient transport failures worth one more attempt with a rebuilt client / connection pool.
@@ -2016,7 +2096,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     client = process_bootstrap.OpenAI(**client_kwargs)
     # Routing proxies name the deployment they served in a response header (#54864).
     from agent.served_model import install_served_model_capture
-    install_served_model_capture(agent, client)
+    install_served_model_capture(vars(agent).get("_client_owner", agent), client)
     _ra().logger.info("OpenAI client created (%s, shared=%s) %s", reason, shared, agent._client_log_context())
     return client
 

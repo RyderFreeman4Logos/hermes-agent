@@ -11,6 +11,8 @@ exhausting remaining entries and falling through to cross-provider fallback.
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
 
 from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
@@ -147,3 +149,513 @@ class TestRestorePrimaryPoolReselect:
         assert result is True
         assert "custom-endpoint.example.com" in agent.base_url
         assert "custom-endpoint.example.com" in agent._client_kwargs["base_url"]
+
+
+_CODEX_URL = "https://chatgpt.com/backend-api/codex"
+_STALE = "fixture-stale-snapshot"
+_FRESH = "fixture-refreshed-approved"
+# Expired synthetic JWT so the real pre-probe refresh helper rotates it. Not a secret.
+_EXPIRED = "e30.eyJleHAiOjF9.e"
+
+
+def _codex_entry(entry_id, token, *, status="ok", reset_at=None, refresh="fixture-refresh"):
+    return PooledCredential.from_dict(
+        "openai-codex",
+        {
+            "id": entry_id,
+            "label": entry_id,
+            "provider": "openai-codex",
+            "auth_type": AUTH_TYPE_OAUTH,
+            "source": "device_code",
+            "priority": 0,
+            "access_token": token,
+            "refresh_token": refresh,
+            "base_url": _CODEX_URL,
+            "last_status": status,
+            "last_status_at": time.time() if status == "exhausted" else None,
+            "last_error_code": 429 if status == "exhausted" else None,
+            "last_error_reason": "usage_limit_reached" if status == "exhausted" else None,
+            "last_error_reset_at": reset_at,
+        },
+    )
+
+
+def _exhausted_codex_agent(pool, *, snapshot_token=_STALE):
+    """Public restore caller: real pool, snapshot client, no live auth/quota/model I/O."""
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.model = "gpt-5.5"
+    agent.provider = "openrouter"
+    agent.base_url = "https://openrouter.ai/api/v1"
+    agent.api_mode = "chat_completions"
+    agent.api_key = "fallback-key"
+    agent._client_kwargs = {"api_key": "fallback-key", "base_url": agent.base_url}
+    agent._credential_pool = pool
+    agent._credential_pool_entry_id = None
+    agent._delegation_fixed_api_key = False
+    agent._fallback_activated = True
+    agent._fallback_index = 1
+    agent._rate_limited_until = 0
+    agent._restore_wait_logged = False
+    agent._use_prompt_caching = False
+    agent._use_native_cache_layout = False
+    agent._provider_fallback_active = False
+    agent.context_compressor = MagicMock()
+    agent._primary_runtime = {
+        "model": "gpt-5.5",
+        "provider": "openai-codex",
+        "requested_provider": "openai-codex",
+        "base_url": _CODEX_URL,
+        "api_mode": "codex_responses",
+        "api_key": snapshot_token,
+        "client_kwargs": {"api_key": snapshot_token, "base_url": _CODEX_URL},
+        "use_prompt_caching": False,
+        "use_native_cache_layout": False,
+        "compressor_model": "gpt-5.5",
+        "compressor_base_url": _CODEX_URL,
+        "compressor_api_key": snapshot_token,
+        "compressor_provider": "openai-codex",
+        "compressor_context_length": 128000,
+    }
+    built = []
+
+    def _build(kwargs, *, reason, shared):
+        client = MagicMock()
+        client.api_key = kwargs["api_key"]
+        built.append(kwargs["api_key"])
+        return client
+
+    agent._create_openai_client = _build
+    agent._built_client_tokens = built
+    agent._apply_client_headers_for_base_url = lambda *a, **k: None
+    agent._reapply_route_client_config = lambda *a, **k: None
+    return agent
+
+
+def _patch_probe(monkeypatch, *, fresh=None, open_=True, persist=True, force_expiring=False):
+    """Stub only the auth-refresh and quota-transport boundaries. Tokens are fixtures."""
+    calls = {"refresh": 0, "probe": 0, "open": open_}
+
+    def _pure(token, refresh_token, **_kwargs):
+        calls["refresh"] += 1
+        if fresh is None:
+            return None
+        return {"access_token": fresh[0], "refresh_token": fresh[1], "last_refresh": "fixture"}
+
+    def _probe(token, *, base_url=None):
+        calls["probe"] += 1
+        calls["probed_token"] = token
+        return calls["open"]
+
+    monkeypatch.setattr("hermes_cli.auth_codex.refresh_codex_oauth_pure", _pure)
+    monkeypatch.setattr("hermes_cli.auth._probe_codex_quota_restored", _probe)
+    if force_expiring:
+        # Non-JWT fixture tokens cannot satisfy the real expiry check.
+        monkeypatch.setattr("hermes_cli.auth_codex._codex_access_token_is_expiring", lambda token, skew: True)
+    monkeypatch.setattr(
+        "agent.credential_pool.CredentialPool._sync_device_code_entry_to_auth_store",
+        lambda self, entry: None,
+    )
+    if not persist:
+        monkeypatch.setattr("agent.credential_pool.CredentialPool._persist", lambda self, **k: None)
+    monkeypatch.setattr("agent.credential_pool.CredentialPool._sync_entry_from_auth_store", lambda self, entry: entry)
+    monkeypatch.setattr("agent.credential_pool.CredentialPool._resync_stale_entry", lambda self, entry: entry)
+    return calls
+
+
+def test_refresh_before_probe_restores_the_approved_entry(monkeypatch):
+    """A positive probe that rotated the token must restore that entry, not the snapshot."""
+    from agent.credential_pool import CredentialPool
+
+    future = time.time() + 6 * 86400
+    entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=future)
+    pool = CredentialPool("openai-codex", [entry])
+    pool._current_id = entry.id
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is True
+    assert calls["refresh"] == 1
+    assert calls["probe"] == 1
+    assert calls["probed_token"] == _FRESH
+    live = pool.current()
+    assert live is not None and live.id == "owned-1"
+    assert live.access_token == _FRESH
+    assert live.last_status == "ok"
+    assert agent.api_key == _FRESH
+    assert agent._client_kwargs["api_key"] == _FRESH
+    assert agent.client.api_key == _FRESH
+    assert agent._credential_pool_entry_id == "owned-1"
+    assert agent._built_client_tokens[-1] == _FRESH
+
+
+def test_ordinary_post_429_reopen_adopts_the_approved_entry(monkeypatch):
+    """mark_exhausted_and_rotate clears current; the next restore still adopts the probed entry."""
+    from agent.credential_pool import CredentialPool
+
+    entry = _codex_entry("owned-1", "fixture-live", status="ok")
+    pool = CredentialPool("openai-codex", [entry])
+    pool._current_id = entry.id
+    rotated = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"reason": "usage_limit_reached", "message": "quota", "reset_at": time.time() + 6 * 86400},
+        credential_id=entry.id,
+        api_key_hint="fixture-live",
+    )
+    assert rotated is None
+    assert pool.current() is None
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is True
+    assert calls["probe"] == 1
+    assert calls["probed_token"] == _FRESH
+    assert agent.api_key == _FRESH
+    assert agent.client.api_key == _FRESH
+    assert agent._credential_pool_entry_id == "owned-1"
+    assert pool.current().id == "owned-1"
+    assert pool.current().last_status == "ok"
+
+
+def test_closed_probe_after_refresh_does_not_restore(monkeypatch):
+    from agent.credential_pool import CredentialPool
+
+    future = time.time() + 6 * 86400
+    entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=future)
+    pool = CredentialPool("openai-codex", [entry])
+    pool._current_id = entry.id
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=False, force_expiring=True)
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert calls["probe"] == 1
+    assert agent._credential_pool_entry_id is None
+    assert pool.current().last_status == "exhausted"
+
+
+def test_wrong_provider_pool_is_not_probed(monkeypatch):
+    from agent.credential_pool import CredentialPool
+
+    entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=time.time() + 86400)
+    pool = CredentialPool("openrouter", [entry])
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is True
+    assert calls["probe"] == 0
+    assert calls["refresh"] == 0
+    assert agent._credential_pool_entry_id is None
+
+
+def test_delegated_fixed_key_does_not_adopt_pool(monkeypatch):
+    from agent.credential_pool import CredentialPool
+
+    entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=time.time() + 86400)
+    pool = CredentialPool("openai-codex", [entry])
+    pool._current_id = entry.id
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
+    agent = _exhausted_codex_agent(pool)
+    agent._delegation_fixed_api_key = True
+
+    assert agent._restore_primary_runtime() is True
+    assert calls["probe"] == 0
+    assert agent.api_key == _STALE
+    assert agent._credential_pool is None
+    assert agent._credential_pool_entry_id is None
+
+
+def test_prefetched_pool_is_loaded_once_then_adopts_refreshed_entry(monkeypatch):
+    """A cross-provider attached pool is not the primary pool: load it once, then adopt."""
+    from agent.credential_pool import CredentialPool, load_pool
+
+    future = time.time() + 6 * 86400
+    entry = _codex_entry("owned-1", "fixture-expired", status="exhausted", reset_at=future)
+    primary = CredentialPool("openai-codex", [entry])
+    attached = CredentialPool("openrouter", [_codex_entry("other", "fixture-other")])
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
+    loads = {"n": 0}
+
+    def _load(key):
+        loads["n"] += 1
+        return primary
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", _load)
+    agent = _exhausted_codex_agent(attached, snapshot_token=_STALE)
+
+    assert agent._restore_primary_runtime() is True
+    assert loads["n"] == 1
+    assert calls["probe"] == 1
+    assert agent.api_key == _FRESH
+    assert agent.client.api_key == _FRESH
+    assert agent._credential_pool_entry_id == "owned-1"
+    assert agent._credential_pool is primary
+    assert load_pool is not None
+
+
+def test_reexhaustion_after_reopen_stays_blocked(monkeypatch):
+    """One reopening authorizes that admission only. A later 429 bench must stick."""
+    from agent.credential_pool import CredentialPool
+
+    future = time.time() + 86400
+    entry = _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=future)
+    pool = CredentialPool("openai-codex", [entry])
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False)
+    assert pool.select(model="gpt-5.5") is not None
+    assert calls["probe"] == 1
+    calls["probe"] = 0
+    calls["open"] = False
+
+    def _closed(token, *, base_url=None):
+        calls["probe"] += 1
+        calls["probed_token"] = token
+        return False
+
+    monkeypatch.setattr("hermes_cli.auth._probe_codex_quota_restored", _closed)
+    rotated = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"reason": "usage_limit_reached", "message": "quota", "reset_at": time.time() + 86400},
+        credential_id="owned-1",
+        api_key_hint=pool.current().access_token,
+    )
+    assert rotated is None
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert pool.current() is None
+    assert pool.entries()[0].last_status == "exhausted"
+    assert pool.has_available(model="gpt-5.5") is False
+
+
+def test_later_persisted_generation_is_not_overwritten(monkeypatch):
+    """A peer's newer access/refresh pair stays the selected credential."""
+    from dataclasses import replace
+
+    from agent.credential_pool import CredentialPool
+    from hermes_cli.auth import write_credential_pool
+
+    entry = _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=time.time() + 86400)
+    pool = CredentialPool("openai-codex", [entry])
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    selected = pool.select(model="gpt-5.5")
+    assert selected is not None and selected.access_token == _FRESH
+    newer = replace(
+        pool.current(),
+        access_token="fixture-newer-access",
+        refresh_token="fixture-newer-refresh",
+    )
+    write_credential_pool("openai-codex", [newer.to_dict()])
+    pool._persist()
+    assert pool.current().access_token == "fixture-newer-access"
+    assert pool.current().refresh_token == "fixture-newer-refresh"
+    calls["probe"] = 0
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is True
+    assert calls["probe"] == 0
+    assert agent.client.api_key == "fixture-newer-access"
+    assert agent.api_key == "fixture-newer-access"
+    live = pool.current()
+    assert live.access_token == "fixture-newer-access"
+    assert live.refresh_token == "fixture-newer-refresh"
+
+
+def test_model_bench_blocks_current_entry_reopen(monkeypatch):
+    """Account quota reopening does not publish a still-benched primary model."""
+    from dataclasses import replace
+
+    from agent.credential_pool import CredentialPool
+
+    future = time.time() + 86400
+    entry = replace(
+        _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=future),
+        model_cooldowns={"gpt-5.5": future},
+    )
+    pool = CredentialPool("openai-codex", [entry])
+    pool._current_id = entry.id
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True, persist=False, force_expiring=True)
+    agent = _exhausted_codex_agent(pool, snapshot_token=_STALE)
+    next_before = pool.next_available_at(model="gpt-5.5")
+
+    assert agent._restore_primary_runtime() is False
+    assert calls["probe"] >= 1
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert agent.api_key == "fallback-key"
+    assert agent._credential_pool_entry_id is None
+    assert pool.next_available_at(model="gpt-5.5") == next_before
+
+
+def test_future_restore_keeps_the_one_selected_entry(monkeypatch, tmp_path):
+    """The gate's selected credential is the one restore publishes. One selection."""
+    from agent.credential_pool import CredentialPool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    future = time.time() + 6 * 86400
+    pool = CredentialPool("openai-codex", [
+        _codex_entry("first", _EXPIRED, status="exhausted", reset_at=future),
+        _codex_entry("second", "fixture-second", status="exhausted", reset_at=future),
+    ])
+    pool._current_id = "first"
+    pool._strategy = "round_robin"
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    chosen = []
+    original = pool.select
+
+    def observe(**kwargs):
+        entry = original(**kwargs)
+        chosen.append(None if entry is None else entry.id)
+        return entry
+
+    pool.select = observe
+    agent = _exhausted_codex_agent(pool)
+
+    assert agent._restore_primary_runtime() is True
+    assert chosen == ["first"]
+    assert agent._credential_pool_entry_id == "first"
+    assert agent.api_key == agent.client.api_key == _FRESH
+    assert pool.current().id == "first"
+    assert next(item for item in pool.entries() if item.id == "first").request_count == 1
+
+
+def test_revoked_future_admission_does_not_publish_snapshot(monkeypatch, tmp_path):
+    """A peer bench during rebuild stops publication and leaves fallback in place."""
+    from agent.credential_pool import CredentialPool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    entry = _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=time.time() + 6 * 86400)
+    pool = CredentialPool("openai-codex", [entry])
+    pool._current_id = entry.id
+    _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    agent = _exhausted_codex_agent(pool)
+    original = agent._create_openai_client
+
+    def peer_bench(kwargs, *, reason, shared):
+        if reason == "restore_primary":
+            live = pool.current()
+            rotated = pool.mark_exhausted_and_rotate(
+                status_code=400, failure_reason="model_entitlement", model="gpt-5.5",
+                credential_id=live.id, api_key_hint=live.access_token,
+            )
+            assert rotated is None
+        return original(kwargs, reason=reason, shared=shared)
+
+    agent._create_openai_client = peer_bench
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert agent.api_key == "fallback-key"
+    assert agent._credential_pool_entry_id is None
+    assert pool.has_available(model="gpt-5.5") is False
+
+
+@pytest.mark.parametrize("strategy", ["round_robin", "least_used"])
+@pytest.mark.parametrize("boundary", ["restore_primary", "credential_rotation"])
+@pytest.mark.parametrize("change", ["bench", "peer_bench", "peer", "raise", "none"])
+def test_restore_publication_preserves_owned_generation_and_fallback(
+    monkeypatch, tmp_path, strategy, boundary, change,
+):
+    """Real constructors may invalidate admission, never partially publish a runtime."""
+    from dataclasses import replace
+
+    import httpx
+    from openai import OpenAI
+    from agent.context_compressor import ContextCompressor
+    from agent.credential_pool import CredentialPool, model_cooldown_until
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.auth._probe_codex_quota_restored", lambda *a, **kw: True)
+    entries = [replace(_codex_entry(name, "fixture-" + name, status="exhausted",
+                                   reset_at=time.time() + 6 * 86400), source="manual")
+               for name in ("first", "second")]
+    pool = CredentialPool("openai-codex", entries)
+    pool._strategy = strategy
+    pool._current_id = "first"
+    pool._persist()
+    agent = _exhausted_codex_agent(pool)
+    # Remove the older fixture's mutator doubles: exercise actual swap/header/client code.
+    for name in ("_apply_client_headers_for_base_url", "_reapply_route_client_config"):
+        delattr(agent, name)
+    agent.model = "fallback"
+    agent.runtime_capabilities = {"fallback_only": True}
+    agent.request_overrides = {"fallback_only": 1}
+    agent._reasoning_echo_flag = True
+    agent._transport_cache = {"fallback": object()}
+    agent._primary_runtime.update(runtime_capabilities={"primary_only": True},
+                                  request_overrides={"primary_only": 1},
+                                  reasoning_echo_flag=False, use_prompt_caching=True,
+                                  use_native_cache_layout=True)
+    compressor = agent.context_compressor = ContextCompressor(
+        "fallback", provider="openrouter", api_key="fallback-key", base_url=agent.base_url,
+        api_mode="chat_completions", config_context_length=64000, quiet_mode=True,
+    )
+    compressor.update_model("fallback", 64000, provider="openrouter", api_key="fallback-key",
+                            base_url=agent.base_url, api_mode="chat_completions")
+    compressor.last_prompt_tokens, compressor.last_completion_tokens, compressor.last_total_tokens = 12345, 123, 12468
+    compressor._aux_context_ceiling = 50000
+    compressor._ineffective_compression_count, compressor._fallback_compression_streak = 2, 3
+    clients, events = [], []
+
+    def no_send(request):
+        raise AssertionError("model send forbidden")
+
+    def construct(kwargs, *, reason, shared):
+        if reason == boundary:
+            events.append(reason)
+            live = next(e for e in pool.entries() if e.id == "first")
+            if change.startswith("peer"):
+                newer = replace(live, access_token="new-generation", refresh_token="new-refresh")
+                write_credential_pool("openai-codex", [newer.to_dict(), *[
+                    e.to_dict() for e in pool.entries() if e.id != live.id]])
+                pool._persist()
+                live = next(e for e in pool.entries() if e.id == "first")
+            if "bench" in change:
+                pool.mark_exhausted_and_rotate(status_code=400, failure_reason="model_entitlement",
+                                              model="gpt-5.5", credential_id=live.id,
+                                              api_key_hint=live.access_token)
+            if change == "raise":
+                raise RuntimeError("constructor rejected")
+        client = OpenAI(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(no_send)))
+        clients.append(client)
+        return client
+
+    agent._create_openai_client = construct
+    agent.client = construct(agent._client_kwargs, reason="initial", shared=True)
+    fields = ("model", "provider", "base_url", "api_mode", "api_key", "client",
+              "_client_kwargs", "_credential_pool", "_credential_pool_entry_id",
+              "_fallback_activated", "_fallback_index", "_use_prompt_caching",
+              "_use_native_cache_layout", "runtime_capabilities", "request_overrides",
+              "_reasoning_echo_flag", "_transport_cache")
+    before = {name: getattr(agent, name) for name in fields}
+    before["_transport_cache"] = dict(agent._transport_cache)
+    compressor_before = dict(compressor.__dict__)
+    try:
+        restored = agent._restore_primary_runtime()
+        assert events == [boundary]
+        refused = change in ("bench", "peer_bench", "raise") or (change == "peer" and boundary == "credential_rotation")
+        assert restored is not refused
+        if refused:
+            assert {name: getattr(agent, name) for name in fields} == before
+            assert compressor.__dict__ == compressor_before
+            assert all(c is agent.client or c.is_closed() for c in clients)
+        else:
+            live = next(e for e in pool.entries() if e.id == "first")
+            assert agent.api_key == agent.client.api_key == compressor.api_key == live.runtime_api_key
+            assert agent._credential_pool_entry_id == pool.current().id == "first"
+            assert sum(e.request_count for e in pool.entries()) == 1
+        if change.startswith("peer"):
+            live = next(e for e in pool.entries() if e.id == "first")
+            disk = next(e for e in read_credential_pool("openai-codex") if e["id"] == "first")
+            assert (live.access_token, live.refresh_token) == ("new-generation", "new-refresh")
+            assert (disk["access_token"], disk["refresh_token"]) == ("new-generation", "new-refresh")
+        if "bench" in change:
+            assert model_cooldown_until(next(e for e in pool.entries() if e.id == "first"), "gpt-5.5")
+            assert pool.has_available(model="gpt-5.5")
+    finally:
+        for client in clients:
+            client.close()

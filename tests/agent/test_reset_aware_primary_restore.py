@@ -315,3 +315,144 @@ class TestResetAwareRestoreGate:
         assert agent._restore_primary_runtime() is False
         # Reset-aware gate never consulted — short-circuited by the 60s gate.
         assert pool.next_available_calls == 0
+
+
+def _codex_runtime(agent, model, provider="openai-codex"):
+    agent._primary_runtime = {
+        **agent._primary_runtime,
+        "provider": provider,
+        "model": model,
+    }
+
+
+class _ProbePool(_FakePool, CredentialPool):
+    """Real selection/reclaim, with only the quota probe and reset clock stubbed."""
+
+    def __init__(self, provider, next_at, *, probe):
+        _FakePool.__init__(self, provider, next_at=next_at)
+        self._current = _entry(provider=provider)
+        CredentialPool.__init__(self, provider, [self._current])
+        self._current_id = self._current.id
+        self._probe = probe
+        self.probed = []
+
+    def current(self):
+        return CredentialPool.current(self)
+
+    def select(self, **kwargs):
+        return CredentialPool.select(self, **kwargs) if self._probe is True else None
+
+    def _codex_quota_restored_upstream(self, entry):
+        self.probed.append(entry)
+        if self._probe == "error":
+            raise RuntimeError("probe failed")
+        return self._probe
+
+
+class TestCodexWeeklyRestoreProbe:
+    """A future Codex weekly stamp is not authoritative once the pool's own probe says otherwise.
+
+    ``next_available_at`` does not run ``_codex_quota_restored_upstream`` (that probe is
+    ``select()``-only, and only when clearing an elapsed cooldown). The public restore must
+    ask the attached primary pool about the current entry before pinning the session.
+    """
+
+    FB = {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+
+def _fallen_back_codex(*, model="gpt-6-sol", probe=True, next_at=None, provider="openai-codex"):
+    agent = _make_agent(fallback_model=TestCodexWeeklyRestoreProbe.FB)
+    _codex_runtime(agent, model, provider)
+    _activate_fallback(agent)
+    agent._rate_limited_until = 0
+    pool = _ProbePool(provider, next_at if next_at is not None else time.time() + 6 * 86400, probe=probe)
+    agent._credential_pool = pool
+    return agent, pool
+
+
+def test_future_stamp_does_not_block_when_codex_probe_is_open():
+    agent, pool = _fallen_back_codex(probe=True)
+    with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        assert agent._restore_primary_runtime() is True
+    assert agent._fallback_activated is False
+    assert agent.provider == "openai-codex"
+    assert agent.model == "gpt-6-sol"
+    assert pool.probed == [pool._current]
+
+
+def test_future_stamp_blocks_when_codex_probe_is_closed():
+    agent, pool = _fallen_back_codex(probe=False)
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+
+
+def test_elapsed_stamp_restores_without_a_probe():
+    agent, pool = _fallen_back_codex(probe=False, next_at=time.time() - 5)
+    with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        assert agent._restore_primary_runtime() is True
+    assert pool.probed == []
+
+
+def test_non_codex_future_stamp_does_not_consult_the_codex_probe():
+    agent, pool = _fallen_back_codex(provider="openrouter", model="anthropic/claude-opus-4", probe=True)
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert pool.probed == []
+
+
+def test_probe_exception_keeps_the_future_stamp_block():
+    """The gate's own read errors stay fail-open. A probe that raises is a negative answer."""
+    agent, _pool = _fallen_back_codex(probe="error")
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+
+
+def test_missing_current_and_probe_keeps_the_future_stamp_block():
+    """A pool that only speaks next_available_at/has_available/select must stay blocked.
+
+    Discovering optional Codex probe support by calling current() first raises into the
+    gate's unrelated fail-open handler and restores despite a known future reset.
+    """
+    agent = _make_agent(fallback_model=TestCodexWeeklyRestoreProbe.FB)
+    _codex_runtime(agent, "gpt-6-sol")
+    _activate_fallback(agent)
+    agent._rate_limited_until = 0
+    pool = _FakePool("openai-codex", next_at=time.time() + 6 * 86400)
+    agent._credential_pool = pool
+    assert not hasattr(pool, "current")
+    assert not hasattr(pool, "_codex_quota_restored_upstream")
+
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+    assert agent._credential_pool_entry_id is None
+
+
+def test_missing_probe_with_current_keeps_the_future_stamp_block():
+    agent, pool = _fallen_back_codex(probe=True)
+    pool._codex_quota_restored_upstream = None
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"
+
+
+def test_raising_probe_descriptor_keeps_the_future_stamp_block():
+    """Looking up the optional probe is itself a negative answer when it raises."""
+    agent = _make_agent(fallback_model=TestCodexWeeklyRestoreProbe.FB)
+    _codex_runtime(agent, "gpt-6-sol")
+    _activate_fallback(agent)
+    agent._rate_limited_until = 0
+
+    class _DescriptorPool(_FakePool):
+        def current(self):
+            return object()
+
+        @property
+        def _codex_quota_restored_upstream(self):
+            raise RuntimeError("optional capability unavailable")
+
+    agent._credential_pool = _DescriptorPool("openai-codex", next_at=time.time() + 6 * 86400)
+    assert agent._restore_primary_runtime() is False
+    assert agent._fallback_activated is True
+    assert agent.provider == "openrouter"

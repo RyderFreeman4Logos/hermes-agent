@@ -1,8 +1,7 @@
 """Multiprocess coverage for SessionDB advisory writer coordination.
 
 Live #183 residual: sidecar flock serializes SessionDB writers. Official
-write patience stays time-based; #14 max_retries / busy remaining-budget
-must stay absent.
+write patience stays time-based; mutex/SQLite waits share its remaining budget.
 """
 
 from __future__ import annotations
@@ -52,12 +51,9 @@ def db(tmp_path: Path):
 
 def test_execute_write_keeps_official_patience_api() -> None:
     params = inspect.signature(SessionDB._execute_write).parameters
-    assert list(params) == ["self", "fn", "patience_s"]
-    src = inspect.getsource(SessionDB._execute_write)
-    assert "_session_db_advisory_write_lock" in src
-    assert "max_retries" not in src
-    assert "previous_busy_timeout_ms" not in src
-    assert "recover_fts_errors" not in src
+    assert list(params) == ["self", "fn", "patience_s", "deadline"]
+    assert params["deadline"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["deadline"].default is None
     assert not hasattr(SessionDB, "_COMPRESSION_LOCK_MAX_RETRIES")
     assert not hasattr(SessionDB, "_write_guard")
 

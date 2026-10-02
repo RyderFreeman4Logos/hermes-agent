@@ -4666,7 +4666,7 @@ class TestFTSExternalContentMigration:
             # The public contract: optimize returns ok=False when still
             # pending. Simulate an unfinishable backfill by stubbing the
             # chunk step to a no-op while markers stay.
-            db.fts_rebuild_step = lambda: False  # type: ignore[method-assign]
+            db.fts_rebuild_step = lambda **kwargs: False  # type: ignore[method-assign]
             result = db.optimize_fts_storage(vacuum=False)
             assert result["ok"] is False
             assert result.get("reason") == "backfill_incomplete"

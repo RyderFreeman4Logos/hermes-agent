@@ -2580,10 +2580,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
-        if session is None or session.owner_task_id != to_owner:
-            return None
         # Checkpoint takes this same lock. Write after release so the new owner
-        # is durable without re-entering it.
+        # is durable without re-entering it. Success was decided under the lock;
+        # a later transfer must not make this caller report failure.
         self._write_checkpoint()
         return session
 

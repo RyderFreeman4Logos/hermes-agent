@@ -98,7 +98,7 @@ def test_transfer_ownership_persists_new_owner_after_releasing_lock(registry, tm
 
     assert registry.transfer_ownership(
         "missing", from_owner="child", to_owner="parent",
-        to_task_id="parent-task", to_session_key="parent-key", note="nope",
+        to_task_id="parent-task", to_parent_session_id="parent-key", note="nope",
     ) is None
     assert calls == []
     assert not checkpoint.exists()
@@ -107,7 +107,7 @@ def test_transfer_ownership_persists_new_owner_after_releasing_lock(registry, tm
     session.exited = True
     assert registry.transfer_ownership(
         session.id, from_owner="child", to_owner="parent",
-        to_task_id="parent-task", to_session_key="parent-key", note="late",
+        to_task_id="parent-task", to_parent_session_id="parent-key", note="late",
     ) is None
     assert calls == []
     assert not checkpoint.exists()
@@ -115,7 +115,7 @@ def test_transfer_ownership_persists_new_owner_after_releasing_lock(registry, tm
 
     moved = registry.transfer_ownership(
         session.id, from_owner="child", to_owner="parent",
-        to_task_id="parent-task", to_session_key="parent-key", note="handoff",
+        to_task_id="parent-task", to_parent_session_id="parent-key", note="handoff",
     )
     assert moved is session
     assert calls == [False]
@@ -176,6 +176,7 @@ def test_successive_public_handoffs_keep_first_transfer(tmp_path, monkeypatch):
         text=True, start_new_session=True,
     )
     session = None
+    watcher = None
     try:
         assert proc.stdout.readline().strip() == "READY"
         register("sa-middle", middle)
@@ -185,6 +186,8 @@ def test_successive_public_handoffs_keep_first_transfer(tmp_path, monkeypatch):
             task_id="sa-leaf", owner_task_id="sa-leaf", session_key="child-key",
             output_so_far="READY\n", notify_on_complete=True,
         )
+        watcher = {"session_id": session.id, "session_key": "child-key", "parent_session_id": "child-db"}
+        registry.pending_watchers.append(watcher)
         calls.clear()
         reached, release = threading.Event(), threading.Event()
         result = {}
@@ -236,9 +239,16 @@ def test_successive_public_handoffs_keep_first_transfer(tmp_path, monkeypatch):
         assert [row["session_id"] for row in middle._handed_off_processes] == [session.id]
         assert sorted(calls) == ["MainThread", "first-handoff"]
         assert session.owner_task_id == "grand"
+        assert session.session_key == "child-key"
+        assert session.parent_session_id == "grand-key"
+        assert watcher == {"session_id": session.id, "session_key": "child-key", "parent_session_id": "grand-key"}
         stored = {row["session_id"]: row for row in json.loads(checkpoint.read_text())}
         assert stored[session.id]["owner_task_id"] == "grand"
+        assert stored[session.id]["session_key"] == "child-key"
+        assert stored[session.id]["parent_session_id"] == "grand-key"
     finally:
+        if watcher is not None and watcher in registry.pending_watchers:
+            registry.pending_watchers.remove(watcher)
         monkeypatch.setattr(registry, "_write_checkpoint", real_write)
         if proc.poll() is None:
             with suppress(Exception):

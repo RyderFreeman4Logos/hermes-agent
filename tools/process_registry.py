@@ -754,7 +754,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return
         # A native child's own watch stays in its transcript. A transferred owner
         # carries an explicit note, so that parent still sees the match.
-        if session.delegated_child and not session.handoff_note:
+        if session.delegated_child and not session.handoff_note and not self._surface_child_process_notifications():
             return
         # Late chunks after the reader declared exit are post-exit noise; dropping them
         # avoids stale notifications minutes after the process ended.
@@ -1227,10 +1227,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
-        from agent.delegation_context import is_delegated_child_process_context
+        from agent.delegation_context import is_delegated_child_context
         from gateway.session_context import get_session_env
 
-        extra.setdefault("delegated_child", is_delegated_child_process_context())
+        extra.setdefault("delegated_child", is_delegated_child_context())
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
@@ -2578,19 +2578,22 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "") -> Optional[ProcessSession]:
-        """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
-        field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
-        whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
-        (the caller must not report a transfer that did not happen)."""
+                           to_parent_session_id: str, note: str = "") -> Optional[ProcessSession]:
+        """Atomically move a RUNNING process to a new owner. Completion notices and teardown use ``owner_task_id``.
+        ``to_parent_session_id`` is the live parent's database ID; preserve ``session.session_key`` as the gateway
+        routing key. Returns None unless the running session is still owned by ``from_owner``."""
         session = self.get(session_id)
+        parent_session_id = str(to_parent_session_id or "")
         with self._lock:
             if session is None or session.exited or session.owner_task_id != from_owner:
                 return None
             session.owner_task_id = to_owner
             session.task_id = to_task_id
-            session.session_key = to_session_key
             session.handoff_note = note
+            session.parent_session_id = parent_session_id
+            for watcher in self.pending_watchers:
+                if watcher.get("session_id") == session.id:
+                    watcher["parent_session_id"] = parent_session_id
         # Checkpoint takes this same lock. Write after release so the new owner
         # is durable without re-entering it. Success was decided under the lock;
         # a later transfer must not make this caller report failure.
@@ -2837,7 +2840,7 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
     session = process_registry.transfer_ownership(
         session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
         to_task_id=_resolve_container_task_id(parent_owner),
-        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note)
+        to_parent_session_id=str(getattr(parent, "session_id", "") or ""), note=note)
     if session is None:
         return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
                          "with poll/log and report it instead)."}

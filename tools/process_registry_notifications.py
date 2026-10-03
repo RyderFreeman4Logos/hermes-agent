@@ -412,8 +412,14 @@ def _completion_status(evt: dict) -> str:
 
 
 def _routine_delegated_child_completion(evt: dict) -> bool:
-    """Ordinary native-child success: no parent turn. Failures and handoffs stay visible."""
+    """Ordinary native-child success: no parent turn. Failures and handoffs stay visible.
+
+    An explicit owning-profile opt-in surfaces the same routine success.
+    """
     if not isinstance(evt, dict) or evt.get("handoff_note"):
+        return False
+    from tools.process_registry import ProcessRegistry
+    if ProcessRegistry._surface_child_process_notifications():
         return False
     started_at = evt.get("started_at")
     return (

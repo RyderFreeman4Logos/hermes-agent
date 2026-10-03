@@ -34,18 +34,38 @@ def _str_or_none(value: Any) -> Optional[str]:
 
 
 def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
-    """Return the accepted route, or the route selected before the child ran."""
+    """Return only a route proven by an accepted child response."""
     route = getattr(child, "_delegate_successful_llm_route", None)
     if isinstance(route, tuple) and len(route) == 2:
         model, provider = map(_str_or_none, route)
         if model is not None or provider is not None:
             return model, provider
-    return _str_or_none(getattr(child, "model", None)), _str_or_none(getattr(child, "provider", None))
+    return None, None
+
+
+def _selected_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return the profile route frozen before the child started."""
+    route = getattr(child, "_delegate_selected_llm_route", None)
+    if not (isinstance(route, tuple) and len(route) == 2):
+        return None, None
+    return _str_or_none(route[0]), _str_or_none(route[1])
+
+
+def _result_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
+    """Prefer an accepted route, then the route selected before the run."""
+    accepted = _accepted_route_identity(child)
+    return accepted if any(value is not None for value in accepted) else _selected_route_identity(child)
+
+
+def _route_owns_xai(model: Optional[str], provider: Optional[str]) -> bool:
+    if provider in {"xai", "xai-oauth"}:
+        return True
+    return bool(model) and "grok" in model.lower()
 
 
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
-    model, provider = _accepted_route_identity(child)
+    model, provider = _result_route_identity(child)
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
         "duration_seconds": duration, "model": model, "provider": provider,
@@ -528,6 +548,16 @@ def _validate_child_output_schema(
         if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
             result["messages"] = result["messages"] + _retry_messages
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
+        if _schema_valid:
+            for key in (
+                "completed", "interrupted", "failed", "error",
+                "failure_reason", "failure_retryable",
+                "billing_block", "billing_unverified", "codex_turn_id",
+            ):
+                if key in _retry_result:
+                    result[key] = _retry_result[key]
+                else:
+                    result.pop(key, None)
     return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
 
 def _build_tool_trace(messages: Any) -> list[Dict[str, Any]]:
@@ -569,6 +599,35 @@ def _build_result_entry(
     ``status``/``exit_reason``/``truncated`` follow the ``_run_single_child`` contract; a structured failure always
     wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
     summary = result.get("final_response") or ""
+    billing = result.get("billing_block")
+    accepted_model, accepted_provider = _accepted_route_identity(child)
+    selected_model, selected_provider = _selected_route_identity(child)
+    if accepted_model is not None or accepted_provider is not None:
+        route_model, route_provider = accepted_model, accepted_provider
+    elif selected_model is not None or selected_provider is not None:
+        route_model, route_provider = selected_model, selected_provider
+    else:
+        route_model = _str_or_none(getattr(child, "model", None))
+        route_provider = _str_or_none(getattr(child, "provider", None))
+    owns_xai = _route_owns_xai(route_model, route_provider)
+    xai_leak = (
+        isinstance(billing, dict)
+        and billing.get("provider") in {"xai", "xai-oauth"}
+        and (
+            not owns_xai
+            or (
+                getattr(child, "_delegate_model_profile", None) == "standard"
+                and result.get("billing_unverified", False)
+            )
+        )
+    )
+    if xai_leak:
+        summary = (
+            "Subagent failed after an unverified provider billing error."
+            if result.get("billing_unverified", False)
+            else "Subagent failed with a provider error unrelated to its effective model."
+        )
+    safe_error = summary if xai_leak else None
     # "(empty)" is run_agent's give-up sentinel after repeated empty LLM
     # responses (usually a transport bug) — a failure, not a success.
     usable_summary = bool(summary) and summary.strip() != "(empty)"
@@ -600,16 +659,25 @@ def _build_result_entry(
 
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
-    # Result entry contract: see the ``_run_single_child`` docstring.
-    accepted_model, accepted_provider = _accepted_route_identity(child)
+    app_server = getattr(child, "api_mode", None) == "codex_app_server"
+    if xai_leak and result.get("billing_unverified", False) and accepted_model is None and accepted_provider is None and selected_model is None and selected_provider is None:
+        model, provider = None, None
+    elif app_server:
+        model, provider = accepted_model, accepted_provider
+    elif accepted_model is not None or accepted_provider is not None:
+        model, provider = accepted_model, accepted_provider
+    elif selected_model is not None or selected_provider is not None:
+        model, provider = selected_model, selected_provider
+    else:
+        model, provider = route_model, route_provider
     entry: Dict[str, Any] = {
         "task_index": task_index,
         "status": status,
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
-        "model": accepted_model,
-        "provider": accepted_provider,
+        "model": model,
+        "provider": provider,
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -629,11 +697,9 @@ def _build_result_entry(
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
     if status == "failed":
-        entry["error"] = result.get("error", "Subagent did not produce a response.")
-        # Classified reason from the child loop (e.g. "rate_limit", "billing")
-        # lets the parent tell a quota wall from a task error without parsing prose.
+        entry["error"] = safe_error if safe_error is not None else result.get("error", "Subagent did not produce a response.")
         _failure_reason = result.get("failure_reason")
-        if isinstance(_failure_reason, str) and _failure_reason:
+        if not xai_leak and isinstance(_failure_reason, str) and _failure_reason:
             entry["failure_reason"] = _failure_reason
     elif interrupt_note:
         entry["error"] = interrupt_note
@@ -937,11 +1003,13 @@ class _ChildRun:
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
         status = "timeout" if is_timeout else "error"
-        accepted_model, accepted_provider = _accepted_route_identity(child)
+        model, provider = _result_route_identity(child)
+        if getattr(child, "api_mode", None) == "codex_app_server":
+            model, provider = _accepted_route_identity(child)
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
-            "model": accepted_model, "provider": accepted_provider,
+            "model": model, "provider": provider,
             "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,

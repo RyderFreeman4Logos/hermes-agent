@@ -465,8 +465,13 @@ def test_response_checker_observes_usage_before_length_recovery(monkeypatch):
         quiet_mode=True,
         verbose_logging=False,
         provider="custom",
+        model="test-model",
         api_mode="chat_completions",
         thinking_callback=None,
+        _get_transport=lambda: SimpleNamespace(
+            normalize_response=lambda _: SimpleNamespace(content=None, tool_calls=None),
+        ),
+        _has_content_after_think_block=bool,
     )
     monkeypatch.setattr(recovery, "validate_response_shape", lambda *_args: (False, None))
     monkeypatch.setattr(checker, "_derive_finish_reason", lambda *_args: "length")

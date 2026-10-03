@@ -96,8 +96,13 @@ def _response_is_usable(agent: Any, response: Any) -> bool:
     ``finish_reason=length`` still has to be continued. Visible text or a real
     tool call is usable; a refusal, empty content, or thinking-only text is not.
     """
+    from agent.turn_recovery import classify_codex_soft_failure
     from agent.turn_truncation import normalize_response_for_agent
 
+    # Failed Responses envelopes can contain text, but normalization raises.
+    # Observing acceptance must not move that failure into a different retry lane.
+    if classify_codex_soft_failure(agent, response)[0] is not None:
+        return False
     normalized = normalize_response_for_agent(agent, response)
     return bool(normalized.tool_calls) or agent._has_content_after_think_block(normalized.content)
 

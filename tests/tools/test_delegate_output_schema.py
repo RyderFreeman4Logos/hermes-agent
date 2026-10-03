@@ -125,6 +125,7 @@ class _StubChild:
     _parent_subagent_id = None
     _delegate_output_schema: dict | None = None
     model = "test-model"
+    provider = "custom"
     session_prompt_tokens = 0
     session_completion_tokens = 0
     session_estimated_cost_usd = 0.0

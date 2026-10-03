@@ -152,6 +152,8 @@ export class GatewayClient extends EventEmitter {
   private pendingExit: number | null | undefined
   private ready = false
   private readyTimer: ReturnType<typeof setTimeout> | null = null
+  private retireTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>()
+  private retiring: ChildProcess | null = null
   private subscribed = false
   private drainGeneration = 0
   private stdoutRl: ReturnType<typeof createInterface> | null = null
@@ -207,6 +209,73 @@ export class GatewayClient extends EventEmitter {
       clearTimeout(this.readyTimer)
       this.readyTimer = null
     }
+  }
+
+  private clearRetireTimer(proc?: ChildProcess) {
+    const procs = proc ? [proc] : [...this.retireTimers.keys()]
+
+    for (const owned of procs) {
+      const timer = this.retireTimers.get(owned)
+
+      if (timer) {
+        clearTimeout(timer)
+      }
+
+      this.retireTimers.delete(owned)
+    }
+  }
+
+  // Own this exact child until its exit event. TERM first; KILL only that
+  // same child if it is still alive. A later generation is a different
+  // ChildProcess and is not signalled by this timer.
+  private retireOwnedChild(proc: ChildProcess, reason: string) {
+    if (this.proc === proc) {
+      this.proc = null
+    }
+
+    this.stdoutRl?.close()
+    this.stderrRl?.close()
+    this.stdoutRl = null
+    this.stderrRl = null
+    this.clearRetireTimer(proc)
+
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      return
+    }
+
+    this.retiring = proc
+
+    try {
+      proc.kill()
+    } catch {
+      // already gone
+    }
+
+    const timer = setTimeout(() => {
+      this.retireTimers.delete(proc)
+
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        return
+      }
+
+      this.lifecycle(`[lifecycle] escalating owned child ${describeChild(proc)} reason=${reason}`)
+
+      try {
+        proc.kill('SIGKILL')
+      } catch {
+        // already gone
+      }
+    }, 1000)
+
+    timer.unref?.()
+    this.retireTimers.set(proc, timer)
+    proc.on('exit', () => {
+      if (this.retiring === proc) {
+        this.retiring = null
+      }
+
+      this.clearRetireTimer(proc)
+    })
   }
 
   private closeSidecarSocket() {
@@ -331,10 +400,11 @@ export class GatewayClient extends EventEmitter {
       // Spawn mode owns this child. A warning leaves it running after the
       // parent is killed. Attached sockets belong to another process, so
       // this path must not signal them. Stop reconnect: the child is dead.
-      if (proc && this.proc === proc && proc.exitCode === null && !proc.killed) {
+      // Keep the ChildProcess until its own exit event; drop the readline
+      // callbacks first so a TERM-resistant child cannot publish ready.
+      if (proc && this.proc === proc && proc.exitCode === null && proc.signalCode === null) {
         this.disposed = true
-        this.proc = null
-        proc.kill()
+        this.retireOwnedChild(proc, 'gateway startup timeout')
         this.handleTransportExit(null, 'gateway startup timeout')
       }
     }, STARTUP_TIMEOUT_MS)
@@ -456,6 +526,7 @@ export class GatewayClient extends EventEmitter {
     env.HERMES_PYTHON_SRC_ROOT = root
     this.startReadyTimer(python, cwd)
     this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    const ownedGate = this.proc
     this.lifecycle(`[lifecycle] spawned gateway child ${describeChild(this.proc)} python=${python} cwd=${cwd}`)
 
     const stdin = this.proc.stdin!
@@ -463,6 +534,10 @@ export class GatewayClient extends EventEmitter {
 
     this.stdoutRl = createInterface({ input: this.proc.stdout! })
     this.stdoutRl.on('line', raw => {
+      if (this.proc !== ownedGate || this.retiring === ownedGate) {
+        return
+      }
+
       if (!this.channel.handleFrame(raw)) {
         this.protocolError('malformed stdout', raw, '(empty line)')
       }
@@ -470,6 +545,9 @@ export class GatewayClient extends EventEmitter {
 
     this.stderrRl = createInterface({ input: this.proc.stderr! })
     this.stderrRl.on('line', raw => {
+      if (this.proc !== ownedGate || this.retiring === ownedGate) {
+        return
+      }
       const line = truncateLine(raw.trim())
 
       if (!line) {
@@ -481,9 +559,10 @@ export class GatewayClient extends EventEmitter {
     })
 
     const ownedProc = this.proc
+    const accept = () => this.proc === ownedProc && this.retiring !== ownedProc
     this.proc.on('error', err => {
-      // Skip stale errors on an already-replaced child.
-      if (this.proc !== ownedProc) {
+      // Skip stale errors on an already-replaced or retiring child.
+      if (!accept()) {
         this.pushLog(`[lifecycle] stale child error ignored ${describeChild(ownedProc)} message=${err.message}`)
 
         return
@@ -504,6 +583,16 @@ export class GatewayClient extends EventEmitter {
       this.handleTransportExit(1, `gateway error: ${err.message}`)
     })
     this.proc.on('exit', (code, signal) => {
+      if (this.retiring === ownedProc) {
+        this.retiring = null
+        this.clearRetireTimer(ownedProc)
+        this.pushLog(
+          `[lifecycle] retired child exit ${describeChild(ownedProc)} code=${code ?? 'null'} signal=${signal ?? 'null'}`
+        )
+
+        return
+      }
+
       // start() can replace `this.proc` while an old child is still
       // tearing down. Skip stale exits so we don't clear the new
       // startup timer or reject newly-issued pending requests.
@@ -657,12 +746,12 @@ export class GatewayClient extends EventEmitter {
     this.sidecarUrl = sidecarUrl
     this.resetStartupState()
 
-    if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
       this.lifecycle(`[lifecycle] replacing live gateway child ${describeChild(this.proc)}`)
-      this.proc.kill()
+      this.retireOwnedChild(this.proc, 'replaced')
+    } else {
+      this.proc = null
     }
-
-    this.proc = null
     this.closeGatewaySocket()
     this.closeSidecarSocket()
 
@@ -813,8 +902,12 @@ export class GatewayClient extends EventEmitter {
     // handleTransportExit → emit('exit') → useMainApp's recovery subscriber
     // → start(), whose first statement un-latches `disposed` and spawns a
     // replacement gateway onto the vanished pipes.
-    this.proc = null
-    const killed = proc?.kill()
+    let killed: boolean | undefined
+
+    if (proc) {
+      killed = true
+      this.retireOwnedChild(proc, reason)
+    }
 
     this.lifecycle(
       `[lifecycle] GatewayClient.kill reason=${reason} ${describeChild(proc)} killResult=${killed ?? 'none'}`

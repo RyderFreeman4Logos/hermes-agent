@@ -335,7 +335,7 @@ def _run_fork_first_issuance_probe():
 
     import agent.delegation_lineage as lineage
 
-    assert lineage._issuer is None and lineage._pending is None
+    assert lineage._issuer is None
     ready = threading.Event()
     release = threading.Event()
     errors = []

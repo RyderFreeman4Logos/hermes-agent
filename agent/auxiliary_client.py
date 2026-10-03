@@ -4000,6 +4000,26 @@ def _fallback_provider_from_label(label: str) -> str:
     return match.group(1).strip() if match else str(label or "").strip()
 
 
+def _is_codex_provider(provider: Optional[str]) -> bool:
+    return _normalize_aux_provider(provider) == "openai-codex"
+
+
+def _record_codex_skip(route_info: Optional[Dict[str, Any]], reason: str) -> None:
+    """Keep one scalar reason when a configured Codex candidate is skipped."""
+    if route_info is not None and "codex_skip_reason" not in route_info:
+        route_info["codex_skip_reason"] = reason
+
+
+def _next_configured_fallback_index(label: str) -> Optional[int]:
+    """Return the entry after a configured-chain label, if it has one."""
+    if not str(label).startswith("fallback_chain["):
+        return None
+    try:
+        return int(label.split("[", 1)[1].split("]", 1)[0]) + 1
+    except (IndexError, ValueError):
+        return None
+
+
 class _FallbackDestination(NamedTuple):
     provider: str
     base_url: str
@@ -4027,8 +4047,14 @@ def _fallback_destination_from_entry(
     entry: Dict[str, Any], fb_client: Any, fb_model: Optional[str]
 ) -> _FallbackDestination:
     provider = str(entry.get("provider") or "").strip()
-    base_url = str(entry.get("base_url") or getattr(fb_client, "base_url", "") or "").strip()
-    api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
+    if _is_codex_provider(provider) and isinstance(
+        fb_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)
+    ):
+        base_url = str(getattr(fb_client, "base_url", "") or "").strip()
+        api_mode = "codex_responses"
+    else:
+        base_url = str(entry.get("base_url") or getattr(fb_client, "base_url", "") or "").strip()
+        api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
     model = fb_model or str(entry.get("model") or "").strip() or None
     return _complete_fallback_destination(provider, base_url, api_mode, model)
 
@@ -4440,10 +4466,11 @@ def _context_too_small(
 def _try_configured_fallback_chain(
     task: str, failed_provider: str, reason: str = "error", failed_model: Optional[str] = None, *,
     failed_base_url: str = "", failure_scope: Any = None,
+    start_index: int = 0, route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try auxiliary.<task>.fallback_chain entries in order (each needs ``provider``; model/base_url/api_key optional).
-    ``failed_model`` scoping per ``_failed_backend_skip`` (sibling models on the same provider still
-    run after a model-scoped failure). Returns (client, model, provider_label) or (None, None, "")."""
+    """Try remaining Codex entries on auxiliary.<task>.fallback_chain.
+    Non-Codex destinations fail closed (#160). ``failed_model`` scoping per
+    ``_failed_backend_skip``. Returns (client, model, provider_label) or (None, None, "")."""
     if not task:
         return None, None, ""
     chain = _get_auxiliary_task_config(task).get("fallback_chain")
@@ -4453,9 +4480,18 @@ def _try_configured_fallback_chain(
         failed_provider, failed_model, failed_base_url=failed_base_url, failure_scope=failure_scope)
     tried = []
     min_ctx = _task_minimum_context_length(task)
-    for i, entry in enumerate(chain):
-        if not isinstance(entry, dict):
-            continue
+    codex_only = _is_codex_provider(failed_provider)
+    candidate_indices = [
+        i for i in range(start_index, len(chain))
+        if isinstance(chain[i], dict)
+        and (not codex_only or _is_codex_provider(chain[i].get("provider")))
+    ]
+    if not candidate_indices:
+        if codex_only:
+            _record_codex_skip(route_info, "unavailable")
+        return None, None, ""
+    for i in candidate_indices:
+        entry = chain[i]
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
             continue
@@ -4479,11 +4515,14 @@ def _try_configured_fallback_chain(
             ) if resolved_model else None
             if too_small:
                 tried.append(too_small)
+                _record_codex_skip(route_info, "too_small")
                 continue
             logger.info("Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                         task, reason, failed_provider, label, resolved_model or fb_model or "default")
+            _record_route_info(route_info, fb_provider, resolved_model or fb_model, fallback_label=label)
             return fb_client, resolved_model or fb_model, label
         tried.append(label)
+        _record_codex_skip(route_info, "unavailable")
     if tried:
         logger.debug("Auxiliary %s: configured fallback_chain exhausted (tried: %s)", task, ", ".join(tried))
     return None, None, ""
@@ -4526,6 +4565,7 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
 def _try_main_fallback_chain(
     task: Optional[str], failed_provider: str = "", reason: str = "error", *,
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Top-level main-agent fallback chain for a ``provider: auto`` auxiliary call: auto tasks honour the
     user's main fallback policy before the built-in discovery chain; read via ``get_fallback_chain`` so
@@ -4553,6 +4593,11 @@ def _try_main_fallback_chain(
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
         fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
+        if not _is_codex_provider(fb_provider):
+            if _is_codex_provider(failed_provider):
+                _record_codex_skip(route_info, "unavailable")
+                tried.append(f"{label} (non-Codex destination)")
+                continue
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
             continue
@@ -7747,6 +7792,14 @@ def _ladder_credential_rungs(
     return None, first_err
 
 
+def _is_explicit_auxiliary_control_denial(error: Exception) -> bool:
+    """Only typed provider controls stop an otherwise recoverable auxiliary request."""
+    from agent.error_classifier import _extract_error_body, _extract_error_code
+    return _extract_error_code(_extract_error_body(error)).lower() in {
+        "approval_denied", "content_policy_violation",
+    }
+
+
 def _next_fallback_after_quarantine(
     task: Optional[str], resolved_provider: str, is_auto: bool, route: _LadderRoute,
     failed_model: Optional[str], failure_scope: Any, *, task_chain_only: bool = False,
@@ -7786,8 +7839,10 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     # (429 + "too many tokens per day") must fall back just like a 402 credit error.
     # Rate limits are included: after retries are exhausted, a 429 means the provider is at capacity. See
     # #52228. See #26803: daily token quota must fall back like a 402 credit error.
+    if _is_explicit_auxiliary_control_denial(first_err):
+        return None
     is_auto = resolved_provider in {"auto", "", None}
-    reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
+    reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), "provider execution error")
     is_capacity_error = any(
         predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")
     task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
@@ -7795,7 +7850,15 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     explicit_auth_with_task_chain = (
         reason == "auth error" and not is_auto and has_task_fallback_chain
     )
-    if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
+    # A configured task chain is an explicit destination list, not discovery. Generic
+    # execution errors walk it; typed control denials already returned above.
+    # Explicit auth still stops at that chain.
+    if (
+        (reason == "provider execution error" and not (
+            is_auto or is_capacity_error or explicit_auth_with_task_chain or has_task_fallback_chain
+        ))
+        or (reason == "auth error" and not is_auto and not has_task_fallback_chain)
+    ):
         return None
     if reason == "payment error":
         # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip
@@ -7825,11 +7888,47 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     )
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
-        failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+        failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+        route_info=route.route_info)
+    attempted = {fb_label} if fb_label else set()
+
+    def _candidate_response(step: _LadderStep):
+        try:
+            return (yield step)
+        except Exception as candidate_error:
+            if _is_explicit_auxiliary_control_denial(candidate_error):
+                raise
+            logger.warning(
+                "Auxiliary %s%s: fallback candidate failed (%s); advancing the configured chain",
+                task or "call", tag, type(candidate_error).__name__,
+            )
+            return None
+
+    while fb_client is not None:
+        _record_route_info(
+            route.route_info, _fallback_provider_from_label(fb_label), fb_model, fallback_label=fb_label,
+        )
+        fb_resp = yield from _candidate_response(_LadderStep("fallback", (fb_client, fb_model, fb_label)))
+        if fb_resp is not None:
+            return fb_resp
+        if _is_codex_provider(_fallback_provider_from_label(fb_label)):
+            _record_codex_skip(route.route_info, "rejected")
+        next_index = _next_configured_fallback_index(fb_label)
+        if next_index is None:
+            break
+        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+            task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
+            failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+            start_index=next_index, route_info=route.route_info)
+        if not fb_label or fb_label in attempted:
+            fb_client = None
+            break
+        attempted.add(fb_label)
     if fb_client is None and is_auto:
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
-            failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
+            failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+            route_info=route.route_info)
         if fb_client is None:
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
@@ -7849,8 +7948,10 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         if lane in tried_lanes:
             break
         tried_lanes.add(lane)
-        _record_route_info(route.route_info, _fallback_provider_from_label(fb_label), fb_model)
-        fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
+        _record_route_info(
+            route.route_info, _fallback_provider_from_label(fb_label), fb_model, fallback_label=fb_label,
+        )
+        fb_resp = yield from _candidate_response(_LadderStep("fallback", (fb_client, fb_model, fb_label)))
         if fb_resp is not None:
             return fb_resp
         fb_client, fb_model, fb_label = _next_fallback_after_quarantine(

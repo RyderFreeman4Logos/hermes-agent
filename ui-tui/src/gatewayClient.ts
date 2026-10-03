@@ -23,6 +23,34 @@ const MAX_LOG_LINE_BYTES = 4096
 const MAX_BUFFERED_EVENTS = 2000
 const MAX_LOG_PREVIEW = 240
 const STARTUP_TIMEOUT_MS = Math.max(5000, parseInt(process.env.HERMES_TUI_STARTUP_TIMEOUT_MS ?? '15000', 10) || 15000)
+const DEFAULT_SHUTDOWN_GRACE_MS = 1000
+// The backend starts its grace timer when it handles SIGTERM. An equal client
+// timer is armed before that handler runs, so give the backend this much
+// scheduling room before SIGKILL. 50ms is one event-loop turn, not a new grace.
+const SHUTDOWN_GRACE_SLACK_MS = 50
+const MAX_TIMER_MS = 2_147_483_647
+const ownedShutdownGraceMs = new WeakMap<ChildProcess, number>()
+
+// Same fallback as tui_gateway.entry._shutdown_grace_seconds: missing, empty,
+// non-numeric, NaN, or <= 0 is 1s. Python float("inf") stays open; Node timers
+// cannot, so that case uses the timer ceiling.
+const shutdownGraceMs = (raw: string | undefined) => {
+  const text = (raw ?? '').trim()
+  const lower = text.toLowerCase()
+  let seconds = Number(text)
+
+  if (lower === 'inf' || lower === '+inf' || lower === 'infinity' || lower === '+infinity') {
+    seconds = Infinity
+  }
+
+  if (!(seconds > 0)) {
+    return DEFAULT_SHUTDOWN_GRACE_MS
+  }
+
+  const ms = seconds * 1000
+
+  return Number.isFinite(ms) && ms <= MAX_TIMER_MS ? ms : MAX_TIMER_MS
+}
 const REQUEST_TIMEOUT_MS = Math.max(30000, parseInt(process.env.HERMES_TUI_RPC_TIMEOUT_MS ?? '120000', 10) || 120000)
 const WS_CONNECTING = 0
 const WS_OPEN = 1
@@ -265,7 +293,7 @@ export class GatewayClient extends EventEmitter {
       } catch {
         // already gone
       }
-    }, 1000)
+    }, (ownedShutdownGraceMs.get(proc) ?? DEFAULT_SHUTDOWN_GRACE_MS) + SHUTDOWN_GRACE_SLACK_MS)
 
     timer.unref?.()
     this.retireTimers.set(proc, timer)
@@ -526,6 +554,7 @@ export class GatewayClient extends EventEmitter {
     env.HERMES_PYTHON_SRC_ROOT = root
     this.startReadyTimer(python, cwd)
     this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    ownedShutdownGraceMs.set(this.proc, shutdownGraceMs(env.HERMES_TUI_GATEWAY_SHUTDOWN_GRACE_S))
     const ownedGate = this.proc
     this.lifecycle(`[lifecycle] spawned gateway child ${describeChild(this.proc)} python=${python} cwd=${cwd}`)
 

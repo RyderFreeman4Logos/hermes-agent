@@ -33,14 +33,20 @@ def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
-def _accepted_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
-    """Return only a route proven by an accepted child response."""
-    route = getattr(child, "_delegate_successful_llm_route", None)
-    if isinstance(route, tuple) and len(route) == 2:
-        model, provider = map(_str_or_none, route)
-        if model is not None or provider is not None:
-            return model, provider
-    return None, None
+def _accepted_route_identity(child: Any, result: Any = None) -> tuple[Optional[str], Optional[str]]:
+    """Return the fallback route still active after a successful adapter switch.
+
+    ``result`` is unused: conversation payloads do not carry route identity, and
+    a restored primary clears ``_provider_fallback_active`` before this runs.
+    """
+    del result
+    if getattr(child, "_provider_fallback_active", False) is not True:
+        return None, None
+    route = getattr(child, "_provider_fallback_route", None)
+    if not (isinstance(route, tuple) and len(route) == 2):
+        return None, None
+    model, provider = map(_str_or_none, route)
+    return (model, provider) if model is not None or provider is not None else (None, None)
 
 
 def _selected_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
@@ -51,9 +57,11 @@ def _selected_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
     return _str_or_none(route[0]), _str_or_none(route[1])
 
 
-def _result_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
-    """Prefer an accepted route, then the route selected before the run."""
-    accepted = _accepted_route_identity(child)
+def _result_route_identity(child: Any, result: Any = None) -> tuple[Optional[str], Optional[str]]:
+    """Prefer the conversation's accepted route, then the route frozen before the run."""
+    if getattr(child, "api_mode", None) == "codex_app_server":
+        return _accepted_route_identity(child, result)
+    accepted = _accepted_route_identity(child, result)
     return accepted if any(value is not None for value in accepted) else _selected_route_identity(child)
 
 
@@ -600,7 +608,7 @@ def _build_result_entry(
     wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
     summary = result.get("final_response") or ""
     billing = result.get("billing_block")
-    accepted_model, accepted_provider = _accepted_route_identity(child)
+    accepted_model, accepted_provider = _accepted_route_identity(child, result)
     selected_model, selected_provider = _selected_route_identity(child)
     if accepted_model is not None or accepted_provider is not None:
         route_model, route_provider = accepted_model, accepted_provider
@@ -609,7 +617,7 @@ def _build_result_entry(
     else:
         route_model = _str_or_none(getattr(child, "model", None))
         route_provider = _str_or_none(getattr(child, "provider", None))
-    owns_xai = _route_owns_xai(route_model, route_provider)
+    owns_xai = _route_owns_xai(selected_model, selected_provider)
     xai_leak = (
         isinstance(billing, dict)
         and billing.get("provider") in {"xai", "xai-oauth"}
@@ -678,6 +686,7 @@ def _build_result_entry(
         "duration_seconds": duration,
         "model": model,
         "provider": provider,
+        **({"requested_provider": requested} if (requested := _str_or_none(getattr(child, "requested_provider", None))) and requested != provider else {}),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -697,7 +706,13 @@ def _build_result_entry(
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
     if status == "failed":
-        entry["error"] = safe_error if safe_error is not None else result.get("error", "Subagent did not produce a response.")
+        if schema.valid is False:
+            entry["error"] = (
+                "Final answer does not satisfy the declared output_schema"
+                + (" (after 1 retry)." if schema.retries else ".")
+            )
+        else:
+            entry["error"] = summary if xai_leak else (safe_error if safe_error is not None else result.get("error", "Subagent did not produce a response."))
         _failure_reason = result.get("failure_reason")
         if not xai_leak and isinstance(_failure_reason, str) and _failure_reason:
             entry["failure_reason"] = _failure_reason
@@ -1004,8 +1019,6 @@ class _ChildRun:
             _err += f" Diagnostic: {diagnostic_path}"
         status = "timeout" if is_timeout else "error"
         model, provider = _result_route_identity(child)
-        if getattr(child, "api_mode", None) == "codex_app_server":
-            model, provider = _accepted_route_identity(child)
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,

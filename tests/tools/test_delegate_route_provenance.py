@@ -107,7 +107,8 @@ def _run(profile, result, *, mutate=None, goal="route provenance", schema=None, 
 
 
 def _stamp(child, model, provider):
-    child._delegate_successful_llm_route = (model, provider)
+    child._provider_fallback_active = True
+    child._provider_fallback_route = (model, provider)
 
 
 def test_non_grok_child_hides_verified_xai_billing():

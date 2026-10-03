@@ -1227,10 +1227,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
-        from agent.delegation_context import is_delegated_child_context
+        from agent.delegation_context import inherited_delegated_child_session, is_delegated_child_context
         from gateway.session_context import get_session_env
 
-        extra.setdefault("delegated_child", is_delegated_child_context())
+        extra.setdefault("delegated_child", is_delegated_child_context() or bool(inherited_delegated_child_session()))
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
@@ -1275,10 +1275,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         doesn't hide progress from process(action="poll")."""
         env = _sanitize_subprocess_env(os.environ, env_vars)
         env["PYTHONUNBUFFERED"] = "1"
-        from agent.delegation_context import positive_child_session_stamp
-        stamp = positive_child_session_stamp()
-        if stamp:
-            env["HERMES_DELEGATED_CHILD_SESSION"] = stamp
+        from agent.delegation_context import delegated_child_lineage_env
+        env.update(delegated_child_lineage_env())
         return env
 
     def _track_started(self, session: ProcessSession, reader_target, reader_name: str, extra_args=()) -> None:

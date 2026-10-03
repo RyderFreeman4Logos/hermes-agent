@@ -18,6 +18,11 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
+# Positive session authority carried to a native child. The value is not trusted
+# by itself: the parent pid and start time must still name this process.
+DELEGATED_CHILD_SESSION_ENV = "HERMES_DELEGATED_CHILD_SESSION"
+DELEGATED_CHILD_PARENT_PID_ENV = "HERMES_DELEGATED_CHILD_PARENT_PID"
+DELEGATED_CHILD_PARENT_START_ENV = "HERMES_DELEGATED_CHILD_PARENT_START"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
@@ -57,14 +62,64 @@ def positive_child_session_stamp() -> str:
     return str(get_session_env("HERMES_SESSION_ID", "") or "")
 
 
+def _parent_still_this_process(pid_text: str, start_text: str) -> bool:
+    """True when the exported parent pid and start time still name our parent.
+
+    The child compares the recorded parent, not its own pid. A recycled pid
+    fails the start-time check.
+    """
+    try:
+        pid = int(pid_text)
+    except (TypeError, ValueError):
+        return False
+    if pid != os.getppid() or not start_text:
+        return False
+    from gateway.status import get_process_start_time
+    live = get_process_start_time(pid)
+    return live is not None and str(live) == start_text
+
+
+def delegated_child_lineage_env() -> dict[str, str]:
+    """Env that lets a native child prove it was spawned by this delegated process.
+
+    An ambient session string with no matching parent identity is omitted.
+    """
+    stamp = positive_child_session_stamp()
+    if not stamp:
+        return {}
+    from gateway.status import get_process_start_time
+    start = get_process_start_time(os.getpid())
+    if start is None:
+        return {}
+    return {
+        DELEGATED_CHILD_SESSION_ENV: stamp,
+        DELEGATED_CHILD_PARENT_PID_ENV: str(os.getpid()),
+        DELEGATED_CHILD_PARENT_START_ENV: str(start),
+    }
+
+
+def inherited_delegated_child_session() -> str:
+    """Session id proven by parent pid + start time, else empty.
+
+    A forged ``HERMES_DELEGATED_CHILD_SESSION`` does not mint authority.
+    Inside an in-process delegated context the ContextVar remains the source.
+    """
+    if _DELEGATED_CHILD_CONTEXT.get():
+        return ""
+    if not _parent_still_this_process(
+        os.environ.get(DELEGATED_CHILD_PARENT_PID_ENV, ""),
+        os.environ.get(DELEGATED_CHILD_PARENT_START_ENV, ""),
+    ):
+        return ""
+    return str(os.environ.get(DELEGATED_CHILD_SESSION_ENV) or "")
+
+
 def delegated_child_session_stamp() -> str:
     """Trusted positive stamp, process-local or carried across a native spawn."""
     local = positive_child_session_stamp()
     if local:
         return local
-    if _DELEGATED_CHILD_CONTEXT.get():
-        return ""
-    return str(os.environ.get("HERMES_DELEGATED_CHILD_SESSION") or "")
+    return inherited_delegated_child_session()
 
 
 def enter_non_dispatcher_owned_context() -> Token[bool]:

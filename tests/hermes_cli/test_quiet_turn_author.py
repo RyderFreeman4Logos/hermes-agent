@@ -258,3 +258,31 @@ def test_quiet_requested_completion_wake_never_muted(tmp_path, monkeypatch):
     result = qsq.continue_quiet_notify_completions(
         "s", lambda text: {"final_response": "REQUESTED_REPLY"}, linger_budget=0.0)
     assert result == {"final_response": "REQUESTED_REPLY"}
+
+
+def test_quiet_owning_off_skips_ordinary_completion_keeps_delegation(tmp_path, monkeypatch):
+    """Owning-profile OFF admits zero turns for an ordinary completion and still runs a delegation result."""
+    from hermes_cli import quiet_single_query as qsq
+    from tools import process_registry as pr
+
+    home = tmp_path / "off"
+    home.mkdir()
+    (home / "config.yaml").write_text("display:\n  background_process_notifications: off\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    turns = []
+    registry = pr.ProcessRegistry()
+    ordinary = {
+        "type": "completion", "session_id": "proc_off", "session_key": "quiet",
+        "command": "echo ordinary", "exit_code": 0, "output": "ordinary",
+        "owner_task_id": "ordinary", "delegated_child": False,
+    }
+    monkeypatch.setattr(pr, "process_registry", registry)
+    registry.completion_queue.put(ordinary)
+    qsq.continue_quiet_notify_completions("quiet", lambda text: turns.append(text), max_rounds=1, linger_budget=0)
+    assert turns == []
+    registry.completion_queue.put({
+        "type": "async_delegation", "delegation_id": "d1", "session_key": "quiet",
+        "goal": "keep", "status": "completed", "summary": "done",
+    })
+    qsq.continue_quiet_notify_completions("quiet", lambda text: turns.append(text), max_rounds=1, linger_budget=0)
+    assert len(turns) == 1

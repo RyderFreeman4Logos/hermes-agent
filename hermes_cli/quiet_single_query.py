@@ -167,6 +167,24 @@ def bind_quiet_session_key(session_id: str):
         reset_current_session_key(token)
 
 
+def _owning_background_notifications_off() -> bool:
+    """Whether the owning profile set ``display.background_process_notifications: off``.
+
+    Reads the config the quiet process already loaded. A missing or unreadable
+    value is not OFF.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        raw = (read_raw_config().get("display") or {}).get("background_process_notifications")
+        # YAML 1.1 reads bare off as False. The documented value is the string off.
+        if raw is False:
+            raw = "off"
+        mode = str(raw or "").strip().lower()
+    except Exception:
+        return False
+    return mode == "off"
+
+
 def _diagnostic_only_wake_muted(events) -> bool:
     """True when every drained event is an automatic diagnostic AND the CLI policy suppresses them."""
     from agent.notification_presentation import diagnostic_process_event
@@ -232,12 +250,19 @@ def continue_quiet_notify_completions(
         # async_delegation results. Keep everything that rendered.
         texts = [text for _event, text in drained if text]
         if texts:
-            follow = run_turn("\n\n".join(texts))
-            # Same admission rule as the interactive CLI turn: a wake made ONLY of automatic
-            # diagnostics (early failure / watch notices) still runs, but under suppression its
-            # reply never displaces the requested one-shot answer on stdout.
-            if not _diagnostic_only_wake_muted([event for event, text in drained if text]):
-                last = follow
+            admitted = drained
+            if _owning_background_notifications_off():
+                # Same OFF rule as the interactive CLI drain: ordinary process
+                # completions do not start a turn. Delegation results still do.
+                admitted = [(event, text) for event, text in drained if event.get("type") == "async_delegation" and text]
+                texts = [text for _event, text in admitted if text]
+            if texts:
+                follow = run_turn("\n\n".join(texts))
+                # Same admission rule as the interactive CLI turn: a wake made ONLY of automatic
+                # diagnostics (early failure / watch notices) still runs, but under suppression its
+                # reply never displaces the requested one-shot answer on stdout.
+                if not _diagnostic_only_wake_muted([event for event, text in admitted if text]):
+                    last = follow
         if wait.get("timed_out"):
             break
         if not texts:

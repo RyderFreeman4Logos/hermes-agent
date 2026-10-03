@@ -3,13 +3,40 @@
 import json
 import itertools
 import logging
+import os
 import time
+import threading
 from typing import Any, Dict, List, Optional
 
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger("tools.process_registry")
-_CHECKPOINT_GENERATIONS = itertools.count(1)
+# One counter per destination file. A write to profile B must not retire a
+# delayed write to profile A. Same path, including two aliases, shares one counter.
+_CHECKPOINT_GENERATIONS: Dict[tuple, itertools.count] = {}
+_CHECKPOINT_GENERATION_LOCK = threading.Lock()
+
+
+def _checkpoint_target_key(path) -> tuple:
+    """Stable identity of the file a checkpoint will replace."""
+    try:
+        parent = path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        device = os.stat(parent).st_dev
+    except OSError:
+        device = None
+    return (device, os.path.normcase(str(path.resolve())))
+
+
+def _next_checkpoint_generation(path) -> int:
+    key = _checkpoint_target_key(path)
+    with _CHECKPOINT_GENERATION_LOCK:
+        counter = _CHECKPOINT_GENERATIONS.get(key)
+        if counter is None:
+            counter = itertools.count(1)
+            _CHECKPOINT_GENERATIONS[key] = counter
+        value = next(counter)
+    return value
 
 
 class ProcessCheckpointMixin:
@@ -30,9 +57,14 @@ class ProcessCheckpointMixin:
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
 
         try:
+            path = _checkpoint_path()
+            generation = _next_checkpoint_generation(path)
             with self._lock:
-                generation = next(_CHECKPOINT_GENERATIONS)
-                self._checkpoint_generation = generation
+                published = getattr(self, "_checkpoint_generations", None)
+                if published is None:
+                    published = {}
+                    self._checkpoint_generations = published
+                published[_checkpoint_target_key(path)] = generation
                 entries = []
                 for s in self._running.values():
                     if s.exited:
@@ -52,10 +84,8 @@ class ProcessCheckpointMixin:
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
-            import os
             import tempfile
             from utils import atomic_replace, _dump_json
-            path = _checkpoint_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(
                 dir=str(path.parent), prefix=f".{path.stem}.g{generation}.", suffix=".tmp")
@@ -65,7 +95,8 @@ class ProcessCheckpointMixin:
                     handle.flush()
                     os.fsync(handle.fileno())
                 with self._lock:
-                    if getattr(self, "_checkpoint_generation", generation) != generation:
+                    current = getattr(self, "_checkpoint_generations", {}).get(_checkpoint_target_key(path))
+                    if current != generation:
                         os.unlink(tmp_name)
                         return
                     atomic_replace(tmp_name, path)

@@ -6,6 +6,7 @@ Gateway completion events and checkpoints carry the stamp and handoff note.
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -229,3 +230,88 @@ def test_checkpoint_roundtrip_restores_child_flag_and_handoff(tmp_path, monkeypa
 def test_malformed_or_visible_child_events_are_not_silenced(event):
     from tools.process_registry_notifications import format_process_notification
     assert format_process_notification(event) is not None
+
+
+def test_cross_profile_delayed_checkpoint_keeps_both_files(tmp_path, monkeypatch):
+    """A later write to profile B must not drop a delayed write to profile A."""
+    import threading
+    from unittest.mock import patch
+    from gateway.run import _profile_runtime_scope
+    from tools import process_registry as pr
+    import utils
+
+    monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", False)
+    a, b = tmp_path / "a", tmp_path / "b"
+    for home in (a, b):
+        home.mkdir()
+        (home / "config.yaml").write_text("display:\n  background_process_notifications: concise\n")
+    reg = pr.ProcessRegistry()
+    reached, release, results = threading.Event(), threading.Event(), {}
+    real = utils._dump_json
+
+    def delayed(payload, handle, *args, **kw):
+        if threading.current_thread().name == "profile-a":
+            reached.set()
+            assert release.wait(10)
+        return real(payload, handle, *args, **kw)
+
+    def spawn(home, key):
+        with _profile_runtime_scope(home, {}):
+            results[key] = reg.spawn_local("sleep 30", cwd=str(home), task_id=key, owner_task_id=key)
+
+    worker = threading.Thread(target=spawn, args=(a, "a"), name="profile-a")
+    try:
+        with patch.object(utils, "_dump_json", delayed):
+            worker.start()
+            assert reached.wait(10)
+            spawn(b, "b")
+            release.set()
+            worker.join(10)
+        assert (a / "processes.json").exists()
+        assert (b / "processes.json").exists()
+        with _profile_runtime_scope(a, {}):
+            restored = pr.ProcessRegistry()
+            restored.recover_from_checkpoint()
+            assert restored.get(results["a"].id) is not None
+    finally:
+        release.set()
+        worker.join(10)
+        for session in results.values():
+            reg.kill_process(session.id, source="test")
+            if session._reader_thread:
+                session._reader_thread.join(10)
+
+
+def test_native_descendant_inherits_positive_stamp_without_context(tmp_path, monkeypatch):
+    """A real child of _spawn_env is positive; a forged session env is not."""
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, DELEGATED_CHILD_SESSION_ENV
+
+    monkeypatch.delenv(DELEGATED_CHILD_SESSION_ENV, raising=False)
+    registry = ProcessRegistry()
+    script = (
+        "import json, os, sys\n"
+        "sys.path.insert(0, os.environ['SRC'])\n"
+        "from tools.process_registry import ProcessRegistry\n"
+        "session = ProcessRegistry._new_session('echo', 't', '', 'sk', '/')\n"
+        "print(json.dumps({'delegated_child': bool(session.delegated_child)}))\n"
+    )
+    with delegated_child_context("native-child-session"):
+        env = registry._spawn_env({})
+    child = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**env, "SRC": os.getcwd(), "HERMES_HOME": str(tmp_path)},
+        cwd=os.getcwd(), capture_output=True, text=True, check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout.strip().splitlines()[-1])["delegated_child"] is True
+    forged = dict(os.environ)
+    forged[DELEGATED_CHILD_SESSION_ENV] = "forged-session"
+    forged.pop(DELEGATED_CHILD_ENV_MARKER, None)
+    forged["SRC"] = os.getcwd()
+    forged["HERMES_HOME"] = str(tmp_path)
+    bad = subprocess.run(
+        [sys.executable, "-c", script], env=forged, cwd=os.getcwd(),
+        capture_output=True, text=True, check=False,
+    )
+    assert bad.returncode == 0, bad.stderr
+    assert json.loads(bad.stdout.strip().splitlines()[-1])["delegated_child"] is False

@@ -126,7 +126,9 @@ def test_handoff_refuses_exited_foreign_or_non_child_callers(clean_queue):
         # A completion for an un-handed child process is still suppressed in the parent.
         reg = ProcessRegistry()
         reg.completion_queue.put({"type": "completion", "session_id": "proc_x", "task_id": other,
-                                  "owner_task_id": other, "command": "sleep", "exit_code": 0, "output": ""})
+                                  "owner_task_id": other, "command": "sleep", "exit_code": 0,
+                                  "completion_reason": "exited", "termination_source": "",
+                                  "started_at": 1.0, "delegated_child": True, "output": ""})
         assert reg.drain_notifications() == []
         assert format_process_notification({"type": "completion", "session_id": "p", "command": "c", "exit_code": 0,
                                             "output": "", "handoff_note": "why"}).count("Handed off to you") == 1

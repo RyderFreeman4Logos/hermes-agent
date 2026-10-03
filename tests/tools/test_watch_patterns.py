@@ -217,18 +217,19 @@ class TestLifetimeCap:
 # =========================================================================
 
 class TestCheckpointPersistence:
-    def test_watch_patterns_in_checkpoint(self, registry):
-        """watch_patterns is included in checkpoint data."""
+    def test_watch_patterns_in_checkpoint(self, registry, tmp_path, monkeypatch):
+        """watch_patterns is written into the real checkpoint file."""
+        import tools.process_registry as pr_mod
+
         session = _make_session(watch_patterns=["ERROR", "FAIL"])
         with registry._lock:
             registry._running[session.id] = session
-
-        with patch("utils.atomic_json_write") as mock_write:
-            registry._write_checkpoint()
-            args = mock_write.call_args
-            entries = args[0][1]  # second positional arg
-            assert len(entries) == 1
-            assert entries[0]["watch_patterns"] == ["ERROR", "FAIL"]
+        checkpoint = tmp_path / "processes.json"
+        monkeypatch.setattr(pr_mod, "CHECKPOINT_PATH", checkpoint)
+        registry._write_checkpoint()
+        entries = json.loads(checkpoint.read_text(encoding="utf-8"))
+        assert len(entries) == 1
+        assert entries[0]["watch_patterns"] == ["ERROR", "FAIL"]
 
     def test_watch_patterns_recovery(self, registry, tmp_path, monkeypatch):
         """watch_patterns survives checkpoint recovery."""

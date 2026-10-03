@@ -466,8 +466,13 @@ def _child_completion_evt(task_id="sa-9-supp0001", sid="proc_childnoise01"):
         "type": "completion",
         "session_id": sid,
         "task_id": task_id,
+        "owner_task_id": task_id,
         "command": "npm ci",
         "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "started_at": 1.0,
+        "delegated_child": True,
         "output": "added 1500 packages",
     }
 
@@ -560,8 +565,8 @@ def test_surface_flag_true_restores_child_notification_delivery(monkeypatch):
     assert "Started by subagent sa-9-supp0003" in text
 
 
-def test_child_watch_match_suppressed_by_default(monkeypatch):
-    """watch_match events from sa- sessions follow the same suppression."""
+def test_child_watch_match_still_delivered_by_default(monkeypatch):
+    """watch_match from an sa- session is not a completion; it still delivers."""
     import hermes_cli.config as _cfg
     from tools.process_registry import ProcessRegistry
 
@@ -578,7 +583,9 @@ def test_child_watch_match_suppressed_by_default(monkeypatch):
             "suppressed": 0,
         }
     )
-    assert reg.drain_notifications() == []
+    results = reg.drain_notifications()
+    assert len(results) == 1
+    assert results[0][0]["type"] == "watch_match"
     assert reg.completion_queue.qsize() == 0
 
 
@@ -596,6 +603,7 @@ def test_child_completion_with_collapsed_container_task_id_suppressed(monkeypatc
     reg = ProcessRegistry()
     evt = _child_completion_evt(task_id="default")
     evt["owner_task_id"] = "sa-9-supp0005"
+    evt["delegated_child"] = True
     reg.completion_queue.put(evt)
     assert reg.drain_notifications() == []
     assert reg.completion_queue.qsize() == 0
@@ -640,6 +648,7 @@ def test_spawn_local_stamps_owner_task_id_and_event_carries_it(monkeypatch, noti
         owner_task_id="sa-9-supp0006",
     )
     session.notify_on_complete = True
+    session.delegated_child = True
     assert session.owner_task_id == "sa-9-supp0006"
     # Do not let a fast child exit before notification admission is configured.
     gate.touch()

@@ -617,7 +617,12 @@ def _build_children(
         except ValueError as exc:
             return [], str(exc)
         child._delegate_model_profile = resolved_profile
-        setattr(child, "_delegate_selected_llm_route", (creds.get("model"), creds.get("provider")))
+        # Preserve declared route spelling; fill inherited slots before the run
+        # can fail or mutate the child onto a fallback.
+        child._delegate_selected_llm_route = (
+            creds.get("model") or child.model,
+            creds.get("provider") or child.provider,
+        )
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema

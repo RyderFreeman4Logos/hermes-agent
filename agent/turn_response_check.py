@@ -89,6 +89,19 @@ def _derive_finish_reason(agent: Any, response: Any, messages: Any) -> str:
     return finish_reason
 
 
+def _response_is_usable(agent: Any, response: Any) -> bool:
+    """True when this response is itself a success the route may accept.
+
+    Structural validity is not enough: an HTTP 200 with an empty body and
+    ``finish_reason=length`` still has to be continued. Visible text or a real
+    tool call is usable; a refusal, empty content, or thinking-only text is not.
+    """
+    from agent.turn_truncation import normalize_response_for_agent
+
+    normalized = normalize_response_for_agent(agent, response)
+    return bool(normalized.tool_calls) or agent._has_content_after_think_block(normalized.content)
+
+
 def _response_policy_blocked(agent: Any, response: Any, response_invalid: bool) -> bool:
     """Read provider policy metadata before shape/truncation recovery can erase it."""
     from agent.turn_recovery import classify_codex_soft_failure
@@ -211,10 +224,11 @@ def check_api_response(
         compression_attempts = 0
         return _verdict("break")
 
-    if not response_invalid:
-        # A usable response accepts the runtime that produced it. Policy refusal
-        # and invalid shape are not success, so a prior accepted route stays.
-        # The body model is not that identity: proxies echo the requested alias.
+    if not response_invalid and _response_is_usable(agent, response):
+        # A usable response accepts the runtime that produced it. Policy refusal,
+        # invalid shape, and an empty/truncated body are not success, so a prior
+        # accepted route stays. The body model is not that identity: proxies echo
+        # the requested alias.
         agent._delegate_accepted_llm_route = (agent.model, agent.provider)
 
     if finish_reason == "length":

@@ -312,6 +312,110 @@ def _run_native_probe(env, script=_NATIVE_COMPLETION_PROBE):
 
 
 @pytest.mark.platforms('linux')
+def test_fork_during_first_issuance_does_not_inherit_listener():
+    """Fork at the first issuer's start-return boundary in a fresh process."""
+    probe_env = os.environ.copy()
+    probe_env['PYTHONPATH'] = os.getcwd() + os.pathsep + probe_env.get('PYTHONPATH', '')
+    result = subprocess.run(
+        [sys.executable, __file__, '--fork-first-issuance-probe'],
+        capture_output=True, text=True, timeout=30, env=probe_env,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed['issuer_threads'] == 0
+    assert observed['after'] == observed['before']
+
+
+def _run_fork_first_issuance_probe():
+    import gc
+    import select
+    import signal
+    import threading
+    from unittest.mock import patch
+
+    import agent.delegation_lineage as lineage
+
+    assert lineage._issuer is None and lineage._pending is None
+    ready = threading.Event()
+    release = threading.Event()
+    errors = []
+    original = threading.Thread.start
+
+    def started(self):
+        original(self)
+        if self.name == 'delegation-lineage':
+            ready.set()
+            assert release.wait(10)
+
+    def issue():
+        try:
+            with delegated_child_context('race-fixture'):
+                ProcessRegistry._spawn_env({})
+        except BaseException as exc:
+            errors.append(type(exc).__name__)
+
+    def sockets():
+        found = []
+        for entry in os.scandir('/proc/self/fd'):
+            try:
+                target = os.readlink(entry.path)
+            except FileNotFoundError:
+                continue
+            if target.startswith('socket:'):
+                found.append(target)
+        return found
+
+    before = sockets()
+    read_fd, write_fd = os.pipe()
+    child = None
+    reaped = False
+    with patch.object(threading.Thread, 'start', started):
+        issuer = threading.Thread(target=issue, name='fixture-issuer')
+        issuer.start()
+        try:
+            assert ready.wait(10), errors
+            child = os.fork()
+            if child == 0:
+                os.close(read_fd)
+                try:
+                    gc.collect()
+                    inherited = sockets()
+                    payload = json.dumps({
+                        'before': len(before),
+                        'after': len(inherited),
+                        'issuer_threads': sum(
+                            thread.name == 'delegation-lineage'
+                            for thread in threading.enumerate()
+                        ),
+                    }).encode()
+                    os.write(write_fd, payload)
+                finally:
+                    os.close(write_fd)
+                    os._exit(0)
+            os.close(write_fd)
+            write_fd = -1
+            assert select.select([read_fd], [], [], 10)[0]
+            observed = json.loads(os.read(read_fd, 4096))
+            _, status = os.waitpid(child, 0)
+            reaped = True
+            assert status == 0
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            os.close(read_fd)
+            release.set()
+            issuer.join(10)
+            if child is not None and not reaped:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child, 0)
+    assert not issuer.is_alive() and not errors
+    print(json.dumps(observed))
+
+
+@pytest.mark.platforms('linux')
 @pytest.mark.parametrize('transport', ['direct', 'nested', 'fork', 'pipe', 'pty'])
 def test_native_descendant_inherits_positive_stamp_without_context(tmp_path, transport):
     """Issued authority survives real shell/nested spawns, never child ContextVar reinjection."""
@@ -377,3 +481,7 @@ def test_native_forged_authority_keeps_public_completion_visible(tmp_path, mutat
         }[mutation]
         env[key] = value
     assert _run_native_probe(env) == [False, False, 1, 0]
+
+
+if __name__ == '__main__' and sys.argv[1:] == ['--fork-first-issuance-probe']:
+    _run_fork_first_issuance_probe()

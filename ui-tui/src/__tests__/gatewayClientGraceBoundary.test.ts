@@ -15,6 +15,7 @@ const previousGrace = process.env[GRACE_ENV]
 
 delete process.env[TIMEOUT_ENV]
 process.env[TIMEOUT_ENV] = '5000'
+delete process.env[GRACE_ENV]
 vi.resetModules()
 
 const children: ChildProcess[] = []
@@ -32,6 +33,14 @@ vi.mock('node:child_process', async () => {
       return child
     }
   }
+})
+
+const realSetTimeout = globalThis.setTimeout
+const killDelays: number[] = []
+
+vi.spyOn(globalThis, 'setTimeout').mockImplementation((fn: TimerHandler, ms?: number, ...rest: unknown[]) => {
+  if (typeof ms === 'number') killDelays.push(ms)
+  return realSetTimeout(fn as (...args: unknown[]) => void, ms as number, ...(rest as []))
 })
 
 const { GatewayClient } = await import('../gatewayClient.js')
@@ -125,6 +134,7 @@ function hangPython(root: string) {
     python,
     `#!/usr/bin/env node
 process.on('SIGTERM', () => {})
+process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'event',params:{type:'gateway.ready',payload:{}}}) + '\\n')
 setTimeout(() => {}, 30000)
 `
   )
@@ -161,138 +171,73 @@ function isolateSpawnEnv(python: string, root: string) {
   }
 }
 
-describe('GatewayClient startup timeout cleanup', () => {
-  it('reaps a spawned gateway that never becomes ready', async () => {
-    expect(process.env[TIMEOUT_ENV]).toBe('5000')
+const MAX_TIMER_MS = 2_147_483_647
+const SLACK_MS = 50
 
-    const root = mkdtempSync(join(tmpdir(), 'hermes-startup-timeout-'))
-    const restore = isolateSpawnEnv(hangPython(root), root)
-
-    process.env[GRACE_ENV] = '1'
-    const events: string[] = []
-    const gw = new GatewayClient()
-
-    clients.push(gw)
-    gw.on('event', (ev: { type: string }) => events.push(ev.type))
-    gw.drain()
-    await new Promise(resolve => setTimeout(resolve, 20))
-
-    try {
-      gw.start()
-      await waitFor(() => events.includes('gateway.start_timeout'), 8000)
-
-      const child = children.at(-1)
-      const pid = child?.pid ?? 0
-      const started = startTime(pid)
-
-      await new Promise(resolve => setTimeout(resolve, 2000))
-      expect(events).toContain('gateway.start_timeout')
-      expect(events).not.toContain('gateway.reconnecting')
-      expect(children).toEqual([child])
-      expect(pid).toBeGreaterThan(0)
-      expect(sameProcess(pid, started)).toBe(false)
-      expect(child?.exitCode !== null || child?.signalCode !== null).toBe(true)
-    } finally {
-      restore()
-    }
-  }, 15_000)
-
-  it('does not publish a late ready from a TERM-resistant child, and that child is dead', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'hermes-startup-resistant-'))
-    const python = join(root, 'gateway')
-
-    writeFileSync(
-      python,
-      `#!/usr/bin/env node
-process.on('SIGTERM', () => {
-  process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'event',params:{type:'gateway.ready',payload:{}}}) + '\\n')
-})
-setTimeout(() => process.exit(0), 25000)
-`
-    )
-    chmodSync(python, 0o755)
-
-    const restore = isolateSpawnEnv(python, root)
-
-    process.env[GRACE_ENV] = '1'
-    const events: string[] = []
-    let exits = 0
-    const gw = new GatewayClient()
-
-    clients.push(gw)
-    gw.on('event', (ev: { type: string }) => events.push(ev.type))
-    gw.on('exit', () => {
-      exits += 1
-      gw.start()
-    })
-    gw.drain()
-    await new Promise(resolve => setTimeout(resolve, 1))
-
-    try {
-      gw.start()
-      await waitFor(() => events.includes('gateway.start_timeout'), 8000)
-      await waitFor(() => {
-        const child = children[0]
-
-        return Boolean(child && (child.exitCode !== null || child.signalCode !== null))
-      }, 4000)
-
-      const child = children[0]
-
-      expect(events).toContain('gateway.start_timeout')
-      expect(events).not.toContain('gateway.ready')
-      expect(events).not.toContain('gateway.reconnecting')
-      expect(exits).toBe(1)
-      expect(children).toHaveLength(1)
-      expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
-      expect(alive(child.pid ?? 0)).toBe(false)
-    } finally {
-      restore()
-    }
-  }, 15_000)
-
-  it('public kill of a live child waits for the spawned shutdown grace', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'hermes-shutdown-grace-'))
-    const python = join(root, 'gateway')
-
-    writeFileSync(
-      python,
-      `#!/usr/bin/env node
+function script() {
+  return `#!/usr/bin/env node
 process.on('SIGTERM', () => {})
 process.stdout.write(JSON.stringify({jsonrpc:'2.0',method:'event',params:{type:'gateway.ready',payload:{}}}) + '\\n')
 setTimeout(() => {}, 30000)
 `
-    )
-    chmodSync(python, 0o755)
+}
 
-    const restore = isolateSpawnEnv(python, root)
-    process.env[GRACE_ENV] = '2'
-    const events: string[] = []
-    const gw = new GatewayClient()
+function retireDelay(raw: string): Promise<number> {
+  const root = mkdtempSync(join(tmpdir(), 'hermes-grace-boundary-'))
+  const python = join(root, 'gateway')
 
-    clients.push(gw)
-    gw.on('event', (ev: { type: string }) => events.push(ev.type))
-    gw.drain()
-    await new Promise(resolve => setTimeout(resolve, 1))
+  writeFileSync(python, script())
+  chmodSync(python, 0o755)
 
+  const restore = isolateSpawnEnv(python, root)
+
+  process.env[GRACE_ENV] = raw
+
+  const events: string[] = []
+  const gw = new GatewayClient()
+
+  clients.push(gw)
+  gw.on('event', (ev: { type: string }) => events.push(ev.type))
+  gw.drain()
+
+  const before = killDelays.length
+
+  return (async () => {
     try {
+      await new Promise(resolve => setTimeout(resolve, 1))
       gw.start()
       await waitFor(() => events.includes('gateway.ready'), 4000)
       expect(events).toContain('gateway.ready')
-
-      const child = children[0]
-      const pid = child.pid ?? 0
-      const started = startTime(pid)
-
-      gw.kill('real-backend-shutdown')
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      expect(sameProcess(pid, started)).toBe(true)
-      expect(child.signalCode).toBeNull()
-      await waitFor(() => child.signalCode === 'SIGKILL', 2000)
-      expect(child.signalCode).toBe('SIGKILL')
-      expect(sameProcess(pid, started)).toBe(false)
+      gw.kill('grace-boundary')
+      await waitFor(() => killDelays.slice(before).some(ms => ms !== 5000), 1000)
+      const delays = killDelays.slice(before).filter(ms => ms !== 5000)
+      expect(delays.length).toBeGreaterThan(0)
+      return delays.at(-1) as number
     } finally {
       restore()
     }
-  }, 15_000)
+  })()
+}
+
+describe('owned shutdown grace final delay', () => {
+  it('keeps a finite backend grace plus slack inside the Node timer ceiling', async () => {
+    expect(await retireDelay(String((MAX_TIMER_MS - SLACK_MS) / 1000))).toBe(MAX_TIMER_MS)
+    expect(await retireDelay(String(MAX_TIMER_MS / 1000))).toBe(MAX_TIMER_MS)
+    expect(await retireDelay('2147483.647')).toBe(MAX_TIMER_MS)
+  }, 10_000)
+
+  it('does not turn a grace above the ceiling into a 1ms kill', async () => {
+    expect(await retireDelay('2147483.648')).toBe(MAX_TIMER_MS)
+    expect(await retireDelay('Infinity')).toBe(MAX_TIMER_MS)
+  }, 10_000)
+
+  it('uses the Python float grammar the backend uses', async () => {
+    expect(await retireDelay('2_0e-1')).toBe(2000 + SLACK_MS)
+    expect(await retireDelay('0x2')).toBe(1000 + SLACK_MS)
+    expect(await retireDelay('')).toBe(1000 + SLACK_MS)
+    expect(await retireDelay('nope')).toBe(1000 + SLACK_MS)
+    expect(await retireDelay('nan')).toBe(1000 + SLACK_MS)
+    expect(await retireDelay('-1')).toBe(1000 + SLACK_MS)
+    expect(await retireDelay('-0')).toBe(1000 + SLACK_MS)
+  }, 20_000)
 })

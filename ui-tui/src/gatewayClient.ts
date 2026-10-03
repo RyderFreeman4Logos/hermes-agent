@@ -31,26 +31,93 @@ const SHUTDOWN_GRACE_SLACK_MS = 50
 const MAX_TIMER_MS = 2_147_483_647
 const ownedShutdownGraceMs = new WeakMap<ChildProcess, number>()
 
-// Same fallback as tui_gateway.entry._shutdown_grace_seconds: missing, empty,
-// non-numeric, NaN, or <= 0 is 1s. Python float("inf") stays open; Node timers
-// cannot, so that case uses the timer ceiling.
-const shutdownGraceMs = (raw: string | undefined) => {
-  const text = (raw ?? '').trim()
+// Same acceptance as Python float() used by tui_gateway.entry._shutdown_grace_seconds.
+// Missing, empty, non-numeric, NaN, or <= 0 is 1s. Underscores, exponents, Unicode
+// spaces, and Unicode decimal digits follow float(); hex/oct/bin do not. Infinity is
+// accepted by the backend and clamped so grace plus the 50ms slack never exceeds the
+// signed 32-bit delay Node would otherwise turn into 1ms.
+const PY_WS = /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/
+const DIGIT_BASES = [
+  0x30, 0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6, 0xe50, 0xed0, 0xf20,
+  0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0,
+  0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0,
+  0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50, 0x11da0, 0x16a60, 0x16ac0, 0x16b50,
+  0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e950, 0x1fbf0
+]
+
+const decimalValue = (code: number) => {
+  for (const base of DIGIT_BASES) {
+    if (code >= base && code < base + 10) return code - base
+  }
+
+  return -1
+}
+
+const digitRun = (run: string) => {
+  if (!run) return false
+
+  return run
+    .split('_')
+    .every(piece => piece.length > 0 && [...piece].every(ch => decimalValue(ch.codePointAt(0) ?? -1) >= 0))
+}
+
+const pythonFloat = (raw: string | undefined): number => {
+  const text = (raw ?? '').replace(new RegExp(`^${PY_WS.source}+|${PY_WS.source}+$`, 'gu'), '')
   const lower = text.toLowerCase()
-  let seconds = Number(text)
 
-  if (lower === 'inf' || lower === '+inf' || lower === 'infinity' || lower === '+infinity') {
-    seconds = Infinity
+  if (/^[+-]?(?:infinity|inf)$/.test(lower)) {
+    return lower.startsWith('-') ? Number.NEGATIVE_INFINITY : Number.POSITIVE_INFINITY
   }
 
-  if (!(seconds > 0)) {
-    return DEFAULT_SHUTDOWN_GRACE_MS
+  if (/^[+-]?nan$/.test(lower)) return Number.NaN
+
+  const signed = lower.startsWith('+') || lower.startsWith('-') ? lower.slice(1) : lower
+  const expAt = signed.search(/e/)
+
+  if ((signed.match(/e/g) ?? []).length > 1) return Number.NaN
+
+  const mant = expAt < 0 ? signed : signed.slice(0, expAt)
+  const exp = expAt < 0 ? undefined : signed.slice(expAt + 1)
+  const groups = mant.split('.')
+
+  if (groups.length > 2 || mant === '' || mant === '.') return Number.NaN
+
+  const whole = groups[0] ?? ''
+  const frac = groups.length === 2 ? (groups[1] ?? '') : undefined
+
+  if (frac === undefined) {
+    if (!digitRun(whole)) return Number.NaN
+  } else if (!((whole === '' || digitRun(whole)) && (frac === '' || digitRun(frac))) || (whole === '' && frac === '')) {
+    return Number.NaN
   }
+
+  if (exp !== undefined && !digitRun(exp.startsWith('+') || exp.startsWith('-') ? exp.slice(1) : exp)) {
+    return Number.NaN
+  }
+
+  const ascii = [...text]
+    .map(ch => {
+      const digit = decimalValue(ch.codePointAt(0) ?? -1)
+
+      return digit >= 0 ? String(digit) : ch
+    })
+    .join('')
+    .replaceAll('_', '')
+
+  return Number(ascii)
+}
+
+const shutdownGraceMs = (raw: string | undefined) => {
+  const seconds = pythonFloat(raw)
+
+  if (!(seconds > 0)) return DEFAULT_SHUTDOWN_GRACE_MS
 
   const ms = seconds * 1000
+  const room = MAX_TIMER_MS - SHUTDOWN_GRACE_SLACK_MS
 
-  return Number.isFinite(ms) && ms <= MAX_TIMER_MS ? ms : MAX_TIMER_MS
+  return Number.isFinite(ms) && ms <= room ? ms : room
 }
+
 const REQUEST_TIMEOUT_MS = Math.max(30000, parseInt(process.env.HERMES_TUI_RPC_TIMEOUT_MS ?? '120000', 10) || 120000)
 const WS_CONNECTING = 0
 const WS_OPEN = 1
@@ -279,21 +346,24 @@ export class GatewayClient extends EventEmitter {
       // already gone
     }
 
-    const timer = setTimeout(() => {
-      this.retireTimers.delete(proc)
+    const timer = setTimeout(
+      () => {
+        this.retireTimers.delete(proc)
 
-      if (proc.exitCode !== null || proc.signalCode !== null) {
-        return
-      }
+        if (proc.exitCode !== null || proc.signalCode !== null) {
+          return
+        }
 
-      this.lifecycle(`[lifecycle] escalating owned child ${describeChild(proc)} reason=${reason}`)
+        this.lifecycle(`[lifecycle] escalating owned child ${describeChild(proc)} reason=${reason}`)
 
-      try {
-        proc.kill('SIGKILL')
-      } catch {
-        // already gone
-      }
-    }, (ownedShutdownGraceMs.get(proc) ?? DEFAULT_SHUTDOWN_GRACE_MS) + SHUTDOWN_GRACE_SLACK_MS)
+        try {
+          proc.kill('SIGKILL')
+        } catch {
+          // already gone
+        }
+      },
+      Math.min(MAX_TIMER_MS, (ownedShutdownGraceMs.get(proc) ?? DEFAULT_SHUTDOWN_GRACE_MS) + SHUTDOWN_GRACE_SLACK_MS)
+    )
 
     timer.unref?.()
     this.retireTimers.set(proc, timer)

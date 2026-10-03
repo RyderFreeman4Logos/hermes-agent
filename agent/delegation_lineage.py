@@ -26,7 +26,9 @@ __all__ = ["issue_lineage", "validate_lineage"]
 _MAX_STAMP_BYTES = 4096
 _TIMEOUT = 1.0
 _lock = threading.Lock()
+_construction_lock = threading.Lock()
 _issuer: tuple[socket.socket, bytes, int, str] | None = None
+_pending: socket.socket | None = None
 
 
 def _address(pid: int, start: str) -> str:
@@ -75,16 +77,32 @@ def _serve(listener: socket.socket, key: bytes, pid: int) -> None:
                 continue
 
 
+def _before_fork() -> None:
+    _construction_lock.acquire()
+
+
+def _after_fork_parent() -> None:
+    _construction_lock.release()
+
+
 def _after_fork() -> None:
-    global _issuer, _lock
+    global _issuer, _lock, _construction_lock, _pending
     if _issuer is not None:
         _issuer[0].close()
+    if _pending is not None and (_issuer is None or _pending is not _issuer[0]):
+        _pending.close()
     _issuer = None
+    _pending = None
     _lock = threading.Lock()
+    _construction_lock = threading.Lock()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_after_fork)
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_parent,
+        after_in_child=_after_fork,
+    )
 
 
 def issue_lineage(stamp: str) -> tuple[str, str, str] | None:
@@ -94,7 +112,7 @@ def issue_lineage(stamp: str) -> tuple[str, str, str] | None:
     grants. The OS closes the listener at exit. Forked children discard it before
     any child issuance, so neither a vanished thread nor its lock is reused.
     """
-    global _issuer
+    global _issuer, _pending
     try:
         payload = stamp.encode()
     except UnicodeError:
@@ -109,7 +127,9 @@ def issue_lineage(stamp: str) -> tuple[str, str, str] | None:
             start = get_process_start_time(pid)
             if start is None:
                 return None
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            with _construction_lock:
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                _pending = listener
             try:
                 listener.bind(_address(pid, str(start)))
                 listener.listen(16)
@@ -121,8 +141,10 @@ def issue_lineage(stamp: str) -> tuple[str, str, str] | None:
                 worker.start()
             except (OSError, RuntimeError):
                 listener.close()
+                _pending = None
                 return None
             _issuer = listener, key, pid, str(start)
+            _pending = None
         _, key, pid, start = _issuer
         return str(pid), start, hmac.digest(key, payload, "sha256").hex()
 

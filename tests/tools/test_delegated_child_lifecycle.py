@@ -282,36 +282,98 @@ def test_cross_profile_delayed_checkpoint_keeps_both_files(tmp_path, monkeypatch
                 session._reader_thread.join(10)
 
 
-def test_native_descendant_inherits_positive_stamp_without_context(tmp_path, monkeypatch):
-    """A real child of _spawn_env is positive; a forged session env is not."""
-    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, DELEGATED_CHILD_SESSION_ENV
+_NATIVE_COMPLETION_PROBE = """
+import json, os, sys
+sys.path.insert(0, os.environ['SRC'])
+from agent.delegation_context import is_delegated_child_context
+from tools.process_registry import ProcessRegistry
+registry = ProcessRegistry()
+session = registry.spawn_local('printf native-ok', cwd=os.environ['HERMES_HOME'],
+    task_id='ordinary', owner_task_id='ordinary', notify_on_complete=True)
+try:
+    assert session._completion_event.wait(10)
+    session._reader_thread.join(10)
+    assert not session._reader_thread.is_alive()
+    print('RESULT:' + json.dumps([is_delegated_child_context(),
+        session.delegated_child, len(registry.drain_notifications()), session.exit_code]), flush=True)
+finally:
+    if not session.exited:
+        registry.kill_process(session.id, source='test')
+"""
 
-    monkeypatch.delenv(DELEGATED_CHILD_SESSION_ENV, raising=False)
-    registry = ProcessRegistry()
-    script = (
-        "import json, os, sys\n"
-        "sys.path.insert(0, os.environ['SRC'])\n"
-        "from tools.process_registry import ProcessRegistry\n"
-        "session = ProcessRegistry._new_session('echo', 't', '', 'sk', '/')\n"
-        "print(json.dumps({'delegated_child': bool(session.delegated_child)}))\n"
-    )
-    with delegated_child_context("native-child-session"):
-        env = registry._spawn_env({})
+
+def _run_native_probe(env, script=_NATIVE_COMPLETION_PROBE):
     child = subprocess.run(
-        [sys.executable, "-c", script],
-        env={**env, "SRC": os.getcwd(), "HERMES_HOME": str(tmp_path)},
-        cwd=os.getcwd(), capture_output=True, text=True, check=False,
+        [sys.executable, '-c', script], env=env, cwd=os.getcwd(),
+        capture_output=True, text=True, timeout=30, check=False,
     )
     assert child.returncode == 0, child.stderr
-    assert json.loads(child.stdout.strip().splitlines()[-1])["delegated_child"] is True
-    forged = dict(os.environ)
-    forged[DELEGATED_CHILD_SESSION_ENV] = "forged-session"
-    forged.pop(DELEGATED_CHILD_ENV_MARKER, None)
-    forged["SRC"] = os.getcwd()
-    forged["HERMES_HOME"] = str(tmp_path)
-    bad = subprocess.run(
-        [sys.executable, "-c", script], env=forged, cwd=os.getcwd(),
-        capture_output=True, text=True, check=False,
-    )
-    assert bad.returncode == 0, bad.stderr
-    assert json.loads(bad.stdout.strip().splitlines()[-1])["delegated_child"] is False
+    return json.loads(next(line[7:] for line in child.stdout.splitlines() if line.startswith('RESULT:')))
+
+
+@pytest.mark.platforms('linux')
+@pytest.mark.parametrize('transport', ['direct', 'nested', 'fork', 'pipe', 'pty'])
+def test_native_descendant_inherits_positive_stamp_without_context(tmp_path, transport):
+    """Issued authority survives real shell/nested spawns, never child ContextVar reinjection."""
+    import shlex
+
+    extra = {'SRC': os.getcwd(), 'HERMES_HOME': str(tmp_path)}
+    registry = ProcessRegistry()
+    with delegated_child_context('native-child-session'):
+        env = registry._spawn_env(extra)
+    if transport in ('direct', 'nested', 'fork'):
+        script = _NATIVE_COMPLETION_PROBE
+        if transport in ('nested', 'fork'):
+            script = (
+                "import os, subprocess, sys\n"
+                "sys.path.insert(0, os.environ['SRC'])\n"
+                "from tools.process_registry import ProcessRegistry\n"
+                "from agent.delegation_context import is_delegated_child_context\n"
+                "assert not is_delegated_child_context()\n"
+                + ("ProcessRegistry._spawn_env({})\npid = os.fork()\nif pid:\n    _, status = os.waitpid(pid, 0)\n    sys.exit(os.waitstatus_to_exitcode(status))\n" if transport == 'fork' else '')
+                + "p = subprocess.run([sys.executable, '-c', " + repr(_NATIVE_COMPLETION_PROBE)
+                + "], env=ProcessRegistry._spawn_env({}), capture_output=True, text=True, timeout=20)\n"
+                "assert p.returncode == 0, p.stderr\nprint(p.stdout, flush=True)\n"
+            )
+        result = _run_native_probe(env, script)
+    else:
+        command = shlex.quote(sys.executable) + ' -c ' + shlex.quote(_NATIVE_COMPLETION_PROBE) + '; :'
+        with delegated_child_context('native-transport-session'):
+            session = registry.spawn_local(command, cwd=os.getcwd(), env_vars=extra, use_pty=transport == 'pty')
+        try:
+            assert session._completion_event.wait(30)
+            assert session._reader_thread is not None
+            session._reader_thread.join(10)
+            assert not session._reader_thread.is_alive()
+            assert bool(session._pty) == (transport == 'pty')
+            result = json.loads(next(line[7:] for line in session.output_buffer.splitlines() if line.startswith('RESULT:')))
+        finally:
+            if not session.exited:
+                registry.kill_process(session.id, source='test')
+    assert result == [False, True, 0, 0]
+
+
+@pytest.mark.platforms('linux')
+@pytest.mark.parametrize('mutation', ['ordinary', 'live-parent', 'session', 'proof', 'pid', 'start'])
+def test_native_forged_authority_keeps_public_completion_visible(tmp_path, mutation):
+    """Neither a genuine parent tuple nor tampering with issued authority may silence ordinary work."""
+    from gateway.status import get_process_start_time
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith('HERMES_DELEGATED_CHILD_')}
+    env.update(SRC=os.getcwd(), HERMES_HOME=str(tmp_path))
+    if mutation == 'live-parent':
+        env.update(HERMES_DELEGATED_CHILD_SESSION='forged',
+                   HERMES_DELEGATED_CHILD_PARENT_PID=str(os.getpid()),
+                   HERMES_DELEGATED_CHILD_PARENT_START=str(get_process_start_time(os.getpid())))
+    elif mutation != 'ordinary':
+        with delegated_child_context('native-issued-session'):
+            issued = ProcessRegistry._spawn_env({})
+        env.update({k: v for k, v in issued.items() if k.startswith('HERMES_DELEGATED_CHILD_')})
+        key, value = {
+            'session': ('HERMES_DELEGATED_CHILD_SESSION', 'different-session'),
+            'proof': ('HERMES_DELEGATED_CHILD_PROOF', '0' * 64),
+            'pid': ('HERMES_DELEGATED_CHILD_PARENT_PID', '999999999'),
+            'start': ('HERMES_DELEGATED_CHILD_PARENT_START', '0'),
+        }[mutation]
+        env[key] = value
+    assert _run_native_probe(env) == [False, False, 1, 0]

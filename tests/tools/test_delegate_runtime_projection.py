@@ -126,7 +126,8 @@ def test_declared_alias_and_direct_alias_positive(tmp_path, monkeypatch, provide
         rt = resolve_runtime_provider(requested=provider, target_model="fixture-model")
     with patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=rt):
         creds = _resolve_delegation_credentials({"provider": provider, "model": "fixture-model"}, None, exclusive=True)
-    assert creds["provider"] == provider
+    assert creds["provider"] == "custom"
+    assert creds["requested_provider"] == rt["requested_provider"]
     assert creds["base_url"] == (URL if named else "https://api.openai.com/v1")
 
 

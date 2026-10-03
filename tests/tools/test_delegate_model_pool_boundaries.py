@@ -244,7 +244,9 @@ def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
             assert result == {"ok": True}, result
             actual = seen[-1]
             assert actual["model"] == f"tier-{home.name}"
-            assert actual["provider"] == {"endpoint": "custom", "provider": "openrouter", "named": "named-tier"}[route_kind]
+            assert actual["provider"] == {"endpoint": "custom", "provider": "openrouter", "named": "custom"}[route_kind]
+            if route_kind == "named":
+                assert actual["requested_provider"] == "named-tier"
             assert actual["api_key"] == (f"fixture-tier-{home.name}-key" if route_kind == "endpoint" else f"owned-{home.name}")
             assert actual["base_url"] == ("http://127.0.0.1:9/v1" if route_kind == "endpoint" else runtime["base_url"])
             if route_kind == "provider":
@@ -441,7 +443,7 @@ def test_public_named_shared_endpoint_keeps_explicit_owner_before_dispatch(tmp_p
 def test_provider_only_fixed_and_derived_keys_stay_owned_before_dispatch(pooled):
     url = "http://127.0.0.1:9/v1"
     parent = _parent()
-    resolved = {"provider": "custom", "model": "fixture-m", "base_url": url,
+    resolved = {"provider": "custom", "requested_provider": "named-b", "model": "fixture-m", "base_url": url,
                 "api_key": "provider-owned", "api_mode": "chat_completions", "source": "custom_provider:named-b"}
     pool = MagicMock()
     pool.has_credentials.return_value = True

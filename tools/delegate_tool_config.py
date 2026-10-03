@@ -10,10 +10,6 @@ from hermes_cli.fallback_config import scoped_fallback_chain
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
-# Runtime-provider sentinel for providers that are not natively known; must
-# match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
-_RUNTIME_PROVIDER_CUSTOM = "custom"
-
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # One-shot guard: _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild, so the >10 cost advisory would otherwise log on every turn.
@@ -590,10 +586,11 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides, *, exclus
         api_mode = host_mandated_api_mode(runtime.get("base_url") or "") or explicit_mode
     return _credential_bundle(
         v["model"] or runtime.get("model") or None,
-        configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
+        runtime.get("provider"),
         runtime.get("base_url"), api_key, api_mode,
         _merge_request_overrides(runtime.get("request_overrides"), explicit_request_overrides) or {},
         command=pinned_command, args=list(runtime.get("args") or []),
+        requested_provider=runtime.get("requested_provider"),
     )
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent, *, exclusive: bool = False) -> dict:

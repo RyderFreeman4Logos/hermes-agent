@@ -1,6 +1,7 @@
 """Running-process checkpoint persistence and PID-safe recovery."""
 
 import json
+import itertools
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger("tools.process_registry")
+_CHECKPOINT_GENERATIONS = itertools.count(1)
 
 
 class ProcessCheckpointMixin:
@@ -18,11 +20,19 @@ class ProcessCheckpointMixin:
     # ----- Checkpoint (crash recovery) -----
 
     def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
-        """Write running process metadata to the checkpoint file atomically."""
+        """Write running process metadata to the checkpoint file atomically.
+
+        The snapshot is taken under the registry lock and published only while
+        that generation is still the latest. A slower earlier caller drops its
+        bytes instead of replacing a newer owner. The call itself stays outside
+        the lock for the file replace.
+        """
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
 
         try:
             with self._lock:
+                generation = next(_CHECKPOINT_GENERATIONS)
+                self._checkpoint_generation = generation
                 entries = []
                 for s in self._running.values():
                     if s.exited:
@@ -42,8 +52,27 @@ class ProcessCheckpointMixin:
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
-            from utils import atomic_json_write
-            atomic_json_write(_checkpoint_path(), entries)
+            import os
+            import tempfile
+            from utils import atomic_replace, _dump_json
+            path = _checkpoint_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=f".{path.stem}.g{generation}.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    _dump_json(entries, handle, indent=2, ensure_ascii=False, dump_kwargs={})
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                with self._lock:
+                    if getattr(self, "_checkpoint_generation", generation) != generation:
+                        os.unlink(tmp_name)
+                        return
+                    atomic_replace(tmp_name, path)
+            except BaseException:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+                raise
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 

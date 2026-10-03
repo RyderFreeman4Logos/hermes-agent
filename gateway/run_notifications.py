@@ -120,6 +120,12 @@ def _mark_internal_notification(text: str) -> str:
     return text + "\n\n" + INTERNAL_NOTIFICATION_FOOTER
 
 
+def _completion_route_session_id(watcher: dict, session) -> str:
+    """Live post-handoff session when the process has one, else the armed snapshot."""
+    live = str(getattr(session, "parent_session_id", "") or "")
+    return live or str(watcher.get("parent_session_id") or "")
+
+
 def _raw_process_event_session_id(evt: dict) -> str:
     """Recognize API routes, not malformed structured or partial messaging routes."""
     session_key = str(evt.get("session_key") or "").strip()
@@ -2036,9 +2042,7 @@ class GatewayNotificationsMixin:
             "delegated_child": bool(getattr(session, "delegated_child", False)),
             **({"handoff_note": session.handoff_note} if getattr(session, "handoff_note", "") else {}),
             # Spawning session-db id: lets pre-flight drop this completion if the user /new'd first.
-            "parent_session_id": (
-                watcher.get("parent_session_id") or getattr(session, "parent_session_id", "") or ""
-            ),
+            "parent_session_id": _completion_route_session_id(watcher, session),
         }
 
     def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:
@@ -2092,13 +2096,24 @@ class GatewayNotificationsMixin:
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
         agent_notify = watcher.get("notify_on_complete", False)
-        # The mode belongs to the profile that started the process; recovered watchers run in the
-        # root context, so resolve it under the owning profile's scope (no-op for the default).
+        # Mode, formatting, and every completion action share the owning profile.
+        # Explicit OFF applies before any of them, including agent_notify.
         async with self._completion_event_scope(watcher):
             notify_mode = self._load_background_notifications_mode()
+            await self._watch_process_until_exit(
+                watcher, session_id, interval, platform_name, chat_id, thread_id,
+                agent_notify, notify_mode,
+            )
+
+    async def _watch_process_until_exit(
+        self, watcher, session_id, interval, platform_name, chat_id, thread_id,
+        agent_notify, notify_mode,
+    ) -> None:
+        from tools.process_registry import process_registry
+        from tools.process_registry_notifications import format_process_notification
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
-        silent = notify_mode == "off" and not agent_notify
+        silent = notify_mode == "off"
         last_output_len = 0
         while True:
             await asyncio.sleep(interval)

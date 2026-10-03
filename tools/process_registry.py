@@ -1275,6 +1275,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         doesn't hide progress from process(action="poll")."""
         env = _sanitize_subprocess_env(os.environ, env_vars)
         env["PYTHONUNBUFFERED"] = "1"
+        from agent.delegation_context import positive_child_session_stamp
+        stamp = positive_child_session_stamp()
+        if stamp:
+            env["HERMES_DELEGATED_CHILD_SESSION"] = stamp
         return env
 
     def _track_started(self, session: ProcessSession, reader_target, reader_name: str, extra_args=()) -> None:
@@ -1939,6 +1943,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return session_id in self._completion_consumed or (skip_poll_observed and session_id in self._poll_observed)
 
     @staticmethod
+    def _routine_child_process_event(evt: dict) -> bool:
+        """True only for an ordinary delegated-child success. Errors and handoffs stay."""
+        from tools.process_registry_notifications import _routine_delegated_child_completion
+        return _routine_delegated_child_completion(evt)
+
+    @staticmethod
     def _surface_child_process_notifications() -> bool:
         """``delegation.surface_child_process_notifications``; False on any config
         error — never crash the drain loop."""
@@ -1994,22 +2004,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if evt.get("type") == "completion" and self._drain_should_skip(
                 _evt_sid, skip_poll_observed=skip_poll_observed):
                 continue
-            # Subagent-owned process notifications are suppressed by default — the
-            # child's delegation result is the deliverable. Judge ownership on
-            # owner_task_id (RAW spawning id; task_id is the container key, collapsed
-            # by _resolve_container_task_id). Dropped, NOT requeued: children never
-            # drain, so a requeue would pin the event forever. 'async_delegation'
-            # is the result itself and is NEVER suppressed.
-            _evt_task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
-            if not is_async_delegation and _evt_task_id.startswith("sa-"):
+            # Routine native-child success is the child's own result. Errors and
+            # handoffs stay visible; owner label alone is not a reason to drop.
+            if not is_async_delegation and self._routine_child_process_event(evt):
                 if surface_child is None:
                     surface_child = self._surface_child_process_notifications()
                 if not surface_child:
                     logger.debug(
-                        "Suppressed subagent-owned process notification "
+                        "Suppressed routine delegated-child completion "
                         "(delegation.surface_child_process_notifications=false): "
-                        "type=%s session_id=%s task_id=%s",
-                        evt.get("type", "completion"), _evt_sid, _evt_task_id)
+                        "session_id=%s", _evt_sid)
                     continue
             if text := format_process_notification(evt):
                 results.append((evt, text))

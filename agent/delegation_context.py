@@ -45,6 +45,28 @@ def is_delegated_child_context() -> bool:
     return bool(_DELEGATED_CHILD_CONTEXT.get())
 
 
+def positive_child_session_stamp() -> str:
+    """Session id of an in-process delegate child, else empty.
+
+    The ambient ``HERMES_DELEGATED_CHILD_CONTEXT`` marker is a denial fence,
+    not authority to stamp a descendant notification.
+    """
+    if not _DELEGATED_CHILD_CONTEXT.get():
+        return ""
+    from gateway.session_context import get_session_env
+    return str(get_session_env("HERMES_SESSION_ID", "") or "")
+
+
+def delegated_child_session_stamp() -> str:
+    """Trusted positive stamp, process-local or carried across a native spawn."""
+    local = positive_child_session_stamp()
+    if local:
+        return local
+    if _DELEGATED_CHILD_CONTEXT.get():
+        return ""
+    return str(os.environ.get("HERMES_DELEGATED_CHILD_SESSION") or "")
+
+
 def enter_non_dispatcher_owned_context() -> Token[bool]:
     """Token form of :func:`non_dispatcher_owned_context` for long try/finally scopes."""
     return _NON_DISPATCHER_OWNED_CONTEXT.set(True)

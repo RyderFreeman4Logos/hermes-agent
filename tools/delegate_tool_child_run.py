@@ -34,15 +34,13 @@ def _str_or_none(value: Any) -> Optional[str]:
 
 
 def _accepted_route_identity(child: Any, result: Any = None) -> tuple[Optional[str], Optional[str]]:
-    """Return the fallback route still active after a successful adapter switch.
+    """Return the route of the last response the runtime actually accepted.
 
-    ``result`` is unused: conversation payloads do not carry route identity, and
-    a restored primary clears ``_provider_fallback_active`` before this runs.
+    Activation and the mutable model are not acceptance. ``result`` is unused:
+    conversation payloads do not carry route identity.
     """
     del result
-    if getattr(child, "_provider_fallback_active", False) is not True:
-        return None, None
-    route = getattr(child, "_provider_fallback_route", None)
+    route = getattr(child, "_delegate_accepted_llm_route", None)
     if not (isinstance(route, tuple) and len(route) == 2):
         return None, None
     model, provider = map(_str_or_none, route)

@@ -155,6 +155,10 @@ def check_api_response(
         logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
 
     response_invalid, error_details = validate_response_shape(agent, response)
+    if not response_invalid:
+        # A usable response accepts the runtime that produced it. The body model
+        # is not that identity: proxies echo the requested alias.
+        agent._delegate_accepted_llm_route = (agent.model, agent.provider)
     from agent.conversation_loop import _standard_child_can_fallback
 
     # All response lanes meet here before malformed/partial responses can resend.

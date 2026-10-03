@@ -714,6 +714,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         _start_codex_thread(agent)
         agent._reset_stream_delivery_tracking()
         turn = agent._codex_session.run_turn(user_input=user_message)
+        if turn.error is None and not turn.interrupted:
+            agent._delegate_accepted_llm_route = (
+                agent._codex_session._model or agent.model,
+                agent._codex_session._model_provider or agent.provider,
+            )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)
@@ -722,6 +727,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
             final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
         )
     interrupt = _consume_user_interrupt(agent, turn.interrupted)
+    user_interrupted = interrupt[0] or bool(turn.interrupted)
     # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool
     # silence alone no longer retires — it only logs a warning (#112928).
     if getattr(turn, "should_retire", False):
@@ -735,7 +741,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
     return _turn_result(
-        interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
+        (user_interrupted, interrupt[1]), messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
         final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
         **usage_result,

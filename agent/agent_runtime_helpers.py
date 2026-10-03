@@ -1483,7 +1483,8 @@ def restore_primary_runtime(agent) -> bool:
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
-        agent._delegate_accepted_llm_route = (agent.model, agent.provider)
+        # Restore selects the primary runtime. It is not a successful response,
+        # so the last accepted route is left for a later usable response to replace.
         if provider_fallback_active:
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):

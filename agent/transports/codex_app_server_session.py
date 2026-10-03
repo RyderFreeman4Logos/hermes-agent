@@ -291,6 +291,7 @@ class CodexAppServerSession:
                 raise CodexAppServerError(
                     code=-32603, message=f"codex thread/start returned no thread id (payload keys: {sorted(result.keys())})",
                 )
+            self._freeze_observed_thread_identity(result)
             logger.info("codex app-server thread started: id=%s profile=%s cwd=%s", thread_id[:8], self._permission_profile, self._cwd)
         self._thread_id = thread_id
         return thread_id
@@ -306,7 +307,23 @@ class CodexAppServerSession:
         thread_id = _extract_thread_id(result)
         if thread_id != wanted:
             raise CodexThreadResumeError(wanted, f"app-server answered with thread {str(thread_id)[:8]!r}")
+        self._freeze_observed_thread_identity(result)
         return wanted
+
+    def _freeze_observed_thread_identity(self, result: dict) -> None:
+        """Keep the model the server actually started, not the request override.
+
+        Native startup sends no model/provider. A returned identity replaces the
+        constructor selection; a missing one leaves it unchanged.
+        """
+        if not isinstance(result, dict):
+            return
+        model = result.get("model")
+        provider = result.get("modelProvider") or result.get("model_provider")
+        if isinstance(model, str) and model.strip():
+            self._model = model.strip()
+        if isinstance(provider, str) and provider.strip():
+            self._model_provider = provider.strip()
 
     def close(self) -> None:
         if self._closed:
@@ -534,7 +551,9 @@ class CodexAppServerSession:
                 return aborted
             turn_obj = (note.get("params") or {}).get("turn") or {}
             turn_status = turn_obj.get("status")
-            if turn_status and turn_status not in {"completed", "interrupted"} and turn_obj.get("error"):
+            if turn_status == "interrupted":
+                result.interrupted = True
+            elif turn_status and turn_status != "completed" and turn_obj.get("error"):
                 err_msg = _format_responses_error(turn_obj["error"], str(turn_status))
                 self._set_classified_error(result, f"turn ended status={turn_status}", err_msg, err_msg)
             return True

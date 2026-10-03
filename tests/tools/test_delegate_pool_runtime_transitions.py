@@ -49,6 +49,29 @@ def install_config(tmp_path, route):
     })
 
 
+def pool_entry(provider, available):
+    """Pool double with the select/reclaim surface restore actually calls."""
+    entry = SimpleNamespace(
+        id=f"{provider}-entry", provider=provider,
+        runtime_api_key="fixture-provider-b" if provider == "owner-b" else f"fixture-{provider}",
+        base_url=URL, label=provider,
+    )
+
+    def select(model=None):
+        return entry if available() else None
+
+    def reclaim(entry_id, model=None):
+        return entry if available() and entry_id == entry.id else None
+
+    return SimpleNamespace(
+        provider=provider, has_credentials=lambda: True,
+        has_available=lambda **kw: available(),
+        next_available_at=lambda **kw: None if available() else time.time() + 3600,
+        select=select, reclaim=reclaim, current=lambda: entry if available() else None,
+        _lock=threading.Lock(),
+    )
+
+
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("fixed", [False, True])
 @pytest.mark.parametrize("provider,expected", [
@@ -105,11 +128,8 @@ def test_public_fallback_restore_uses_only_primary_owner(tmp_path, direct, fixed
     original = run_agent.AIAgent
     children = []
     cooldown = {"owner-a": None, "owner-b": None}
-    own = SimpleNamespace(provider="owner-b", has_credentials=lambda: True,
-                          has_available=lambda **kw: False, next_available_at=lambda **kw: cooldown["owner-b"])
-    foreign = SimpleNamespace(provider="owner-a", has_credentials=lambda: True,
-                              has_available=lambda **kw: cooldown["owner-a"] is None,
-                              next_available_at=lambda **kw: cooldown["owner-a"])
+    own = pool_entry("owner-b", lambda: cooldown["owner-b"] is None)
+    foreign = pool_entry("owner-a", lambda: cooldown["owner-a"] is None)
 
     def build(**kw):
         child = original(**kw)

@@ -961,6 +961,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         """
         mock_resolve.return_value = {
             "provider": "custom",  # runtime marks it as "custom" type
+            "requested_provider": "crof.ai",
             "model": "deepseek-v4-pro-CEER",
             "base_url": "https://api.crof.ai/v1",
             "api_key": "crof-key-abc",
@@ -969,8 +970,9 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         parent = _make_mock_parent(depth=0)
         cfg = {"model": "deepseek-v4-pro-CEER", "provider": "crof.ai"}
         creds = _resolve_delegation_credentials(cfg, parent)
-        # The key assertion: subagent must keep "crof.ai", NOT "custom"
-        self.assertEqual(creds["provider"], "crof.ai")
+        # Runtime provider is canonical "custom"; the requested alias stays owned.
+        self.assertEqual(creds["provider"], "custom")
+        self.assertEqual(creds["requested_provider"], "crof.ai")
         self.assertEqual(creds["model"], "deepseek-v4-pro-CEER")
         self.assertEqual(creds["base_url"], "https://api.crof.ai/v1")
         self.assertEqual(creds["api_key"], "crof-key-abc")

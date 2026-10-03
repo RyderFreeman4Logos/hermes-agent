@@ -155,10 +155,6 @@ def check_api_response(
         logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
 
     response_invalid, error_details = validate_response_shape(agent, response)
-    if not response_invalid:
-        # A usable response accepts the runtime that produced it. The body model
-        # is not that identity: proxies echo the requested alias.
-        agent._delegate_accepted_llm_route = (agent.model, agent.provider)
     from agent.conversation_loop import _standard_child_can_fallback
 
     # All response lanes meet here before malformed/partial responses can resend.
@@ -214,6 +210,12 @@ def check_api_response(
         retry_count = 0
         compression_attempts = 0
         return _verdict("break")
+
+    if not response_invalid:
+        # A usable response accepts the runtime that produced it. Policy refusal
+        # and invalid shape are not success, so a prior accepted route stays.
+        # The body model is not that identity: proxies echo the requested alias.
+        agent._delegate_accepted_llm_route = (agent.model, agent.provider)
 
     if finish_reason == "length":
         _tv = recover_from_truncation(

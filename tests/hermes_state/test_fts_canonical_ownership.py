@@ -4,6 +4,7 @@ import contextlib
 import pytest
 
 from hermes_state import SessionDB
+from tests.hermes_state.fts_fixtures import require_fts_snapshot
 import hermes_state_repair as repair
 
 
@@ -20,7 +21,9 @@ def _stale_owner(tmp_path, monkeypatch, *, reserved_table=False):
         seed._conn.execute("UPDATE messages_fts_data SET block=X'DEADBEEFDEADBEEFDEADBEEFDEADBEEF'")
     with monkeypatch.context() as opening:
         opening.setattr(SessionDB, "_foreign_state_db_holders", lambda self: [(222, str(path))])
-        return SessionDB(db_path=path)
+        db = SessionDB(db_path=path)
+    require_fts_snapshot(db)
+    return db
 
 
 @pytest.mark.parametrize("mutation", ["change", "delete", "insert", "unchanged"])

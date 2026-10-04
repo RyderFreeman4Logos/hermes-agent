@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from hermes_state import SessionDB
+from tests.hermes_state.fts_fixtures import require_fts_snapshot
 from hermes_state_repair import _db_opens_cleanly
 
 
@@ -32,6 +33,7 @@ def test_header_recovery_preserves_complete_canonical_store(tmp_path, monkeypatc
         opening.setattr(SessionDB, "_foreign_state_db_holders", lambda self: [(222, str(path))])
         reopened = SessionDB(db_path=path)
     with reopened as db:
+        require_fts_snapshot(db)
         if pooled:
             with db._read_ctx() as conn:
                 assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
@@ -77,6 +79,7 @@ def test_header_recovery_refuses_or_rolls_back_without_losing_store(tmp_path, mo
         opening.setattr(SessionDB, "_foreign_state_db_holders", lambda self: [(222, str(path))])
         db = SessionDB(db_path=path)
     with db, contextlib.ExitStack() as cleanup:
+        require_fts_snapshot(db)
         if failure == "implicit_rowids":
             db._conn.execute("CREATE TABLE unindexed(payload TEXT DEFAULT 'WITHOUT ROWID')")
             db._conn.execute("INSERT INTO unindexed(rowid, payload) VALUES(19, 'keep rowid')")
@@ -238,6 +241,7 @@ def test_scratch_canonical_comparison_preserves_sqlite_storage_classes(
         )
         db = SessionDB(db_path=path)
     with db:
+        require_fts_snapshot(db)
         def connection():
             conn = db._conn
             assert conn is not None

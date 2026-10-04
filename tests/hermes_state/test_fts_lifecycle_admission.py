@@ -7,6 +7,7 @@ import pytest
 
 from hermes_cli import sqlite_safe_read as safe
 from hermes_state import SessionDB
+from tests.hermes_state.fts_fixtures import require_fts_snapshot
 import hermes_state_repair as repair
 from hermes_state_registry import acquire, release as registry_release
 def _stale_owner(tmp_path, monkeypatch, *, backup=False):
@@ -20,7 +21,9 @@ def _stale_owner(tmp_path, monkeypatch, *, backup=False):
         path.with_name("state.db.malformed-backup-20000101").write_bytes(path.read_bytes())
     with monkeypatch.context() as opening:
         opening.setattr(SessionDB, "_foreign_state_db_holders", lambda self: [(222, str(path))])
-        return SessionDB(db_path=path)
+        db = SessionDB(db_path=path)
+    require_fts_snapshot(db)
+    return db
 
 
 @pytest.mark.parametrize("alias_kind", ["hardlink", "rename", "symlink"])
@@ -96,7 +99,9 @@ def test_recovery_does_not_block_unrelated_lifecycle(tmp_path, monkeypatch, stag
                 original_reader = repair._read_offline
                 def read_offline(path, what, reader):
                     def read():
-                        if (path == db.db_path) == (stage == "forensic"):
+                        target = (db.db_path if stage == "forensic" else
+                                  db.db_path.with_name("state.db.malformed-backup-20000101"))
+                        if path == target:
                             park()
                         return reader()
                     return original_reader(path, what, read)

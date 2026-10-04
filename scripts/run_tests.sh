@@ -158,7 +158,11 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # Keep this an explicit allowlist (no HERMES_TEST_* glob) so the "no
 # credential can leak" property stays auditable at a glance.
 TEST_ENV=()
-for _test_var in TMPDIR HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
+# An explicitly empty TMPDIR is invalid, not an invitation to select another root.
+if [ "${TMPDIR+x}" = x ]; then
+  TEST_ENV+=("TMPDIR=$TMPDIR")
+fi
+for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS; do

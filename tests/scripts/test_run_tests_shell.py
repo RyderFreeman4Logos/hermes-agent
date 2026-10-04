@@ -34,3 +34,24 @@ def test_shell_runner_executes_tests_and_propagates_failure(tmp_path):
     assert marker.read_text(encoding="utf-8") == "executed", result.stdout + result.stderr
     assert result.returncode != 0, result.stdout + result.stderr
     assert "runner failure propagation canary" in result.stdout + result.stderr
+
+
+@pytest.mark.platforms("posix")
+def test_shell_runner_rejects_explicit_empty_tmpdir(tmp_path):
+    case = tmp_path / "test_empty_tmpdir.py"
+    marker = tmp_path / "executed"
+    case.write_text(
+        "from pathlib import Path\n"
+        f"def test_canary():\n    Path({str(marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=180,
+        env={**os.environ, "TMPDIR": "", "HERMES_PYTHON": sys.executable,
+             "HERMES_TEST_FILE_RETRIES": "0"},
+    )
+    assert not marker.exists(), result.stdout + result.stderr
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "TMPDIR must be an absolute existing directory" in result.stdout + result.stderr

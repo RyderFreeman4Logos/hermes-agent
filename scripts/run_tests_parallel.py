@@ -88,11 +88,18 @@ def _rmtree_force(path: str) -> None:
             pass
     shutil.rmtree(path, onerror=_chmod_retry)
 
+def _check_scratch_socket_path(root: Path, platform: str) -> None:
+    # Reserve one worker directory and a short socket filename; never shorten by rerouting.
+    limit = {"linux": 107, "darwin": 103}.get(platform)
+    if limit is not None and len(os.fsencode(root)) + len("/r-XXXXXXXX/socket.sock") > limit:
+        raise ValueError("TMPDIR is too long for AF_UNIX worker sockets")
+
+
 def _runner_scratch_root() -> str:
     """Honor an explicit temp root without tempfile's silent invalid-path fallback.
 
     Keep the per-user directory private and short: each attempt adds ``r-XXXXXXXX``;
-    pathname AF_UNIX sockets on Linux have only 107 usable bytes.
+    pathname AF_UNIX sockets have only 107 usable bytes on Linux, 103 on macOS.
     """
     import stat
 
@@ -110,14 +117,17 @@ def _runner_scratch_root() -> str:
                 raise PermissionError(f"unsafe temp ancestor: {ancestor}")
     name = "h" + (str(os.getuid()) if hasattr(os, "getuid") else "")
     root = base / name
-    # Reserve one worker directory and a short socket filename; never shorten by rerouting.
-    if sys.platform == "linux" and len(os.fsencode(root)) + len("/r-XXXXXXXX/socket.sock") > 107:
-        raise ValueError("TMPDIR is too long for AF_UNIX worker sockets")
+    _check_scratch_socket_path(root, sys.platform)
+    if os.name == "nt":
+        # chmod/mkdir mode bits cannot verify Windows privacy, especially for existing roots.
+        from hermes_cli.windows_ssh_runtime import _ensure_directory
+        _ensure_directory(root)
+        return str(root)
     root.mkdir(mode=0o700, exist_ok=True)
     info = root.lstat()
-    if not stat.S_ISDIR(info.st_mode) or (os.name != "nt" and (
+    if not stat.S_ISDIR(info.st_mode) or (
         info.st_uid != os.getuid() or info.st_mode & 0o077
-    )):
+    ):
         raise PermissionError(f"runner scratch root is not a private owned directory: {root}")
     return str(root)
 

@@ -523,6 +523,7 @@ def test_files_from_dash_reads_the_list_from_stdin(tmp_path: Path) -> None:
     assert "✓2" in proc.stdout or "2 passed" in proc.stdout, proc.stdout
 
 
+@pytest.mark.platforms("posix")
 def test_scratch_root_is_private_and_honors_tmpdir(monkeypatch) -> None:
     """Explicit temp locations survive cached defaults, with private per-user roots."""
     import importlib
@@ -549,6 +550,7 @@ def test_scratch_root_is_private_and_honors_tmpdir(monkeypatch) -> None:
             runner._runner_scratch_root()
 
 
+@pytest.mark.platforms("posix")
 def test_invalid_tmpdir_never_falls_back(tmp_path, monkeypatch) -> None:
     import importlib
 
@@ -561,6 +563,48 @@ def test_invalid_tmpdir_never_falls_back(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     with pytest.raises(PermissionError):
         runner._runner_scratch_root()
+
+
+@pytest.mark.parametrize("platform,limit", [("linux", 107), ("darwin", 103)])
+def test_scratch_socket_path_budget(platform, limit):
+    from scripts.run_tests_parallel import _check_scratch_socket_path
+
+    # Platform is policy data, not a mocked host. Budget encoded bytes, not characters.
+    suffix = len(b"/r-XXXXXXXX/socket.sock")
+    root = Path("/" + "x" * (limit - suffix - 1))
+    _check_scratch_socket_path(root, platform)
+    with pytest.raises(ValueError, match="too long for AF_UNIX"):
+        _check_scratch_socket_path(Path(str(root) + "x"), platform)
+    multibyte = Path("/" + "\N{LATIN SMALL LETTER E WITH ACUTE}" * ((limit - suffix) // 2))
+    assert len(os.fsencode(multibyte)) > limit - suffix
+    with pytest.raises(ValueError, match="too long for AF_UNIX"):
+        _check_scratch_socket_path(multibyte, platform)
+
+
+@pytest.mark.platforms("windows")
+def test_windows_scratch_root_rejects_permissive_existing_acl(tmp_path, monkeypatch):
+    import win32security
+    from scripts.run_tests_parallel import _runner_scratch_root
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    root = tmp_path / "h"
+    root.mkdir()
+    descriptor = win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+        "D:P(A;;FA;;;WD)", win32security.SDDL_REVISION_1)
+    win32security.SetFileSecurity(str(root), win32security.DACL_SECURITY_INFORMATION, descriptor)
+    with pytest.raises(OSError, match="permissive DACL"):
+        _runner_scratch_root()
+    root.rmdir()
+    assert Path(_runner_scratch_root()) == root
+    descriptor = win32security.GetFileSecurity(str(root), win32security.DACL_SECURITY_INFORMATION)
+    dacl = descriptor.GetSecurityDescriptorDacl()
+    from hermes_cli.windows_ssh_runtime import _allowed_sids
+    assert dacl is not None
+    assert {win32security.ConvertSidToStringSid(dacl.GetAce(i)[-1])
+            for i in range(dacl.GetAceCount())} == _allowed_sids()
+    # Same creation/verification boundary must work for the native default as well.
+    monkeypatch.delenv("TMPDIR")
+    assert Path(_runner_scratch_root()).is_dir()
 
 
 def test_off_host_note_names_platforms_specs_that_exclude_this_host(tmp_path: Path) -> None:

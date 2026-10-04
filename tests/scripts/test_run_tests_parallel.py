@@ -552,27 +552,69 @@ def test_scratch_root_is_private_and_honors_tmpdir(monkeypatch) -> None:
 
 @pytest.mark.platforms("posix")
 def test_unset_tmpdir_uses_hermes_scratch_not_system_temp(monkeypatch):
-    import hermes_constants
     import tempfile
     from scripts.run_tests_parallel import _runner_scratch_root
 
     base = Path(os.environ["TMPDIR"]).parent.parent
     with tempfile.TemporaryDirectory(prefix="t-", dir=base) as directory:
+        home = Path(directory) / "home"
+        link = Path(directory) / "link"
+        link.symlink_to(directory, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(link / "home"))
         monkeypatch.delenv("TMPDIR")
-        calls = []
-        def scratch(*, prune):
-            calls.append(prune)
-            return Path(directory)
-        monkeypatch.setattr(hermes_constants, "get_scratch_dir", scratch)
         monkeypatch.setattr(tempfile, "gettempdir", lambda: pytest.fail("system temp fallback"))
         root = Path(_runner_scratch_root())
-        assert calls == [False]
-        assert root.parent == Path(directory).resolve()
+        assert root.parent == home / "cache/scratch"
         assert root.stat().st_mode & 0o777 == 0o700
         assert root.stat().st_uid == os.getuid()
-        monkeypatch.setattr(hermes_constants, "get_scratch_dir", lambda **_: Path(directory) / "missing")
-        with pytest.raises(FileNotFoundError):
-            _runner_scratch_root()
+        assert link.is_symlink()
+        assert Path(_runner_scratch_root()) == root
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("caller", ["root", "main", "worker"])
+@pytest.mark.parametrize("case", ["missing-home", "missing-cache", "existing-scratch", "symlink", "explicit"])
+def test_rejected_scratch_ancestor_is_never_mutated(monkeypatch, caller, case):
+    import tempfile
+    from scripts import run_tests_parallel as runner
+
+    base = Path(os.environ["TMPDIR"]).parent.parent
+    with tempfile.TemporaryDirectory(prefix="t-", dir=base) as directory:
+        directory = Path(directory)
+        unsafe = directory / "unsafe"
+        unsafe.mkdir(mode=0o700)
+        home = unsafe / "home"
+        if case in ("missing-cache", "existing-scratch", "explicit"):
+            home.mkdir(mode=0o700)
+        if case in ("existing-scratch", "explicit"):
+            (home / "cache/scratch").mkdir(parents=True, mode=0o755)
+        unsafe.chmod(0o777)
+        selected = home
+        if case == "symlink":
+            selected = directory / "link"
+            selected.symlink_to(home, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(selected))
+        monkeypatch.delenv("TMPDIR")
+        if case == "explicit":
+            monkeypatch.setenv("TMPDIR", str(home / "cache/scratch"))
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: pytest.fail("system temp fallback"))
+        probe = directory / "test_probe.py"
+        probe.write_text("def test_probe():\n    assert True\n", encoding="utf-8")
+        before = {p.relative_to(unsafe): p.lstat() for p in (unsafe, *unsafe.rglob("*"))}
+        monkeypatch.setattr(sys, "argv", [str(runner.__file__), "--files", str(probe), "-j", "1"])
+        with pytest.raises(PermissionError, match="unsafe temp ancestor"):
+            if caller == "root":
+                runner._runner_scratch_root()
+            elif caller == "worker":
+                runner._run_one_file_once(probe, [], directory, 30)
+            else:
+                runner.main()
+        after = {p.relative_to(unsafe): p.lstat() for p in (unsafe, *unsafe.rglob("*"))}
+        assert after.keys() == before.keys(), "rejected ancestry must not create descendants"
+        for path, info in before.items():
+            assert (after[path].st_ino, after[path].st_mode, after[path].st_ctime_ns) == (
+                info.st_ino, info.st_mode, info.st_ctime_ns
+            ), "rejected ancestry must not replace or chmod descendants"
 
 
 @pytest.mark.platforms("posix")

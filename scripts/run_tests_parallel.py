@@ -104,37 +104,59 @@ def _runner_scratch_root() -> str:
     import stat
 
     configured = os.environ.get("TMPDIR")
-    if configured is None and os.name != "nt":
-        # Hermes scratch is real storage; system temp can be RAM-backed. No fallback.
-        from hermes_constants import get_scratch_dir
-        base = get_scratch_dir(prune=False)
+    default = configured is None and os.name != "nt"
+    if default:
+        # Select policy without get_scratch_dir's recursive mkdir/chmod before admission.
+        from hermes_constants import get_hermes_home
+        base = get_hermes_home() / "cache" / "scratch"
     else:
         base = Path(configured if configured is not None else tempfile.gettempdir())
     if not base.is_absolute():
         raise ValueError("TMPDIR must be an absolute existing directory")
-    base = base.resolve(strict=True)  # preserve directory symlinks; validate their target
-    if not base.is_dir():
+    base = base.resolve(strict=not default)  # preserve symlinks to admitted targets
+    if not default and not base.is_dir():
         raise ValueError("TMPDIR must be an absolute existing directory")
-    if os.name != "nt":
-        for ancestor in (base, *base.parents):
-            mode = ancestor.stat().st_mode
-            if mode & 0o022 and not mode & stat.S_ISVTX:
-                raise PermissionError(f"unsafe temp ancestor: {ancestor}")
     uid = os.getuid() if hasattr(os, "getuid") else None
     name = "h" + (str(uid) if uid is not None else "")
     root = base / name
-    _check_scratch_socket_path(root, sys.platform)
     if os.name == "nt":
+        _check_scratch_socket_path(root, sys.platform)
         # chmod/mkdir mode bits cannot verify Windows privacy, especially for existing roots.
         from hermes_cli.windows_ssh_runtime import _ensure_directory
         _ensure_directory(root)
         return str(root)
-    root.mkdir(mode=0o700, exist_ok=True)
-    info = root.lstat()
-    if not stat.S_ISDIR(info.st_mode) or (
-        uid is None or info.st_uid != uid or info.st_mode & 0o077
-    ):
-        raise PermissionError(f"runner scratch root is not a private owned directory: {root}")
+
+    # Pin each canonical component: never reopen a validated parent by pathname.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(base.anchor, flags)
+    ancestor = Path(base.anchor)
+    try:
+        for component in (*base.parts[1:], name):
+            mode = os.fstat(fd).st_mode
+            if mode & 0o022 and not mode & stat.S_ISVTX:
+                raise PermissionError(f"unsafe temp ancestor: {ancestor}")
+            if ancestor == base:
+                _check_scratch_socket_path(root, sys.platform)
+            try:
+                child = os.open(component, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not default and ancestor != base:
+                    raise
+                # Reject overlong defaults before creating their first missing component.
+                _check_scratch_socket_path(root, sys.platform)
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                except FileExistsError:  # another worker may have just created it
+                    pass
+                child = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            ancestor /= component
+        info = os.fstat(fd)
+        if uid is None or info.st_uid != uid or info.st_mode & 0o077:
+            raise PermissionError(f"runner scratch root is not a private owned directory: {root}")
+    finally:
+        os.close(fd)
     return str(root)
 
 

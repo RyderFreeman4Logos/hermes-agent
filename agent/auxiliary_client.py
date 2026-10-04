@@ -4152,10 +4152,12 @@ def _quarantine_fallback_candidate(
 ) -> None:
     """The candidate cannot serve this walk (``reason`` = its ``_FALLBACK_REASONS`` capacity label,
     None = dead token): mark it unhealthy so the ordered re-walk skips it and the caller moves on to
-    the next entry. Transient classes get a short hold, payment/quota and dead tokens the long one."""
-    _mark_provider_unhealthy(
-        fb_provider or fb_label, ttl=fallback_candidate_quarantine_ttl(reason),
-        base_url=base_url, reason=reason or "stale fallback credential")
+    the next entry. Transient classes get a short hold, payment/quota and dead tokens the long one.
+    A malformed body is that model, not the provider, so it must not hide the next Codex hop."""
+    if reason != "invalid provider response":
+        _mark_provider_unhealthy(
+            fb_provider or fb_label, ttl=fallback_candidate_quarantine_ttl(reason),
+            base_url=base_url, reason=reason or "stale fallback credential")
     why = f"is out of capacity ({reason})" if reason else "has a stale/unrefreshable credential"
     logger.warning("Auxiliary %s%s: fallback candidate %s %s (%s) — skipping to next fallback",
                    task or "call", tag, fb_label, why, fb_err)
@@ -4235,7 +4237,15 @@ def _call_fallback_candidate_sync(
             _quarantine_fallback_candidate(
                 task, fb_label, destination.provider, fb_err, base_url=destination.base_url,
                 reason=capacity)
-            return None
+            nxt = _next_configured_fallback_index(fb_label)
+            chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
+            has_later = isinstance(chain, list) and nxt is not None and any(
+                isinstance(entry, dict) and _is_codex_provider(entry.get("provider"))
+                for entry in chain[nxt:]
+            )
+            if has_later:
+                return None
+            raise
         fb_provider, retry = _plan_fallback_auth_retry(
             destination, rebuild, async_mode=False, failed_api_key=getattr(fb_client, "api_key", ""))
         failed_destination = destination
@@ -4290,7 +4300,15 @@ async def _call_fallback_candidate_async(
             _quarantine_fallback_candidate(
                 task, fb_label, destination.provider, fb_err, base_url=destination.base_url,
                 tag=" (async)", reason=capacity)
-            return None
+            nxt = _next_configured_fallback_index(fb_label)
+            chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
+            has_later = isinstance(chain, list) and any(
+                isinstance(entry, dict) and _is_codex_provider(entry.get("provider"))
+                for entry in chain[nxt:]
+            ) if nxt is not None else False
+            if has_later:
+                return None
+            raise
         fb_provider, retry = _plan_fallback_auth_retry(
             destination, rebuild, async_mode=True, failed_api_key=getattr(fb_client, "api_key", ""))
         failed_destination = destination
@@ -4329,6 +4347,10 @@ def _try_payment_fallback(
     tried = []
     for label, try_fn in _get_provider_chain():
         candidate_base_url = _custom_health_base_url(label)
+        if not _is_codex_provider(label):
+            _record_codex_skip(None, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         if (not failed_base_url and label in skip_chain_labels) or skip_backend(
                 label, None, candidate_base_url):
             continue
@@ -4383,6 +4405,9 @@ def _try_main_agent_model_fallback(
             return None, None, ""
         main_provider, main_model = _agg_provider, _agg_model
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
+        return None, None, ""
+    if not _is_codex_provider(main_provider):
+        _record_codex_skip(None, "unavailable")
         return None, None, ""
     if task == "vision" and (
             main_provider in _PROVIDERS_WITHOUT_VISION or not _main_model_supports_vision(main_provider, main_model)):
@@ -4480,15 +4505,12 @@ def _try_configured_fallback_chain(
         failed_provider, failed_model, failed_base_url=failed_base_url, failure_scope=failure_scope)
     tried = []
     min_ctx = _task_minimum_context_length(task)
-    codex_only = _is_codex_provider(failed_provider)
     candidate_indices = [
         i for i in range(start_index, len(chain))
-        if isinstance(chain[i], dict)
-        and (not codex_only or _is_codex_provider(chain[i].get("provider")))
+        if isinstance(chain[i], dict) and _is_codex_provider(chain[i].get("provider"))
     ]
     if not candidate_indices:
-        if codex_only:
-            _record_codex_skip(route_info, "unavailable")
+        _record_codex_skip(route_info, "unavailable")
         return None, None, ""
     for i in candidate_indices:
         entry = chain[i]
@@ -4592,12 +4614,11 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
-        fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
         if not _is_codex_provider(fb_provider):
-            if _is_codex_provider(failed_provider):
-                _record_codex_skip(route_info, "unavailable")
-                tried.append(f"{label} (non-Codex destination)")
-                continue
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
+            continue
+        fb_base_url = _custom_health_base_url(fb_provider, entry.get("base_url"))
         if fb_norm == "auto" or skip(fb_provider, fb_model, fb_base_url):
             tried.append(f"{label} (skipped)")
             continue
@@ -4735,9 +4756,12 @@ def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> 
 
 
 def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
-    """Step 3: hardcoded aggregator/fallback chain, skipping unhealthy providers."""
+    """Step 3: Codex-only discovery, skipping unhealthy and non-Codex destinations (#160)."""
     tried = []
     for label, try_fn in _get_provider_chain():
+        if not _is_codex_provider(label) and label != "local/custom":
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         candidate_base_url = _custom_health_base_url(label)
         if _is_provider_unhealthy(label, candidate_base_url):
             _log_skip_unhealthy(label, base_url=candidate_base_url)
@@ -4745,12 +4769,16 @@ def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
             continue
         client, model = try_fn()
         if client is not None:
+            if not _is_codex_provider(label) and not isinstance(client, CodexAuxiliaryClient):
+                tried.append(f"{label} (non-Codex destination)")
+                continue
+            effective_label = "openai-codex" if isinstance(client, CodexAuxiliaryClient) else label
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
-                            label, model or "default", ", ".join(tried))
+                            effective_label, model or "default", ", ".join(tried))
             else:
-                logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
-            return client, model, label
+                logger.info("Auxiliary auto-detect: using %s (%s)", effective_label, model or "default")
+            return client, model, effective_label
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
@@ -5609,7 +5637,7 @@ def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str
     )
 
 
-_VISION_AUTO_PROVIDER_ORDER = ("openrouter", "nous", "deepinfra")
+_VISION_AUTO_PROVIDER_ORDER = ("openai-codex",)
 
 
 def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
@@ -7898,6 +7926,11 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         except Exception as candidate_error:
             if _is_explicit_auxiliary_control_denial(candidate_error):
                 raise
+            if not str(step.args[2]).startswith("fallback_chain["):
+                raise
+            from agent.auxiliary_health import fallback_candidate_unavailable_reason
+            if fallback_candidate_unavailable_reason(candidate_error) is None:
+                raise
             logger.warning(
                 "Auxiliary %s%s: fallback candidate failed (%s); advancing the configured chain",
                 task or "call", tag, type(candidate_error).__name__,
@@ -8301,7 +8334,16 @@ def _call_llm_impl_unscoped(
                 return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
             if kind == "retry":
                 return _retry_same_provider_sync(**kw)
-            return _call_fallback_candidate_sync(*args, **kw)
+            try:
+                return _call_fallback_candidate_sync(*args, **kw)
+            except Exception as candidate_error:
+                if (
+                    str(args[2]).startswith("fallback_chain[")
+                    and not _is_explicit_auxiliary_control_denial(candidate_error)
+                    and fallback_candidate_unavailable_reason(candidate_error) is not None
+                ):
+                    return None
+                raise
         return _drive_ladder(
             _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
             _perform)
@@ -8450,7 +8492,16 @@ async def _async_call_llm_impl_unscoped(
                 return await _retry_same_provider_async(**kw)
             fb_client, fb_model, fb_label = args
             fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
-            return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
+            try:
+                return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
+            except Exception as candidate_error:
+                if (
+                    str(fb_label).startswith("fallback_chain[")
+                    and not _is_explicit_auxiliary_control_denial(candidate_error)
+                    and fallback_candidate_unavailable_reason(candidate_error) is not None
+                ):
+                    return None
+                raise
         return await _drive_ladder_async(
             _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=True, route_info=route_info),
             _perform)

@@ -151,31 +151,37 @@ def test_configured_chain_rejects_non_codex_entry(provider):
     assert resolved == []
 
 
-def test_non_codex_failure_keeps_configured_chain_order():
-    """Codex-only does not rewrite a non-Codex task chain."""
+def test_configured_chain_keeps_valid_codex_after_rejected_prefix():
+    """Rejected custom/aggregator prefixes must not block a later Codex entry."""
     chain = [
-        {"provider": "custom:aux-fb", "model": "fallback-model"},
+        {"provider": "custom", "model": "custom-model"},
+        {"provider": "custom:localrouter", "model": "grok-model"},
         {"provider": "openai-codex", "model": "codex-model"},
+        {"provider": "openrouter", "model": "or-model"},
     ]
     resolved = []
+    clients = {
+        "openai-codex": _client("codex", "https://chatgpt.com/backend-api"),
+    }
 
     def resolve_entry(entry):
         resolved.append(entry["provider"])
-        return _client(entry["model"], "https://custom.invalid/v1"), entry["model"]
+        return clients[entry["provider"]], entry["model"]
 
     with (
-        patch.object(aux, "_read_main_provider", return_value="qwen"),
         patch.object(aux, "_get_auxiliary_task_config", return_value={"fallback_chain": chain}),
         patch.object(aux, "_resolve_fallback_entry", side_effect=resolve_entry),
     ):
         client, model, label = aux._try_configured_fallback_chain(
-            "compression", "custom", reason="payment error",
+            "title_generation",
+            "qwen",
+            reason="rate limit",
         )
 
-    assert model == "fallback-model"
-    assert label.startswith("fallback_chain[0]")
-    assert client is not None
-    assert resolved == ["custom:aux-fb"]
+    assert model == "codex-model"
+    assert "openai-codex" in label
+    assert client is clients["openai-codex"]
+    assert resolved == ["openai-codex"]
 
 
 def test_configured_chain_keeps_codex_order_after_rejected_prefix():
@@ -226,48 +232,46 @@ def test_distinct_custom_endpoint_cache_isolation_at_shared_seam():
         aux._reset_aux_unhealthy_cache()
 
 
-def test_payment_fallback_keeps_configured_discovery_order():
-    """Payment discovery is not the Codex-only gate; configured order stays."""
+def test_payment_fallback_skips_non_codex_discovery():
+    """Payment/discovery fallback must not return Nous/OpenRouter."""
     nous = _client("nous", "https://nous.invalid/v1")
     with (
         patch.object(aux, "_try_openrouter", return_value=(None, None)),
         patch.object(aux, "_try_nous", return_value=(nous, "nous-model")),
         patch.object(aux, "_try_custom_endpoint", return_value=(None, None)),
         patch.object(aux, "_resolve_api_key_provider", return_value=(None, None)),
-        patch.object(aux, "_read_main_provider", return_value=""),
+        patch.object(aux, "_read_main_provider", return_value="openrouter"),
         patch.object(aux, "_is_provider_unhealthy", return_value=False),
     ):
         client, model, label = aux._try_payment_fallback("openrouter", task="compression")
 
-    assert client is nous
-    assert model == "nous-model"
-    assert label == "nous"
+    assert client is None
+    assert model is None
+    assert label == ""
 
 
-def test_main_agent_fallback_keeps_non_codex_safety_net():
-    """The main-agent net is not the Codex-only gate."""
-    client = _client("qwen", "https://qwen.invalid/v1")
+def test_main_agent_fallback_fails_closed_for_non_codex():
+    """Non-Codex main-agent safety nets fail closed."""
     with (
         patch.object(aux, "_read_main_provider", return_value="qwen"),
         patch.object(aux, "_read_main_model", return_value="qwen-model"),
-        patch.object(aux, "resolve_provider_client", return_value=(client, "qwen-model")) as resolve,
-        patch.object(aux, "_is_provider_unhealthy", return_value=False),
+        patch.object(aux, "resolve_provider_client") as resolve,
     ):
-        got, model, label = aux._try_main_agent_model_fallback(
-            "openrouter", task="compression", reason="rate limit",
+        client, model, label = aux._try_main_agent_model_fallback(
+            "openrouter", task="compression", reason="rate limit"
         )
 
-    assert got is client
-    assert model == "qwen-model"
-    assert label == "main-agent(qwen)"
-    resolve.assert_called_once()
+    assert client is None
+    assert model is None
+    assert label == ""
+    resolve.assert_not_called()
 
 
-def test_discovery_keeps_configured_provider_order():
-    """Auto discovery keeps its existing order. Codex-only applies to configured chains."""
+def test_discovery_skips_non_codex_destinations():
+    """Auto discovery must not return OpenRouter/Nous."""
     nous = _client("nous", "https://nous.invalid/v1")
     with (
-        patch.object(aux, "_try_openrouter", return_value=(None, None)),
+        patch.object(aux, "_try_openrouter", return_value=(MagicMock(), "or-model")),
         patch.object(aux, "_try_nous", return_value=(nous, "nous-model")),
         patch.object(aux, "_try_custom_endpoint", return_value=(None, None)),
         patch.object(aux, "_resolve_api_key_provider", return_value=(None, None)),
@@ -275,13 +279,13 @@ def test_discovery_keeps_configured_provider_order():
     ):
         client, model, label = aux._try_discovery_chain()
 
-    assert client is nous
-    assert model == "nous-model"
-    assert label == "nous"
+    assert client is None
+    assert model is None
+    assert label == ""
 
 
-def test_vision_auto_order_is_unchanged():
-    assert aux._VISION_AUTO_PROVIDER_ORDER == ("openrouter", "nous", "deepinfra")
+def test_vision_auto_order_is_codex_only():
+    assert aux._VISION_AUTO_PROVIDER_ORDER == ("openai-codex",)
 
 
 def test_lean_summary_keeps_the_real_codex_call_receipt():
@@ -375,6 +379,13 @@ def test_lean_summary_keeps_the_real_codex_call_receipt():
     }]
 
 
+def _route_capacity(message):
+    return RuntimeError(
+        f"Auxiliary classifier LLM returned invalid response: {message}; "
+        "expected choices[0].message"
+    )
+
+
 def test_public_sync_generic_error_advances_failed_candidate_to_later_codex_hop(monkeypatch, tmp_path):
     _configure_classifier_fallbacks(monkeypatch, tmp_path, count=2)
     calls = []
@@ -382,11 +393,11 @@ def test_public_sync_generic_error_advances_failed_candidate_to_later_codex_hop(
 
     def primary(**kwargs):
         calls.append(("primary", kwargs))
-        raise ValueError("upstream transport: safety filter cache unavailable")
+        raise _route_capacity("upstream transport: safety filter cache unavailable")
 
     def failed_candidate(**kwargs):
         calls.append(("codex-0", kwargs))
-        raise ValueError("approval denied cache unavailable")
+        raise _route_capacity("approval denied cache unavailable")
 
     def successful_candidate(**kwargs):
         calls.append(("codex-1", kwargs))
@@ -418,7 +429,7 @@ def test_public_async_generic_error_advances_to_codex(monkeypatch, tmp_path):
 
     async def primary(**_kwargs):
         calls.append("primary")
-        raise ValueError("approval denied cache unavailable")
+        raise _route_capacity("approval denied cache unavailable")
 
     async def fallback(**_kwargs):
         calls.append("codex")
@@ -443,7 +454,7 @@ def test_public_forced_stream_generic_error_advances_to_codex(monkeypatch, tmp_p
     def primary(**kwargs):
         calls.append(("primary", kwargs))
         assert kwargs["stream"] is True
-        raise ValueError("content policy cache unavailable")
+        raise _route_capacity("content policy cache unavailable")
 
     def fallback(**kwargs):
         calls.append(("codex", kwargs))
@@ -475,7 +486,7 @@ def test_public_forced_stream_generic_error_advances_to_codex(monkeypatch, tmp_p
 def test_public_exhaustion_reraises_original_after_admitted_candidate(monkeypatch, tmp_path):
     _configure_classifier_fallbacks(monkeypatch, tmp_path)
     attempts = []
-    original = ValueError("safety filter cache unavailable")
+    original = _route_capacity("safety filter cache unavailable")
 
     def primary(**_kwargs):
         attempts.append("primary")
@@ -483,7 +494,7 @@ def test_public_exhaustion_reraises_original_after_admitted_candidate(monkeypatc
 
     def fallback(**_kwargs):
         attempts.append("codex")
-        raise ValueError("candidate unavailable")
+        raise _route_capacity("candidate unavailable")
 
     primary_client = _chat_client(primary, "https://primary.invalid/v1")
     fallback_client = _chat_client(fallback, "https://codex.invalid/v1")
@@ -491,7 +502,7 @@ def test_public_exhaustion_reraises_original_after_admitted_candidate(monkeypatc
     monkeypatch.setattr(aux, "resolve_provider_client", lambda _provider, model, **_kwargs: (fallback_client, model))
     monkeypatch.setattr(aux, "_try_main_agent_model_fallback", lambda *_args, **_kwargs: (None, None, ""))
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(RuntimeError) as raised:
         aux.call_llm(task="classifier", messages=[{"role": "user", "content": "hi"}])
 
     assert raised.value is original

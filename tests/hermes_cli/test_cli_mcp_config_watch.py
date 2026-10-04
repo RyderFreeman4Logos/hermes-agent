@@ -224,11 +224,19 @@ def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
     obj._config_sig = file_signature(cfg_file.stat())
     other = tmp_path / "other.yaml"
     other.write_text("mcp_servers:\n  aa: {command: a}\n")
-    shutil.copy2(other, cfg_file)
-    os.utime(cfg_file, ns=(obj._config_sig[0], obj._config_sig[0]))
+    # A replacement must change inode even on filesystems with coarse ctime.
+    shutil.copystat(cfg_file, other)
+    os.replace(other, cfg_file)
+    assert file_signature(cfg_file.stat())[:2] == obj._config_sig[:2]
+    assert file_signature(cfg_file.stat())[2] != obj._config_sig[2]
 
+    from threading import Event
+
+    reloaded = Event()
+    obj._reload_mcp.side_effect = reloaded.set
     with patch("hermes_cli.config.get_config_path", return_value=cfg_file):
         obj._check_config_mcp_changes()
+        assert reloaded.wait(2), "MCP reload worker did not run"
 
     obj._reload_mcp.assert_called_once()
     assert obj._config_mcp_servers == {"aa": {"command": "a"}}

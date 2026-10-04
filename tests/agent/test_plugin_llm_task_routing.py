@@ -438,7 +438,7 @@ auxiliary:
   classifier:
     provider: auto
     fallback_chain:
-      - provider: fallback-provider
+      - provider: openai-codex
         model: fallback-model
 """,
             encoding="utf-8",
@@ -478,10 +478,10 @@ auxiliary:
         )
 
         assert (captured["provider"], captured["model"]) == (
-            "fallback-provider", "fallback-model"
+            "openai-codex", "fallback-model"
         )
         assert (result.provider, result.model) == (
-            "fallback-provider", "fallback-model"
+            "openai-codex", "fallback-model"
         )
 
     def test_async_auto_resolution_preserves_route_provider(self, monkeypatch):
@@ -522,7 +522,7 @@ auxiliary:
     provider: primary-provider
     model: primary-model
     fallback_chain:
-      - provider: fallback-provider
+      - provider: openai-codex
         model: fallback-model
 """,
             encoding="utf-8",
@@ -556,7 +556,7 @@ auxiliary:
             plugin_id="my-plugin", policy=_policy()
         ).complete([{"role": "user", "content": "hi"}], task="classifier")
 
-        assert (result.provider, result.model) == ("fallback-provider", "fallback-model")
+        assert (result.provider, result.model) == ("openai-codex", "fallback-model")
 
     def test_async_fallback_reports_the_successful_route(self, tmp_path, monkeypatch):
         from hermes_cli import config as config_mod
@@ -570,7 +570,7 @@ auxiliary:
     provider: primary-provider
     model: primary-model
     fallback_chain:
-      - provider: fallback-provider
+      - provider: openai-codex
         model: fallback-model
 """,
             encoding="utf-8",
@@ -612,4 +612,4 @@ auxiliary:
             )
         )
 
-        assert (result.provider, result.model) == ("fallback-provider", "fallback-model")
+        assert (result.provider, result.model) == ("openai-codex", "fallback-model")

@@ -65,15 +65,19 @@ def _ok_response(text: str):
 
 
 def _walk_patches(primary, main_chain_selections):
-    """``provider: auto`` primary; per-task chain empty; main ``fallback_providers`` hands out the
-    given (client, model, label) tuples in order and then reports exhaustion; discovery is empty."""
+    """Keep real main-chain selection; fake only its configured Codex transports."""
+    entries = [
+        {"provider": "custom:openai-codex", "model": model, "base_url": str(client.base_url)}
+        for client, model, _label in main_chain_selections
+    ]
+    clients = {model: client for client, model, _label in main_chain_selections}
     return (
         patch("agent.auxiliary_client._resolve_task_provider_model",
               return_value=("auto", None, None, None, None)),
         patch("agent.auxiliary_client._get_cached_client", return_value=(primary, "modelA")),
-        patch("agent.auxiliary_client._try_configured_fallback_chain", return_value=(None, None, "")),
-        patch("agent.auxiliary_client._try_main_fallback_chain",
-              side_effect=list(main_chain_selections) + [(None, None, "")]),
+        patch("hermes_cli.config.load_config_readonly", return_value={"fallback_providers": entries}),
+        patch("agent.auxiliary_client.resolve_provider_client",
+              side_effect=lambda provider, model, **kwargs: (clients[model], model)),
         patch("agent.auxiliary_client._try_payment_fallback", return_value=(None, None, "")),
     )
 
@@ -112,8 +116,8 @@ async def test_async_walk_exhausts_every_configured_lane_once_then_raises_primar
 
     assert lane_b.chat.completions.create.call_count == 1
     assert lane_c.chat.completions.create.call_count == 1
-    # Walk stopped once the configured chain reported exhaustion — no lane was re-tried.
-    assert main_chain.call_count == 3
+    # Only the two admitted Codex transports were resolved, once each.
+    assert main_chain.call_count == 2
     # Exhaustion is controlled: discovery was consulted and found nothing, no fourth lane appended.
     assert discovery.call_count >= 1
 
@@ -135,5 +139,5 @@ def test_candidate_quarantine_ttl_is_short_for_transient_429_and_long_for_paymen
     assert result.choices[0].message.content == "OK"
     assert 0 < _quarantine_remaining("http://127.0.0.1:2/v1") <= 60
     assert _quarantine_remaining("http://127.0.0.1:3/v1") > 60
-    marks = [r.getMessage() for r in caplog.records if "marking local/custom unhealthy" in r.getMessage()]
+    marks = [r.getMessage() for r in caplog.records if "marking custom:openai-codex unhealthy" in r.getMessage()]
     assert marks and "payment" not in marks[0] and "rate limit" in marks[0]

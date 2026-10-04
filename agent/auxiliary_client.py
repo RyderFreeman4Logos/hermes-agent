@@ -4587,7 +4587,7 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
 def _try_main_fallback_chain(
     task: Optional[str], failed_provider: str = "", reason: str = "error", *,
     failed_model: Optional[str] = None, failed_base_url: str = "", failure_scope: Any = None,
-    route_info: Optional[Dict[str, Any]] = None,
+    route_info: Optional[Dict[str, Any]] = None, start_index: int = 0,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Top-level main-agent fallback chain for a ``provider: auto`` auxiliary call: auto tasks honour the
     user's main fallback policy before the built-in discovery chain; read via ``get_fallback_chain`` so
@@ -4614,6 +4614,8 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
+        if i < start_index:
+            continue
         if not _is_codex_provider(fb_provider):
             _record_codex_skip(route_info, "unavailable")
             tried.append(f"{label} (non-Codex destination)")
@@ -4640,7 +4642,7 @@ def _try_main_fallback_chain(
                 continue
             logger.info("Auxiliary %s: %s on %s — main fallback chain to %s (%s)",
                         task or "call", reason, failed_provider or "auto", label, resolved_model or fb_model)
-            return fb_client, resolved_model or fb_model, fb_provider
+            return fb_client, resolved_model or fb_model, label
         tried.append(label)
     if tried:
         logger.debug("Auxiliary %s: main fallback chain exhausted (tried: %s)", task or "call", ", ".join(tried))
@@ -4810,7 +4812,7 @@ def _resolve_auto_route(
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
-        return fb_client, fb_model, fb_label
+        return fb_client, fb_model, _fallback_provider_from_label(fb_label)
     if not _discovery_chain_allowed(main_provider, task):
         return None, None, ""
     return _try_discovery_chain()
@@ -7926,10 +7928,7 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         except Exception as candidate_error:
             if _is_explicit_auxiliary_control_denial(candidate_error):
                 raise
-            if not str(step.args[2]).startswith("fallback_chain["):
-                raise
-            from agent.auxiliary_health import fallback_candidate_unavailable_reason
-            if fallback_candidate_unavailable_reason(candidate_error) is None:
+            if not str(step.args[2]).startswith(("fallback_chain[", "fallback_providers[")):
                 raise
             logger.warning(
                 "Auxiliary %s%s: fallback candidate failed (%s); advancing the configured chain",
@@ -7987,9 +7986,20 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
         fb_resp = yield from _candidate_response(_LadderStep("fallback", (fb_client, fb_model, fb_label)))
         if fb_resp is not None:
             return fb_resp
-        fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
-            task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
-            task_chain_only=explicit_auth_with_task_chain)
+        if fb_label.startswith("fallback_providers["):
+            next_index = int(fb_label.split("[", 1)[1].split("]", 1)[0]) + 1
+            fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
+                failed_base_url=route.base_info, failure_scope=_chain_failure_scope,
+                start_index=next_index, route_info=route.route_info)
+            if fb_client is None:
+                fb_client, fb_model, fb_label = _try_payment_fallback(
+                    resolved_provider, task, reason=reason, failed_base_url=route.base_info,
+                    failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
+        else:
+            fb_client, fb_model, fb_label = _next_fallback_after_quarantine(
+                task, resolved_provider, is_auto, route, _chain_failed_model, _chain_failure_scope,
+                task_chain_only=explicit_auth_with_task_chain)
     # All fallback layers exhausted — one user-visible warning, then re-raise.
     logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
                    # All fallback layers exhausted — emit a single user-visible warning so the operator

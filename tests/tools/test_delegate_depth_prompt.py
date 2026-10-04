@@ -28,6 +28,9 @@ def test_dispatched_child_prompt_matches_depth_capability(
     parent.disabled_toolsets = []
     parent.request_overrides = {}
     parent.provider = "custom"
+    parent.requested_provider = "custom"
+    parent.acp_command = None
+    parent.acp_args = []
     parent.base_url = "https://fixture.invalid/v1"
     parent.api_key = "fixture-only"
     parent.api_mode = "chat_completions"

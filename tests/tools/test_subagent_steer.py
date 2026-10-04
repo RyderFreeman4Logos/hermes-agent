@@ -54,6 +54,23 @@ def _with_registered(
     )
 
 
+def _make_delegate_parent():
+    parent = MagicMock()
+    parent.base_url = "https://openrouter.ai/api/v1"
+    parent.api_key = "test-key"
+    parent.provider = "openrouter"
+    parent.requested_provider = "openrouter"
+    parent.acp_command = None
+    parent.acp_args = []
+    parent.api_mode = "chat_completions"
+    parent.request_overrides = None
+    parent._delegate_depth = 0
+    parent._session_db = None
+    parent.model = "test-model"
+    parent.interactive_mode = False
+    return parent
+
+
 def test_steer_reaches_the_live_child():
     agent = _StubAgent()
     _with_registered("sid-steer-1", agent)
@@ -165,11 +182,7 @@ class TestMissedSteerRetention:
 
         from tools.delegate_tool import delegate_task
 
-        parent = MagicMock()
-        parent._delegate_depth = 0
-        parent._session_db = None
-        parent.model = "test-model"
-        parent.interactive_mode = False
+        parent = _make_delegate_parent()
 
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
@@ -203,11 +216,7 @@ class TestMissedSteerRetention:
 
         from tools.delegate_tool import delegate_task
 
-        parent = MagicMock()
-        parent._delegate_depth = 0
-        parent._session_db = None
-        parent.model = "test-model"
-        parent.interactive_mode = False
+        parent = _make_delegate_parent()
 
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()

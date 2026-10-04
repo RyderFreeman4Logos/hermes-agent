@@ -1942,8 +1942,9 @@ def _config_file_signature(path: Path) -> Tuple[Any, ...]:
     try:
         return (*sig, file_digest(path))
     except OSError:
-        # Let the existing loader surface read failures and preserve the last good config.
-        return sig
+        # Keep the tuple contract, but never admit unverified bytes as a cache hit.
+        # A fresh sentinel forces the existing loader to re-read (and recover on error).
+        return (*sig, object())
 
 
 def _raw_config_cache_hit(path_key: str, cache_key: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
@@ -1951,7 +1952,7 @@ def _raw_config_cache_hit(path_key: str, cache_key: Tuple[Any, ...]) -> Optional
     else ``None``. Shared by the lock-free fast path and the locked re-check of
     ``_read_raw_config_impl`` so the predicate cannot drift between them."""
     cached = _RAW_CONFIG_CACHE.get(path_key)
-    if cached is not None and cached[:len(cache_key)] == cache_key:
+    if cached is not None and len(cached) == len(cache_key) + 1 and cached[:-1] == cache_key:
         return cached[len(cache_key)]
     return None
 
@@ -2225,7 +2226,7 @@ def _load_config_cache_sig(config_path: Path) -> Tuple[Optional[Tuple[Any, ...]]
         managed_sig = (0, 0, 0, 0)
     if user_sig is None and managed_sig == (0, 0, 0, 0):
         return None, None
-    return user_sig, (*(user_sig or (0, 0, 0, 0)), *managed_sig)
+    return user_sig, (*(user_sig or (0, 0, 0, 0, None)), *managed_sig)
 
 
 def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Dict[str, Any]]:
@@ -2284,14 +2285,18 @@ def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], An
     return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
 
 
-def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, Any]]:
+def _load_config_cache_hit(
+    path_key: str, cache_sig: Any, *, cache: Optional[Dict[str, Tuple[Any, ...]]] = None,
+) -> Optional[Dict[str, Any]]:
     """Lookup: the cached expanded config for ``path_key`` if its signature equals
     ``cache_sig`` AND every ``${VAR}`` it was expanded against still has the same value, else
     ``None``. Signatures matching is not enough: a load before load_hermes_dotenv() would otherwise
     pin unexpanded literals (e.g. auxiliary.<task>.api_key) for the process lifetime (#58514).
-    Shared by the lock-free fast path and the locked re-check of ``_load_config_impl``."""
-    cached = _LOAD_CONFIG_CACHE.get(path_key)
-    if cached is None or cache_sig is None or cached[:len(cache_sig)] != cache_sig:
+    Shared by expanded/effective readers and their locked re-checks.
+    Entries are exactly ``(*signature, mapping, env_snapshot)``; no prefix admission."""
+    cached = (_LOAD_CONFIG_CACHE if cache is None else cache).get(path_key)
+    if (cached is None or cache_sig is None or len(cached) != len(cache_sig) + 2
+            or cached[:-2] != cache_sig):
         return None
     hit = cached[len(cache_sig)]
     if isinstance(hit, FailedConfigRead) and isinstance(hit.read_error, OSError):
@@ -2303,7 +2308,7 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, 
             return None
         except OSError:
             return hit
-    env_snapshot = cached[len(cache_sig) + 1] if len(cached) > len(cache_sig) + 1 else {}
+    env_snapshot = cached[-1]
     if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
         return hit
     return None

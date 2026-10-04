@@ -4,7 +4,7 @@ import json
 from unittest.mock import patch
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from tests.tools.test_delegate_model_pool_boundaries import _fake_child, _parent
 from tests.tools.test_review_identity_dispatch import URL, _dispatch, _named, _runtime

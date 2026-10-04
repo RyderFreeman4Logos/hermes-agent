@@ -900,10 +900,9 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                         return f"fts5 read probe failed on {fts_table}: {exc}"
             # FTS write probe: drive a row through the messages_fts* triggers in a transaction that is always
             # rolled back. The trigger INSERT alone only buffers the row in FTS5's in-memory segment; the
-            # documented ``integrity-check`` command flushes pending data and checks the index.
-            # A stale ``_idx`` row at the next segid (IntegrityError "constraint failed", the #100227
-            # class: integrity_check and MATCH both clean, every real append fails) is hit here rather than
-            # by the user's next message.
+            # integrity-check validates the index, then SAVEPOINT flushes the pending
+            # segment through FTS5 xSavepoint. A stale next-segid _idx row (#100227)
+            # must fail here rather than at the user's next committed append.
             probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -917,6 +916,9 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                     except sqlite3.OperationalError as exc:
                         if not (SessionDB._is_fts5_unavailable_error(exc) or _schema_not_built(exc)):
                             raise
+                # FTS5 xSavepoint syncs pending segments without committing the outer
+                # transaction; integrity-check alone can leave the probe row buffered.
+                conn.execute("SAVEPOINT hermes_fts_health_probe")
             except sqlite3.DatabaseError as exc:
                 # IntegrityError is a DatabaseError sibling of OperationalError, not a child: catching only the
                 # latter let the trigram-segment collision report "healthy".

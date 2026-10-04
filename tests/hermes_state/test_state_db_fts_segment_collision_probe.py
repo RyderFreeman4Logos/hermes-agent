@@ -67,6 +67,7 @@ def test_repair_heals_segment_collision_and_restores_appends(tmp_path):
     db_path = tmp_path / "state.db"
     sid = _build_db_with_trigram(db_path)
     _plant_stale_trigram_segment(db_path)
+    assert _real_append_fails(db_path, sid), "fixture must break real appends before repair"
 
     report = repair_state_db_schema(db_path, backup=False)
     assert report.get("repaired"), report

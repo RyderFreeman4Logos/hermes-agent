@@ -130,6 +130,7 @@ def _runner_scratch_root() -> str:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = os.open(base.anchor, flags)
     ancestor = Path(base.anchor)
+    materializing = False
     try:
         for component in (*base.parts[1:], name):
             mode = os.fstat(fd).st_mode
@@ -144,6 +145,7 @@ def _runner_scratch_root() -> str:
                     raise
                 # Reject overlong defaults before creating their first missing component.
                 _check_scratch_socket_path(root, sys.platform)
+                materializing = True
                 try:
                     os.mkdir(component, mode=0o700, dir_fd=fd)
                 except FileExistsError:  # another worker may have just created it
@@ -152,6 +154,11 @@ def _runner_scratch_root() -> str:
             os.close(fd)
             fd = child
             ancestor /= component
+            if materializing:
+                # Sticky traversal is not custody of a newly materialized chain.
+                info = os.fstat(fd)
+                if uid is None or info.st_uid != uid or info.st_mode & 0o077:
+                    raise PermissionError(f"runner scratch component is not a private owned directory: {ancestor}")
         info = os.fstat(fd)
         if uid is None or info.st_uid != uid or info.st_mode & 0o077:
             raise PermissionError(f"runner scratch root is not a private owned directory: {root}")

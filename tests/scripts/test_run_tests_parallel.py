@@ -617,6 +617,93 @@ def test_rejected_scratch_ancestor_is_never_mutated(monkeypatch, caller, case):
             ), "rejected ancestry must not replace or chmod descendants"
 
 
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("creation", ["created", "eexist", "existing-child"])
+@pytest.mark.parametrize("boundary", ["foreign", "sticky", "private", "fstat-error"])
+def test_missing_scratch_chain_requires_private_owner(monkeypatch, creation, boundary):
+    """Synthetic stat-owner boundary, not a privileged cross-UID attack."""
+    import errno
+    import tempfile
+    from scripts import run_tests_parallel as runner
+
+    base = Path(os.environ["TMPDIR"]).parent.parent
+    with tempfile.TemporaryDirectory(prefix="t-", dir=base) as directory:
+        parent = Path(directory)
+        parent.chmod(0o1777)  # Legitimate pre-existing sticky traversal is allowed.
+        home = parent / "home"
+        suspect = home / "cache" if creation == "existing-child" else home
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("TMPDIR")
+        original_mkdir, original_fstat = os.mkdir, os.fstat
+        seen = []
+        def mkdir(path, *args, **kwargs):
+            if path == "home" and "dir_fd" in kwargs:
+                original_mkdir(path, *args, **kwargs)
+                if creation == "existing-child":
+                    (home / "cache").mkdir(mode=0o700)
+                if creation == "eexist":
+                    raise FileExistsError(errno.EEXIST, "concurrent winner")
+                return None
+            return original_mkdir(path, *args, **kwargs)
+        def fstat(fd):
+            info = original_fstat(fd)
+            if suspect.exists() and info.st_ino == suspect.stat().st_ino:
+                seen.append(fd)
+                if boundary == "fstat-error":
+                    raise OSError(errno.EIO, "injected owner stat failure")
+                fields = list(info)
+                if boundary == "foreign":
+                    fields[4] = os.getuid() + 1
+                if boundary == "sticky":
+                    fields[0] = (fields[0] & ~0o7777) | 0o1777
+                return os.stat_result(fields)
+            return info
+        before = set(Path("/proc/self/fd").iterdir())
+        with monkeypatch.context() as patch:
+            patch.setattr(runner.os, "mkdir", mkdir)
+            patch.setattr(runner.os, "fstat", fstat)
+            if boundary == "private":
+                assert Path(runner._runner_scratch_root()).is_dir()
+            elif boundary == "fstat-error":
+                with pytest.raises(OSError, match="injected owner stat failure"):
+                    runner._runner_scratch_root()
+            else:
+                with pytest.raises(PermissionError):
+                    runner._runner_scratch_root()
+        assert seen, "must reach the opened missing-chain component"
+        assert set(Path("/proc/self/fd").iterdir()) == before
+        if boundary != "private":
+            assert not list(suspect.iterdir()), "reject before creating any child"
+            assert suspect.is_dir(), "do not remove a concurrent worker's name"
+
+
+@pytest.mark.platforms("posix")
+def test_preexisting_foreign_sticky_scratch_parent_is_traversable(monkeypatch):
+    import tempfile
+    from scripts import run_tests_parallel as runner
+
+    base = Path(os.environ["TMPDIR"]).parent.parent
+    with tempfile.TemporaryDirectory(prefix="t-", dir=base) as directory:
+        parent = Path(directory)
+        parent.chmod(0o1777)
+        inode = parent.stat().st_ino
+        original_fstat = os.fstat
+        seen = []
+        def fstat(fd):
+            info = original_fstat(fd)
+            if info.st_ino == inode:
+                fields = list(info)
+                fields[4] = os.getuid() + 1
+                seen.append(fd)
+                return os.stat_result(fields)
+            return info
+        monkeypatch.setenv("TMPDIR", directory)
+        monkeypatch.setattr(runner.os, "fstat", fstat)
+        root = Path(runner._runner_scratch_root())
+        assert seen and root.is_dir() and root.parent == parent
+        assert root.stat().st_uid == os.getuid() and root.stat().st_mode & 0o077 == 0
+
+
 @pytest.mark.platforms("posix")
 def test_invalid_tmpdir_never_falls_back(tmp_path, monkeypatch) -> None:
     import importlib

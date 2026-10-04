@@ -37,7 +37,9 @@ def test_compression_child_keeps_parent_source(db, parent_source):
     cc._publish_rotated_compaction(
         agent, [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}],
         [{"role": "user", "content": "[handoff]"}], new_system_prompt="sys",
-        lease=types.SimpleNamespace(holder=None, ttl=60.0, watermark=None),
+        lease=types.SimpleNamespace(
+            holder=None, ttl=60.0, watermark=None, source_signature=None
+        ),
         old_session_id="parent", compressed_user_turn_outcome="none",
     )
 

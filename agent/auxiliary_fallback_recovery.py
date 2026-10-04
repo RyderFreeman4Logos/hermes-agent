@@ -21,7 +21,7 @@ def _parameter_ladder(first_err: Exception, client: Any, kwargs: Dict[str, Any],
     resp, err, _ = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
     if err is None:
         return resp
-    return None
+    raise err
 
 
 def send_with_parameter_rungs(
@@ -35,8 +35,6 @@ def send_with_parameter_rungs(
     except Exception as first_err:
         ladder = _parameter_ladder(first_err, client, kwargs, task=task, tag="")
         recovered = _drive_ladder(ladder, lambda step: send(*step.args))
-        if recovered is None:
-            raise first_err
         return recovered
 
 
@@ -51,6 +49,4 @@ async def send_with_parameter_rungs_async(
     except Exception as first_err:
         ladder = _parameter_ladder(first_err, client, kwargs, task=task, tag=" (async)")
         recovered = await _drive_ladder_async(ladder, lambda step: send(*step.args))
-        if recovered is None:
-            raise first_err
         return recovered

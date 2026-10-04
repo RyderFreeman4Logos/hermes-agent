@@ -3367,6 +3367,8 @@ def _is_transient_transport_error(exc: Exception) -> bool:
 
     Deliberately narrow: payment/auth/rate-limit errors switch provider, refresh creds, or rotate the pool.
     """
+    if _is_explicit_auxiliary_control_denial(exc):
+        return False
     if _is_connection_error(exc):
         return True
     status = _exc_http_status(exc)
@@ -4230,6 +4232,8 @@ def _call_fallback_candidate_sync(
     try:
         return _send_recovering(fb_client, fb_kwargs, destination)
     except Exception as fb_err:
+        if _is_explicit_auxiliary_control_denial(fb_err):
+            raise
         if not _is_auth_error(fb_err):
             capacity = fallback_candidate_unavailable_reason(fb_err)
             if capacity is None:
@@ -4254,6 +4258,8 @@ def _call_fallback_candidate_sync(
             try:
                 return _send_recovering(*retry)
             except Exception as retry_err:
+                if _is_explicit_auxiliary_control_denial(retry_err):
+                    raise
                 if not _is_auth_error(retry_err) and fallback_candidate_unavailable_reason(retry_err) is None:
                     raise
         _quarantine_fallback_candidate(
@@ -4293,6 +4299,8 @@ async def _call_fallback_candidate_async(
     try:
         return await _send_recovering(fb_client, fb_kwargs, destination)
     except Exception as fb_err:
+        if _is_explicit_auxiliary_control_denial(fb_err):
+            raise
         if not _is_auth_error(fb_err):
             capacity = fallback_candidate_unavailable_reason(fb_err)
             if capacity is None:
@@ -4317,6 +4325,8 @@ async def _call_fallback_candidate_async(
             try:
                 return await _send_recovering(*retry)
             except Exception as retry_err:
+                if _is_explicit_auxiliary_control_denial(retry_err):
+                    raise
                 if not _is_auth_error(retry_err) and fallback_candidate_unavailable_reason(retry_err) is None:
                     raise
         _quarantine_fallback_candidate(
@@ -7676,6 +7686,8 @@ def _ladder_parameter_rungs(
     temperature AND max_tokens; a reasoning-strip retry can then trip temperature, #78273), each
     field stripped at most once, so a request with N rejected fields recovers in N retries.
     Returns ``(response, None, kwargs)`` or ``(None, narrowed_err, stripped_kwargs)``."""
+    if _is_explicit_auxiliary_control_denial(first_err):
+        raise first_err
     client, task, tag = route.client, route.task, route.tag
     rungs = list(_parameter_rungs(client, max_tokens))
     while rungs:
@@ -7825,7 +7837,9 @@ def _ladder_credential_rungs(
 def _is_explicit_auxiliary_control_denial(error: Exception) -> bool:
     """Only typed provider controls stop an otherwise recoverable auxiliary request."""
     from agent.error_classifier import _extract_error_body, _extract_error_code
-    return _extract_error_code(_extract_error_body(error)).lower() in {
+    body = _extract_error_body(error)
+    code = _extract_error_code(body) or body.get("type", "")
+    return isinstance(code, str) and code.lower() in {
         "approval_denied", "content_policy_violation",
     }
 
@@ -8066,6 +8080,8 @@ def _drive_ladder(ladder, perform: Callable[[_LadderStep], Any]) -> Any:
             try:
                 result = perform(step)
             except Exception as exc:
+                if _is_explicit_auxiliary_control_denial(exc):
+                    raise
                 step = ladder.throw(exc)
             else:
                 step = ladder.send(result)
@@ -8081,6 +8097,8 @@ async def _drive_ladder_async(ladder, perform: Callable[[_LadderStep], Any]) -> 
             try:
                 result = await perform(step)
             except Exception as exc:
+                if _is_explicit_auxiliary_control_denial(exc):
+                    raise
                 step = ladder.throw(exc)
             else:
                 step = ladder.send(result)

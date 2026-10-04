@@ -48,7 +48,9 @@ def fallback_candidate_unavailable_reason(exc: Exception) -> Optional[str]:
     for now, try the next configured one"; anything else (a 400 request-shape error, a ValueError)
     is the caller's bug and must still propagate. Auth errors are excluded on purpose: they have
     their own refresh-then-quarantine path in the candidate helpers (#106367)."""
-    from agent.auxiliary_client import _FALLBACK_REASONS
+    from agent.auxiliary_client import _FALLBACK_REASONS, _is_explicit_auxiliary_control_denial
+    if _is_explicit_auxiliary_control_denial(exc):
+        return None
     return next(
         (label for predicate, label in _FALLBACK_REASONS if label != "auth error" and predicate(exc)),
         None,

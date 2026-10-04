@@ -104,7 +104,12 @@ def _runner_scratch_root() -> str:
     import stat
 
     configured = os.environ.get("TMPDIR")
-    base = Path(configured if configured is not None else tempfile.gettempdir())
+    if configured is None and os.name != "nt":
+        # Hermes scratch is real storage; system temp can be RAM-backed. No fallback.
+        from hermes_constants import get_scratch_dir
+        base = get_scratch_dir(prune=False)
+    else:
+        base = Path(configured if configured is not None else tempfile.gettempdir())
     if not base.is_absolute():
         raise ValueError("TMPDIR must be an absolute existing directory")
     base = base.resolve(strict=True)  # preserve directory symlinks; validate their target
@@ -115,7 +120,8 @@ def _runner_scratch_root() -> str:
             mode = ancestor.stat().st_mode
             if mode & 0o022 and not mode & stat.S_ISVTX:
                 raise PermissionError(f"unsafe temp ancestor: {ancestor}")
-    name = "h" + (str(os.getuid()) if hasattr(os, "getuid") else "")
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    name = "h" + (str(uid) if uid is not None else "")
     root = base / name
     _check_scratch_socket_path(root, sys.platform)
     if os.name == "nt":
@@ -126,7 +132,7 @@ def _runner_scratch_root() -> str:
     root.mkdir(mode=0o700, exist_ok=True)
     info = root.lstat()
     if not stat.S_ISDIR(info.st_mode) or (
-        info.st_uid != os.getuid() or info.st_mode & 0o077
+        uid is None or info.st_uid != uid or info.st_mode & 0o077
     ):
         raise PermissionError(f"runner scratch root is not a private owned directory: {root}")
     return str(root)

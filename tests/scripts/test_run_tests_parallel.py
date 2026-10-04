@@ -551,6 +551,31 @@ def test_scratch_root_is_private_and_honors_tmpdir(monkeypatch) -> None:
 
 
 @pytest.mark.platforms("posix")
+def test_unset_tmpdir_uses_hermes_scratch_not_system_temp(monkeypatch):
+    import hermes_constants
+    import tempfile
+    from scripts.run_tests_parallel import _runner_scratch_root
+
+    base = Path(os.environ["TMPDIR"]).parent.parent
+    with tempfile.TemporaryDirectory(prefix="t-", dir=base) as directory:
+        monkeypatch.delenv("TMPDIR")
+        calls = []
+        def scratch(*, prune):
+            calls.append(prune)
+            return Path(directory)
+        monkeypatch.setattr(hermes_constants, "get_scratch_dir", scratch)
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: pytest.fail("system temp fallback"))
+        root = Path(_runner_scratch_root())
+        assert calls == [False]
+        assert root.parent == Path(directory).resolve()
+        assert root.stat().st_mode & 0o777 == 0o700
+        assert root.stat().st_uid == os.getuid()
+        monkeypatch.setattr(hermes_constants, "get_scratch_dir", lambda **_: Path(directory) / "missing")
+        with pytest.raises(FileNotFoundError):
+            _runner_scratch_root()
+
+
+@pytest.mark.platforms("posix")
 def test_invalid_tmpdir_never_falls_back(tmp_path, monkeypatch) -> None:
     import importlib
 

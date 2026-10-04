@@ -8,7 +8,6 @@ from agent import auxiliary_client as aux
 @pytest.mark.parametrize('failure', ['generic', 'capacity'])
 def test_configured_exhaustion_preserves_primary_without_unconfigured_send(monkeypatch, tmp_path, wire, failure):
     from hermes_cli import config
-    assert '/ord52-recover-52/base/' in aux.__file__ or '/hermes-lane-52-59-4a3e16bf-20261003/' in aux.__file__
     home = tmp_path / 'home'; home.mkdir()
     (home / 'config.yaml').write_text('model:\n  provider: openai-codex\n  default: unconfigured-main\nauxiliary:\n  classifier:\n    provider: custom\n    model: primary\n    base_url: https://primary.invalid/v1\n    fallback_chain:\n      - {provider: openai-codex, model: first, base_url: https://first.invalid/v1}\n      - {provider: openai-codex, model: second, base_url: https://second.invalid/v1}\n')
     monkeypatch.setenv('HERMES_HOME', str(home))

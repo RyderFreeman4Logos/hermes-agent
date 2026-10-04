@@ -7,7 +7,6 @@ from agent import auxiliary_client as aux
 @pytest.mark.parametrize('wire', ['sync', 'async'])
 def test_public_progress_stream_denial_has_no_plain_retry(monkeypatch, tmp_path, wire):
     from hermes_cli import config
-    assert '/ord52-recover-52/base/' in aux.__file__ or '/hermes-lane-52-59-4a3e16bf-20261003/' in aux.__file__
     (tmp_path / 'config.yaml').write_text('model: {provider: custom, default: primary}\nauxiliary:\n  classifier: {provider: custom, model: primary, base_url: https://primary.invalid/v1}\n')
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(config, '_LOAD_CONFIG_CACHE', {})

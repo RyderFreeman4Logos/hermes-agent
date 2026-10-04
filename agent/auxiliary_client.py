@@ -4436,7 +4436,9 @@ def _try_main_agent_model_fallback(
         return None, None, ""
     try:
         client, resolved_model = resolve_provider_client(provider=main_provider, model=main_model)
-    except Exception:
+    except Exception as exc:
+        if _is_explicit_auxiliary_control_denial(exc):
+            raise
         client, resolved_model = None, None
     if client is None:
         return None, None, ""
@@ -4539,7 +4541,9 @@ def _try_configured_fallback_chain(
         label = f"fallback_chain[{i}]({fb_provider})"
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
-        except Exception:
+        except Exception as exc:
+            if _is_explicit_auxiliary_control_denial(exc):
+                raise
             fb_client, resolved_model = None, None
         if fb_client is not None:
             too_small = _context_too_small(
@@ -4641,6 +4645,8 @@ def _try_main_fallback_chain(
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception as exc:
+            if _is_explicit_auxiliary_control_denial(exc):
+                raise
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
         if fb_client is not None:
@@ -4752,12 +4758,25 @@ def _try_main_provider_route(
     return client, resolved or main_model, resolved_provider
 
 
+def _configured_fallbacks_present(task: Optional[str]) -> bool:
+    """Whether destination lists forbid ambient/main-last-resort expansion after exhaustion."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.fallback_config import get_fallback_chain
+    task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
+    return bool((isinstance(task_chain, list) and task_chain) or get_fallback_chain(load_config_readonly()))
+
+
 def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> bool:
-    """The built-in discovery chain is a convenience for installs with NO selected main provider.
-    Once the user picked one, every auxiliary route must be a provider they configured (main,
-    ``auxiliary.<task>``, ``fallback_providers``); guessing "whatever else is logged in" bills an
-    account they never pointed this session at (xAI OAuth session with a dead token → every
-    compression silently charged to a Nous Portal balance)."""
+    """Discovery needs auto routing and no configured destination list.
+
+    Startup and recovery share this gate: an explicit list stays authoritative after
+    exhaustion, including when the main route is auto. Explicit main sessions must
+    opt in through task/main fallback lists rather than billing another account.
+    """
+    if _configured_fallbacks_present(task):
+        # Exhausting an explicit destination list never authorizes account discovery,
+        # even when the main/auxiliary provider is auto (startup and execution share this gate).
+        return False
     if (main_provider or "").strip().lower() in {"", "auto"}:
         return True
     logger.warning(
@@ -7097,7 +7116,7 @@ def _affordable_max_tokens_from_error(exc: Exception) -> Optional[int]:
     """Affordable output budget (minus margin) from an OpenRouter credit-limited 402
     ("...but can only afford 7117": credit exists, the cap was too large); ``None``
     when no count is present or the budget is too small to be useful."""
-    if not _is_payment_error(exc):
+    if _is_explicit_auxiliary_control_denial(exc) or not _is_payment_error(exc):
         return None
     match = _AFFORDABLE_TOKENS_RE.search(str(exc))
     if not match:
@@ -7179,7 +7198,8 @@ def _create_with_progress_once(
     except Exception as exc:
         # Genuine provider failures aren't streaming's fault — surface unchanged so the
         # recovery chains see the same error as a plain call.
-        if (force_stream or _is_transient_transport_error(exc) or _is_auth_error(exc)
+        if (_is_explicit_auxiliary_control_denial(exc) or force_stream
+                or _is_transient_transport_error(exc) or _is_auth_error(exc)
                 or _is_payment_error(exc) or _is_rate_limit_error(exc)):
             raise
         # Possibly a streaming-specific rejection: retry non-streaming once; a genuinely bad
@@ -7406,7 +7426,8 @@ async def _acreate_with_progress(
         # Only a rejected stream NEGOTIATION falls back to a plain call (mirrors the sync wrapper); a
         # failure mid-consumption below reaches the classified recovery ladder instead of silently
         # re-sending the whole prompt non-streaming.
-        if (force_stream or _is_transient_transport_error(exc) or _is_auth_error(exc)
+        if (_is_explicit_auxiliary_control_denial(exc) or force_stream
+                or _is_transient_transport_error(exc) or _is_auth_error(exc)
                 or _is_payment_error(exc) or _is_rate_limit_error(exc)):
             raise
         logger.debug("Auxiliary %s: streamed async request failed (%s); retrying non-streaming",
@@ -7979,7 +8000,8 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason, failed_base_url=route.base_info,
                 failure_scope=_chain_failure_scope, main_runtime=route.main_runtime)
-    elif fb_client is None and not explicit_auth_with_task_chain:
+    elif (fb_client is None and not explicit_auth_with_task_chain
+            and not _configured_fallbacks_present(task)):
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model,
             failed_base_url=route.base_info, failure_scope=_chain_failure_scope)

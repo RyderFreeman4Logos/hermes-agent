@@ -38,7 +38,7 @@ def _run_py(code: str, env_extra: dict[str, str], tmp_path: Path) -> dict:
     out_file = tmp_path / "e2e_result.json"
     env = dict(os.environ)
     env.pop("PYTEST_CURRENT_TEST", None)
-    env["PYTHONPATH"] = str(REPO_ROOT)
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["E2E_OUT_FILE"] = str(out_file)
     env.update(env_extra)
     proc = subprocess.run(
@@ -52,6 +52,22 @@ def _run_py(code: str, env_extra: dict[str, str], tmp_path: Path) -> dict:
     assert proc.returncode == 0, f"subprocess failed:\n{proc.stdout}\n{proc.stderr}"
     assert out_file.exists(), f"no result file:\n{proc.stdout}\n{proc.stderr}"
     return json.loads(out_file.read_text(encoding="utf-8"))
+
+
+def test_run_py_preserves_inherited_pythonpath(tmp_path, monkeypatch):
+    import os
+
+    inherited = os.pathsep.join(
+        [str(tmp_path / "first"), str(tmp_path / "second"), os.environ.get("PYTHONPATH", "")]
+    )
+    monkeypatch.setenv("PYTHONPATH", inherited)
+    out = _run_py(
+        "import json, os; from pathlib import Path; "
+        "Path(os.environ['E2E_OUT_FILE']).write_text(json.dumps(os.environ['PYTHONPATH']))",
+        {},
+        tmp_path,
+    )
+    assert out == str(REPO_ROOT) + os.pathsep + inherited
 
 
 def test_behavioral_read_gets_expansion_and_overlay_while_writeback_stays_raw(

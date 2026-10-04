@@ -1,6 +1,8 @@
 """Tests for automatic MCP reload when config.yaml mcp_servers section changes."""
 from unittest.mock import MagicMock, patch
 
+import pytest
+from hermes_cli.config import _config_file_signature
 from utils import file_signature
 
 
@@ -18,7 +20,7 @@ def _make_cli(tmp_path, mcp_servers=None, extra_config=None):
 
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("mcp_servers: {}\n")
-    obj._config_sig = file_signature(cfg_file.stat())
+    obj._config_sig = _config_file_signature(cfg_file)
 
     obj._reload_mcp = MagicMock()
     obj._busy_command = MagicMock()
@@ -27,6 +29,27 @@ def _make_cli(tmp_path, mcp_servers=None, extra_config=None):
     obj._slow_command_status = MagicMock(return_value="reloading...")
 
     return obj, cfg_file
+
+
+def test_watch_preserves_snapshot_on_missing_or_invalid_config(tmp_path):
+    obj, path = _make_cli(tmp_path, mcp_servers={"bb": {"command": "b"}})
+    with patch("hermes_cli.config.get_config_path", return_value=path):
+        path.unlink()
+        obj._check_config_mcp_changes()
+        for text in ("mcp_servers: [", "[not, a, mapping]", "[]", "false", "0"):
+            path.write_text(text)
+            obj._last_config_check = 0.0
+            obj._check_config_mcp_changes()
+        assert obj._config_mcp_servers == {"bb": {"command": "b"}}
+        obj._reload_mcp.assert_not_called()
+        from threading import Event
+        reloaded = Event()
+        obj._reload_mcp.side_effect = reloaded.set
+        path.write_text("mcp_servers:\n  aa: {command: a}\n")
+        obj._last_config_check = 0.0
+        obj._check_config_mcp_changes()
+        assert reloaded.wait(2)
+        assert obj._config_mcp_servers == {"aa": {"command": "a"}}
 
 
 class TestMCPConfigWatch:
@@ -211,32 +234,62 @@ def test_tui_init_run_state_seeds_config_sig_when_config_exists(monkeypatch):
     obj.config = {"mcp_servers": {}}
     obj._tui_init_run_state()
 
-    assert obj._config_sig == file_signature(cfg_file.stat())
+    assert obj._config_sig == _config_file_signature(cfg_file)
 
 
-def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
+@pytest.mark.parametrize('writer', ['inplace', 'atomic'])
+def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path, writer):
     """#111105: cp -p / rsync -t style replacement (same mtime, same size) must still reload."""
     import os
     import shutil
 
     obj, cfg_file = _make_cli(tmp_path, mcp_servers={"bb": {"command": "b"}})
     cfg_file.write_text("mcp_servers:\n  bb: {command: b}\n")
-    obj._config_sig = file_signature(cfg_file.stat())
+    obj._config_sig = _config_file_signature(cfg_file)
+    with patch("hermes_cli.config.get_config_path", return_value=cfg_file):
+        from hermes_cli.config import load_config_readonly
+        assert load_config_readonly()["mcp_servers"] == {"bb": {"command": "b"}}
+    stat_before = file_signature(cfg_file.stat())
     other = tmp_path / "other.yaml"
     other.write_text("mcp_servers:\n  aa: {command: a}\n")
-    # A replacement must change inode even on filesystems with coarse ctime.
-    shutil.copystat(cfg_file, other)
-    os.replace(other, cfg_file)
-    assert file_signature(cfg_file.stat())[:2] == obj._config_sig[:2]
-    assert file_signature(cfg_file.stat())[2] != obj._config_sig[2]
+    if writer == 'atomic':
+        shutil.copystat(cfg_file, other)
+        os.replace(other, cfg_file)
+        assert file_signature(cfg_file.stat())[:2] == stat_before[:2]
+        assert file_signature(cfg_file.stat())[2] != stat_before[2]
+    else:
+        # Real in-place cp -p update; locate a same-clock-tick write without mocking stat.
+        for _ in range(32):
+            cfg_file.write_text("mcp_servers:\n  bb: {command: b}\n")
+            before = cfg_file.stat()
+            stat_before = file_signature(before)
+            obj._config_sig = _config_file_signature(cfg_file)
+            shutil.copy2(other, cfg_file)
+            os.utime(cfg_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+            if file_signature(cfg_file.stat()) == stat_before:
+                break
+        assert file_signature(cfg_file.stat()) == stat_before, 'no unchanged-stat witness'
+        assert cfg_file.read_text() != "mcp_servers:\n  bb: {command: b}\n"
 
     from threading import Event
 
     reloaded = Event()
-    obj._reload_mcp.side_effect = reloaded.set
+    loaded = []
+
+    def reload_from_disk():
+        from hermes_cli.config import load_config_readonly
+        loaded.append(load_config_readonly()['mcp_servers'])
+        reloaded.set()
+
+    obj._reload_mcp.side_effect = reload_from_disk
     with patch("hermes_cli.config.get_config_path", return_value=cfg_file):
         obj._check_config_mcp_changes()
         assert reloaded.wait(2), "MCP reload worker did not run"
+        assert _config_file_signature(cfg_file) == obj._config_sig
+        obj._last_config_check = 0.0
+        obj._check_config_mcp_changes()
 
     obj._reload_mcp.assert_called_once()
     assert obj._config_mcp_servers == {"aa": {"command": "a"}}
+    assert loaded == [{"aa": {"command": "a"}}]
+    print("MCP_WRITER_WITNESS", writer, stat_before, file_signature(cfg_file.stat()), loaded)

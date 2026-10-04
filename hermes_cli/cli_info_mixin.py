@@ -16,7 +16,7 @@ import time
 
 from hermes_constants import is_termux as _is_termux_environment
 from rich.markup import escape as _escape
-from utils import base_url_hostname, file_signature
+from utils import base_url_hostname
 
 from hermes_cli.cli_modal_mixin import _gated_confirm
 from hermes_cli.colors import Colors as _Colors
@@ -842,21 +842,25 @@ class CLIInfoMixin:
             return
         self._last_config_check = now
 
-        from hermes_cli.config import get_config_path as _get_config_path
+        from hermes_cli.config import _config_file_signature, get_config_path as _get_config_path
         cfg_path = _get_config_path()
         if not cfg_path.exists():
             return
         try:
-            sig = file_signature(cfg_path.stat())
+            sig = _config_file_signature(cfg_path)
         except OSError:
             return
         if sig == self._config_sig:
-            return  # unchanged — fast path
+            return  # unchanged bytes — skip YAML parsing
 
         self._config_sig = sig
         try:
             with open(cfg_path, encoding="utf-8-sig") as f:
-                new_cfg = _yaml.safe_load(f) or {}
+                new_cfg = _yaml.safe_load(f)
+            if new_cfg is None:
+                new_cfg = {}
+            if not isinstance(new_cfg, dict):
+                return
         except Exception:
             return
 

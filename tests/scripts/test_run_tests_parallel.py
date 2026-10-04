@@ -523,34 +523,44 @@ def test_files_from_dash_reads_the_list_from_stdin(tmp_path: Path) -> None:
     assert "✓2" in proc.stdout or "2 passed" in proc.stdout, proc.stdout
 
 
-def test_scratch_root_is_per_user(tmp_path: Path, monkeypatch) -> None:
-    """Two users on one host must never share the runner's scratch root.
+def test_scratch_root_is_private_and_honors_tmpdir(monkeypatch) -> None:
+    """Explicit temp locations survive cached defaults, with private per-user roots."""
+    import importlib
+    import tempfile
 
-    A fixed literal in a world-writable sticky dir belongs to whoever created it first: a
-    root-owned root (a container or system-service run) makes every later ``mkdtemp`` there
-    fail with EPERM for every other user, with no non-root way back.
-    """
+    runner = importlib.import_module("scripts.run_tests_parallel")
+    # Stay short enough for real AF_UNIX paths, even inside this file's worker.
+    base = Path(os.environ["TMPDIR"]).parent.parent
+    with tempfile.TemporaryDirectory(prefix="t-", dir=base) as directory:
+        monkeypatch.setenv("TMPDIR", directory)
+        monkeypatch.setattr(runner.tempfile, "gettempdir", lambda: "must-not-fallback")
+        root = Path(runner._runner_scratch_root())
+        assert root.parent == Path(directory).resolve()
+        assert root.name.endswith(str(os.getuid()))
+        assert root.stat().st_mode & 0o777 == 0o700
+        assert root.stat().st_uid == os.getuid()
+        link = Path(directory) / "link"
+        link.symlink_to(directory, target_is_directory=True)
+        monkeypatch.setenv("TMPDIR", str(link))
+        assert Path(runner._runner_scratch_root()) == root
+        assert link.is_symlink()
+        root.chmod(0o755)
+        with pytest.raises(PermissionError):
+            runner._runner_scratch_root()
+
+
+def test_invalid_tmpdir_never_falls_back(tmp_path, monkeypatch) -> None:
     import importlib
 
-    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
-    monkeypatch.syspath_prepend(str(scripts_dir))
-    runner = importlib.import_module("run_tests_parallel")
-
-    # Exercise the non-/var/tmp arm so the probe never mints roots in the real shared dir.
-    # (Narrow: on 3.14 ``Path.is_dir()`` itself goes through ``os.path.isdir``.)
-    monkeypatch.setattr(runner.tempfile, "gettempdir", lambda: str(tmp_path))
-    real_isdir = os.path.isdir
-    monkeypatch.setattr(runner.os.path, "isdir",
-                        lambda path: False if str(path) == "/var/tmp" else real_isdir(path))
-
-    monkeypatch.setattr(runner.os, "getuid", lambda: 1000)
-    mine = Path(runner._runner_scratch_root())
-    monkeypatch.setattr(runner.os, "getuid", lambda: 0)
-    theirs = Path(runner._runner_scratch_root())
-
-    assert mine != theirs
-    assert mine.is_dir() and theirs.is_dir()
-    assert mine.parent == tmp_path and theirs.parent == tmp_path
+    runner = importlib.import_module("scripts.run_tests_parallel")
+    for value in ("relative", "", str(tmp_path / "missing")):
+        monkeypatch.setenv("TMPDIR", value)
+        with pytest.raises((ValueError, FileNotFoundError)):
+            runner._runner_scratch_root()
+    tmp_path.chmod(0o777)
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    with pytest.raises(PermissionError):
+        runner._runner_scratch_root()
 
 
 def test_off_host_note_names_platforms_specs_that_exclude_this_host(tmp_path: Path) -> None:

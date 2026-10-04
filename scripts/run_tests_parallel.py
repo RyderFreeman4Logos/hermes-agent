@@ -34,6 +34,8 @@ Usage:
     pytest failure. Tokens after ``--`` are never validated.
 
 Environment:
+    TMPDIR              Existing writable temp parent (symlinks supported);
+                        invalid/unsafe/overlong explicit roots fail without fallback.
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep; on Windows
                          ';' also works and drive letters are handled;
@@ -87,25 +89,37 @@ def _rmtree_force(path: str) -> None:
     shutil.rmtree(path, onerror=_chmod_retry)
 
 def _runner_scratch_root() -> str:
-    """Per-run temp roots live on DISK, never the system temp dir: a full-suite run writes
-    gigabytes of tmp_path fixtures and /tmp is RAM-backed tmpfs on many Linux hosts. /var/tmp is
-    the FHS disk-backed temp root and is used because the alternatives fail tests that assume
-    the root's shape: under the Hermes home conftest relocates the basetemp; under a dot-dir
-    (~/.cache) the hidden-dir search tests see every fixture as hidden; anything longer than
-    the old /tmp root pushes AF_UNIX test sockets past sun_path.
+    """Honor an explicit temp root without tempfile's silent invalid-path fallback.
 
-    The name is per-USER because a fixed literal in a world-writable sticky dir belongs to
-    whoever created it first: a root-owned root (a container or system-service run) makes every
-    later makedirs/mkdtemp here fail with EPERM for every other user on the host, with no way
-    back that does not need root. Keying by uid means no run is blocked by another's leftovers.
+    Keep the per-user directory private and short: each attempt adds ``r-XXXXXXXX``;
+    pathname AF_UNIX sockets on Linux have only 107 usable bytes.
     """
-    name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
-    if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
-        root = os.path.join(tempfile.gettempdir(), name)
-    else:
-        root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
-    os.makedirs(root, exist_ok=True)
-    return root
+    import stat
+
+    configured = os.environ.get("TMPDIR")
+    base = Path(configured if configured is not None else tempfile.gettempdir())
+    if not base.is_absolute():
+        raise ValueError("TMPDIR must be an absolute existing directory")
+    base = base.resolve(strict=True)  # preserve directory symlinks; validate their target
+    if not base.is_dir():
+        raise ValueError("TMPDIR must be an absolute existing directory")
+    if os.name != "nt":
+        for ancestor in (base, *base.parents):
+            mode = ancestor.stat().st_mode
+            if mode & 0o022 and not mode & stat.S_ISVTX:
+                raise PermissionError(f"unsafe temp ancestor: {ancestor}")
+    name = "h" + (str(os.getuid()) if hasattr(os, "getuid") else "")
+    root = base / name
+    # Reserve one worker directory and a short socket filename; never shorten by rerouting.
+    if sys.platform == "linux" and len(os.fsencode(root)) + len("/r-XXXXXXXX/socket.sock") > 107:
+        raise ValueError("TMPDIR is too long for AF_UNIX worker sockets")
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or (os.name != "nt" and (
+        info.st_uid != os.getuid() or info.st_mode & 0o077
+    )):
+        raise PermissionError(f"runner scratch root is not a private owned directory: {root}")
+    return str(root)
 
 
 
@@ -533,7 +547,8 @@ def _run_one_file_once(
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
-    env["TMPDIR"] = temproot
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        env[key] = temproot
 
     subproc_start = time.monotonic()
     # launch the pytest process

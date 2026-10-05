@@ -74,6 +74,9 @@ def _descendant(pid: int, ancestor: int) -> bool:
 
 
 def _serve(listener: socket.socket, key: bytes, pid: int) -> None:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return
     ready = select.poll()
     ready.register(listener, select.POLLIN)
     while True:
@@ -90,7 +93,7 @@ def _serve(listener: socket.socket, key: bytes, pid: int) -> None:
             packet = conn.recv(_MAX_STAMP_BYTES + 65)
             proof, stamp = packet[:64], packet[64:]
             valid = (
-                uid == os.getuid() and 0 < len(stamp) <= _MAX_STAMP_BYTES
+                uid == getuid() and 0 < len(stamp) <= _MAX_STAMP_BYTES
                 and hmac.compare_digest(proof, hmac.digest(key, stamp, "sha256").hex().encode())
                 and _descendant(peer_pid, pid)
             )
@@ -139,7 +142,7 @@ def issue_lineage(stamp: str) -> tuple[str, str, str] | None:
         payload = stamp.encode()
     except UnicodeError:
         return None
-    if sys.platform != "linux" or not payload or len(payload) > _MAX_STAMP_BYTES:
+    if sys.platform != "linux" or not hasattr(os, "getuid") or not payload or len(payload) > _MAX_STAMP_BYTES:
         return None
     from gateway.status import get_process_start_time
 
@@ -180,7 +183,8 @@ def validate_lineage(stamp: str, pid_text: str, start: str, proof: str) -> bool:
         payload = stamp.encode()
     except UnicodeError:
         return False
-    if sys.platform != "linux" or not payload or len(payload) > _MAX_STAMP_BYTES:
+    getuid = getattr(os, "getuid", None)
+    if sys.platform != "linux" or getuid is None or not payload or len(payload) > _MAX_STAMP_BYTES:
         return False
     if not pid_text.isascii() or not pid_text.isdecimal() or not start.isascii() or not start.isdecimal():
         return False
@@ -201,7 +205,7 @@ def validate_lineage(stamp: str, pid_text: str, start: str, proof: str) -> bool:
             conn.settimeout(_TIMEOUT)
             conn.connect(_address(pid, start))
             peer_pid, uid, _ = _peer(conn)
-            if peer_pid != pid or uid != os.getuid():
+            if peer_pid != pid or uid != getuid():
                 return False
             conn.sendall(proof.encode() + payload)
             accepted = conn.recv(2) == b"1"

@@ -14,6 +14,34 @@ import pytest
 
 
 @pytest.mark.platforms("linux")
+def test_missing_uid_before_import_refuses_native_authority():
+    result = subprocess.run([sys.executable, "-c", """
+import os
+import threading
+del os.getuid
+from agent.delegation_lineage import issue_lineage, validate_lineage
+refused = issue_lineage("fresh-uid-fixture") is None
+assert refused
+assert not validate_lineage("fresh-uid-fixture", str(os.getpid()), "0", "0" * 64)
+assert not any(t.name == "delegation-lineage" for t in threading.enumerate())
+"""], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.platforms("linux")
+def test_missing_uid_capability_refuses_issuance_and_validation(monkeypatch):
+    from agent.delegation_lineage import issue_lineage, validate_lineage
+
+    grant = issue_lineage("uid-capability-fixture")
+    assert grant is not None
+    assert validate_lineage("uid-capability-fixture", *grant)
+    monkeypatch.delattr(os, "getuid")
+    refused = issue_lineage("uid-capability-fixture") is None
+    assert refused
+    assert not validate_lineage("uid-capability-fixture", *grant)
+
+
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize("side", ["accepted", "outgoing"])
 def test_fork_discards_inflight_validation_sockets(side):
     env = os.environ.copy()

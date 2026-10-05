@@ -740,6 +740,10 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     # retired thread (the next agent would only resume into the same wedge).
     if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
         _store_codex_thread_id(agent, turn.thread_id)
+    # Match the shared finalizer after persistence has retained the wire sidecar.
+    # Failed turns may still need the decorated input for the fallback request.
+    if turn.error is None and not turn.interrupted:
+        agent._apply_persist_user_message_override(messages)
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )

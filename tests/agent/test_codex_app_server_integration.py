@@ -26,16 +26,20 @@ def fake_session(monkeypatch):
     """Replace CodexAppServerSession with a stub that returns a fixed
     TurnResult, so we can drive AIAgent without spawning real codex."""
 
+    stub = SimpleNamespace(reply="echo: hello", inputs=[])
+
     def fake_run_turn(self, user_input: str, **kwargs):
+        # The model reply is independent of API-only instructions in its input.
+        stub.inputs.append(user_input)
         return TurnResult(
-            final_text=f"echo: {user_input}",
+            final_text=stub.reply,
             projected_messages=[
                 {"role": "assistant", "content": None,
                  "tool_calls": [{"id": "exec_1", "type": "function",
                                  "function": {"name": "exec_command",
                                               "arguments": "{}"}}]},
                 {"role": "tool", "tool_call_id": "exec_1", "content": "ok"},
-                {"role": "assistant", "content": f"echo: {user_input}"},
+                {"role": "assistant", "content": stub.reply},
             ],
             tool_iterations=1,
             interrupted=False,
@@ -48,6 +52,7 @@ def fake_session(monkeypatch):
     monkeypatch.setattr(
         CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
     )
+    return stub
 
 
 def _make_codex_agent(**kwargs):
@@ -70,10 +75,13 @@ def _make_codex_agent(**kwargs):
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
+        fake_session.reply = "echo: hello there"
         agent = _make_codex_agent()
         # No background review fork during tests
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello there")
+        assert len(fake_session.inputs) == 1
+        assert fake_session.inputs[0].startswith("hello there\n\n[Agent loop timing]")
         assert result["final_response"] == "echo: hello there"
         assert result["completed"] is True
         assert result["partial"] is False
@@ -184,10 +192,21 @@ class TestRunConversationCodexPath:
             )
         ]
 
-    def test_projected_messages_are_spliced(self, fake_session):
-        agent = _make_codex_agent()
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            result = agent.run_conversation("hello")
+    def test_projected_messages_are_spliced(self, fake_session, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            agent = _make_codex_agent(session_db=db)
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = agent.run_conversation("hello")
+            persisted = db.get_messages(agent.session_id)
+        finally:
+            db.close()
+        user_rows = [m for m in persisted if m["role"] == "user"]
+        assert len(user_rows) == 1
+        assert user_rows[0]["content"] == "hello"
+        assert user_rows[0]["api_content"] == fake_session.inputs[0]
         msgs = result["messages"]
         # User message + 3 projected (assistant tool_call + tool + assistant text)
         assert len(msgs) >= 4

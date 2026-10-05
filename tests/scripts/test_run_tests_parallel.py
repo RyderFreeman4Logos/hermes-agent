@@ -723,14 +723,27 @@ def test_invalid_tmpdir_never_falls_back(tmp_path, monkeypatch) -> None:
 def test_scratch_socket_path_budget(platform, limit):
     from scripts.run_tests_parallel import _check_scratch_socket_path
 
-    # Platform is policy data, not a mocked host. Budget encoded bytes, not characters.
-    suffix = len(b"/r-XXXXXXXX/socket.sock")
-    root = Path("/" + "x" * (limit - suffix - 1))
+    # Include the production apt-stage GNUPGHOME nested under each r-XXXXXXXX
+    # temp root, with every socket name reported by gpgconf --list-dirs.
+    # The test-only apt-test-gnupg- prefix is shorter than this production one.
+    agent_home = "/r-XXXXXXXX/apt-stage-gnupg-XXXXXXXX"
+    suffixes = (
+        "/r-XXXXXXXX/socket.sock",
+        *(f"{agent_home}/S.gpg-agent{variant}" for variant in ("", ".extra", ".ssh", ".browser")),
+    )
+    suffix = max(suffixes, key=lambda value: len(os.fsencode(value)))
+    root = Path("/" + "x" * (limit - len(os.fsencode(suffix)) - 1))
     _check_scratch_socket_path(root, platform)
+
+    too_long = Path(str(root) + "x")
+    assert len(os.fsencode(too_long)) + len(os.fsencode(suffixes[0])) <= limit
+    assert len(os.fsencode(too_long)) + len(os.fsencode(suffix)) > limit
     with pytest.raises(ValueError, match="too long for AF_UNIX"):
-        _check_scratch_socket_path(Path(str(root) + "x"), platform)
-    multibyte = Path("/" + "\N{LATIN SMALL LETTER E WITH ACUTE}" * ((limit - suffix) // 2))
-    assert len(os.fsencode(multibyte)) > limit - suffix
+        _check_scratch_socket_path(too_long, platform)
+
+    multibyte_root_budget = limit - len(os.fsencode(suffix))
+    multibyte = Path("/" + "\N{LATIN SMALL LETTER E WITH ACUTE}" * (multibyte_root_budget // 2 + 1))
+    assert len(os.fsencode(multibyte)) > multibyte_root_budget
     with pytest.raises(ValueError, match="too long for AF_UNIX"):
         _check_scratch_socket_path(multibyte, platform)
 

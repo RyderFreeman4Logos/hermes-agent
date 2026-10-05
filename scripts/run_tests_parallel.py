@@ -89,9 +89,16 @@ def _rmtree_force(path: str) -> None:
     shutil.rmtree(path, onerror=_chmod_retry)
 
 def _check_scratch_socket_path(root: Path, platform: str) -> None:
-    # Reserve one worker directory and a short socket filename; never shorten by rerouting.
+    # Reserve the longest pathname socket: runner workers and GnuPG agent sockets
+    # created under the production apt-stage-gnupg-* homedir.
     limit = {"linux": 107, "darwin": 103}.get(platform)
-    if limit is not None and len(os.fsencode(root)) + len("/r-XXXXXXXX/socket.sock") > limit:
+    suffixes = (
+        "/r-XXXXXXXX/socket.sock",
+        *(f"/r-XXXXXXXX/apt-stage-gnupg-XXXXXXXX/S.gpg-agent{variant}"
+          for variant in ("", ".extra", ".ssh", ".browser")),
+    )
+    suffix_bytes = max(len(os.fsencode(suffix)) for suffix in suffixes)
+    if limit is not None and len(os.fsencode(root)) + suffix_bytes > limit:
         raise ValueError("TMPDIR is too long for AF_UNIX worker sockets")
 
 

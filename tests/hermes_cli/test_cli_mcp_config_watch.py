@@ -249,7 +249,9 @@ def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path, writer):
     with patch("hermes_cli.config.get_config_path", return_value=cfg_file):
         from hermes_cli.config import load_config_readonly
         assert load_config_readonly()["mcp_servers"] == {"bb": {"command": "b"}}
-    stat_before = file_signature(cfg_file.stat())
+    before = cfg_file.stat()
+    physical_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    stat_before = file_signature(before)
     other = tmp_path / "other.yaml"
     other.write_text("mcp_servers:\n  aa: {command: a}\n")
     if writer == 'atomic':
@@ -258,19 +260,17 @@ def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path, writer):
         assert file_signature(cfg_file.stat())[:2] == stat_before[:2]
         assert file_signature(cfg_file.stat())[2] != stat_before[2]
     else:
-        # Real in-place cp -p update; locate a same-clock-tick write without mocking stat.
-        for _ in range(32):
-            cfg_file.write_text("mcp_servers:\n  bb: {command: b}\n")
-            before = cfg_file.stat()
-            stat_before = file_signature(before)
-            obj._config_sig = _config_file_signature(cfg_file)
-            shutil.copy2(other, cfg_file)
-            os.utime(cfg_file, ns=(before.st_atime_ns, before.st_mtime_ns))
-            if file_signature(cfg_file.stat()) == stat_before:
-                break
-        assert file_signature(cfg_file.stat()) == stat_before, 'no unchanged-stat witness'
-        assert cfg_file.read_text() != "mcp_servers:\n  bb: {command: b}\n"
+        # Real in-place rewrite: preserve inode, size and mtime; ctime stays OS-managed.
+        obj._config_sig = _config_file_signature(cfg_file)
+        shutil.copy2(other, cfg_file)
+        os.utime(cfg_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = cfg_file.stat()
+        physical_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        assert physical_after == physical_before
+        assert cfg_file.read_bytes() == other.read_bytes()
 
+    after = cfg_file.stat()
+    physical_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
     from threading import Event
 
     reloaded = Event()

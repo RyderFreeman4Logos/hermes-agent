@@ -7,9 +7,11 @@ branch of ``_execute_write`` probed outside it and could observe the mid-teardow
 unlinked, identity not yet cleared), setting the sticky ``_db_wal_generation_lost`` flag on a
 healthy handle. ``normal`` is the control.
 """
+import errno
+import fcntl
+import os
 import sqlite3
 import threading
-from contextlib import contextmanager
 import pytest
 from hermes_state import SessionDB
 
@@ -23,7 +25,8 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
     conn = db._conn
     assert db._db_sidecar_identity and path.with_name(path.name + "-wal").exists()
     lock, close, guard = db._lock, db._close_connection_quietly, db._raise_if_db_replaced
-    advisory_lock = db._advisory_write_lock
+    flock = fcntl.flock
+    sidecar = path.with_name(path.name + ".write.lock").stat()
     closed, progress, second = threading.Event(), threading.Event(), threading.Event()
     calls = 0
     errors = []
@@ -51,14 +54,18 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
         def __exit__(self, *args):
             self.release()
 
-    @contextmanager
-    def observed_advisory_lock(*args, **kwargs):
-        # close() holds the sidecar flock through teardown. Normal writes reach
-        # that admission lock before the Python mutex; observe, never bypass it.
-        if is_writer():
-            progress.set()
-        with advisory_lock(*args, **kwargs):
-            yield
+    def observed_flock(fd, operation):
+        try:
+            return flock(fd, operation)
+        except OSError as exc:
+            # Wake close only after the real nonblocking attempt proves contention
+            # on this DB's sidecar, not on entry or successful acquisition.
+            if (is_writer() and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+                    and exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}):
+                identity = os.fstat(fd)
+                if (identity.st_dev, identity.st_ino) == (sidecar.st_dev, sidecar.st_ino):
+                    progress.set()
+            raise
 
     def observed_guard():
         nonlocal calls
@@ -78,7 +85,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
             assert progress.wait(10), "writer reached neither guard nor lock"
 
     monkeypatch.setattr(db, "_lock", ObservedLock())
-    monkeypatch.setattr(db, "_advisory_write_lock", observed_advisory_lock)
+    monkeypatch.setattr(fcntl, "flock", observed_flock)
     monkeypatch.setattr(db, "_close_connection_quietly", paused_close)
     monkeypatch.setattr(db, "_raise_if_db_replaced", observed_guard)
 

@@ -188,7 +188,7 @@ def test_reconnect_cannot_cross_orphan_interrupt_claim(monkeypatch, path, claim)
                           defer_history=False, target="stored", profile=None,
                           profile_home=None, profile_resume_cwd=None, found={},
                           messages=lambda history: [], mint=lambda: ("unused", "tui", "."),
-                          restore=lambda: ([], [], []), display_prefix=lambda: [],
+                          restore=lambda: ([], [], []), display_prefix=lambda _display, _raw: [],
                           inline_images=True)
     if path == "eager":
         monkeypatch.setattr(server, "_profile_build_scope", lambda *a: nullcontext())

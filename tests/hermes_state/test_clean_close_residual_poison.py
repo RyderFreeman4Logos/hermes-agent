@@ -9,6 +9,7 @@ healthy handle. ``normal`` is the control.
 """
 import sqlite3
 import threading
+from contextlib import contextmanager
 import pytest
 from hermes_state import SessionDB
 
@@ -22,6 +23,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
     conn = db._conn
     assert db._db_sidecar_identity and path.with_name(path.name + "-wal").exists()
     lock, close, guard = db._lock, db._close_connection_quietly, db._raise_if_db_replaced
+    advisory_lock = db._advisory_write_lock
     closed, progress, second = threading.Event(), threading.Event(), threading.Event()
     calls = 0
     errors = []
@@ -49,6 +51,15 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
         def __exit__(self, *args):
             self.release()
 
+    @contextmanager
+    def observed_advisory_lock(*args, **kwargs):
+        # close() holds the sidecar flock through teardown. Normal writes reach
+        # that admission lock before the Python mutex; observe, never bypass it.
+        if is_writer():
+            progress.set()
+        with advisory_lock(*args, **kwargs):
+            yield
+
     def observed_guard():
         nonlocal calls
         if is_writer():
@@ -67,6 +78,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
             assert progress.wait(10), "writer reached neither guard nor lock"
 
     monkeypatch.setattr(db, "_lock", ObservedLock())
+    monkeypatch.setattr(db, "_advisory_write_lock", observed_advisory_lock)
     monkeypatch.setattr(db, "_close_connection_quietly", paused_close)
     monkeypatch.setattr(db, "_raise_if_db_replaced", observed_guard)
 

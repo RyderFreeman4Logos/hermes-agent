@@ -5,7 +5,6 @@ diagnostics without changing provider results. No durable replay is promised.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import hmac
 import json
@@ -96,6 +95,8 @@ def _private_dir(path: Path) -> None:
 
 @contextmanager
 def _locked(directory: Path):
+    import fcntl
+
     # ponytail: one shared deadline for normal contention; stalled holders lose
     # diagnostics, never provider results. No queue or background replay.
     deadline = time.monotonic() + _LOCK_TIMEOUT

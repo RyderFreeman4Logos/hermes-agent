@@ -372,22 +372,12 @@ class SessionFtsSetupMixin:
             patience_s = self._WRITE_PATIENCE_S
         if deadline is None:
             deadline = time.monotonic() + patience_s
-        from hermes_state import _advisory_write_owners
-
-        lock_path = Path(str(self.db_path) + ".write.lock")
-        try:
-            identity = lock_path.stat()
-        except OSError:
-            immediate = False
-        else:
-            owner_key = (os.getpid(), identity.st_dev, identity.st_ino)
-            immediate = owner_key in getattr(_advisory_write_owners, "held", ())
         while True:
             # Re-checked every attempt: a sibling may quarantine the file while we wait for the
             # lock, and nothing may be committed on a quarantined handle.
             self._raise_if_db_corrupt(storage=True)
             try:
-                with self._write_transaction(deadline=deadline, immediate=immediate) as conn:
+                with self._write_transaction(deadline=deadline, fts_recovery=True) as conn:
                     conn.execute(
                         "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -406,14 +396,10 @@ class SessionFtsSetupMixin:
                             (FTS_CJK_STALE_KEY,),
                         )
                     self._drop_all_fts_triggers(conn.cursor())
-                    # Recovery is optional new work. Honor the caller's deadline unless this
-                    # thread already owned the writer lock before the recovery began.
-                    self._remaining_write_budget(deadline, immediate=immediate)
                 break
             except sqlite3.Error as detach_exc:
                 if (
-                    not immediate
-                    and isinstance(detach_exc, sqlite3.OperationalError) and is_sqlite_lock_error(detach_exc)
+                    isinstance(detach_exc, sqlite3.OperationalError) and is_sqlite_lock_error(detach_exc)
                     and self._sleep_before_write_retry(deadline, patience_s)
                 ):
                     continue

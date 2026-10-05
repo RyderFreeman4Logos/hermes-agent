@@ -456,9 +456,10 @@ def _session_db_advisory_write_lock(
     The OFD guard in hermes_state_lockguard keeps a live WAL generation; it is
     not a writer mutex. This sidecar is. Nested scopes in the owning thread
     borrow outer custody by actual sidecar inode; forked children are not owners.
+    Yield whether this admission borrowed already-held FD custody.
     """
     if sys.platform == "win32":
-        yield
+        yield False
         return
     lock_path = Path(str(db_path) + ".write.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -469,7 +470,7 @@ def _session_db_advisory_write_lock(
         if held is None:
             held = _advisory_write_owners.held = set()
         if owner_key in held:
-            yield
+            yield True
             return
         acquired = False
         try:
@@ -488,7 +489,7 @@ def _session_db_advisory_write_lock(
                         ) from exc
                     time.sleep(min(0.02, remaining_s))
             held.add(owner_key)
-            yield
+            yield False
         finally:
             if acquired:
                 held.discard(owner_key)
@@ -605,14 +606,14 @@ class SessionDB(
 
     @contextmanager
     def _advisory_write_lock(self, deadline: Optional[float] = None):
-        """Use the shared sidecar lock for SessionDB write/maintenance admission."""
+        """Use the shared sidecar lock, yielding whether admission borrowed custody."""
         patience_s = self._WRITE_PATIENCE_S
         with _session_db_advisory_write_lock(
             self.db_path,
             deadline=deadline if deadline is not None else time.monotonic() + patience_s,
             patience_s=patience_s,
-        ):
-            yield
+        ) as borrowed:
+            yield borrowed
 
     @staticmethod
     def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> None:
@@ -1074,15 +1075,21 @@ class SessionDB(
         return remaining
 
     @contextmanager
-    def _write_transaction(self, *, deadline: float, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    def _write_transaction(
+        self, *, deadline: float, immediate: bool = False, fts_recovery: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
         """Bound contention/admission for canonical and FTS-recovery transactions.
 
         Not a whole-operation deadline: admitted healthy callbacks may finish late.
         SQLite waits are capped; filesystem work, scheduling and callbacks cannot be
         preempted. Restore the actual connection setting before releasing custody.
+        Optional FTS recovery must finish in budget unless admitted under borrowed custody.
         """
-        self._remaining_write_budget(deadline, immediate=immediate)
-        with self._advisory_write_lock(deadline=deadline):
+        # Recovery's exemption follows the admitted FD, never a pathname snapshot.
+        if not fts_recovery:
+            self._remaining_write_budget(deadline, immediate=immediate)
+        with self._advisory_write_lock(deadline=deadline) as borrowed:
+            immediate = immediate or (fts_recovery and borrowed)
             if not self._lock.acquire(timeout=self._remaining_write_budget(deadline, immediate=immediate)):
                 raise sqlite3.OperationalError("database is locked (writer mutex deadline expired)")
             try:
@@ -1101,6 +1108,8 @@ class SessionDB(
                         conn.execute("BEGIN IMMEDIATE")
                         self._remaining_write_budget(deadline, immediate=immediate)
                         yield conn
+                        if fts_recovery:
+                            self._remaining_write_budget(deadline, immediate=immediate)
                         # No new waiting budget at COMMIT, but a healthy late commit is allowed.
                         remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
                         conn.execute(f"PRAGMA busy_timeout={min(previous_ms, remaining_ms)}")

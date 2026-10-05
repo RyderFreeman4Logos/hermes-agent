@@ -101,3 +101,67 @@ def test_corrupt_fts_detach_can_nest_under_existing_writer(tmp_path, table):
         ).fetchone()
         db.append_message("corrupt", role="user", content="canonical write survives")
         assert len(db.get_messages("corrupt")) == 2
+
+
+@pytest.mark.platforms("linux")
+def test_expired_recovery_refuses_replaced_sidecar_inode(tmp_path):
+    from hermes_state import _advisory_write_owners
+
+    path = tmp_path / "state.db"
+    with SessionDB(path) as db:
+        db.create_session("corrupt", source="cli")
+        db.append_message("corrupt", role="user", content="original searchable text")
+        db._conn.execute(
+            "UPDATE messages_fts_data SET block=X'DEADBEEFDEADBEEFDEADBEEFDEADBEEF' WHERE id>10"
+        )
+        with pytest.raises(sqlite3.DatabaseError) as corrupt:
+            db._conn.execute(
+                "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'hermes' LIMIT 1"
+            ).fetchone()
+        assert corrupt.value.sqlite_errorcode == sqlite3.SQLITE_CORRUPT_VTAB
+        lock_path = Path(f"{path}.write.lock")
+        changed = []
+        transaction_code = SessionDB._write_transaction.__wrapped__.__code__
+        triggers_before = db._conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'messages_fts%'"
+        ).fetchone()[0]
+        assert triggers_before > 0
+
+        def replace_before_admission(frame, event, arg):
+            # Schedule the real rename between recovery entry and FD admission;
+            # never replace the ownership oracle, clock, transaction or SQLite.
+            if event == "call" and frame.f_code is transaction_code and not changed:
+                previous = lock_path.stat()
+                lock_path.rename(Path(f"{lock_path}.retired"))
+                with lock_path.open("xb"):
+                    pass
+                current = lock_path.stat()
+                old_key = (os.getpid(), previous.st_dev, previous.st_ino)
+                new_key = (os.getpid(), current.st_dev, current.st_ino)
+                assert old_key in _advisory_write_owners.held
+                assert new_key not in _advisory_write_owners.held
+                assert old_key != new_key
+                changed.append((old_key, new_key))
+            return replace_before_admission
+
+        with db._advisory_write_lock(deadline=time.monotonic()):
+            deadline = time.monotonic()
+            previous_trace = sys.gettrace()
+            sys.settrace(replace_before_admission)
+            try:
+                result = db._enter_fts_fail_open(corrupt.value, deadline=deadline)
+            finally:
+                sys.settrace(previous_trace)
+            assert changed, "replacement schedule did not run"
+            assert time.monotonic() > deadline
+            assert result is False, "expired recovery admitted a not-preowned sidecar inode"
+            old_key, new_key = changed[0]
+            assert old_key in _advisory_write_owners.held
+            assert new_key not in _advisory_write_owners.held
+            assert db.get_meta("fts_stale") is None
+            assert db._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'messages_fts%'"
+            ).fetchone()[0] == triggers_before
+            assert not db._conn.in_transaction
+            assert _rival_process(path) == 0, "refused new-inode admission stranded its flock"
+        assert old_key not in _advisory_write_owners.held

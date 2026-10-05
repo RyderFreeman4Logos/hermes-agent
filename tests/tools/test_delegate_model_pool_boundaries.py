@@ -147,7 +147,7 @@ def test_exclusive_pool_refuses_ambient_routes_before_registry_child_constructio
     tmp_path, monkeypatch, route, runtime, error,
 ):
     from tools.registry import registry
-    import yaml
+    import hermes_yaml as yaml
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("OPENROUTER_API_KEY", "ambient-key")
@@ -171,7 +171,7 @@ def test_exclusive_pool_registry_constructor_uses_only_owned_route_across_homes(
 ):
     from tools.registry import registry
     from hermes_cli.runtime_provider import resolve_runtime_provider
-    import yaml
+    import hermes_yaml as yaml
 
     parent = _parent()
     parent.acp_command = "parent-acp"
@@ -384,7 +384,7 @@ def test_direct_endpoint_keeps_canonical_custom_identity_through_lease():
 
 
 def test_public_named_shared_endpoint_keeps_explicit_owner_before_dispatch(tmp_path, monkeypatch):
-    import yaml
+    import hermes_yaml as yaml
 
     url = "http://127.0.0.1:9/v1"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

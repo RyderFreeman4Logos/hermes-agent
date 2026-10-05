@@ -19,7 +19,7 @@ from tools.delegate_tool import (
     delegate_task,
 )
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from tools.registry import registry
 

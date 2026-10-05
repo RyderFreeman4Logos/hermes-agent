@@ -23,6 +23,7 @@ def _plan(timeout: float = 0.05) -> SimpleNamespace:
         effective_task_id="pre-guard-deadline-test",
         cwd="/tmp",
         effective_timeout=timeout,
+        auto_promoted=False,
         promoted_from_foreground_timeout=None,
     )
 

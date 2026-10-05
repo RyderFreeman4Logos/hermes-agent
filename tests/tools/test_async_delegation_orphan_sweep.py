@@ -232,7 +232,7 @@ def test_tui_notification_poller_sweeps_under_its_session_profile(tmp_path, monk
     monkeypatch.setattr(ad, "maybe_sweep_orphaned_completions", fake_sweep)
     isolated = queue.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated)
-    session = {"profile_home": str(home_b), "_finalized": False}
+    session = _tui_session("sid-orphan-sweep", home_b)
     server._notification_poller_loop(stop, "sid-orphan-sweep", session)
     assert seen and seen[0][0] == str(home_b) and seen[0][1] is isolated
 

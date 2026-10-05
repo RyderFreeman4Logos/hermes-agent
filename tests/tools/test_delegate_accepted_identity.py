@@ -13,6 +13,7 @@ import pytest
 
 from hermes_cli.config import atomic_config_write
 from run_agent import AIAgent
+from tools import delegate_tool
 from tools.delegate_tool import delegate_task
 
 
@@ -47,30 +48,45 @@ def test_public_fallback_reports_actual_accepted_route(tmp_path, monkeypatch, in
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(socket.socket, "connect", _deny_network)
-    url = "https://accepted.invalid/v1"
+    primary_url = "https://primary.invalid/v1"
+    accepted_url = "https://accepted.invalid/v1"
     route = {
-        "provider": "custom", "model": "gpt-4o-mini", "base_url": url,
+        "provider": "named-primary", "model": "gpt-4o-mini", "base_url": primary_url,
         "api_key": "fixture-primary-key", "api_mode": "chat_completions",
         "request_overrides": {"extra_body": {"probe_route": "accepted"}},
-        "fallback_chain": [{"provider": "custom", "model": "gpt-4o", "base_url": url,
+        "fallback_chain": [{"provider": "named-fallback", "model": "gpt-4o", "base_url": accepted_url,
                             "api_key": "fixture-backup-key"}],
     }
     atomic_config_write(tmp_path / "config.yaml", {
-        "model": {"provider": "custom", "default": "gpt-4o-mini", "base_url": url, "context_length": 128000, "streaming": False},
+        "model": {"provider": "custom", "default": "gpt-4o-mini", "base_url": primary_url, "context_length": 128000, "streaming": False},
+        "providers": {
+            "named-primary": {"name": "Primary", "base_url": primary_url, "api_key": "fixture-primary-key"},
+            "named-fallback": {"name": "Fallback", "base_url": accepted_url, "api_key": "fixture-backup-key"},
+        },
         "agent": {"max_retries": 2, "auto_recovery_cycles": 0},
         "compression": {"enabled": False},
         "delegation": {"max_spawn_depth": 1, "model_pool": {"standard": route, "review": route}},
     })
     attempts = []
+    children = []
+    original_build = delegate_tool._build_child_preserving_parent_tools
+
+    def capture_child(**kwargs):
+        child = original_build(**kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(delegate_tool, "_build_child_preserving_parent_tools", capture_child)
 
     def send(_client, request, **_kwargs):
-        assert request.url.host == "accepted.invalid"
+        assert request.url.host in {"primary.invalid", "accepted.invalid"}
         if request.url.path.endswith("/models"):
+            model = "gpt-4o-mini" if request.url.host == "primary.invalid" else "gpt-4o"
             return httpx.Response(200, request=request, json={"object": "list", "data": [
-                {"id": model, "object": "model"} for model in ("gpt-4o-mini", "gpt-4o")
+                {"id": model, "object": "model"}
             ]})
         payload = json.loads(request.content)
-        attempts.append((payload["model"], request.headers["authorization"]))
+        attempts.append((request.url.host, payload["model"], request.headers["authorization"]))
         if len(attempts) == 1:
             return httpx.Response(
                 429, request=request, headers={"x-should-retry": "false"},
@@ -91,11 +107,15 @@ def test_public_fallback_reports_actual_accepted_route(tmp_path, monkeypatch, in
         parent.close()
     entry = result["results"][0]
     assert attempts == [
-        ("gpt-4o-mini", "Bearer fixture-primary-key"),
-        ("gpt-4o", "Bearer fixture-backup-key"),
+        ("primary.invalid", "gpt-4o-mini", "Bearer fixture-primary-key"),
+        ("accepted.invalid", "gpt-4o", "Bearer fixture-backup-key"),
     ]
     assert entry["status"] == "completed"
-    assert (entry["model"], entry["provider"]) == ("gpt-4o", "custom")
+    assert (entry["model"], entry["provider"]) == ("gpt-4o", "named-fallback")
+    accepted_route = children[0]._delegate_accepted_llm_route
+    assert accepted_route[:3] == ("gpt-4o", "named-fallback", "named-fallback")
+    assert accepted_route[3] is not None and accepted_route[3].rstrip("/") == accepted_url
+    assert accepted_url not in json.dumps(entry)
 
 
 def test_named_alias_keeps_runtime_provider_canonical(tmp_path, monkeypatch):
@@ -165,7 +185,7 @@ def test_codex_fabricated_error_does_not_report_selected_as_accepted(monkeypatch
         api_mode="codex_app_server", model="gpt-selected", provider="openai-codex",
         requested_provider="openai-codex", tool_progress_callback=None,
         _delegate_role="leaf", _delegate_depth=1, _subagent_id=None,
-        _delegate_selected_llm_route=("gpt-selected", "openai-codex"),
+        _delegate_selected_llm_route=("gpt-selected", "openai-codex", "openai-codex", None),
         session_prompt_tokens=0, session_completion_tokens=0, session_estimated_cost_usd=0.0,
         session_reasoning_tokens=0, _credential_pool=None,
     )
@@ -177,6 +197,65 @@ def test_codex_fabricated_error_does_not_report_selected_as_accepted(monkeypatch
     entry = _run_single_child(0, "goal", child, SimpleNamespace(_current_task_id=None, _delegate_depth=0, _touch_activity=lambda *_a: None))
     assert entry["status"] == "error"
     assert (entry["model"], entry["provider"]) == (None, None)
+
+
+@pytest.mark.parametrize("ingress", ["goal", "task", "top"])
+def test_public_outer_exception_preserves_selected_route_authority(tmp_path, monkeypatch, ingress):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(socket.socket, "connect", _deny_network)
+    selected_url = "https://selected.invalid/v1"
+    route = {
+        "provider": "named-selected", "model": "gpt-selected", "base_url": selected_url,
+        "api_key": "fixture-selected-key", "api_mode": "chat_completions",
+    }
+    atomic_config_write(tmp_path / "config.yaml", {
+        "model": {"provider": "custom", "default": "gpt-parent", "base_url": "https://parent.invalid/v1",
+                  "context_length": 128000, "streaming": False},
+        "providers": {"named-selected": {"name": "Selected", "base_url": selected_url,
+                                           "api_key": "fixture-selected-key", "models": {"gpt-selected": {}}}},
+        "agent": {"max_retries": 0, "auto_recovery_cycles": 0},
+        "compression": {"enabled": False},
+        "delegation": {"max_spawn_depth": 1, "model_pool": {"standard": route, "fast": route}},
+    })
+    parent = _parent(tmp_path)
+    children = []
+    original_agent = AIAgent
+
+    def capture_child(**kwargs):
+        child = original_agent(**kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr("run_agent.AIAgent", capture_child)
+
+    def fail_during_workspace_seed(self):
+        child = self.child
+        child.model, child.provider = "fallback-model", "fallback-provider"
+        child.requested_provider, child.base_url = "fallback-owner", "https://fallback.invalid/v1"
+        raise RuntimeError("workspace seed failed")
+
+    monkeypatch.setattr("tools.delegate_tool_child_run._ChildRun.seed_workspace", fail_during_workspace_seed)
+    kwargs = {"goal": "exercise selected route on outer failure", "parent_agent": parent}
+    if ingress == "task":
+        kwargs["tasks"] = [{"goal": kwargs.pop("goal"), "model_profile": "fast"}]
+    elif ingress == "top":
+        kwargs["model_profile"] = "fast"
+    try:
+        result = json.loads(delegate_task(**kwargs))
+    finally:
+        parent.close()
+    entry = result["results"][0]
+    assert entry["status"] == "error"
+    assert children[0]._delegate_selected_llm_route == (
+        "gpt-selected", "custom", "named-selected", selected_url,
+    )
+    assert (entry["model"], entry["provider"], entry["requested_provider"]) == (
+        "gpt-selected", "custom", "named-selected",
+    )
+    assert "fallback-model" not in json.dumps(entry)
+    assert "fallback-owner" not in json.dumps(entry)
+    assert selected_url not in json.dumps(entry)
 
 
 _SCHEMA = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}

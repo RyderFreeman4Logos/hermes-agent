@@ -234,7 +234,10 @@ def check_api_response(
         # invalid shape, and an empty/truncated body are not success, so a prior
         # accepted route stays. The body model is not that identity: proxies echo
         # the requested alias.
-        agent._delegate_accepted_llm_route = (agent.model, agent.provider)
+        agent._delegate_accepted_llm_route = (
+            agent.model, agent.provider,
+            getattr(agent, "requested_provider", None), getattr(agent, "base_url", None),
+        )
 
     if finish_reason == "length":
         _tv = recover_from_truncation(

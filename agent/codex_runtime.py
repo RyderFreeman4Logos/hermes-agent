@@ -715,9 +715,12 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         agent._reset_stream_delivery_tracking()
         turn = agent._codex_session.run_turn(user_input=user_message)
         if turn.error is None and not turn.interrupted:
+            route_model = agent._codex_session._model or agent.model
+            route_provider = agent._codex_session._model_provider or agent.provider
             agent._delegate_accepted_llm_route = (
-                agent._codex_session._model or agent.model,
-                agent._codex_session._model_provider or agent.provider,
+                route_model, route_provider,
+                getattr(agent, "requested_provider", None) or route_provider,
+                getattr(agent, "base_url", None),
             )
     except Exception as exc:
         logger.exception("codex app-server turn failed")

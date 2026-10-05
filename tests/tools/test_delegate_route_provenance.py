@@ -1,8 +1,8 @@
 """Public route identity and xAI billing hedges for delegated children.
 
-Selected identity is the profile route frozen before the child runs.
-Accepted identity is a successful SDK route stamp, not the mutable model.
-Neither is proof of provider acceptance, and neither inherits parent creds.
+The selected route is frozen before the child runs; the accepted route is stamped
+only after a usable response. Both retain provider authority and endpoint internally,
+while parent-visible results omit the endpoint.
 """
 
 from __future__ import annotations
@@ -49,7 +49,6 @@ def _route(provider, model, api_mode=None):
         "model": model,
         "base_url": f"http://127.0.0.1:9/{provider}",
         "api_key": f"{provider}-key",
-        "xai_family": provider in {"xai", "xai-oauth"},
     }
     if api_mode:
         route["api_mode"] = api_mode
@@ -84,7 +83,9 @@ def _run(profile, result, *, mutate=None, goal="route provenance", schema=None, 
     def capture(**kwargs):
         child = MagicMock()
         child.model = kwargs.get("model")
-        child.provider = "xai-oauth" if profile.get("xai_family") else kwargs.get("provider")
+        child.provider = kwargs.get("provider")
+        child.requested_provider = kwargs.get("requested_provider")
+        child.base_url = kwargs.get("base_url")
         child.api_mode = kwargs.get("api_mode")
         child.api_key = kwargs.get("api_key")
         child.run_conversation.return_value = result
@@ -106,8 +107,19 @@ def _run(profile, result, *, mutate=None, goal="route provenance", schema=None, 
     return payload["results"][0], built
 
 
-def _stamp(child, model, provider):
-    child._delegate_accepted_llm_route = (model, provider)
+def _stamp(child, model, provider, *, requested_provider=None, base_url=None):
+    child._delegate_accepted_llm_route = (
+        model, provider, requested_provider or provider, base_url,
+    )
+
+
+def _xai_credentials(model):
+    return {
+        "model": model, "provider": "xai-oauth", "requested_provider": "xai-oauth",
+        "base_url": "https://api.x.ai/v1", "api_key": "fixture-xai-key",
+        "api_mode": "chat_completions", "request_overrides": None, "fallback_chain": [],
+        "fixed_api_key": True, "exclusive_route": True,
+    }
 
 
 def test_non_grok_child_hides_verified_xai_billing():
@@ -124,11 +136,10 @@ def test_non_grok_child_hides_verified_xai_billing():
 
 
 def test_unverified_standard_grok_child_hides_xai_billing():
-    entry, _ = _run(
-        _route("xai-oauth", "grok-4.6"),
-        _billing_result(unverified=True),
-        profile_name="standard",
-    )
+    with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=_xai_credentials("grok-4.6")):
+        entry, _ = _run(
+            _route("xai-oauth", "grok-4.6"), _billing_result(unverified=True), profile_name="standard",
+        )
     assert entry["summary"] == _HEDGE_UNVERIFIED
     assert entry["error"] == _HEDGE_UNVERIFIED
     assert "failure_reason" not in entry
@@ -136,14 +147,12 @@ def test_unverified_standard_grok_child_hides_xai_billing():
 
 
 def test_verified_grok_child_keeps_owned_billing():
-    entry, _ = _run(
-        _route("xai-oauth", "grok-4.6"),
-        _billing_result(unverified=False),
-    )
+    with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=_xai_credentials("grok-4.6")):
+        entry, _ = _run(_route("xai-oauth", "grok-4.6"), _billing_result(unverified=False))
     assert entry["failure_reason"] == "billing"
     assert entry["summary"] == _SPEND
     assert entry["error"] == _SPEND
-    assert entry["provider"] == "custom"
+    assert entry["provider"] == "xai-oauth"
 
 
 def test_invalid_schema_error_names_the_contract():
@@ -191,17 +200,13 @@ def test_schema_retry_clears_rejected_turn_provenance():
             calls["n"] += 1
             if calls["n"] == 1:
                 return first
-            _stamp(child, "claude-sonnet", "openrouter")
+            _stamp(child, "claude-sonnet", "openrouter", requested_provider="openrouter", base_url="https://openrouter.ai/api/v1")
             return retry
 
         child.run_conversation.side_effect = turn
 
-    entry, _ = _run(
-        _route("xai-oauth", "grok-4.6"),
-        first,
-        mutate=mutate,
-        schema=_SCHEMA,
-    )
+    with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=_xai_credentials("grok-4.6")):
+        entry, _ = _run(_route("xai-oauth", "grok-4.6"), first, mutate=mutate, schema=_SCHEMA)
     assert entry["status"] == "completed"
     assert entry["schema_valid"] is True
     assert entry["summary"] == '{"city": "Oslo"}'
@@ -213,23 +218,50 @@ def test_schema_retry_clears_rejected_turn_provenance():
 
 
 def test_outer_exception_reports_frozen_selected_not_fallback():
-    def mutate(child):
-        child.model, child.provider = "fallback-model", "fallback-provider"
-        child.run_conversation.side_effect = RuntimeError("worker exploded")
+    profile = _route("selected", "selected-model")
+    selected_url = profile["base_url"]
+    creds = {
+        "model": "selected-model",
+        "provider": "custom",
+        "requested_provider": "custom",
+        "base_url": selected_url,
+        "api_key": "fixture-selected-key",
+        "api_mode": "chat_completions",
+        "request_overrides": None,
+        "fallback_chain": [],
+        "fixed_api_key": True,
+        "exclusive_route": True,
+    }
+    observed = {}
 
-    entry, _ = _run(
-        _route("selected", "selected-model"),
-        {},
-        mutate=mutate,
-    )
+    def mutate(child):
+        def fail_after_fallback(*_args, **_kwargs):
+            observed["selected_route"] = child._delegate_selected_llm_route
+            child.model, child.provider = "fallback-model", "fallback-provider"
+            child.requested_provider = "fallback-owner"
+            child.base_url = "https://fallback.invalid/v1"
+            raise RuntimeError("worker exploded")
+
+        child.run_conversation.side_effect = fail_after_fallback
+
+    with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=creds):
+        entry, _ = _run(profile, {}, mutate=mutate)
+
     assert entry["status"] == "error"
+    assert observed["selected_route"] == (
+        "selected-model", "custom", "custom", selected_url,
+    )
     assert (entry["model"], entry["provider"]) == ("selected-model", "custom")
+    assert "requested_provider" not in entry
     assert "fallback-model" not in json.dumps(entry)
+    assert "fallback-owner" not in json.dumps(entry)
+    assert selected_url not in json.dumps(entry)
+    assert "base_url" not in entry
 
 
 def test_accepted_route_beats_selected_on_failure():
     def mutate(child):
-        _stamp(child, "accepted-model", "accepted-provider")
+        _stamp(child, "accepted-model", "accepted-provider", base_url="https://accepted.invalid/v1")
         child.model, child.provider = "fallback-model", "fallback-provider"
 
     entry, _ = _run(
@@ -255,6 +287,7 @@ def test_selected_route_is_frozen_before_the_child_runs():
     creds = {
         "model": "selected-model",
         "provider": "custom",
+        "requested_provider": "custom",
         "base_url": profile["base_url"],
         "api_key": profile["api_key"],
         "api_mode": None,
@@ -275,9 +308,13 @@ def test_selected_route_is_frozen_before_the_child_runs():
         )
     assert error is None
     child = children[0][2]
-    assert child._delegate_selected_llm_route == ("selected-model", "custom")
+    assert child._delegate_selected_llm_route == (
+        "selected-model", "custom", "custom", profile["base_url"],
+    )
     child.model, child.provider = "fallback-model", "fallback-provider"
-    assert child._delegate_selected_llm_route == ("selected-model", "custom")
+    assert child._delegate_selected_llm_route == (
+        "selected-model", "custom", "custom", profile["base_url"],
+    )
 
 
 def test_nonsuccess_codex_app_server_reports_accepted_only():
@@ -304,7 +341,7 @@ def test_nonsuccess_codex_app_server_reports_accepted_only():
 def test_codex_app_server_keeps_prior_accepted_route_on_later_failure():
     def mutate(child):
         child.api_mode = "codex_app_server"
-        _stamp(child, "accepted-codex", "openai-codex")
+        _stamp(child, "accepted-codex", "openai-codex", requested_provider="openai-codex", base_url=None)
         child.model, child.provider = "mutable-model", "mutable-provider"
 
     entry, _ = _run(
@@ -358,3 +395,19 @@ def test_unverified_billing_on_selected_non_xai_is_not_owned():
     assert "failure_reason" not in entry
     assert _SPEND not in json.dumps(entry)
     assert (entry["model"], entry["provider"]) == ("deepseek-v4-flash", "custom")
+
+
+def test_grok_model_on_foreign_endpoint_does_not_own_xai_billing():
+    profile = _route("proxy", "grok-4.6")
+    proxy_creds = {
+        "model": "grok-4.6", "provider": "custom", "requested_provider": "named-proxy",
+        "base_url": "https://proxy.invalid/v1", "api_key": "fixture-proxy-key",
+        "api_mode": "chat_completions", "request_overrides": None, "fallback_chain": [],
+        "fixed_api_key": True, "exclusive_route": True,
+    }
+    with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=proxy_creds):
+        entry, _ = _run(profile, _billing_result(unverified=False))
+    assert entry["summary"] == _HEDGE_FOREIGN
+    assert entry["error"] == _HEDGE_FOREIGN
+    assert "failure_reason" not in entry
+    assert _SPEND not in json.dumps(entry)

@@ -622,6 +622,9 @@ def _build_children(
         child._delegate_selected_llm_route = (
             creds.get("model") or child.model,
             creds.get("provider") or child.provider,
+            creds.get("requested_provider") or getattr(child, "requested_provider", None)
+            or creds.get("provider") or getattr(child, "provider", None),
+            creds.get("base_url") or getattr(child, "base_url", None),
         )
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):

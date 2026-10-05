@@ -11,6 +11,7 @@ import threading
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 from agent.compression_marker import elide
 from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
@@ -33,48 +34,81 @@ def _str_or_none(value: Any) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
-def _accepted_route_identity(child: Any, result: Any = None) -> tuple[Optional[str], Optional[str]]:
-    """Return the route of the last response the runtime actually accepted.
+def _route_identity(
+    child: Any, attribute: str,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Read the frozen ``(model, provider, authority, endpoint)`` route stamp."""
+    route = getattr(child, attribute, None)
+    if not (isinstance(route, tuple) and len(route) == 4):
+        return None, None, None, None
+    model, provider, requested_provider, base_url = route
+    return (
+        _str_or_none(model), _str_or_none(provider),
+        _str_or_none(requested_provider), _str_or_none(base_url),
+    )
+
+
+def _accepted_route_identity(
+    child: Any, result: Any = None,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return the full route of the last response the runtime actually accepted.
 
     Activation and the mutable model are not acceptance. ``result`` is unused:
     conversation payloads do not carry route identity.
     """
     del result
-    route = getattr(child, "_delegate_accepted_llm_route", None)
-    if not (isinstance(route, tuple) and len(route) == 2):
-        return None, None
-    model, provider = map(_str_or_none, route)
-    return (model, provider) if model is not None or provider is not None else (None, None)
+    return _route_identity(child, "_delegate_accepted_llm_route")
 
 
-def _selected_route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
-    """Return the profile route frozen before the child started."""
-    route = getattr(child, "_delegate_selected_llm_route", None)
-    if not (isinstance(route, tuple) and len(route) == 2):
-        return None, None
-    return _str_or_none(route[0]), _str_or_none(route[1])
+def _selected_route_identity(
+    child: Any,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return the full profile route frozen before the child started."""
+    return _route_identity(child, "_delegate_selected_llm_route")
 
 
-def _result_route_identity(child: Any, result: Any = None) -> tuple[Optional[str], Optional[str]]:
-    """Prefer the conversation's accepted route, then the route frozen before the run."""
+def _result_route_identity(
+    child: Any, result: Any = None,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Prefer the accepted route, then the selected route before the run."""
     if getattr(child, "api_mode", None) == "codex_app_server":
         return _accepted_route_identity(child, result)
     accepted = _accepted_route_identity(child, result)
     return accepted if any(value is not None for value in accepted) else _selected_route_identity(child)
 
 
-def _route_owns_xai(model: Optional[str], provider: Optional[str]) -> bool:
-    if provider in {"xai", "xai-oauth"}:
+def _public_route_fields(
+    route: tuple[Optional[str], Optional[str], Optional[str], Optional[str]],
+) -> Dict[str, Optional[str]]:
+    """Project route identity to safe parent-visible model/provider/authority fields.
+
+    The endpoint stays internal so a private URL is never copied into a tool result.
+    """
+    model, provider, requested_provider, _base_url = route
+    fields: Dict[str, Optional[str]] = {"model": model, "provider": provider}
+    if requested_provider and requested_provider != provider:
+        fields["requested_provider"] = requested_provider
+    return fields
+
+
+def _route_owns_xai(
+    provider: Optional[str], requested_provider: Optional[str], base_url: Optional[str],
+) -> bool:
+    """Classify billing from route authority/endpoint, never a model-name guess."""
+    xai_providers = {"xai", "xai-oauth", "grok-oauth"}
+    if any(identity and identity.strip().lower() in xai_providers for identity in (provider, requested_provider)):
         return True
-    return bool(model) and "grok" in model.lower()
+    try:
+        return urlsplit(base_url or "").hostname == "api.x.ai"
+    except ValueError:
+        return False
 
 
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
-    model, provider = _result_route_identity(child)
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
-        "duration_seconds": duration, "model": model, "provider": provider,
+        "duration_seconds": duration, **_public_route_fields(_result_route_identity(child)),
         "_child_role": getattr(child, "_delegate_role", None),
     }
 
@@ -606,16 +640,24 @@ def _build_result_entry(
     wins over the summary-presence heuristic (a fallback for legacy/mock results only)."""
     summary = result.get("final_response") or ""
     billing = result.get("billing_block")
-    accepted_model, accepted_provider = _accepted_route_identity(child, result)
-    selected_model, selected_provider = _selected_route_identity(child)
-    if accepted_model is not None or accepted_provider is not None:
-        route_model, route_provider = accepted_model, accepted_provider
-    elif selected_model is not None or selected_provider is not None:
-        route_model, route_provider = selected_model, selected_provider
+    accepted_route = _accepted_route_identity(child, result)
+    selected_route = _selected_route_identity(child)
+    app_server = getattr(child, "api_mode", None) == "codex_app_server"
+    if app_server:
+        result_route = accepted_route
+    elif any(value is not None for value in accepted_route):
+        result_route = accepted_route
+    elif any(value is not None for value in selected_route):
+        result_route = selected_route
     else:
-        route_model = _str_or_none(getattr(child, "model", None))
-        route_provider = _str_or_none(getattr(child, "provider", None))
-    owns_xai = _route_owns_xai(selected_model, selected_provider)
+        result_route = (
+            _str_or_none(getattr(child, "model", None)),
+            _str_or_none(getattr(child, "provider", None)),
+            _str_or_none(getattr(child, "requested_provider", None)),
+            _str_or_none(getattr(child, "base_url", None)),
+        )
+    selected_model, selected_provider, selected_requested_provider, selected_base_url = selected_route
+    owns_xai = _route_owns_xai(selected_provider, selected_requested_provider, selected_base_url)
     xai_leak = (
         isinstance(billing, dict)
         and billing.get("provider") in {"xai", "xai-oauth"}
@@ -665,26 +707,16 @@ def _build_result_entry(
 
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
-    app_server = getattr(child, "api_mode", None) == "codex_app_server"
-    if xai_leak and result.get("billing_unverified", False) and accepted_model is None and accepted_provider is None and selected_model is None and selected_provider is None:
-        model, provider = None, None
-    elif app_server:
-        model, provider = accepted_model, accepted_provider
-    elif accepted_model is not None or accepted_provider is not None:
-        model, provider = accepted_model, accepted_provider
-    elif selected_model is not None or selected_provider is not None:
-        model, provider = selected_model, selected_provider
-    else:
-        model, provider = route_model, route_provider
+    if xai_leak and result.get("billing_unverified", False) and not any(accepted_route) and not any(selected_route):
+        result_route = (None, None, None, None)
+    route_fields = _public_route_fields(result_route)
     entry: Dict[str, Any] = {
         "task_index": task_index,
         "status": status,
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
-        "model": model,
-        "provider": provider,
-        **({"requested_provider": requested} if (requested := _str_or_none(getattr(child, "requested_provider", None))) and requested != provider else {}),
+        **route_fields,
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -1016,11 +1048,11 @@ class _ChildRun:
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
         status = "timeout" if is_timeout else "error"
-        model, provider = _result_route_identity(child)
+        route_fields = _public_route_fields(_result_route_identity(child))
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
-            "model": model, "provider": provider,
+            **route_fields,
             "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,

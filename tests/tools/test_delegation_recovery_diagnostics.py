@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sqlite3
 
 import pytest
 
@@ -13,13 +14,15 @@ def test_unfinished_delegation_recovery_keeps_transcript_locator(tmp_path, split
     repo = str(Path(__file__).resolve().parents[2])
     handle_path = tmp_path / "dispatch.json"
     # The source may be a read-only export without .git; owner diagnostics need a real checkout.
-    owner_cwd = tmp_path / "owner"
+    owner_cwd = tmp_path / "private-owner-cwd-sentinel"
     owner_cwd.mkdir()
     subprocess.run(["git", "init", "-q", str(owner_cwd)], check=True)
     subprocess.run(["git", "-C", str(owner_cwd), "-c", "user.name=Diagnostic Fixture",
                     "-c", "user.email=fixture@example.invalid", "commit", "-q", "--allow-empty",
-                    "-m", "diagnostic baseline"], check=True)
+                    "-m", "private-commit-message-sentinel"], check=True)
     (owner_cwd / "private-owner-file").write_text("private contents", encoding="utf-8")
+    subprocess.run(["git", "-C", str(owner_cwd), "branch", "-m",
+                    "private-branch-sentinel"], check=True)
     env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo,
            "REPRO_HANDLE": str(handle_path), "REPRO_SPLIT": str(int(split)),
            "REPRO_MISSING": str(int(missing_writer))}
@@ -58,7 +61,10 @@ if os.environ['REPRO_MISSING'] == '1':
         writers[0] = None
         return ident, writers, paths[1:]
     live.create_live_transcripts = missing
-kwargs = {'tasks': [{'goal': 'first diagnostic task'}, {'goal': 'second diagnostic task'}]} if os.environ['REPRO_SPLIT'] == '1' else {'goal': 'unfinished diagnostic task'}
+private_goal = 'private-task-prompt-sentinel'
+private_context = 'private-task-context-sentinel Authorization: Bearer fixture-credential-sentinel'
+kwargs = {'tasks': [{'goal': private_goal, 'context': private_context}, {'goal': private_goal, 'context': private_context}]} if os.environ['REPRO_SPLIT'] == '1' else {'goal': private_goal, 'context': private_context}
+kwargs["context"] = private_context
 handle = json.loads(dt.delegate_task(**kwargs, background=True, parent_agent=parent))
 assert handle["status"] == "dispatched", handle
 assert started.wait(10), "child did not start"
@@ -71,6 +77,16 @@ os._exit(0)
     handle = json.loads(handle_path.read_text(encoding="utf-8"))
     transcripts = handle["live_transcripts"]
     assert all(Path(path).is_file() for path in transcripts)
+    # Canonical evidence remains authorized; recovery must only duplicate locators/metadata.
+    private_evidence = 'private-file-content-sentinel request_body=private-request-body-sentinel'
+    for path in transcripts:
+        with Path(path).open("a", encoding="utf-8") as stream:
+            stream.write(private_evidence + " Authorization: Bearer fixture-credential-sentinel\n")
+    transcript_bytes = {path: Path(path).read_bytes() for path in transcripts}
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        canonical_before = dict(conn.execute("SELECT delegation_id, task_json FROM async_delegations"))
+    owner_sha = subprocess.check_output(["git", "-C", str(owner_cwd), "rev-parse", "--short", "HEAD"],
+                                        text=True).strip()
     consumer = r'''
 import json, queue
 from tools import async_delegation as ad
@@ -78,7 +94,10 @@ from tools.process_registry import format_process_notification
 q = queue.Queue()
 count = ad.restore_undelivered_completions(q)
 events = [q.get_nowait() for _ in range(count)]
-print(json.dumps([{"event": event, "message": format_process_notification(event)} for event in events]))
+with ad._connect() as conn:
+    durable = {row[0]: {"event_json": row[1], "result_json": row[2], "task_json": row[3]}
+               for row in conn.execute("SELECT delegation_id, event_json, result_json, task_json FROM async_delegations")}
+print(json.dumps([{"event": event, "message": format_process_notification(event), "durable": durable[event["delegation_id"]]} for event in events]))
 '''
     second = subprocess.run([sys.executable, "-c", consumer], cwd=repo, env=env,
                             text=True, capture_output=True, timeout=20)
@@ -101,16 +120,35 @@ print(json.dumps([{"event": event, "message": format_process_notification(event)
             by_index[index] = path
         for path in transcripts:
             assert (path in item['message']) == (path in paths.values())
-        # #116000: the event itself carries what the parent needs to continue — the verbatim
-        # transcript tail per task and the owner's git state — on both renderers (single/batch).
-        tails = event.get("transcript_tails") or {}
-        assert set(tails) == set(paths)
-        for index, tail in tails.items():
-            assert "kickoff" in tail and tail in item["message"]
+        private_markers = (str(owner_cwd), "private-task-prompt-sentinel",
+                           "private-task-context-sentinel", "fixture-credential-sentinel",
+                           "private-file-content-sentinel", "private-request-body-sentinel",
+                           "private-branch-sentinel", "private-commit-message-sentinel",
+                           "private-owner-file", "private contents")
+        def contains_private(payload):
+            return any(marker in json.dumps(payload) for marker in private_markers)
+        assert item["durable"]["task_json"] == canonical_before[event["delegation_id"]]
+        assert event["parent_session_id"] == "diagnostic-parent"
+        assert event["session_key"] == "diagnostic-parent"
+        canonical = json.loads(item["durable"]["task_json"])
+        assert len(event.get("goals") or []) == len(canonical.get("goals") or [])
+        if canonical.get("is_batch"):
+            assert f"{len(canonical['goals'])} subagent(s)" in item["message"]
+        assert canonical["owner_cwd"] == str(owner_cwd)
+        assert contains_private(canonical), "negative control must detect canonical private input"
+        assert "private-task-prompt-sentinel" in json.dumps(canonical)
+        assert "private-task-context-sentinel" in json.dumps(canonical)
+        assert not contains_private({"status": "unknown", "task_transcripts": paths}), "safe control rejected"
+        assert not contains_private({"event": event, "message": item["message"],
+                                     "event_json": item["durable"]["event_json"],
+                                     "result_json": item["durable"]["result_json"]}), "recovery privacy boundary leaked"
+        assert not event.get("transcript_tails")
         assert "uncommitted file(s)" in event["git_state_hint"]
         assert "1 uncommitted file(s)" in event["git_state_hint"]
+        assert owner_sha in event["git_state_hint"]
         assert "private-owner-file" not in event["git_state_hint"]
         assert "private contents" not in event["git_state_hint"]
         assert event["git_state_hint"] in item["message"]
     assert set(by_index) == ({'1'} if missing_writer else {'0', '1'} if split else {'0'})
     assert set(by_index.values()) == set(transcripts)
+    assert {path: Path(path).read_bytes() for path in transcripts} == transcript_bytes

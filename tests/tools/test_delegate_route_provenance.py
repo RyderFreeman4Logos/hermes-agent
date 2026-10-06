@@ -76,7 +76,10 @@ def _billing_result(*, unverified, model_text="grok-4.6"):
     }
 
 
-def _run(profile, result, *, mutate=None, goal="route provenance", schema=None, profile_name="fast"):
+def _run(
+    profile, result, *, mutate=None, goal="route provenance", schema=None,
+    profile_name="fast", background=False,
+):
     parent = _parent()
     built = {}
 
@@ -99,10 +102,17 @@ def _run(profile, result, *, mutate=None, goal="route provenance", schema=None, 
     task = {"goal": goal, "model_profile": profile_name}
     if schema is not None:
         task["output_schema"] = schema
+    if background:
+        parent.session_id = None
+        parent._current_task_id = None
     with patch("tools.delegate_tool._load_config", return_value=_pool(profile, profile_name)), patch(
         "run_agent.AIAgent", side_effect=capture
     ):
-        payload = json.loads(delegate_task(tasks=[task], parent_agent=parent))
+        payload = json.loads(
+            delegate_task(tasks=[task], parent_agent=parent, background=background)
+        )
+    if background:
+        return payload, built
     assert "error" not in payload
     return payload["results"][0], built
 
@@ -153,6 +163,69 @@ def test_verified_grok_child_keeps_owned_billing():
     assert entry["summary"] == _SPEND
     assert entry["error"] == _SPEND
     assert entry["provider"] == "xai-oauth"
+
+
+def test_public_sync_unverified_billing_requires_accepted_route():
+    with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=_xai_credentials("grok-4.6")):
+        entry, _ = _run(
+            _route("xai-oauth", "grok-4.6"),
+            _billing_result(unverified=True),
+            profile_name="premium",
+        )
+
+    assert entry["summary"] == _HEDGE_UNVERIFIED
+    assert "failure_reason" not in entry
+    assert _SPEND not in json.dumps(entry)
+
+
+def test_public_background_durably_drops_unaccepted_xai_billing_reason(
+    tmp_path, monkeypatch,
+):
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    profile = _route("deepseek", "deepseek-v4-flash")
+    handle, _ = _run(
+        profile,
+        _billing_result(unverified=True),
+        profile_name="premium",
+        background=True,
+    )
+
+    delegation_id = handle["delegation_id"]
+    assert delegation_id
+    event = process_registry.completion_queue.get(timeout=5)
+    assert event["type"] == "async_delegation"
+    assert event["delegation_id"] == delegation_id
+    with async_delegation._connect() as conn:
+        event_json, result_json = conn.execute(
+            "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    persisted_event = json.loads(event_json)
+    persisted_result = json.loads(result_json)
+    for entry in (
+        event["results"][0],
+        persisted_event["results"][0],
+        persisted_result["results"][0],
+    ):
+        assert entry["status"] == "failed"
+        assert entry["summary"] == _HEDGE_UNVERIFIED
+        assert entry["error"] == _HEDGE_UNVERIFIED
+        assert (entry["model"], entry["provider"]) == (
+            "deepseek-v4-flash",
+            "custom",
+        )
+        assert "failure_reason" not in entry
+        serialized = json.dumps(entry)
+        assert _SPEND not in serialized
+        assert "http://127.0.0.1:9/deepseek" not in serialized
+        assert "deepseek-key" not in serialized
+        assert "base_url" not in entry
 
 
 def test_invalid_schema_error_names_the_contract():
@@ -215,6 +288,57 @@ def test_schema_retry_clears_rejected_turn_provenance():
     assert _SPEND not in json.dumps(entry)
     assert entry["model"] == "claude-sonnet"
     assert entry["provider"] == "openrouter"
+
+
+def test_valid_app_server_retry_projects_unknown_route():
+    rejected = {
+        "final_response": "not json",
+        "completed": False,
+        "failed": True,
+        "error": _SPEND,
+        "failure_reason": "billing",
+        "failure_retryable": False,
+        "billing_block": {"provider": "xai-oauth", "message": _SPEND},
+        "billing_unverified": True,
+        "codex_turn_id": "rejected-turn",
+        "api_calls": 3,
+        "messages": [],
+    }
+    retry = {
+        "final_response": '{"city": "Oslo"}',
+        "completed": True,
+        "api_calls": 1,
+        "messages": [],
+    }
+
+    def mutate(child):
+        child.api_mode = "codex_app_server"
+        child._delegate_accepted_llm_route = None
+        child.run_conversation.side_effect = [rejected, retry]
+
+    entry, _ = _run(
+        _route("openai-codex", "gpt-5.2-codex", "codex_app_server"),
+        rejected,
+        mutate=mutate,
+        schema=_SCHEMA,
+        profile_name="premium",
+    )
+
+    assert entry["summary"] == '{"city": "Oslo"}'
+    assert entry["status"] == "completed"
+    assert entry["exit_reason"] == "completed"
+    assert entry["schema_valid"] is True
+    assert entry["schema_retries"] == 1
+    assert entry["api_calls"] == 4
+    assert entry["model"] is None
+    assert entry["provider"] is None
+    assert "error" not in entry
+    assert "failure_reason" not in entry
+    assert "base_url" not in entry
+    assert "http://127.0.0.1:9/openai-codex" not in json.dumps(entry)
+    assert _SPEND not in json.dumps(entry)
+    for key in ("error", "failure_reason", "failure_retryable", "billing_block", "billing_unverified", "codex_turn_id"):
+        assert key not in rejected
 
 
 def test_outer_exception_reports_frozen_selected_not_fallback():

@@ -656,8 +656,9 @@ def _build_result_entry(
             _str_or_none(getattr(child, "requested_provider", None)),
             _str_or_none(getattr(child, "base_url", None)),
         )
-    selected_model, selected_provider, selected_requested_provider, selected_base_url = selected_route
-    owns_xai = _route_owns_xai(selected_provider, selected_requested_provider, selected_base_url)
+    # An unverified terminal needs accepted-route proof; selection alone is insufficient.
+    billing_route = accepted_route if result.get("billing_unverified", False) else selected_route
+    owns_xai = _route_owns_xai(*billing_route[1:])
     xai_leak = (
         isinstance(billing, dict)
         and billing.get("provider") in {"xai", "xai-oauth"}

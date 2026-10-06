@@ -5,7 +5,10 @@ and the conversation loop stay real. A scripted send is not provider acceptance.
 """
 
 import json
+import queue
 import socket
+import threading
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -15,6 +18,8 @@ from hermes_cli.config import atomic_config_write
 from run_agent import AIAgent
 from tools import delegate_tool
 from tools.delegate_tool import delegate_task
+
+_REAL_RUN_CONVERSATION = AIAgent.run_conversation
 
 
 def _deny_network(*_args, **_kwargs):
@@ -430,3 +435,260 @@ def test_inherited_route_survives_outer_failure(tmp_path, monkeypatch, model_onl
     assert sends == ([] if failure == "outer" else [(expected, "Bearer fixture-parent-key")])
     assert entry["status"] == ("error" if failure == "outer" else "failed")
     assert (entry["model"], entry["provider"]) == (expected, "custom")
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected"),
+    [
+        pytest.param(
+            "accepted",
+            ("gpt-4o", "named-fallback", None),
+            id="accepted-over-selected",
+        ),
+        pytest.param(
+            "selected",
+            ("gpt-selected", "custom", "named-selected"),
+            id="frozen-selected",
+        ),
+    ],
+)
+def test_public_background_timeout_persists_route_identity(
+    tmp_path, monkeypatch, identity, expected
+):
+    """The public timeout row persists accepted-else-frozen-selected identity.
+
+    HTTP results are synthetic at the client boundary; dispatch, timeout,
+    result assembly, and background persistence use the production path.
+    """
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(socket.socket, "connect", _deny_network)
+    # Short test-only budget selects the real timeout path; it is not a duration assertion.
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 2.0)
+
+    if identity == "accepted":
+        selected_url = "https://primary.invalid/v1"
+        accepted_url = "https://accepted.invalid/v1"
+        route = {
+            "provider": "named-primary",
+            "model": "gpt-4o-mini",
+            "base_url": selected_url,
+            "api_key": "fixture-primary-key",
+            "api_mode": "chat_completions",
+            "fallback_chain": [{
+                "provider": "named-fallback",
+                "model": "gpt-4o",
+                "base_url": accepted_url,
+                "api_key": "fixture-backup-key",
+            }],
+        }
+        providers = {
+            "named-primary": {
+                "name": "Primary",
+                "base_url": selected_url,
+                "api_key": "fixture-primary-key",
+                "models": {"gpt-4o-mini": {}},
+            },
+            "named-fallback": {
+                "name": "Fallback",
+                "base_url": accepted_url,
+                "api_key": "fixture-backup-key",
+                "models": {"gpt-4o": {}},
+            },
+        }
+        selected_route = (
+            "gpt-4o-mini", "custom", "named-primary", selected_url,
+        )
+        accepted_route = (
+            "gpt-4o", "named-fallback", "named-fallback", accepted_url,
+        )
+        allowed_hosts = {"primary.invalid", "accepted.invalid"}
+    else:
+        selected_url = "https://selected.invalid/v1"
+        accepted_url = None
+        route = {
+            "provider": "named-selected",
+            "model": "gpt-selected",
+            "base_url": selected_url,
+            "api_key": "fixture-selected-key",
+            "api_mode": "chat_completions",
+        }
+        providers = {
+            "named-selected": {
+                "name": "Selected",
+                "base_url": selected_url,
+                "api_key": "fixture-selected-key",
+                "models": {"gpt-selected": {}},
+            },
+        }
+        selected_route = (
+            "gpt-selected", "custom", "named-selected", selected_url,
+        )
+        accepted_route = None
+        allowed_hosts = {"selected.invalid"}
+
+    atomic_config_write(tmp_path / "config.yaml", {
+        "model": {
+            "provider": "custom",
+            "default": "gpt-parent",
+            "base_url": "https://parent.invalid/v1",
+            "context_length": 128000,
+            "streaming": False,
+        },
+        "providers": providers,
+        "agent": {"max_retries": 2, "auto_recovery_cycles": 0},
+        "compression": {"enabled": False},
+        "delegation": {
+            "max_spawn_depth": 1,
+            "child_timeout_seconds": 30,
+            "model_pool": {"standard": route, "review": route},
+        },
+    })
+    release = threading.Event()
+    started = threading.Event()
+    finished = threading.Event()
+    original_build = delegate_tool._build_child_preserving_parent_tools
+
+    def capture_child(**kwargs):
+        child = original_build(**kwargs)
+
+        def block_after_synthetic_turn(user_message, task_id="", stream_callback=None):
+            result = _REAL_RUN_CONVERSATION(
+                child,
+                user_message=user_message,
+                task_id=task_id,
+                stream_callback=stream_callback,
+            )
+            started.set()
+            selected = getattr(child, "_delegate_selected_llm_route", None)
+            assert isinstance(selected, tuple) and len(selected) == 4
+            assert selected[:3] == selected_route[:3]
+            assert selected[3].rstrip("/") == selected_route[3].rstrip("/")
+            if accepted_route is None:
+                assert result["failed"] is True
+                assert getattr(child, "_delegate_accepted_llm_route", None) is None
+            else:
+                assert result["completed"] is True
+                accepted = getattr(child, "_delegate_accepted_llm_route", None)
+                assert isinstance(accepted, tuple) and len(accepted) == 4
+                assert accepted[:3] == accepted_route[:3]
+                assert accepted[3].rstrip("/") == accepted_route[3].rstrip("/")
+            setattr(child, "model", "fallback-model")
+            setattr(child, "provider", "fallback-provider")
+            setattr(child, "requested_provider", "fallback-owner")
+            setattr(child, "base_url", "https://fallback.invalid/v1")
+            release.wait(timeout=5)
+            finished.set()
+            return {
+                "final_response": "synthetic late completion",
+                "completed": True,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        setattr(child, "run_conversation", block_after_synthetic_turn)
+        return child
+
+    def send(_client, request, **_kwargs):
+        assert request.url.host in allowed_hosts
+        if request.url.path.endswith("/models"):
+            if request.url.host == "primary.invalid":
+                model = "gpt-4o-mini"
+            elif request.url.host == "accepted.invalid":
+                model = "gpt-4o"
+            else:
+                model = "gpt-selected"
+            return httpx.Response(200, request=request, json={
+                "object": "list",
+                "data": [{"id": model, "object": "model"}],
+            })
+        payload = json.loads(request.content)
+        if identity == "accepted" and request.url.host == "primary.invalid":
+            return httpx.Response(
+                429,
+                request=request,
+                headers={"x-should-retry": "false"},
+                json={"error": {"message": "synthetic fallback control"}},
+            )
+        if identity == "accepted":
+            return _ok(request, payload["model"])
+        return httpx.Response(
+            401,
+            request=request,
+            headers={"x-should-retry": "false"},
+            json={"error": {"message": "synthetic terminal rejection"}},
+        )
+
+    monkeypatch.setattr(delegate_tool, "_build_child_preserving_parent_tools", capture_child)
+    monkeypatch.setattr(httpx.Client, "send", send)
+    parent = _parent(tmp_path)
+    try:
+        handle = json.loads(delegate_task(
+            tasks=[{"goal": "exercise timeout route identity", "model_profile": "review"}],
+            parent_agent=parent,
+            background=True,
+        ))
+        delegation_id = handle["delegation_id"]
+        assert started.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        unmatched = []
+        event = None
+        try:
+            while event is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    candidate = process_registry.completion_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if (
+                    candidate.get("delegation_id") == delegation_id
+                    and not candidate.get("task_failure_notice")
+                ):
+                    event = candidate
+                else:
+                    unmatched.append(candidate)
+        finally:
+            for candidate in unmatched:
+                process_registry.completion_queue.put(candidate)
+        assert event is not None, "the public background timeout must publish its exact completion"
+        with async_delegation._connect() as conn:
+            event_json, result_json = conn.execute(
+                "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",
+                (delegation_id,),
+            ).fetchone()
+        persisted_event = json.loads(event_json)
+        persisted_result = json.loads(result_json)
+        for entry in (
+            event["results"][0],
+            persisted_event["results"][0],
+            persisted_result["results"][0],
+        ):
+            assert entry["status"] == "timeout"
+            assert (entry["model"], entry["provider"]) == expected[:2]
+            if expected[2] is None:
+                assert "requested_provider" not in entry
+            else:
+                assert entry["requested_provider"] == expected[2]
+            assert entry["timeout_phase"] == "after_llm_calls"
+            assert entry["api_calls"] > 0
+            assert "base_url" not in entry
+            serialized = json.dumps(entry)
+            assert selected_url not in serialized
+            if accepted_url is not None:
+                assert accepted_url not in serialized
+            assert "https://fallback.invalid/v1" not in serialized
+            assert "fixture-primary-key" not in serialized
+            assert "fixture-backup-key" not in serialized
+            assert "fixture-selected-key" not in serialized
+            assert "fallback-model" not in serialized
+            assert "fallback-owner" not in serialized
+    finally:
+        release.set()
+        worker_settled = finished.wait(timeout=5)
+        parent.close()
+    assert worker_settled

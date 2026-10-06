@@ -249,14 +249,30 @@ def test_public_background_durably_drops_unaccepted_xai_billing_reason(
                     unmatched.append(candidate)
         finally:
             for candidate in unmatched:
-                completion_queue.put(candidate)
+                if candidate is unrelated_completion:
+                    completion_queue.task_done()
+                else:
+                    completion_queue.put(candidate)
         assert unrelated_completion in unmatched
+        with completion_queue.mutex:
+            assert all(
+                candidate is not unrelated_completion
+                for candidate in completion_queue.queue
+            )
         assert event is not None, "the public background billing event must publish its exact completion"
     finally:
         if event is not None and (
             delegation_id is None or event.get("delegation_id") != delegation_id
         ):
             completion_queue.put(event)
+        # Queue has no identity-removal API; keep every foreign event and its order.
+        with completion_queue.mutex:
+            for index in reversed(range(len(completion_queue.queue))):
+                if completion_queue.queue[index] is unrelated_completion:
+                    del completion_queue.queue[index]
+                    completion_queue.unfinished_tasks -= 1
+            if completion_queue.unfinished_tasks == 0:
+                completion_queue.all_tasks_done.notify_all()
     with async_delegation._connect() as conn:
         event_json, result_json = conn.execute(
             "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",

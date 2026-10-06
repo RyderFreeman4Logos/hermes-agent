@@ -12,6 +12,14 @@ import pytest
 def test_unfinished_delegation_recovery_keeps_transcript_locator(tmp_path, split, missing_writer):
     repo = str(Path(__file__).resolve().parents[2])
     handle_path = tmp_path / "dispatch.json"
+    # The source may be a read-only export without .git; owner diagnostics need a real checkout.
+    owner_cwd = tmp_path / "owner"
+    owner_cwd.mkdir()
+    subprocess.run(["git", "init", "-q", str(owner_cwd)], check=True)
+    subprocess.run(["git", "-C", str(owner_cwd), "-c", "user.name=Diagnostic Fixture",
+                    "-c", "user.email=fixture@example.invalid", "commit", "-q", "--allow-empty",
+                    "-m", "diagnostic baseline"], check=True)
+    (owner_cwd / "private-owner-file").write_text("private contents", encoding="utf-8")
     env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo,
            "REPRO_HANDLE": str(handle_path), "REPRO_SPLIT": str(int(split)),
            "REPRO_MISSING": str(int(missing_writer))}
@@ -57,7 +65,7 @@ assert started.wait(10), "child did not start"
 Path(os.environ["REPRO_HANDLE"]).write_text(json.dumps(handle), encoding="utf-8")
 os._exit(0)
 '''
-    first = subprocess.run([sys.executable, "-c", producer], cwd=repo, env=env,
+    first = subprocess.run([sys.executable, "-c", producer], cwd=owner_cwd, env=env,
                            text=True, capture_output=True, timeout=30)
     assert first.returncode == 0, first.stdout + first.stderr
     handle = json.loads(handle_path.read_text(encoding="utf-8"))
@@ -100,6 +108,9 @@ print(json.dumps([{"event": event, "message": format_process_notification(event)
         for index, tail in tails.items():
             assert "kickoff" in tail and tail in item["message"]
         assert "uncommitted file(s)" in event["git_state_hint"]
+        assert "1 uncommitted file(s)" in event["git_state_hint"]
+        assert "private-owner-file" not in event["git_state_hint"]
+        assert "private contents" not in event["git_state_hint"]
         assert event["git_state_hint"] in item["message"]
     assert set(by_index) == ({'1'} if missing_writer else {'0', '1'} if split else {'0'})
     assert set(by_index.values()) == set(transcripts)

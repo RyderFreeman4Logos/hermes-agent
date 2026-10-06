@@ -8,7 +8,9 @@ while parent-visible results omit the endpoint.
 from __future__ import annotations
 
 import json
+import queue
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -177,6 +179,25 @@ def test_public_sync_unverified_billing_requires_accepted_route():
     assert "failure_reason" not in entry
     assert _SPEND not in json.dumps(entry)
 
+    def accept_xai_route(child):
+        _stamp(child, "grok-4.6", "xai-oauth", base_url="https://api.x.ai/v1")
+
+    with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=_xai_credentials("grok-4.6")):
+        owned, _ = _run(
+            _route("xai-oauth", "grok-4.6"),
+            _billing_result(unverified=True),
+            profile_name="premium",
+            mutate=accept_xai_route,
+        )
+    assert owned["summary"] == _SPEND
+    assert owned["error"] == _SPEND
+    assert owned["failure_reason"] == "billing"
+    assert (owned["model"], owned["provider"]) == ("grok-4.6", "xai-oauth")
+    serialized = json.dumps(owned)
+    assert "https://api.x.ai/v1" not in serialized
+    assert "fixture-xai-key" not in serialized
+    assert "base_url" not in owned
+
 
 def test_public_background_durably_drops_unaccepted_xai_billing_reason(
     tmp_path, monkeypatch,
@@ -189,18 +210,53 @@ def test_public_background_durably_drops_unaccepted_xai_billing_reason(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
     profile = _route("deepseek", "deepseek-v4-flash")
-    handle, _ = _run(
-        profile,
-        _billing_result(unverified=True),
-        profile_name="premium",
-        background=True,
-    )
+    completion_queue = process_registry.completion_queue
+    unrelated_completion = {
+        "type": "async_delegation",
+        "delegation_id": "unrelated-route-provenance-sentinel",
+        "results": [],
+    }
+    completion_queue.put(unrelated_completion)
+    event = None
+    delegation_id = None
+    try:
+        handle, _ = _run(
+            profile,
+            _billing_result(unverified=True),
+            profile_name="premium",
+            background=True,
+        )
 
-    delegation_id = handle["delegation_id"]
-    assert delegation_id
-    event = process_registry.completion_queue.get(timeout=5)
-    assert event["type"] == "async_delegation"
-    assert event["delegation_id"] == delegation_id
+        delegation_id = handle["delegation_id"]
+        assert delegation_id
+        deadline = time.monotonic() + 5
+        unmatched = []
+        try:
+            while event is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    candidate = completion_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if (
+                    candidate.get("delegation_id") == delegation_id
+                    and not candidate.get("task_failure_notice")
+                ):
+                    event = candidate
+                else:
+                    unmatched.append(candidate)
+        finally:
+            for candidate in unmatched:
+                completion_queue.put(candidate)
+        assert unrelated_completion in unmatched
+        assert event is not None, "the public background billing event must publish its exact completion"
+    finally:
+        if event is not None and (
+            delegation_id is None or event.get("delegation_id") != delegation_id
+        ):
+            completion_queue.put(event)
     with async_delegation._connect() as conn:
         event_json, result_json = conn.execute(
             "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",

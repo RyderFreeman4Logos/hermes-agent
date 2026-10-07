@@ -37,6 +37,12 @@ def isolated_probe_environment(monkeypatch):
     # Probe files exercise pytest/runner mechanics, not installed third-party
     # plugins. Autoloading the developer environment changes their startup cost.
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    # A nested runner selects the same approved base, not the outer worker's
+    # temp directory: adding another per-user root there exceeds sun_path.
+    worker = Path(os.environ["TMPDIR"])
+    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    assert worker.parent.name == "hermes-pytest" + suffix
+    monkeypatch.setenv("TMPDIR", str(worker.parent.parent))
 
 
 def _probe_root(tmp_path):
@@ -523,34 +529,24 @@ def test_files_from_dash_reads_the_list_from_stdin(tmp_path: Path) -> None:
     assert "✓2" in proc.stdout or "2 passed" in proc.stdout, proc.stdout
 
 
+@pytest.mark.platforms("posix")
 def test_scratch_root_is_per_user(tmp_path: Path, monkeypatch) -> None:
-    """Two users on one host must never share the runner's scratch root.
-
-    A fixed literal in a world-writable sticky dir belongs to whoever created it first: a
-    root-owned root (a container or system-service run) makes every later ``mkdtemp`` there
-    fail with EPERM for every other user, with no non-root way back.
-    """
+    """The root is UID-keyed; a different UID cannot use this user's private parent."""
     import importlib
 
     scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
     monkeypatch.syspath_prepend(str(scripts_dir))
     runner = importlib.import_module("run_tests_parallel")
 
-    # Exercise the non-/var/tmp arm so the probe never mints roots in the real shared dir.
-    # (Narrow: on 3.14 ``Path.is_dir()`` itself goes through ``os.path.isdir``.)
-    monkeypatch.setattr(runner.tempfile, "gettempdir", lambda: str(tmp_path))
-    real_isdir = os.path.isdir
-    monkeypatch.setattr(runner.os.path, "isdir",
-                        lambda path: False if str(path) == "/var/tmp" else real_isdir(path))
-
-    monkeypatch.setattr(runner.os, "getuid", lambda: 1000)
+    uid = os.getuid()
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     mine = Path(runner._runner_scratch_root())
-    monkeypatch.setattr(runner.os, "getuid", lambda: 0)
-    theirs = Path(runner._runner_scratch_root())
-
-    assert mine != theirs
-    assert mine.is_dir() and theirs.is_dir()
-    assert mine.parent == tmp_path and theirs.parent == tmp_path
+    assert mine == tmp_path / f"hermes-pytest-{uid}"
+    assert mine.is_dir()
+    monkeypatch.setattr(runner.os, "getuid", lambda: uid + 1)
+    with pytest.raises(ValueError, match="not owned"):
+        runner._runner_scratch_root()
+    assert not (tmp_path / f"hermes-pytest-{uid + 1}").exists()
 
 
 def test_off_host_note_names_platforms_specs_that_exclude_this_host(tmp_path: Path) -> None:

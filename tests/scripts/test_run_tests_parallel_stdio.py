@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -28,6 +29,12 @@ def _load_runner():
 def test_silent_child_failure_reports_exit_code(tmp_path, monkeypatch):
     from types import SimpleNamespace
     mod = _load_runner()
+    # Keep the real scratch/socket admission; this fixture exercises child
+    # status reporting, so use the canonical caller's already-approved base.
+    worker = Path(os.environ["TMPDIR"])
+    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    assert worker.parent.name == "hermes-pytest" + suffix
+    monkeypatch.setenv("TMPDIR", str(worker.parent.parent))
     child = SimpleNamespace(pid=123, returncode=23, communicate=lambda **kwargs: ("", None))
     monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: child)
     monkeypatch.setattr(mod, "_kill_tree", lambda *args, **kwargs: None)

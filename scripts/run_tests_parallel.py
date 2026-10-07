@@ -45,10 +45,12 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -86,26 +88,104 @@ def _rmtree_force(path: str) -> None:
             pass
     shutil.rmtree(path, onerror=_chmod_retry)
 
-def _runner_scratch_root() -> str:
-    """Per-run temp roots live on DISK, never the system temp dir: a full-suite run writes
-    gigabytes of tmp_path fixtures and /tmp is RAM-backed tmpfs on many Linux hosts. /var/tmp is
-    the FHS disk-backed temp root and is used because the alternatives fail tests that assume
-    the root's shape: under the Hermes home conftest relocates the basetemp; under a dot-dir
-    (~/.cache) the hidden-dir search tests see every fixture as hidden; anything longer than
-    the old /tmp root pushes AF_UNIX test sockets past sun_path.
+def _validate_runner_tmp_ancestry(base: Path) -> None:
+    """Check namespaces used by the lexical path and every symlink target before mkdir.
 
-    The name is per-USER because a fixed literal in a world-writable sticky dir belongs to
-    whoever created it first: a root-owned root (a container or system-service run) makes every
-    later makedirs/mkdtemp here fail with EPERM for every other user on the host, with no way
-    back that does not need root. Keying by uid means no run is blocked by another's leftovers.
+    Trusted owners may change their own private namespace; shared writable ancestors,
+    including sticky directories, cannot provide that trust and are always refused.
+    """
+    pending = [base]
+    seen = set()
+    while pending:
+        path = pending.pop()
+        for ancestor in (path, *path.parents):
+            if ancestor in seen:
+                continue
+            seen.add(ancestor)
+            if ancestor.is_symlink():
+                target = Path(os.readlink(ancestor))
+                pending.append(target if target.is_absolute() else ancestor.parent / target)
+            if ancestor.stat().st_mode & 0o022:
+                raise ValueError(f"TMPDIR has a group/other-writable ancestor: {ancestor}")
+
+
+def _runner_scratch_root() -> str:
+    """Keep per-run temp roots on disk, never the system temp dir: a full-suite run writes
+    gigabytes of tmp_path fixtures and /tmp is RAM-backed tmpfs on many Linux hosts. /var/tmp is
+    considered as the default when present, but only if its ancestry passes the private-mode check;
+    other locations can break tests that assume the root's shape: under the Hermes home conftest
+    relocates the basetemp; under a dot-dir (~/.cache) hidden-dir search tests see every fixture as
+    hidden; anything longer than the old /tmp root pushes AF_UNIX test sockets past sun_path.
+
+    The selected path and symlink targets must have no group/other-writable ancestry; sticky directories are refused
+    before the per-user root is created. Set TMPDIR to a private SSD directory instead of silently
+    redirecting to another location. The per-user leaf name is retained for compatibility.
     """
     name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
-    if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
-        root = os.path.join(tempfile.gettempdir(), name)
+    explicit_tmpdir = os.environ.get("TMPDIR")
+    if explicit_tmpdir is None:
+        base = (
+            Path(tempfile.gettempdir())
+            if os.name == "nt" or not os.path.isdir("/var/tmp")
+            else Path("/var/tmp")
+        )
     else:
-        root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
-    os.makedirs(root, exist_ok=True)
+        base = Path(explicit_tmpdir)
+    if not base.is_absolute():
+        raise ValueError(f"TMPDIR must be an absolute existing directory: {str(base)!r}")
+    try:
+        resolved_base = base.resolve(strict=True)
+        base_stat = resolved_base.stat()
+        if os.name != "nt":
+            _validate_runner_tmp_ancestry(base)
+    except OSError as exc:
+        raise ValueError(f"TMPDIR must be an absolute existing directory: {str(base)!r}") from exc
+    if not stat.S_ISDIR(base_stat.st_mode) or not os.access(resolved_base, os.W_OK | os.X_OK):
+        raise ValueError(f"TMPDIR must be a writable directory: {str(base)!r}")
+    if os.name != "nt" and hasattr(os, "getuid") and base_stat.st_uid != os.getuid():
+        raise ValueError(f"TMPDIR is not owned by this user: {resolved_base}")
+
+    # Preserve the selected root spelling after validating every namespace it uses;
+    # do not silently normalize to a different scratch location.
+    root = os.path.join(base, name)
+    try:
+        try:
+            os.mkdir(root, mode=0o700)
+        except FileExistsError:
+            pass
+        root_stat = os.lstat(root)
+        if not stat.S_ISDIR(root_stat.st_mode) or Path(root).resolve(strict=True).parent != resolved_base:
+            raise ValueError(f"TMPDIR scratch root failed canonical-path checks: {root}")
+        if (
+            hasattr(os, "getuid") and root_stat.st_uid != os.getuid()
+            or stat.S_IMODE(root_stat.st_mode) != 0o700
+            or root_stat.st_dev != base_stat.st_dev
+        ):
+            raise ValueError(f"TMPDIR scratch root failed ownership, permission, or device checks: {root}")
+    except OSError as exc:
+        raise ValueError(f"cannot use TMPDIR scratch root {root}: {exc}") from exc
     return root
+
+
+def _validate_runner_socket_path(temproot: str) -> None:
+    """Reject a worker root whose real pytest tmp_path cannot hold the AF_UNIX canary."""
+    if os.name == "nt":
+        return
+    # Linux sun_path is 108 bytes including NUL; macOS/BSD use 104.
+    usable_bytes = 107 if sys.platform.startswith("linux") else 103
+    socket_path = (
+        Path(temproot).resolve()
+        / f"pytest-of-{getpass.getuser()}"
+        / "pytest-0"
+        / "test_socket0"
+        / "s.sock"
+    )
+    path_bytes = len(os.fsencode(socket_path))
+    if path_bytes > usable_bytes:
+        raise ValueError(
+            f"runner socket path is too long: {path_bytes} bytes exceeds "
+            f"the {usable_bytes}-byte AF_UNIX sun_path budget: {socket_path}"
+        )
 
 
 
@@ -529,7 +609,12 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+    temproot = tempfile.mkdtemp(prefix="r", dir=_runner_scratch_root())
+    try:
+        _validate_runner_socket_path(temproot)
+    except ValueError as exc:
+        _rmtree_force(temproot)
+        return file, 2, f"{exc}\n", {}, 0.0
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.

@@ -991,6 +991,34 @@ class SessionDB(
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
+    @contextmanager
+    def _write_retry_ctx(self, deadline: Optional[float]) -> Iterator[sqlite3.Connection]:
+        """Bound lock acquisition and SQLite's busy wait; restore timeout before unlocking."""
+        # None preserves the existing explicit patience_s=0 one-shot/no-wait contract.
+        remaining = 0.0 if deadline is None else deadline - time.monotonic()
+        if (deadline is not None and remaining <= 0) or not self._lock.acquire(timeout=max(0.0, remaining)):
+            raise sqlite3.OperationalError("database is locked (write patience exhausted)")
+        conn = None
+        previous_ms = None
+        try:
+            self._raise_if_db_replaced()
+            if self._conn is None:
+                self._reopen_after_close_locked(context="write")
+            conn = cast(sqlite3.Connection, self._conn)
+            remaining = 0.0 if deadline is None else deadline - time.monotonic()
+            if deadline is not None and remaining <= 0:
+                raise sqlite3.OperationalError("database is locked (write patience exhausted)")
+            previous_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            conn.execute(f"PRAGMA busy_timeout={min(previous_ms, int(remaining * 1000))}")
+            yield conn
+        finally:
+            try:
+                if conn is not None and previous_ms is not None:
+                    with suppress(sqlite3.Error):
+                        conn.execute(f"PRAGMA busy_timeout={previous_ms}")
+            finally:
+                self._lock.release()
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
     ) -> T:
@@ -1024,10 +1052,7 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._lock:
-                    self._raise_if_db_replaced()
-                    if self._conn is None:  # close() raced this writer
-                        self._reopen_after_close_locked(context="write")
+                with self._write_retry_ctx(deadline if patience_s != 0 else None):
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         fn_started = True
@@ -1444,8 +1469,8 @@ class SessionDB(
             (self._WRITE_RETRY_SLOW_MIN_S, self._WRITE_RETRY_SLOW_MAX_S) if slow
             else (self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S)
         ))
-        time.sleep(min(jitter, max(deadline - now, 0.001)))
-        return True
+        time.sleep(min(jitter, deadline - now))
+        return time.monotonic() < deadline
 
     def _foreign_state_db_holders(self) -> List[Tuple[int, str]]:
         """Foreign processes holding this DB or its WAL sidecars (see hermes_state_holders)."""

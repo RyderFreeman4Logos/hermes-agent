@@ -5,6 +5,7 @@ Must never import hermes_state (cycle); shared constants live in hermes_state_co
 """
 
 import contextlib
+from contextvars import ContextVar
 import logging
 import re
 import sqlite3
@@ -22,6 +23,9 @@ from hermes_state_errors import is_transient_sqlite_error
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
+
+# Scoped to one driver step: concurrent/standalone maintenance retains its own budget.
+_FTS_WRITE_DEADLINE: ContextVar[Optional[Tuple[object, float]]] = ContextVar("fts_write_deadline", default=None)
 
 
 def _search_slow_ms() -> float:
@@ -283,6 +287,16 @@ class SessionSearchMixin:
         f"WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' AND {fts_trigram_session_sql('s')}"
     )
 
+    def _fts_write_patience(self) -> Optional[float]:
+        """Remaining phase patience, without changing the standalone step API."""
+        budget = _FTS_WRITE_DEADLINE.get()
+        if budget is None or budget[0] is not self:
+            return None
+        remaining = budget[1] - time.monotonic()
+        if remaining <= 0:
+            raise sqlite3.OperationalError("database is locked (FTS phase patience exhausted)")
+        return remaining
+
     def _fts_rebuild_finish(self) -> None:
         """Finalize the deferred rebuild: boundary sweep + clear markers. The sweep is cheap
         insurance against a write that slipped between high_water capture and trigger
@@ -312,7 +326,7 @@ class SessionSearchMixin:
                     params = (FTS_TOOL_CONTENT_PREFIX_CHARS,) if bounded else ()
                     conn.execute(sql, (*params, hw - 1000, hw + 1000))
             _delete_meta(conn, f"{prefix}_high_water", f"{prefix}_progress")
-        self._execute_write(_do)
+        self._execute_write(_do, patience_s=self._fts_write_patience())
 
     def fts_rebuild_step(self) -> bool:
         """Backfill one chunk of the deferred FTS rebuild; True while work remains. Chunks are
@@ -362,7 +376,7 @@ class SessionSearchMixin:
             return upper < high_water
 
         try:
-            more = self._execute_write(_do)
+            more = self._execute_write(_do, patience_s=self._fts_write_patience())
         except sqlite3.OperationalError as exc:
             return self._fts_chunk_error(exc, fail_msg)
         if more is False:
@@ -441,7 +455,7 @@ class SessionSearchMixin:
             return True
 
         try:
-            return bool(self._execute_write(_do))
+            return bool(self._execute_write(_do, patience_s=self._fts_write_patience()))
         except sqlite3.OperationalError as exc:
             return self._fts_chunk_error(exc, "FTS trash teardown chunk failed (will retry): %s")
 
@@ -703,11 +717,16 @@ class SessionSearchMixin:
             deadline = time.monotonic() + self._WRITE_PATIENCE_S
             while True:
                 _t0 = time.monotonic()
+                if _t0 >= deadline:
+                    return "fts_error"
+                token = _FTS_WRITE_DEADLINE.set((self, deadline))
                 try:
                     if not step():
                         return None
                 except sqlite3.OperationalError:
                     return "fts_error"
+                finally:
+                    _FTS_WRITE_DEADLINE.reset(token)
                 if time.monotonic() >= deadline:
                     return "fts_error"
                 _emit(phase)

@@ -49,6 +49,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -100,11 +101,53 @@ def _runner_scratch_root() -> str:
     back that does not need root. Keying by uid means no run is blocked by another's leftovers.
     """
     name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
-    if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
-        root = os.path.join(tempfile.gettempdir(), name)
-    else:
-        root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
-    os.makedirs(root, exist_ok=True)
+    explicit_tmpdir = os.environ.get("TMPDIR")
+    if explicit_tmpdir is None:
+        if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
+            root = os.path.join(tempfile.gettempdir(), name)
+        else:
+            root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    base = Path(explicit_tmpdir)
+    if not base.is_absolute():
+        raise ValueError(f"TMPDIR must be an absolute existing directory: {explicit_tmpdir!r}")
+    try:
+        resolved_base = base.resolve(strict=True)
+        base_stat = resolved_base.stat()
+    except OSError as exc:
+        raise ValueError(f"TMPDIR must be an absolute existing directory: {explicit_tmpdir!r}") from exc
+    if not stat.S_ISDIR(base_stat.st_mode) or not os.access(resolved_base, os.W_OK | os.X_OK):
+        raise ValueError(f"TMPDIR must be a writable directory: {explicit_tmpdir!r}")
+    if os.name != "nt":
+        for ancestor in (resolved_base, *resolved_base.parents):
+            mode = ancestor.stat().st_mode
+            if mode & 0o022 and not mode & stat.S_ISVTX:
+                raise ValueError(f"TMPDIR has a group/other-writable ancestor: {ancestor}")
+        if hasattr(os, "getuid") and base_stat.st_uid != os.getuid() and not (
+            base_stat.st_mode & stat.S_ISVTX and base_stat.st_mode & 0o002
+        ):
+            raise ValueError(f"TMPDIR is not owned by this user or a sticky shared directory: {resolved_base}")
+
+    # Preserve the requested root spelling after validating its resolved target;
+    # do not silently normalize to a different scratch location.
+    root = os.path.join(os.path.abspath(explicit_tmpdir), name)
+    if os.path.islink(root):
+        raise ValueError(f"TMPDIR scratch root must not be a symlink: {root}")
+    try:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        root_stat = os.stat(root)
+        if not stat.S_ISDIR(root_stat.st_mode) or Path(root).resolve(strict=True).parent != resolved_base:
+            raise ValueError(f"TMPDIR scratch root failed canonical-path checks: {root}")
+        if (
+            hasattr(os, "getuid") and root_stat.st_uid != os.getuid()
+            or stat.S_IMODE(root_stat.st_mode) != 0o700
+            or root_stat.st_dev != base_stat.st_dev
+        ):
+            raise ValueError(f"TMPDIR scratch root failed ownership, permission, or device checks: {root}")
+    except OSError as exc:
+        raise ValueError(f"cannot use explicit TMPDIR scratch root {root}: {exc}") from exc
     return root
 
 

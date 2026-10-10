@@ -37,6 +37,9 @@ def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: f
     return {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
         "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
+        "model": _str_or_none(getattr(child, "model", None)),
+        "provider": _str_or_none(getattr(child, "provider", None)),
+        "model_profile": _str_or_none(getattr(child, "_delegate_model_profile", None)),
     }
 
 def _append_missed_steer(entry: dict[str, Any], late_steer: Optional[str]) -> None:
@@ -366,6 +369,8 @@ def _register_child(
         "goal": goal,
         "delegation_id": _str_or_none(getattr(child, "_delegation_id", None)),
         "model": _str_or_none(getattr(child, "model", None)),
+        "provider": _str_or_none(getattr(child, "provider", None)),
+        "model_profile": _str_or_none(getattr(child, "_delegate_model_profile", None)),
         "started_at": time.time(), "status": "running", "tool_count": 0, "agent": child,
         # Owning conversation's durable session id (same lineage completion delivery routes by), sourced from the
         # child's stamp so it survives a parent_agent rebuild between dispatch and run; used for list/steer/stop
@@ -595,6 +600,8 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "model": _str_or_none(getattr(child, "model", None)),
+        "provider": _str_or_none(getattr(child, "provider", None)),
+        "model_profile": _str_or_none(getattr(child, "_delegate_model_profile", None)),
         "exit_reason": exit_reason,
         # A budget-exhausted child still returns a summary (status stays
         # "completed"), so the parent needs this explicit flag.
@@ -951,6 +958,9 @@ class _ChildRun:
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
+            "model": _str_or_none(getattr(child, "model", None)),
+            "provider": _str_or_none(getattr(child, "provider", None)),
+            "model_profile": _str_or_none(getattr(child, "_delegate_model_profile", None)),
             "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": "before_first_llm_call" if before_first_call else "after_llm_calls" if is_timeout else None,

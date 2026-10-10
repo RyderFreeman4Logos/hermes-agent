@@ -26,6 +26,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _build_child_system_prompt,
 )
 from hermes_state import SessionDB
 
@@ -54,6 +55,98 @@ def _make_mock_parent(depth=0):
 
 
 
+    def test_schema_valid(self):
+        self.assertEqual(DELEGATE_TASK_SCHEMA["name"], "delegate_task")
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        # tasks[] is the only advertised spawn shape (single task = one-entry
+        # array); legacy top-level goal/context/output_schema stay
+        # handler-accepted but unadvertised.
+        self.assertIn("tasks", props)
+        self.assertNotIn("goal", props)
+        self.assertNotIn("context", props)
+        self.assertNotIn("output_schema", props)
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("goal", task_props)
+        self.assertIn("context", task_props)
+        self.assertIn("output_schema", task_props)
+        # toolsets is intentionally NOT exposed to the model — subagents always
+        # inherit the parent's toolsets. Letting the model name toolsets was a
+        # capability-selection surface the model should not control.
+        self.assertNotIn("toolsets", props)
+        self.assertNotIn("toolsets", props["tasks"]["items"]["properties"])
+        # max_iterations is intentionally NOT exposed to the model — it's
+        # config-authoritative via delegation.max_iterations so users get
+        # predictable budgets.
+        self.assertNotIn("max_iterations", props)
+        # ACP subprocess transport is operator-controlled via config.yaml, not
+        # model-controlled via delegate_task arguments.
+        self.assertNotIn("acp_command", props)
+        self.assertNotIn("acp_args", props)
+        self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
+        self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
+        self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+
+    def test_top_level_description_compact_and_complete(self):
+        """The top-level description must stay compact while keeping every
+        contract that exists nowhere else in the schema (keyword-level, not
+        prose-literal, so rewording doesn't break CI)."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        # Compaction ceiling: the old description was ~4,000 chars.
+        self.assertLessEqual(len(desc), 2400)
+        # Contracts only the top-level text carries:
+        for keyword in (
+            "background",          # async semantics
+            "wait or poll",        # no-poll rule
+            "execute_code",        # mechanical-work routing
+            "cronjob",             # durable-work routing
+            "/stop",               # non-durability warning
+            "context",             # pass-everything-via-context rule
+            "respond in Chinese",  # language example (weak models regress without it)
+            "SELF-REPORTS",        # verification contract
+            "clarify",             # child blocked-tool list
+            "model_profile",       # pool routing (omitted uses standard)
+            "standard",            # required pool profile
+            "fail closed",         # unknown names / pool without standard
+        ):
+            self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
+        # Runtime provider pinning still lives in delegate_tool_config/docs;
+        # the compact top-level text now carries the model_pool contract.
+        self.assertNotIn("delegation.provider", desc)
+        # send_message must NOT be named: gateway-internal vocabulary most
+        # sessions never see (still enforced via DELEGATE_BLOCKED_TOOLS).
+        self.assertNotIn("send_message", desc)
+
+    def test_dynamic_limits_moved_to_param_descriptions(self):
+        """Concurrency reaches the model through the tasks parameter
+        description; the depth ceiling lives in the top-level description's
+        depth-derived recursion rule (role param is gone)."""
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        from tools.registry import registry
+
+        with (
+            patch("tools.delegate_tool._get_max_concurrent_children", return_value=7),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=4),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+        ):
+            overrides = _build_dynamic_schema_overrides()
+            definition = registry.get_definitions({"delegate_task"})[0]["function"]
+
+        for parameters in (overrides["parameters"], definition["parameters"]):
+            self.assertIn("up to 7", parameters["properties"]["tasks"]["description"])
+            self.assertNotIn("role", parameters["properties"])
+        # Depth ceiling now rides the depth-derived recursion rule in the
+        # top-level text (only rendered when nesting is available).
+        self.assertIn("max_spawn_depth=4", overrides["description"])
+        self.assertNotIn("up to 7", overrides["description"])
+
+class TestChildSystemPrompt(unittest.TestCase):
+    def test_goal_is_not_duplicated_in_system_prompt(self):
+        """The goal is the child's first user turn; the system prompt must not carry a second copy."""
+        prompt = _build_child_system_prompt("Reply with the single word PONG and stop.")
+        self.assertNotIn("Reply with the single word PONG and stop.", prompt)
+        self.assertNotIn("CONTEXT", prompt)
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

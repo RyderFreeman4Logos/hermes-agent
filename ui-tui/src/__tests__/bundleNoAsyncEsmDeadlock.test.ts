@@ -94,6 +94,10 @@ describe('TUI bundle (issue #31227)', () => {
     expect(bundleSrc.includes('node_modules/ink-text-input/build/index.js')).toBe(false)
   })
 
+  it('bundles one React instance for Ink and app hooks', () => {
+    expect(bundleSrc.match(/^\/\/ .*node_modules\/react\/index\.js$/gm)).toHaveLength(1)
+  })
+
   it('has the @hermes/ink entry-exports module compiled to sync init', () => {
     // Sanity check that the alias swap to packages/hermes-ink/src/entry-exports.ts
     // is still active and producing the expected synchronous init shape.

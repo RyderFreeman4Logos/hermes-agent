@@ -43,7 +43,11 @@ await build({
   //     bundle entirely — re-exporting them from entry-exports created a
   //     circular async chain that hung the TUI at startup with only ANSI
   //     reset bytes on screen (#31227).
-  alias: { '@hermes/ink': resolve(root, 'packages/hermes-ink/src/entry-exports.ts') },
+  // Keep hooks and Ink's renderer on the same React when a nested install exists.
+  alias: {
+    '@hermes/ink': resolve(root, 'packages/hermes-ink/src/entry-exports.ts'),
+    react: dirname(fileURLToPath(import.meta.resolve('react')))
+  },
   plugins: [stubDevtools],
   // Some transitive deps use CommonJS `require(...)` at runtime. ESM bundles
   // don't get a `require` binding automatically, so we inject one.

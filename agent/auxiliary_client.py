@@ -633,14 +633,6 @@ def _is_codex_spark(model: Optional[str], provider: Optional[str] = None) -> boo
     return _codex_route_bare_model(model, provider) == "gpt-5.3-codex-spark"
 
 
-def _is_openai_default_temperature_only(model: Optional[str]) -> bool:
-    """True for OpenAI reasoning families that 400 (``unsupported_value``) on any non-default
-    ``temperature``: gpt-5.x (incl. dated snapshots, ``-pro``, ``-codex``), o1/o3/o4. The
-    ``gpt-5-chat`` non-reasoning line still accepts it (#51083)."""
-    bare = _bare_model(model)
-    return bare.startswith(("gpt-5", "o1", "o3", "o4")) and not bare.startswith("gpt-5-chat")
-
-
 # Routes (host + model) that rejected ``temperature`` at runtime; the next call omits it up front
 # instead of paying the 400 round-trip again (the retry alone left #51083's first call to time out).
 _TEMPERATURE_REJECTED_ROUTES: set = set()
@@ -661,6 +653,7 @@ def _fixed_temperature_for_model(
     if _is_kimi_model(model):
         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
         return OMIT_TEMPERATURE
+    from agent.auxiliary_temperature import is_openai_default_temperature_only as _is_openai_default_temperature_only
     if _is_openai_default_temperature_only(model):
         logger.debug("Omitting temperature for %r (accepts only the default)", model)
         return OMIT_TEMPERATURE
@@ -4046,14 +4039,17 @@ def _fallback_request_kwargs(
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task)
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task,
+        no_progress_timeout=(
+            _get_task_no_progress_timeout(task or "") if destination.api_mode == "codex_responses" else None
+        ))
     return fb_kwargs
 
 
 def _plan_fallback_candidate(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str],
     effective_timeout: float, apply_fast_lane: bool, **request,
-) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], dict[str, Any]]]:
+) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]]]:
     """Resolve the destination + first-attempt kwargs for a fallback candidate.
 
     Returns ``(destination, kwargs, rebuild)`` where ``rebuild(provider, client, model)`` produces

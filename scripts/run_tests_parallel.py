@@ -63,6 +63,7 @@ from typing import Dict, List, Optional, Tuple
 # "skipped on this host" note and the lanes can never disagree.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
+from scripts.test_temp_root import configured_test_temp_root
 
 
 def _sweep_killed_run_roots(root: str) -> None:
@@ -99,7 +100,14 @@ def _runner_scratch_root() -> str:
     whoever created it first: a root-owned root (a container or system-service run) makes every
     later makedirs/mkdtemp here fail with EPERM for every other user on the host, with no way
     back that does not need root. Keying by uid means no run is blocked by another's leftovers.
+
+    HERMES_TEST_TMP_ROOT, when set, is used directly after strict validation; otherwise these
+    canonical defaults and platform fallbacks remain unchanged.
     """
+    explicit_root = configured_test_temp_root()
+    if explicit_root is not None:
+        return str(explicit_root)
+
     name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
     if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
         root = os.path.join(tempfile.gettempdir(), name)
@@ -108,6 +116,13 @@ def _runner_scratch_root() -> str:
     os.makedirs(root, exist_ok=True)
     return root
 
+
+def _validated_runner_scratch_root() -> str:
+    try:
+        return _runner_scratch_root()
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
 
 
 # Default test discovery roots.
@@ -1531,7 +1546,7 @@ def main() -> int:
 
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    _sweep_killed_run_roots(_runner_scratch_root())
+    _sweep_killed_run_roots(_validated_runner_scratch_root())
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         # Duration cache for the timeout scaler: known-slow files get

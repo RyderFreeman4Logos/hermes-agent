@@ -1956,7 +1956,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 "Reconciled session %s: direct child exited with code %s; "
                 "reader will publish the owned completion after its final drain.",
                 session.id, rc)
-            self._move_to_finished(session)
             return
         # Best-effort non-blocking drain of whatever the reader hasn't consumed.
         stdout = getattr(proc, "stdout", None)

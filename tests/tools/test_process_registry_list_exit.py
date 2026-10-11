@@ -8,6 +8,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,9 +17,12 @@ import pytest
 
 
 @pytest.mark.platforms("posix")
-def test_list_leaves_live_reader_as_completion_owner():
+def test_list_does_not_finish_a_live_reader_early(monkeypatch):
+    import tools.process_registry as module
     from tools.process_registry import ProcessRegistry, ProcessSession
 
+    monkeypatch.setattr(module, "_READER_FINAL_DRAIN_WAIT_SECONDS", 0)
+    reader_finished = threading.Event()
     registry = ProcessRegistry()
     session = ProcessSession(
         id="proc_owned_reader",
@@ -33,19 +37,24 @@ def test_list_leaves_live_reader_as_completion_owner():
         poll=lambda: 0, stdout=None, stderr=None, stdin=None,
     ))
     session._reader_selectable = True
-    session._reader_thread = cast(Any, SimpleNamespace(is_alive=lambda: True))
+    session._reader_thread = cast(Any, SimpleNamespace(is_alive=lambda: not reader_finished.is_set()))
     registry._running[session.id] = session
 
     listed = registry.list_sessions(session_key="owner-session")
 
     assert listed[0]["status"] == "exited"
     assert session._reader_finish_requested.is_set()
-    assert session.id in registry._finished
-    event = registry.completion_queue.get_nowait()
-    assert (event["owner_task_id"], event["output"]) == ("owner-owner", "")
+    assert session.id in registry._running
+    assert session.id not in registry._finished
+    assert not session._completion_event.is_set()
+    assert registry.completion_queue.empty()
 
     session.append_output("owner-output")
-    registry._move_to_finished(session)
+    reader_finished.set()
+    registry._finish_exited(session, 0)
+    event = registry.completion_queue.get_nowait()
+    assert (event["owner_task_id"], event["output"]) == ("owner-owner", "owner-output")
+    registry._finish_exited(session, 0)
     assert registry.completion_queue.empty()
 
 

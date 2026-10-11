@@ -10,6 +10,8 @@ import json
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     _credentials_for_model_profile,
     _normalize_profile_fallback_chain,
@@ -208,6 +210,63 @@ def test_shared_url_keeps_own_key_and_rejects_the_other_owner(monkeypatch):
         assert "named-b" in str(exc)
     else:
         raise AssertionError("foreign key on the same URL was accepted")
+
+
+_OWN = "https://shared.example/v1"
+
+
+@pytest.mark.parametrize("declared", [
+    "https://Shared.Example/v1",
+    "https://shared.example:443/v1",
+    "https://shared.example/v1/",
+])
+def test_canonical_endpoint_keeps_own_key(monkeypatch, declared):
+    from tools.delegate_tool_config import _require_pool_provider
+
+    runtime = {"provider": "custom", "base_url": _OWN, "api_key": "owned-b", "source": "custom_provider:named-b"}
+
+    def _named(name):
+        if name == "named-b":
+            return {"name": "named-b", "provider_key": "named-b", "base_url": declared, "api_key": "owned-b"}
+        return None
+
+    monkeypatch.setattr("hermes_cli.runtime_provider_custom._get_named_custom_provider", _named)
+    _require_pool_provider("named-b", runtime)
+
+
+@pytest.mark.parametrize("declared", [
+    "http://shared.example/v1",
+    "https://shared.example/v2",
+    "https://shared.example:8443/v1",
+])
+def test_distinct_endpoint_rejects_owned_key(monkeypatch, declared):
+    from tools.delegate_tool_config import _require_pool_provider
+
+    runtime = {"provider": "custom", "base_url": _OWN, "api_key": "owned-b", "source": "custom_provider:named-b"}
+
+    def _named(name):
+        if name == "named-b":
+            return {"name": "named-b", "provider_key": "named-b", "base_url": declared, "api_key": "owned-b"}
+        return None
+
+    monkeypatch.setattr("hermes_cli.runtime_provider_custom._get_named_custom_provider", _named)
+    with pytest.raises(ValueError, match="named-b"):
+        _require_pool_provider("named-b", runtime)
+
+
+def test_same_canonical_url_wrong_provider_still_rejected(monkeypatch):
+    from tools.delegate_tool_config import _require_pool_provider
+
+    runtime = {"provider": "custom", "base_url": _OWN, "api_key": "owned-b", "source": "custom_provider:named-b"}
+
+    def _named(name):
+        if name == "named-a":
+            return {"name": "named-a", "provider_key": "named-a", "base_url": "https://Shared.Example/v1/", "api_key": "owned-a"}
+        return None
+
+    monkeypatch.setattr("hermes_cli.runtime_provider_custom._get_named_custom_provider", _named)
+    with pytest.raises(ValueError, match="named-a"):
+        _require_pool_provider("named-a", runtime)
 
 
 def test_fallback_success_stamp_is_the_route_that_served():

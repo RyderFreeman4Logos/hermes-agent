@@ -177,7 +177,8 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(_cfg().get("inherit_mcp_toolsets"), default=True)
 
 def _normalized_runtime_url(value: Any) -> str:
-    return str(value or "").strip().rstrip("/")
+    from hermes_cli.route_identity import normalize_route_base_url
+    return normalize_route_base_url(str(value or "").strip())
 
 def _inherit_parent_capabilities(parent_agent, override_provider, override_base_url) -> Optional[dict]:
     """Parent's endpoint-trust capability map for a child, or None. ``agent.capabilities`` is a trust decision scoped

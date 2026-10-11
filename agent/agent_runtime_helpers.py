@@ -1290,6 +1290,9 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
     future reset; fails open on any error/None. Returns ``(blocked, prefetched_pool, prefetched)``
     so the rebind step reuses the loaded pool (one auth.json read at most)."""
     prefetched_pool, prefetched = None, False
+    from agent.route_binding import _primary_pool_owner
+    if _primary_pool_owner(agent, primary_provider) is None:
+        return False, prefetched_pool, prefetched
     try:
         pool = getattr(agent, "_credential_pool", None)
         if not matches_primary(pool):
@@ -1319,46 +1322,6 @@ def _restore_runtime_capabilities(agent, rt: dict[str, Any]) -> None:
         agent.runtime_capabilities = dict(raw)
     elif "runtime_capabilities" in rt:
         logger.warning("Ignoring malformed runtime capabilities snapshot")
-
-
-def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched) -> None:
-    """Rebind and re-select the primary credential pool after a fallback turn. A cross-provider
-    fallback attaches its own pool, which would trip the provider-mismatch guard on the next
-    401/429: reload the primary pool, else clear it. The snapshot api_key may be stale after
-    rotation; re-select the pool's best entry, keeping the snapshot key when none is usable."""
-    pool = getattr(agent, "_credential_pool", None)
-    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
-    if pool is not None and pool_provider and not matches_primary(pool):
-        agent._credential_pool = None
-        agent._credential_pool_entry_id = None
-        try:
-            # Reuse the pool the reset-aware gate already loaded (avoids a second auth.json read).
-            agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
-        except Exception as exc:
-            logger.warning(
-                "Restore could not reload primary credential pool for %s: %s", primary_provider, exc
-            )
-    agent._credential_pool_entry_id = None
-    pool = getattr(agent, "_credential_pool", None)
-    entry = pool.select(model=primary_model or None) if pool is not None and pool.has_available(model=primary_model or None) else None
-    if entry is None or not (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")):
-        return
-    if matches_primary(entry):
-        # _swap_credential rebuilds the client and reapplies base-url-scoped headers.
-        # ``_swap_credential`` rebuilds the OpenAI/Anthropic client, reapplies base-url-scoped headers, and
-        # carries the accumulated base_url / OAuth-detection fixes (#33163).
-        agent._swap_credential(entry)
-        logger.info(
-            "Restore re-selected pool entry %s (%s)",
-            getattr(entry, "id", "?"), getattr(entry, "label", "?"),
-        )
-    else:
-        logger.info(
-            "Restore skipped pool entry %s (%s): provider %s does not match primary provider %s",
-            getattr(entry, "id", "?"), getattr(entry, "label", "?"),
-            str(getattr(entry, "provider", "") or "").strip().lower() or "?",
-            primary_provider or "?",
-        )
 
 
 def _revert_credential_rotation(agent) -> None:
@@ -1446,14 +1409,16 @@ def restore_primary_runtime(agent) -> bool:
         # that was never verified and re-fail every turn. Stay on the fallback.
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
+    from agent.route_binding import _primary_pool_owner
+    primary_pool_owner = _primary_pool_owner(agent, primary_provider)
 
     def _matches_primary(candidate) -> bool:
-        return credential_pool_matches_provider(candidate, primary_provider, base_url=primary_runtime_base_url)
+        return credential_pool_matches_provider(candidate, primary_pool_owner, base_url=primary_runtime_base_url)
 
     def _load_primary_pool():
         """Load the primary provider's pool; None when absent or provider-mismatched."""
         from agent.credential_pool import load_pool
-        key = resolve_runtime_pool_key(primary_provider, primary_runtime_base_url)
+        key = resolve_runtime_pool_key(primary_pool_owner, primary_runtime_base_url)
         loaded = load_pool(key) if key else None
         return loaded if loaded is not None and _matches_primary(loaded) else None
     if _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool):
@@ -1476,6 +1441,8 @@ def restore_primary_runtime(agent) -> bool:
         reinstall_primary_runtime(
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
         )
+        if primary_pool_owner is None:
+            agent._credential_pool = agent._credential_pool_entry_id = None
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None

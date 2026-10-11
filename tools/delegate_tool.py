@@ -214,6 +214,10 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[dict[str, Any]] = None,
+    override_fallback_chain: Optional[list[dict[str, Any]]] = None,
+    override_requested_provider: Optional[str] = None,
+    override_fixed_api_key: bool = False,
+    override_exclusive_route: bool = False,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -260,6 +264,8 @@ def _build_child_agent(
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
+        override_fallback_chain=override_fallback_chain,
+        override_requested_provider=override_requested_provider,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -302,6 +308,7 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    setattr(child, "_delegate_successful_llm_route", None)  # noqa: B010 — not declared on AIAgent
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -313,9 +320,13 @@ def _build_child_agent(
     # parent delete orphans them (mirrors /branch's ``_branched_from``).
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
-    # Shared pool lets children rotate credentials on rate limits.
-    child_pool = _resolve_child_credential_pool(
+    # A named tier with its own key does not lease the parent pool or another profile's pool.
+    if override_fixed_api_key:
+        setattr(child, "_delegation_fixed_api_key", True)  # noqa: B010
+        setattr(child, "_credential_pool", None)  # noqa: B010
+    child_pool = None if override_fixed_api_key else _resolve_child_credential_pool(
         rt["provider"], parent_agent, rt["base_url"], effective_requested_provider=rt.get("requested_provider"),
+        inherit_parent=not override_exclusive_route,
     )
     if child_pool is not None:
         child._credential_pool = child_pool
@@ -400,8 +411,132 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
+def _model_pool(cfg: dict) -> dict:
+    pool = cfg.get("model_pool") or {}
+    return pool if isinstance(pool, dict) else {}
+
+
+def _available_model_profile_names(cfg: Optional[dict] = None) -> list[str]:
+    if cfg is None:
+        cfg = _load_config()
+    from tools.delegate_tool_config import _model_pool_errors
+    if _model_pool_errors(cfg.get("model_pool")):
+        return []
+    return [name for name in _model_pool(cfg) if isinstance(name, str) and name and name == name.strip()]
+
+
+def _fallback_hop_admitted(entry: dict[str, Any]) -> bool:
+    """False only when a declared credential cannot be resolved.
+
+    A hop with no key stays: activation resolves that provider's own key.
+    The log names the exception class, not the exception text.
+    """
+    from hermes_cli.auth import AuthError
+    from hermes_cli.fallback_config import resolve_entry_api_key
+
+    reason = "invalid or unavailable fallback credential; check inline key and env references"
+    try:
+        resolve_entry_api_key(entry)
+    except (AuthError, ValueError, OSError, TypeError, RuntimeError) as exc:
+        if isinstance(exc, AuthError):
+            reason = "authentication failed; configure credentials or run hermes auth"
+        logger.info(
+            "delegate profile fallback skipped %s/%s: %s (%s)",
+            entry.get("provider"), entry.get("model"), reason, type(exc).__name__,
+        )
+        return False
+    return True
+
+
+def _normalize_profile_fallback_chain(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    chain: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        if not provider or not model or provider.lower() == "auto":
+            continue
+        normalized = dict(entry)
+        normalized["provider"] = provider
+        normalized["model"] = model
+        if not _fallback_hop_admitted(normalized):
+            continue
+        chain.append(normalized)
+    return chain
+
+
+def _credentials_for_model_profile(cfg: dict, parent_agent, profile_name: Optional[str]) -> dict:
+    """Resolve one tier. An empty pool keeps the legacy route. A named tier is exclusive."""
+    name = str(profile_name or "").strip() or None
+    pool = _model_pool(cfg)
+    names = _available_model_profile_names(cfg)
+    if pool and "standard" not in names:
+        raise ValueError("Non-empty model_pool requires an explicit 'standard' profile.")
+    if name is None and not pool:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds.setdefault("fallback_chain", None)
+        return creds
+    name = name or "standard"
+    if name not in pool:
+        available = ", ".join(names) or "(none)"
+        raise ValueError(f"Unknown {name!r}. Configured: {available}.")
+    profile = pool[name]
+    from tools.delegate_tool_config import _pool_route_error
+    error = _pool_route_error(name, profile)
+    if error:
+        raise ValueError(error)
+    provider = str(profile.get("provider") or "").strip() or None
+    model = str(profile.get("model") or "").strip() or None
+    base_url = str(profile.get("base_url") or "").strip() or None
+    api_key = str(profile.get("api_key") or "").strip() or None
+    route_keys = {"model", "provider", "base_url", "api_key", "api_mode", "request_overrides", "fallback_providers"}
+    merged = {key: value for key, value in cfg.items() if key not in route_keys}
+    merged.update(model=model, provider=provider, base_url=base_url, api_key=api_key)
+    if isinstance(profile.get("request_overrides"), dict):
+        merged["request_overrides"] = profile["request_overrides"]
+    if base_url and not api_key and provider:
+        from tools.delegate_tool_config import _normalized_runtime_url, _resolve_pool_runtime
+        runtime = _resolve_pool_runtime(provider, model)
+        if (_normalized_runtime_url(runtime.get("base_url")) != _normalized_runtime_url(base_url)
+                or not runtime.get("api_key")):
+            raise ValueError(f"{name!r} requires an api_key for its endpoint.")
+        merged["api_key"] = runtime["api_key"]
+    elif api_key and provider and provider != "custom":
+        from hermes_cli.providers import get_provider
+        if get_provider(provider, allow_network=False) is None:
+            raise ValueError(f"{name!r} provider {provider!r} is not a configured provider.")
+    creds = _resolve_delegation_credentials(merged, parent_agent, exclusive=True)
+    creds["model"] = model
+    creds["fixed_api_key"] = bool(api_key)
+    creds["exclusive_route"] = True
+    if provider and base_url:
+        creds["requested_provider"] = provider
+    if not creds.get("api_key"):
+        raise ValueError(f"{name!r} requires an api_key for its route.")
+    creds["fallback_chain"] = _normalize_profile_fallback_chain(profile.get("fallback_chain"))
+    return creds
+
+
+def _resolve_task_routes(task_list, cfg, parent_agent, top_profile):
+    """Resolve every task before any child, transcript, or DB exists."""
+    routes = []
+    seen: dict[Optional[str], tuple] = {}
+    has_pool = bool(_model_pool(cfg))
+    for task in task_list:
+        requested = str(task.get("model_profile") or "").strip() or top_profile
+        if requested not in seen:
+            creds = _credentials_for_model_profile(cfg, parent_agent, requested)
+            seen[requested] = (requested or ("standard" if has_pool else None), creds)
+        routes.append(seen[requested])
+    return routes
+
+
 def _build_children(
-    task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]], creds: dict[str, Any], *,
+    task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]],
+    task_routes: list[tuple[Optional[str], dict[str, Any]]], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
 ) -> tuple[list[tuple], Optional[str]]:
@@ -409,20 +544,32 @@ def _build_children(
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = {
-        "override_provider": creds["provider"], "override_base_url": creds["base_url"],
-        "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
-        "override_request_overrides": creds.get("request_overrides"),
-        "override_acp_command": creds.get("command"),
-        "override_acp_args": creds.get("args"),
-        "routing_cfg": routing_cfg,
-    }
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
+        resolved_profile, creds = task_routes[i]
+        logger.info(
+            "delegate_task: resolved profile=%s model=%s provider=%s reasoning=%s fallback=%s",
+            resolved_profile, creds.get("model"), creds.get("provider"),
+            routing_cfg.get("reasoning_effort") or "",
+            [{"provider": str(e.get("provider") or ""), "model": str(e.get("model") or "")}
+             for e in (creds.get("fallback_chain") or []) if isinstance(e, dict)],
+        )
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        overrides = {
+            "override_provider": creds["provider"], "override_base_url": creds["base_url"],
+            "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
+            "override_request_overrides": creds.get("request_overrides"),
+            "override_acp_command": creds.get("command"),
+            "override_acp_args": creds.get("args"),
+            "routing_cfg": routing_cfg,
+            "override_fallback_chain": creds.get("fallback_chain"),
+            "override_requested_provider": creds.get("requested_provider"),
+            "override_fixed_api_key": creds.get("fixed_api_key", False),
+            "override_exclusive_route": creds.get("exclusive_route", False),
+        }
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
@@ -432,6 +579,8 @@ def _build_children(
             )
         except ValueError as exc:
             return [], str(exc)
+        setattr(child, "_delegate_model_profile", resolved_profile)  # noqa: B010
+        setattr(child, "_delegate_selected_route", (creds.get("model"), creds.get("provider")))  # noqa: B010
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -479,7 +628,8 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    subagent_id: Optional[str] = None, message: Optional[str] = None,
+    model_profile: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
@@ -529,12 +679,7 @@ def delegate_task(
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
-    try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
-    except ValueError as exc:
-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
-        return tool_error(str(exc))
+    top_profile = str(model_profile or "").strip() or None
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
@@ -543,6 +688,17 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
+    try:
+        task_routes = _resolve_task_routes(task_list, routing_cfg, parent_agent, top_profile)
+    except ValueError as exc:
+        return tool_error(str(exc))
+    creds = task_routes[0][1]
+    route_metadata = [
+        {"model": route.get("model"), "provider": route.get("provider")}
+        for _, route in task_routes
+    ]
+    common_models = {route["model"] for route in route_metadata}
+    common_providers = {route["provider"] for route in route_metadata}
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
@@ -564,14 +720,16 @@ def delegate_task(
 
     from tools.delegation_live_log import create_live_transcripts
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider"),
-        home=_live_home,
+        task_list, context,
+        model=next(iter(common_models)) if len(common_models) == 1 else None,
+        provider=next(iter(common_providers)) if len(common_providers) == 1 else None,
+        task_routes=route_metadata, home=_live_home,
     )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
     children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+        task_list, task_schemas, task_routes, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
     if err:
@@ -642,7 +800,8 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Omitted model_profile uses standard. Unknown names and a pool without "
+    "standard fail closed. A non-empty pool is the only routing source."
 )
 
 def _build_tasks_param_description() -> str:
@@ -668,6 +827,25 @@ def _build_dynamic_schema_overrides() -> dict:
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    profile_names = _available_model_profile_names()
+    profile_prop = dict(overrides_params["properties"].get("model_profile") or {})
+    if profile_names:
+        profile_prop["enum"] = profile_names
+    else:
+        profile_prop.pop("enum", None)
+    overrides_params["properties"]["model_profile"] = profile_prop
+    tasks_prop = dict(overrides_params["properties"]["tasks"])
+    tasks_items = dict(tasks_prop.get("items") or {})
+    tasks_item_props = dict(tasks_items.get("properties") or {})
+    task_profile_prop = dict(tasks_item_props.get("model_profile") or {})
+    if profile_names:
+        task_profile_prop["enum"] = profile_names
+    else:
+        task_profile_prop.pop("enum", None)
+    tasks_item_props["model_profile"] = task_profile_prop
+    tasks_items["properties"] = tasks_item_props
+    tasks_prop["items"] = tasks_items
+    overrides_params["properties"]["tasks"] = tasks_prop
 
     if not independent_completions:
         tasks = overrides_params["properties"]["tasks"]
@@ -737,6 +915,10 @@ DELEGATE_TASK_SCHEMA = {
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
                         ),
+                        "model_profile": _p(
+                            "string",
+                            "Per-task pool tier. Overrides the top-level model_profile.",
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -759,6 +941,11 @@ DELEGATE_TASK_SCHEMA = {
                 "string",
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
+            ),
+            "model_profile": _p(
+                "string",
+                "Named pool tier. Omitted uses standard. Unknown names and a pool "
+                "without standard fail closed. Per-task value overrides this.",
             ),
         },
         "required": [],
@@ -795,6 +982,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        model_profile=args.get("model_profile"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

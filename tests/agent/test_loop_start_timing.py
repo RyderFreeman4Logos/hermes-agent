@@ -452,3 +452,27 @@ def test_public_branch_and_new_session_do_not_inherit_parent_stop(
         assert db.get_session_model_config_value("main", loop_timing.LOOP_STOP_KEY)
     finally:
         db.close()
+
+
+def test_none_init_config_persists_stop_on_compression_child(tmp_path):
+    """None is SQL NULL. A recorded stop still rides the child as model_config JSON."""
+    from agent.loop_timing import LOOP_STOP_KEY, model_config_for_compression_child
+
+    db = SessionDB(db_path=tmp_path / "none-base.db")
+    db.create_session("parent", source="cli", model="m", model_config=None)
+    db.patch_session_model_config("parent", {LOOP_STOP_KEY: "2026-09-15T13:00:00-07:00"})
+    agent = SimpleNamespace(
+        _session_db=db,
+        session_id="parent",
+        _session_init_model_config=None,
+    )
+    try:
+        child_config = model_config_for_compression_child(agent, None)
+        assert child_config == {LOOP_STOP_KEY: "2026-09-15T13:00:00-07:00"}
+        db.create_session("child", source="cli", model="m", model_config=child_config, parent_session_id="parent")
+        raw = db._read_one("SELECT model_config FROM sessions WHERE id = ?", ("child",))
+        assert raw is not None and raw["model_config"] is not None
+        assert db.get_session_model_config_value("child", LOOP_STOP_KEY) == "2026-09-15T13:00:00-07:00"
+        assert model_config_for_compression_child(agent, None) == child_config
+    finally:
+        db.close()

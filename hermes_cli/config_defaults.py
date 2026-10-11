@@ -82,9 +82,9 @@ DEFAULT_CONFIG = {
         # Wall-clock budget (seconds) per run. null = off. When set: one-time wrap-up notice at 80%
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
-        "run_budget_seconds": None,
-        "loop_timing_context": True,  # current start + last successful stop on each loop input
-        # Gateway inactivity timeout (seconds). Idle only; 0 = unlimited. Not during tools or API calls.
+        "run_budget_seconds": None, "loop_timing_context": True,  # budget: hermes chat --run-budget N; timing: start + last successful stop
+        # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
+        # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
         # Max seconds an alias routing key waits for the active turn holding the same session lease;
         # on expiry the message is rejected with a resend notice. Keep short: Telegram dispatches

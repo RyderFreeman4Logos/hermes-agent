@@ -2560,7 +2560,8 @@ def strip_opaque_replay_items(items: Any) -> Any:
 
 def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
-    * ``api_content`` SUBSTITUTES ``content`` via ``turn_context.substitute_api_content``.
+    * ``api_content`` SUBSTITUTES ``content`` (``turn_context.substitute_api_content``): a non-empty
+      string or structured sidecar on a user/assistant row displaces content.
     * Base64 images become a placeholder; ``_count_image_tokens`` charges them flat.
     * ``reasoning`` never ships as-is (request builds pop it after optionally promoting it into
       ``reasoning_content``); counting both inflated estimates up to +53%.

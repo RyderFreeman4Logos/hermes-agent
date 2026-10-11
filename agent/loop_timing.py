@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime
 from typing import Any, Mapping, Optional
 
+from hermes_state_errors import StateDbReplacedError
 from utils import is_truthy_value
 
 
 logger = logging.getLogger(__name__)
 LOOP_STOP_KEY = "_latest_successful_loop_stop"
 _HEADER = "[Agent loop timing]"
+# sqlite3.Error covers corrupt images. Replacement is a RuntimeError, so name it or a swapped DB aborts the turn.
+_SESSION_BOUNDARY = (sqlite3.Error, StateDbReplacedError)
 
 
 def _now() -> datetime:
@@ -19,12 +23,10 @@ def _now() -> datetime:
 
 
 def _enabled() -> bool:
-    try:
-        from hermes_cli.config import load_config_readonly
+    from hermes_cli.config import load_config_readonly
 
-        config = load_config_readonly() or {}
-    except Exception:  # health: allow BLE001 -- config load can raise outside its own handlers; timing defaults on rather than aborting the turn
-        return True
+    # load_config_readonly already fails open to defaults on a bad file.
+    config = load_config_readonly() or {}
     agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
     return is_truthy_value(
         agent_config.get("loop_timing_context") if isinstance(agent_config, dict) else None,
@@ -43,8 +45,12 @@ def _latest_stop(agent: Any) -> Optional[str]:
         return None
     try:
         value = getter(session_id, LOOP_STOP_KEY)
-    except Exception:  # health: allow BLE001 -- session read raises sqlite, replaced-db, and corrupt-db errors; timing must not abort the turn
-        logger.warning("Could not read loop timing state for session=%s", session_id, exc_info=True)
+    except _SESSION_BOUNDARY:
+        logger.warning(
+            "Could not read loop timing state for session=%s",
+            session_id,
+            exc_info=True,
+        )
         return None
     return value if isinstance(value, str) and value else None
 
@@ -114,8 +120,12 @@ def record_completed_loop_stop(
         return False
     try:
         patcher(session_id, {LOOP_STOP_KEY: _iso(now or _now())})
-    except Exception:  # health: allow BLE001 -- session write raises sqlite, replaced-db, and corrupt-db errors; a missed stop must not fail the completed turn
-        logger.warning("Could not persist completed loop stop for session=%s", session_id, exc_info=True)
+    except _SESSION_BOUNDARY:
+        logger.warning(
+            "Could not persist completed loop stop for session=%s",
+            session_id,
+            exc_info=True,
+        )
         return False
     return True
 
@@ -124,6 +134,7 @@ def model_config_for_compression_child(agent: Any, base: Any) -> Any:
     """Copy the current stop scalar into a compression continuation's config."""
     latest_stop = _latest_stop(agent)
     if not isinstance(base, dict):
+        # None stays SQL NULL until a stop exists. The store merges that stop into {} and writes JSON; dropping it loses the previous end.
         return {LOOP_STOP_KEY: latest_stop} if latest_stop else base
     child = dict(base)
     if latest_stop:

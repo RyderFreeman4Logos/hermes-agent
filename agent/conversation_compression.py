@@ -3339,7 +3339,6 @@ def _publish_rotated_compaction(
         _foreign_tail_ceiling = agent._session_db.get_active_message_watermark(agent.session_id)
     with contextlib.suppress(Exception):  # best-effort — don't block compression on a flush error
         agent._flush_messages_to_session_db(messages, conversation_history=persisted_history)
-    # One transaction: closure, child, handoff. Child stays on the parent profile (default is NULL) and keeps a live /yolo.
     _profile_for_child = None
     with contextlib.suppress(Exception):
         from hermes_cli.profiles import get_active_profile_name
@@ -3349,7 +3348,7 @@ def _publish_rotated_compaction(
     new_session_id = mint_session_id()
     from agent.context_compressor import _DB_PERSISTED_MARKER
     from tools.approval_yolo import with_session_yolo
-    from agent.loop_timing import model_config_for_compression_child as _child_cfg
+    from agent.loop_timing import model_config_for_compression_child as _child_cfg  # one txn; child keeps parent profile (default NULL), live /yolo, COALESCE
     agent._session_db.publish_compression_child(
         parent_session_id=old_session_id, child_session_id=new_session_id,
         source=_compression_child_source(agent, old_session_id), model=agent.model,

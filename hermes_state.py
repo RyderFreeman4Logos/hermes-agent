@@ -501,7 +501,7 @@ def _session_db_advisory_write_lock(
             held.add(owner_key)
             yield
         finally:
-            if acquired:
+            if acquired and owner_key[0] == os.getpid():
                 held.discard(owner_key)
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 

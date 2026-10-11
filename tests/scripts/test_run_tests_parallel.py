@@ -45,6 +45,8 @@ def _probe_root(tmp_path):
     (scripts / "ci").mkdir(parents=True, exist_ok=True)
     real = Path(__file__).resolve().parents[2] / "scripts"
     shutil.copy2(real / "run_tests_parallel.py", scripts)
+    shutil.copy2(real / "test_temp_root.py", scripts)
+    shutil.copy2(real.parent / "hermes_constants.py", root)
     # The runner shares the platforms() spec resolver with the CI lane selector.
     shutil.copy2(real / "ci" / "list_os_marked_tests.py", scripts / "ci")
     return root
@@ -610,6 +612,7 @@ def test_scratch_root_is_per_user(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.syspath_prepend(str(scripts_dir))
     runner = importlib.import_module("run_tests_parallel")
 
+    monkeypatch.delenv("HERMES_TEST_TMP_ROOT", raising=False)
     # Exercise the non-/var/tmp arm so the probe never mints roots in the real shared dir.
     # (Narrow: on 3.14 ``Path.is_dir()`` itself goes through ``os.path.isdir``.)
     monkeypatch.setattr(runner.tempfile, "gettempdir", lambda: str(tmp_path))
@@ -625,6 +628,92 @@ def test_scratch_root_is_per_user(tmp_path: Path, monkeypatch) -> None:
     assert mine != theirs
     assert mine.is_dir() and theirs.is_dir()
     assert mine.parent == tmp_path and theirs.parent == tmp_path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode validation")
+def test_explicit_runner_temp_root_is_validated_and_used(tmp_path: Path, monkeypatch) -> None:
+    import importlib
+    from scripts import test_temp_root
+
+    root = tmp_path.resolve() / "runner-root"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    monkeypatch.setattr(test_temp_root, "SOCKET_TMPDIR_MAX_LEN", len(os.fsencode(str(root))) + 11)
+    monkeypatch.setenv("HERMES_TEST_TMP_ROOT", str(root))
+
+    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts_dir))
+    runner = importlib.import_module("run_tests_parallel")
+
+    assert Path(runner._runner_scratch_root()) == root
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink/ownership validation")
+def test_explicit_runner_temp_root_rejects_symlinks_and_foreign_owners(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import importlib
+    from scripts import test_temp_root
+
+    base = tmp_path.resolve()
+    target = base / "target"
+    target.mkdir(mode=0o700)
+    target.chmod(0o700)
+    link = base / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(test_temp_root, "SOCKET_TMPDIR_MAX_LEN", len(os.fsencode(str(target))) + 11)
+    monkeypatch.setenv("HERMES_TEST_TMP_ROOT", str(link))
+
+    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts_dir))
+    runner = importlib.import_module("run_tests_parallel")
+    with pytest.raises(ValueError, match="symlink"):
+        runner._runner_scratch_root()
+
+    target.chmod(0o777)
+    monkeypatch.setenv("HERMES_TEST_TMP_ROOT", str(target))
+    with pytest.raises(ValueError, match="mode 0700"):
+        runner._runner_scratch_root()
+
+    target.chmod(0o700)
+    unsafe_parent = base / "unsafe-parent"
+    unsafe_parent.mkdir(mode=0o700)
+    unsafe_parent.chmod(0o777)
+    unsafe_root = unsafe_parent / "runner-root"
+    unsafe_root.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        test_temp_root, "SOCKET_TMPDIR_MAX_LEN", len(os.fsencode(str(unsafe_root))) + 11,
+    )
+    monkeypatch.setenv("HERMES_TEST_TMP_ROOT", str(unsafe_root))
+    try:
+        with pytest.raises(ValueError, match="unsafe writable ancestor"):
+            runner._runner_scratch_root()
+    finally:
+        unsafe_parent.chmod(0o700)
+
+    monkeypatch.setenv("HERMES_TEST_TMP_ROOT", str(target))
+    actual_uid = os.getuid()
+    monkeypatch.setattr(test_temp_root.os, "getuid", lambda: actual_uid + 1)
+    with pytest.raises(ValueError, match="owned by the current user"):
+        runner._runner_scratch_root()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode validation")
+def test_explicit_runner_temp_root_enforces_socket_path_budget(tmp_path: Path, monkeypatch) -> None:
+    import importlib
+    from scripts import test_temp_root
+
+    root = tmp_path.resolve() / "runner-root"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    monkeypatch.setattr(test_temp_root, "SOCKET_TMPDIR_MAX_LEN", len(os.fsencode(str(root))) + 10)
+    monkeypatch.setenv("HERMES_TEST_TMP_ROOT", str(root))
+
+    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts_dir))
+    runner = importlib.import_module("run_tests_parallel")
+    with pytest.raises(ValueError, match="socket-safe"):
+        runner._runner_scratch_root()
 
 
 def test_off_host_note_names_platforms_specs_that_exclude_this_host(tmp_path: Path) -> None:

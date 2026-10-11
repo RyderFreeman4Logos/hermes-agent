@@ -2,7 +2,7 @@
 // Self-contained TUI compiler. Dependencies must already be prepared.
 import { cpSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { resolve, join } from 'node:path'
+import { dirname, resolve, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { frontendArgs, isMain, productOutput, publishDirectory, repoRoot, withProduct, workspaceTool } from './frontend-common.mjs'
 import { recordProduct, buildInputs } from './freshness.mjs'
@@ -48,7 +48,10 @@ export async function buildTui(options) {
       //     bundle entirely — re-exporting them from entry-exports created a
       //     circular async chain that hung the TUI at startup with only ANSI
       //     reset bytes on screen (#31227).
-      alias: { '@hermes/ink': resolve(root, 'packages/hermes-ink/src/entry-exports.ts') },
+      alias: {
+        '@hermes/ink': resolve(root, 'packages/hermes-ink/src/entry-exports.ts'),
+        react: dirname(workspaceTool(source, 'ui-tui', 'react'))
+      },
       plugins: [stubDevtools],
       // Some transitive deps use CommonJS `require(...)` at runtime. ESM bundles
       // don't get a `require` binding automatically, so we inject one.

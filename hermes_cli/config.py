@@ -1187,9 +1187,9 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
     issues: list[ConfigIssue] = []
     _validate_voice(config, issues)
     _validate_timezone(config, issues)
-    cp = config.get("custom_providers")
-    fb = config.get("fallback_model")
-    for value, validator in ((cp, _validate_custom_providers), (fb, _validate_fallback_model)):
+    cp, fb = config.get("custom_providers"), config.get("fallback_model")
+    from tools.delegate_tool_config import record_model_pool_issues
+    for value, validator in ((cp, _validate_custom_providers), (fb, _validate_fallback_model), (config, record_model_pool_issues)):
         if value is not None:
             validator(value, issues)
 
@@ -1211,12 +1211,6 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
             _issue(issues, "warning",
                    f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                    f"Move '{key}' under the appropriate section")
-
-    delegation_cfg = config.get("delegation")
-    if isinstance(delegation_cfg, dict):
-        from tools.delegate_tool_config import _model_pool_errors
-        for message in _model_pool_errors(delegation_cfg.get("model_pool")):
-            _issue(issues, "error", message, "Fix the named tier, or remove model_pool.")
 
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)

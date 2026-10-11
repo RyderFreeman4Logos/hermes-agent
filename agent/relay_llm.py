@@ -759,11 +759,14 @@ def _is_cancellation(error: BaseException) -> bool:
 def complete_logical_call(
     api_request_id: str, *, outcome: str, model_name: str | None = None,
     provider_name: str | None = None, response_model_name: str | None = None,
-    error_class: str | None = None,
+    error_class: str | None = None, agent: Any | None = None,
 ) -> None:
     """Complete the active turn's logical LLM call after caller validation. ``error_class``
     (a classifier reason) rides on a call that reports its route: the error that ended a
-    failed call, or the last one a successful call recovered from."""
+    failed call, or the last one a successful call recovered from. A successful call that
+    passes ``agent`` stamps the route that served it, when the agent records one."""
+    if outcome == "success" and agent is not None and hasattr(agent, "_delegate_successful_llm_route"):
+        agent._delegate_successful_llm_route = (agent.model, agent.provider)
     turn = relay_runtime.active_turn()
     if turn is None or not api_request_id:
         return

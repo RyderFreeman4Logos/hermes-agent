@@ -475,6 +475,16 @@ def _model_pool_errors(pool: Any) -> list[str]:
         errors.append("delegation.model_pool is non-empty but has no 'standard' profile")
     return errors
 
+
+def record_model_pool_issues(config: dict, issues: list) -> None:
+    """Same admission contract as runtime, reported as config structure errors."""
+    if not isinstance(config.get("delegation"), dict):
+        return
+    from hermes_cli.config import _issue
+    for message in _model_pool_errors(config["delegation"].get("model_pool")):
+        _issue(issues, "error", message, "Fix the named tier, or remove model_pool.")
+
+
 def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusive: bool = False) -> dict:
     """``delegation.base_url`` branch: provider/api_mode from URL heuristics."""
     # Shared URL-based api_mode detector so Anthropic-compatible direct endpoints (/anthropic suffix: Azure AI

@@ -2327,8 +2327,6 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
             if text:
                 summary_call_outcome = "success"
-                if hasattr(agent, "_delegate_successful_llm_route"):
-                    agent._delegate_successful_llm_route = (agent.model, agent.provider)
                 append_message(messages, {"role": "assistant", "content": text})
                 final_response = text
             break
@@ -2346,7 +2344,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
     finally:
         from agent import relay_llm
-        relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
+        relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome, agent=agent)
 
     return final_response
 

@@ -2531,6 +2531,13 @@ def _count_image_tokens(msg: dict[str, Any], cost_per_image: int) -> int:
     if not isinstance(msg, dict):
         return 0
     content = msg.get("content")
+    sidecar = msg.get("api_content")
+    if (
+        isinstance(sidecar, (str, list, dict))
+        and sidecar
+        and msg.get("role") in ("user", "assistant")
+    ):
+        content = sidecar
     count = _count_parts(content, _IMAGE_PART_TYPES)
     count += _count_parts(msg.get("_anthropic_content_blocks"), {"image"})
     # Multimodal tool results that haven't been converted yet.
@@ -2557,8 +2564,7 @@ def strip_opaque_replay_items(items: Any) -> Any:
 def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
     * ``api_content`` SUBSTITUTES ``content`` (mirrors ``turn_context.substitute_api_content`` exactly):
-      only a non-empty STRING sidecar on a user/assistant row displaces content; substituting any
-      other shape would UNDERcount — the dangerous direction.
+      a non-empty string or structured sidecar on a user/assistant row displaces content.
     * Base64 images become a placeholder; ``_count_image_tokens`` charges them flat.
     * ``reasoning`` never ships as-is (request builds pop it after optionally promoting it into
       ``reasoning_content``); counting both inflated estimates up to +53%.
@@ -2567,7 +2573,11 @@ def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
       checkpoint alone can be 5M chars (#100611). They contribute 0 here: only real usage ever
       prices them, and the usage anchor carries that price forward."""
     sidecar = msg.get("api_content")
-    sidecar_wins = isinstance(sidecar, str) and bool(sidecar) and msg.get("role") in ("user", "assistant")
+    sidecar_wins = (
+        isinstance(sidecar, (str, list, dict))
+        and bool(sidecar)
+        and msg.get("role") in ("user", "assistant")
+    )
     _rc = msg.get("reasoning_content")
     drop_reasoning_dup = isinstance(_rc, str) and bool(_rc.strip())
     shadow: dict[str, Any] = {}
@@ -2576,7 +2586,16 @@ def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
             continue
         if k == "api_content":
             if sidecar_wins:
-                shadow["content"] = v
+                shadow["content"] = (
+                    [
+                        {"type": part.get("type"), "image": "[stripped]"}
+                        if isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES
+                        else part
+                        for part in v
+                    ]
+                    if isinstance(v, list)
+                    else (v.get("text_summary", "") if isinstance(v, dict) and v.get("_multimodal") else v)
+                )
         elif k == "content" and sidecar_wins:
             continue
         elif k == "content" and isinstance(v, list):

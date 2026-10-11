@@ -272,6 +272,8 @@ class SessionMessagesMixin:
         _str_or_none = lambda v: _scrub_surrogates(v) if isinstance(v, str) else None
         _reasoning = lambda key: msg.get(key) if keep_reasoning else None
         encoded_content = self._encode_content(msg.get("content"))
+        api_content = msg.get("api_content")
+        encoded_api_content = self._encode_content(api_content) if api_content is not None else None
         encoded_tool_calls = json.dumps(tool_calls) if tool_calls else None
         encoded_tool_name = _scrub_surrogates(msg.get("tool_name"))
         display_metadata = self._encode_display_metadata(msg.get("display_metadata"))
@@ -289,7 +291,7 @@ class SessionMessagesMixin:
               for k in ("reasoning_details", "codex_reasoning_items", "codex_message_items")),
             msg.get("platform_message_id") or msg.get("message_id"),
             1 if msg.get("observed") else 0, 1 if msg.get("_compressed_summary") else 0, 1,
-            _str_or_none(msg.get("api_content")), _str_or_none(msg.get("display_kind")),
+            encoded_api_content, _str_or_none(msg.get("display_kind")),
             display_metadata, self._display_identity(self._display_dedupe_key(identity_row)),
             message_uid_or_none(msg), _absorbed_uids_json(msg),
             _tool_call_uids_json(msg), _tool_call_uid_or_none(msg))
@@ -355,7 +357,7 @@ class SessionMessagesMixin:
             msg["_compressed_summary"] = True
         _restore_identity_columns(row, msg)
         if row["api_content"] is not None:
-            msg["api_content"] = row["api_content"]
+            msg["api_content"] = self._decode_content(row["api_content"])
         if row["display_kind"] is not None:
             msg["display_kind"] = row["display_kind"]
         if row["display_metadata"] is not None:
@@ -392,13 +394,13 @@ class SessionMessagesMixin:
         reasoning_content: str | None = None, reasoning_details: Any = None, codex_reasoning_items: Any = None,
         codex_message_items: Any = None, platform_message_id: str | None = None, observed: bool = False,
         effect_disposition: Optional[str] = None, _compressed_summary: bool = False, timestamp: Any = None,
-        api_content: Optional[str] = None, display_kind: Optional[str] = None,
+        api_content: Any = None, display_kind: Optional[str] = None,
         display_metadata: Optional[dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
         message_uid: Optional[str] = None) -> int:
         """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
-        the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
-        it differed from ``content``, stored as sent except lone surrogates. ``message_uid``: the id a caller
+        the platform's own id. ``api_content``: byte-fidelity sidecar, the exact value sent to the API when
+        it differed from ``content``; structured values use the same JSON encoding as ``content``. ``message_uid``: the id a caller
         that keeps the message as a live dict already stamped on it (``stamp_message_uid``); minted when
         absent, but then only the row carries it."""
         msg = dict(locals())  # every keyword above is a message-dict field of the same name
@@ -1075,7 +1077,7 @@ class SessionMessagesMixin:
             self._message_columns_cache = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
         return self._message_columns_cache
 
-    def set_latest_user_api_content(self, session_id: str, content: Any, api_content: str) -> int:
+    def set_latest_user_api_content(self, session_id: str, content: Any, api_content: Any) -> int:
         """Backfill the ``api_content`` sidecar onto the newest ACTIVE user row (0/1 rows). Preflight compaction
         inserts that row BEFORE the sidecar exists and the later persist identity-skips compacted dicts;
         without this a reload reopens the prompt-cache divergence. ``content`` match guards a racing rewrite.
@@ -1096,10 +1098,10 @@ class SessionMessagesMixin:
             "UPDATE messages SET api_content = ? WHERE id = (SELECT id FROM messages "
             "WHERE session_id = ? AND role = 'user' AND active = 1 ORDER BY id DESC LIMIT 1"
             ") AND content IS ?",
-            (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
+            (self._encode_content(api_content), session_id, self._encode_content(content)))
 
     def set_message_api_content(
-        self, session_id: str, row_id: int, content: Any, api_content: str
+        self, session_id: str, row_id: int, content: Any, api_content: Any
     ) -> int:
         """Backfill the ``api_content`` sidecar onto ONE known durable row.
 
@@ -1123,7 +1125,7 @@ class SessionMessagesMixin:
         return self._write_rowcount(
             "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
             "AND role = 'user' AND active = 1 AND content IS ?",
-            (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
+            (self._encode_content(api_content), row_id, session_id, self._encode_content(content)))
 
     def set_user_message_content(self, session_id: str, row_id: int, content: Any) -> int:
         """Rewrite the content of ONE known active user row. Used when a user turn was written at submit
@@ -1325,6 +1327,8 @@ class SessionMessagesMixin:
         if summary_flag and msg.pop("_compressed_summary", 0):
             msg["_compressed_summary"] = True
         msg["content"] = self._decode_content(msg["content"])
+        if msg.get("api_content"):
+            msg["api_content"] = self._decode_content(msg["api_content"])
         if msg.get("tool_calls"):
             msg["tool_calls"] = _json_or(
                 msg["tool_calls"], [], f"Failed to deserialize tool_calls in {warn_context}, falling back to []")
@@ -1597,7 +1601,9 @@ class SessionMessagesMixin:
             # The durable identity is part of the message, like ``timestamp``: restored on EVERY projection
             # (ACP, gateway, CLI, TUI, compression adoption), never opt-in like ``_row_id``.
             _restore_identity_columns(row, msg)
-            msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
+            msg.update((col, row[col]) for col in ("display_kind",) if row[col])
+            if row["api_content"]:
+                msg["api_content"] = self._decode_content(row["api_content"])
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded
             if include_summary_markers and row["_compressed_summary"]:

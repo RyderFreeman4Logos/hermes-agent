@@ -4963,7 +4963,7 @@ class TestNoProgressTimeoutTaskConfigGating:
     """#108104: ``auxiliary.<task>.no_progress_timeout`` must only reach the request kwargs
     when the resolved client is a Codex Responses-shim client — forwarding it to a real
     OpenAI-SDK-shaped client's ``chat.completions.create()`` would raise ``TypeError:
-    unexpected keyword argument 'no_progress_timeout'``."""
+    unexpected keyword argument 'no_progress_timeout'."""
 
     def test_non_codex_client_never_receives_the_kwarg(self, monkeypatch):
         client = MagicMock()

@@ -292,3 +292,27 @@ def test_fallback_success_stamp_is_the_route_that_served():
     child.model, child.provider = "mutated-model", "mutated-provider"
     failed = _build_result_entry(child, {"failed": True, "error": "down"}, 0, 1, schema)
     assert (failed["model"], failed["provider"]) == ("primary-model", "openrouter")
+
+
+@pytest.mark.parametrize("outcome", ["success", "failed", "cancelled"])
+def test_complete_logical_call_stamps_served_route_only_on_success(outcome):
+    from agent.relay_llm import complete_logical_call
+    from tools.delegate_tool_child_run import _build_result_entry, _SchemaOutcome
+
+    child = MagicMock()
+    child.model = "served-model"
+    child.provider = "anthropic"
+    child._delegate_model_profile = "standard"
+    child._delegate_selected_route = ("primary-model", "openrouter")
+    child._delegate_successful_llm_route = ("primary-model", "openrouter")
+    child.session_estimated_cost_usd = 0
+    child.session_cost_status = None
+    child.session_prompt_tokens = 0
+    child.session_completion_tokens = 0
+    child._delegate_role = "leaf"
+    complete_logical_call("req-1", outcome=outcome, agent=child)
+    schema = _SchemaOutcome(None, None, [], 0)
+    result = {"final_response": "ok", "completed": True} if outcome == "success" else {"failed": True, "error": "down"}
+    entry = _build_result_entry(child, result, 0, 1, schema)
+    expected = ("served-model", "anthropic") if outcome == "success" else ("primary-model", "openrouter")
+    assert (entry["model"], entry["provider"]) == expected

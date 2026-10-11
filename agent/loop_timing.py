@@ -24,9 +24,14 @@ def _now() -> datetime:
 
 def _enabled() -> bool:
     from hermes_cli.config import load_config_readonly
+    from hermes_cli.config_home import HomeInitializationError
 
-    # load_config_readonly already fails open to defaults on a bad file.
-    config = load_config_readonly() or {}
+    # YAML parse already fails open inside the loader. Home init does not.
+    try:
+        config = load_config_readonly() or {}
+    except (HomeInitializationError, FileNotFoundError):
+        logger.warning("Could not read loop timing config; using the default", exc_info=True)
+        return True
     agent_config = config.get("agent", {}) if isinstance(config, dict) else {}
     return is_truthy_value(
         agent_config.get("loop_timing_context") if isinstance(agent_config, dict) else None,

@@ -8,6 +8,7 @@ stop scalar used by the next loop.
 
 from __future__ import annotations
 
+import sqlite3
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -16,6 +17,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_errors import StateDbReplacedError
+from hermes_cli.config_home import HomeInitializationError
 from run_agent import AIAgent
 
 
@@ -476,3 +479,32 @@ def test_none_init_config_persists_stop_on_compression_child(tmp_path):
         assert model_config_for_compression_child(agent, None) == child_config
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("exc", [sqlite3.OperationalError("locked"), StateDbReplacedError("replaced")])
+def test_session_boundary_errors_fail_open(exc):
+    """sqlite and a replaced state DB miss the stop. They do not abort the turn."""
+    from agent import loop_timing
+
+    agent = SimpleNamespace(
+        _session_db=SimpleNamespace(
+            get_session_model_config_value=MagicMock(side_effect=exc),
+            patch_session_model_config=MagicMock(side_effect=exc),
+        ),
+        session_id="parent",
+        _loop_timing_start_decorated=True,
+    )
+    assert loop_timing._latest_stop(agent) is None
+    assert loop_timing.record_completed_loop_stop(agent, {"completed": True}) is False
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [HomeInitializationError("home"), FileNotFoundError("config")],
+)
+def test_config_home_errors_fail_open(exc):
+    """Home init and a missing config file keep the default on. They do not abort the turn."""
+    from agent import loop_timing
+
+    with patch("hermes_cli.config.load_config_readonly", side_effect=exc):
+        assert loop_timing._enabled() is True

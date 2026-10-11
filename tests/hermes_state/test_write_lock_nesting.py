@@ -102,3 +102,26 @@ def test_corrupt_fts_detach_can_nest_under_existing_writer(tmp_path, table):
         ).fetchone()
         db.append_message("corrupt", role="user", content="canonical write survives")
         assert len(db.get_messages("corrupt")) == 2
+
+
+@pytest.mark.platforms("linux")
+def test_forked_child_unwind_does_not_release_parent_lock(tmp_path):
+    """Unwinding a copied scope closes the child's fd without unlocking the parent's flock."""
+    path = tmp_path / "state.db"
+    child_pid = None
+    try:
+        with _lock(path):
+            child_pid = os.fork()
+            if child_pid == 0:
+                child_pid = 0
+            else:
+                _, status = os.waitpid(child_pid, 0)
+                assert os.waitstatus_to_exitcode(status) == 0
+                assert _rival_process(path) == 23, "forked child released parent custody"
+    except BaseException:
+        if child_pid == 0:
+            os._exit(1)
+        raise
+    if child_pid == 0:
+        os._exit(0)
+    assert _rival_process(path) == 0, "parent exit stranded flock"

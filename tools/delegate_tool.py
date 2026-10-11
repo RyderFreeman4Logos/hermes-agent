@@ -419,31 +419,33 @@ def _model_pool(cfg: dict) -> dict:
 def _available_model_profile_names(cfg: Optional[dict] = None) -> list[str]:
     if cfg is None:
         cfg = _load_config()
-    return [str(name) for name in _model_pool(cfg) if str(name).strip()]
+    from tools.delegate_tool_config import _model_pool_errors
+    if _model_pool_errors(cfg.get("model_pool")):
+        return []
+    return [name for name in _model_pool(cfg) if isinstance(name, str) and name and name == name.strip()]
 
 
 def _fallback_hop_admitted(entry: dict[str, Any]) -> bool:
-    """False when this hop has no credential the child can use. Log the class, not the exception text."""
-    from hermes_cli.auth import AuthError, has_usable_secret
-    from hermes_cli.fallback_config import resolve_entry_api_key
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    """False only when a declared credential cannot be resolved.
 
+    A hop with no key stays: activation resolves that provider's own key.
+    The log names the exception class, not the exception text.
+    """
+    from hermes_cli.auth import AuthError
+    from hermes_cli.fallback_config import resolve_entry_api_key
+
+    reason = "invalid or unavailable fallback credential; check inline key and env references"
     try:
-        api_key = resolve_entry_api_key(entry)
-        if api_key:
-            return True
-        resolved = resolve_runtime_provider(requested=entry["provider"], target_model=entry["model"])
+        resolve_entry_api_key(entry)
     except (AuthError, ValueError, OSError, TypeError, RuntimeError) as exc:
+        if isinstance(exc, AuthError):
+            reason = "authentication failed; configure credentials or run hermes auth"
         logger.info(
-            "delegate profile fallback skipped %s/%s (%s)",
-            entry.get("provider"), entry.get("model"), type(exc).__name__,
+            "delegate profile fallback skipped %s/%s: %s (%s)",
+            entry.get("provider"), entry.get("model"), reason, type(exc).__name__,
         )
         return False
-    key = resolved.get("api_key")
-    if callable(key) or key == "no-key-required" or has_usable_secret(key):
-        return True
-    logger.info("delegate profile fallback skipped %s/%s: no owned credential", entry.get("provider"), entry.get("model"))
-    return False
+    return True
 
 
 def _normalize_profile_fallback_chain(raw: Any) -> list[dict[str, Any]]:
@@ -478,23 +480,34 @@ def _credentials_for_model_profile(cfg: dict, parent_agent, profile_name: Option
         creds.setdefault("fallback_chain", None)
         return creds
     name = name or "standard"
-    if name not in pool or not isinstance(pool.get(name), dict):
+    if name not in pool:
         available = ", ".join(names) or "(none)"
         raise ValueError(f"Unknown {name!r}. Configured: {available}.")
     profile = pool[name]
+    from tools.delegate_tool_config import _pool_route_error
+    error = _pool_route_error(name, profile)
+    if error:
+        raise ValueError(error)
     provider = str(profile.get("provider") or "").strip() or None
     model = str(profile.get("model") or "").strip() or None
     base_url = str(profile.get("base_url") or "").strip() or None
     api_key = str(profile.get("api_key") or "").strip() or None
-    if not model or (not provider and not base_url):
-        raise ValueError(f"{name!r} requires a model and a provider or base_url.")
-    if provider == "auto":
-        raise ValueError(f"{name!r} requires an explicit provider; auto uses ambient routing.")
     route_keys = {"model", "provider", "base_url", "api_key", "api_mode", "request_overrides", "fallback_providers"}
     merged = {key: value for key, value in cfg.items() if key not in route_keys}
     merged.update(model=model, provider=provider, base_url=base_url, api_key=api_key)
     if isinstance(profile.get("request_overrides"), dict):
         merged["request_overrides"] = profile["request_overrides"]
+    if base_url and not api_key and provider:
+        from tools.delegate_tool_config import _normalized_runtime_url, _resolve_pool_runtime
+        runtime = _resolve_pool_runtime(provider, model)
+        if (_normalized_runtime_url(runtime.get("base_url")) != _normalized_runtime_url(base_url)
+                or not runtime.get("api_key")):
+            raise ValueError(f"{name!r} requires an api_key for its endpoint.")
+        merged["api_key"] = runtime["api_key"]
+    elif api_key and provider and provider != "custom":
+        from hermes_cli.providers import get_provider
+        if get_provider(provider, allow_network=False) is None:
+            raise ValueError(f"{name!r} provider {provider!r} is not a configured provider.")
     creds = _resolve_delegation_credentials(merged, parent_agent, exclusive=True)
     creds["model"] = model
     creds["fixed_api_key"] = bool(api_key)
@@ -536,6 +549,13 @@ def _build_children(
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         resolved_profile, creds = task_routes[i]
+        logger.info(
+            "delegate_task: resolved profile=%s model=%s provider=%s reasoning=%s fallback=%s",
+            resolved_profile, creds.get("model"), creds.get("provider"),
+            routing_cfg.get("reasoning_effort") or "",
+            [{"provider": str(e.get("provider") or ""), "model": str(e.get("model") or "")}
+             for e in (creds.get("fallback_chain") or []) if isinstance(e, dict)],
+        )
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         overrides = {
@@ -673,6 +693,12 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
     creds = task_routes[0][1]
+    route_metadata = [
+        {"model": route.get("model"), "provider": route.get("provider")}
+        for _, route in task_routes
+    ]
+    common_models = {route["model"] for route in route_metadata}
+    common_providers = {route["provider"] for route in route_metadata}
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
@@ -694,8 +720,10 @@ def delegate_task(
 
     from tools.delegation_live_log import create_live_transcripts
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider"),
-        home=_live_home,
+        task_list, context,
+        model=next(iter(common_models)) if len(common_models) == 1 else None,
+        provider=next(iter(common_providers)) if len(common_providers) == 1 else None,
+        task_routes=route_metadata, home=_live_home,
     )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
@@ -799,6 +827,25 @@ def _build_dynamic_schema_overrides() -> dict:
     # Copy properties so the static schema dict is never mutated.
     overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    profile_names = _available_model_profile_names()
+    profile_prop = dict(overrides_params["properties"].get("model_profile") or {})
+    if profile_names:
+        profile_prop["enum"] = profile_names
+    else:
+        profile_prop.pop("enum", None)
+    overrides_params["properties"]["model_profile"] = profile_prop
+    tasks_prop = dict(overrides_params["properties"]["tasks"])
+    tasks_items = dict(tasks_prop.get("items") or {})
+    tasks_item_props = dict(tasks_items.get("properties") or {})
+    task_profile_prop = dict(tasks_item_props.get("model_profile") or {})
+    if profile_names:
+        task_profile_prop["enum"] = profile_names
+    else:
+        task_profile_prop.pop("enum", None)
+    tasks_item_props["model_profile"] = task_profile_prop
+    tasks_items["properties"] = tasks_item_props
+    tasks_prop["items"] = tasks_items
+    overrides_params["properties"]["tasks"] = tasks_prop
 
     if not independent_completions:
         tasks = overrides_params["properties"]["tasks"]

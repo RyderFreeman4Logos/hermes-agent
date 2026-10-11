@@ -1214,14 +1214,9 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
 
     delegation_cfg = config.get("delegation")
     if isinstance(delegation_cfg, dict):
-        pool = delegation_cfg.get("model_pool")
-        if isinstance(pool, dict) and pool and "standard" not in {str(name).strip() for name in pool}:
-            _issue(
-                issues, "error",
-                "delegation.model_pool is non-empty but has no 'standard' profile",
-                "Add an explicit standard profile, or remove model_pool. "
-                "YAML key order is not a routing default.",
-            )
+        from tools.delegate_tool_config import _model_pool_errors
+        for message in _model_pool_errors(delegation_cfg.get("model_pool")):
+            _issue(issues, "error", message, "Fix the named tier, or remove model_pool.")
 
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)

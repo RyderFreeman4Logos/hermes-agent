@@ -34,7 +34,12 @@ def _str_or_none(value: Any) -> Optional[str]:
 
 
 def _route_identity(child: Any) -> tuple[Optional[str], Optional[str]]:
-    """Accepted route, else the route selected before the child ran."""
+    """Accepted response route, else the route selected before the child ran.
+
+    The success stamp is written after fallback binding, so it is the route
+    that served the response. A failed child keeps the route selected before
+    it ran, not a later mutation of the live agent.
+    """
     for attr in ("_delegate_successful_llm_route", "_delegate_selected_route"):
         route = getattr(child, attr, None)
         if isinstance(route, tuple) and len(route) == 2:

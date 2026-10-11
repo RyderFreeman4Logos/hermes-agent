@@ -114,8 +114,16 @@ def test_named_tier_does_not_attach_parent_pool_or_overrides(monkeypatch, tmp_pa
     assert creds["fallback_chain"][0]["model"] == "owned-hop"
 
 
-def test_unauthenticated_fallback_hop_is_dropped_and_log_has_no_exception_text(caplog):
+def test_unauthenticated_fallback_hop_is_dropped_and_log_has_no_exception_text(caplog, monkeypatch):
     import logging
+    from hermes_cli.auth import AuthError
+
+    def _boom(entry):
+        if entry.get("model") == "borrowed":
+            raise AuthError("secret-traceback")
+        return entry.get("api_key")
+
+    monkeypatch.setattr("hermes_cli.fallback_config.resolve_entry_api_key", _boom)
     with caplog.at_level(logging.INFO, logger="tools.delegate_tool"):
         chain = _normalize_profile_fallback_chain([
             {"provider": "openrouter", "model": "owned", "api_key": "owned-key-value"},
@@ -123,6 +131,7 @@ def test_unauthenticated_fallback_hop_is_dropped_and_log_has_no_exception_text(c
         ])
     assert [entry["model"] for entry in chain] == ["owned"]
     assert "secret-traceback" not in caplog.text
+    assert "AuthError" in caplog.text
 
 
 def test_result_identity_prefers_accepted_route_else_selected():
@@ -177,3 +186,50 @@ def test_fixed_key_restore_does_not_load_another_pool(monkeypatch):
     monkeypatch.setattr("agent.route_binding.reinstall_primary_runtime", lambda *args, **kwargs: setattr(agent, "model", "std-model"))
     assert restore_primary_runtime(agent) is True
     assert agent._credential_pool is None
+
+
+def test_shared_url_keeps_own_key_and_rejects_the_other_owner(monkeypatch):
+    from tools.delegate_tool_config import _require_pool_provider
+
+    shared = "https://shared.example/v1"
+    own = {"provider": "custom", "base_url": shared, "api_key": "owned-b", "source": "custom_provider:named-b"}
+    foreign = {"provider": "custom", "base_url": shared, "api_key": "owned-a", "source": "custom_provider:named-a"}
+
+    def _named(name):
+        if name == "named-b":
+            return {"name": "named-b", "provider_key": "named-b", "base_url": shared, "api_key": "owned-b"}
+        return None
+
+    monkeypatch.setattr("hermes_cli.runtime_provider_custom._get_named_custom_provider", _named)
+    _require_pool_provider("named-b", own)
+    try:
+        _require_pool_provider("named-b", foreign)
+    except ValueError as exc:
+        assert "named-b" in str(exc)
+    else:
+        raise AssertionError("foreign key on the same URL was accepted")
+
+
+def test_fallback_success_stamp_is_the_route_that_served():
+    from tools.delegate_tool_child_run import _build_result_entry, _SchemaOutcome
+
+    child = MagicMock()
+    child.model = "served-model"
+    child.provider = "anthropic"
+    child._delegate_model_profile = "standard"
+    child._delegate_successful_llm_route = ("served-model", "anthropic")
+    child._delegate_selected_route = ("primary-model", "openrouter")
+    child._fallback_activated = True
+    child._primary_runtime = {"model": "primary-model"}
+    child.session_estimated_cost_usd = 0
+    child.session_cost_status = None
+    child.session_prompt_tokens = 0
+    child.session_completion_tokens = 0
+    child._delegate_role = "leaf"
+    schema = _SchemaOutcome(None, None, [], 0)
+    entry = _build_result_entry(child, {"final_response": "ok", "completed": True, "api_calls": 2}, 0, 1, schema)
+    assert (entry["model"], entry["provider"]) == ("served-model", "anthropic")
+    child._delegate_successful_llm_route = None
+    child.model, child.provider = "mutated-model", "mutated-provider"
+    failed = _build_result_entry(child, {"failed": True, "error": "down"}, 0, 1, schema)
+    assert (failed["model"], failed["provider"]) == ("primary-model", "openrouter")

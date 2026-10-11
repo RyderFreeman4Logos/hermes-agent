@@ -330,6 +330,150 @@ def _credential_bundle(model, provider, base_url, api_key, api_mode, request_ove
         "request_overrides": request_overrides, **extra,
     }
 
+def _route_shape_error(route: Any, *, runtime: bool = False) -> Optional[str]:
+    """Validate only fields consumed by delegation, before coercion or construction."""
+    if not isinstance(route, dict):
+        return "expected a runtime mapping" if runtime else "expected a route mapping"
+    fields = ("model", "provider", "base_url", "api_mode")
+    if runtime:
+        fields += ("requested_provider", "command", "source")
+    for field in fields:
+        value = route.get(field)
+        if value is not None and not isinstance(value, str):
+            return f"invalid {field}; expected a string"
+    key = route.get("api_key")
+    if key is not None and not isinstance(key, str) and not callable(key):
+        return "invalid api_key; expected a string or token callable"
+    overrides = route.get("request_overrides")
+    if overrides is not None and not isinstance(overrides, dict):
+        return "invalid request_overrides; expected a mapping"
+    if runtime:
+        args = route.get("args")
+        if args is not None and (not isinstance(args, list) or any(not isinstance(arg, str) for arg in args)):
+            return "invalid args; expected a list of strings"
+        pool = route.get("credential_pool")
+        if pool is not None and (
+            not isinstance(getattr(pool, "provider", None), str)
+            or not callable(getattr(pool, "has_credentials", None))
+        ):
+            return "invalid credential_pool; expected a provider credential pool"
+    return None
+
+
+def _validate_delegation_runtime(runtime: Any) -> dict:
+    error = _route_shape_error(runtime, runtime=True)
+    if error:
+        raise ValueError(f"Cannot resolve delegation runtime: {error}.")
+    return runtime
+
+
+def _require_pool_provider(
+    configured_provider: Optional[str], runtime: dict, *, explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> None:
+    """A named tier keeps its own credential. A shared URL is not a shared owner."""
+    if not isinstance(runtime, dict):
+        raise ValueError(f"Delegation model_pool provider '{configured_provider}' did not resolve runtime credentials.")
+    from hermes_cli.providers import custom_provider_aliases, normalize_provider
+    from hermes_cli.runtime_provider import _same_registered_provider
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider, expand_direct_api_alias
+
+    requested = normalize_provider(configured_provider or "")
+    resolved = normalize_provider(str(runtime.get("provider") or ""))
+    if requested != "auto" and resolved != "custom" and _same_registered_provider(resolved, requested):
+        return
+    named = _get_named_custom_provider(configured_provider or "")
+    same_url = _normalized_runtime_url(runtime.get("base_url"))
+    if named and _normalized_runtime_url(named.get("base_url")) == same_url:
+        from hermes_cli.runtime_provider_custom import _key_env_secret
+        pool_key = getattr(runtime.get("credential_pool"), "provider", None)
+        owned_key = explicit_api_key or named.get("api_key") or _key_env_secret(named, "delegation model_pool")
+        owns_pool = pool_key in custom_provider_aliases(named.get("name") or "", named.get("provider_key") or "")
+        owns_key = bool(owned_key) and owned_key == runtime.get("api_key")
+        owns_cmd = bool(named.get("key_cmd")) and callable(runtime.get("api_key"))
+        if (owns_pool and runtime.get("source") == f"pool:{pool_key}") or owns_key or owns_cmd:
+            return
+    alias_provider, alias_url = expand_direct_api_alias(configured_provider or "", None)
+    if (alias_provider == "custom" and alias_url and _normalized_runtime_url(alias_url) == same_url
+            and runtime.get("source") == "direct-alias" and runtime.get("api_key")):
+        return
+    if (requested == "custom" and explicit_base_url and _normalized_runtime_url(explicit_base_url) == same_url
+            and runtime.get("source") == "direct-alias"
+            and runtime.get("api_key") == (explicit_api_key or "no-key-required")):
+        return
+    raise ValueError(f"Delegation model_pool provider '{configured_provider}' did not resolve its own provider credentials.")
+
+
+def _resolve_pool_runtime(provider: Optional[str], model: Optional[str]) -> dict:
+    """Resolve and revalidate owned identity before any runtime dereference."""
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    try:
+        runtime = _validate_delegation_runtime(resolve_runtime_provider(requested=provider, target_model=model))
+        _require_pool_provider(provider, runtime)
+    except (RuntimeError, ValueError, TypeError, OSError) as exc:
+        raise ValueError(
+            f"Cannot resolve delegation provider '{provider}': "
+            "did not resolve its own provider credentials for this exclusive model-pool route."
+        ) from exc
+    return runtime
+
+
+def _pool_route_error(name: str, profile: Any) -> Optional[str]:
+    """Structural requirements of an exclusive named delegation route."""
+    if not isinstance(profile, dict):
+        return f"{name!r} is not a mapping."
+    for field in ("model", "provider", "base_url", "api_key"):
+        value = profile.get(field)
+        if value is not None and (not isinstance(value, str) or (value and not value.strip())):
+            return f"{name!r} has an invalid {field}; expected a string."
+    error = _route_shape_error(profile)
+    if error:
+        return f"{name!r} has an {error}."
+    mode = profile.get("api_mode")
+    if mode is not None and mode != "":
+        from hermes_cli.runtime_provider import _parse_api_mode
+        if not isinstance(mode, str) or _parse_api_mode(mode) is None:
+            return f"{name!r} has an invalid api_mode; expected a supported transport."
+    if not (profile.get("model") or "").strip():
+        return f"{name!r} requires a model."
+    provider = (profile.get("provider") or "").strip()
+    if provider.lower() == "auto":
+        return f"{name!r} requires an explicit provider; auto uses ambient routing."
+    endpoint = (profile.get("base_url") or "").strip()
+    if not provider and not endpoint:
+        return f"{name!r} requires a provider or base_url."
+    if not provider and not (profile.get("api_key") or "").strip():
+        return f"{name!r} requires an api_key for its endpoint."
+    if "fallback_chain" in profile:
+        chain = profile["fallback_chain"]
+        if not isinstance(chain, list) or any(
+            not isinstance(entry, dict) or any(
+                not isinstance(entry.get(field), str) or not entry[field].strip()
+                for field in ("provider", "model")
+            ) or entry.get("provider", "").strip().lower() == "auto" for entry in chain
+        ):
+            return f"{name!r} has an invalid fallback_chain; expected a list of provider/model routes."
+    return None
+
+
+def _model_pool_errors(pool: Any) -> list[str]:
+    """One structural admission contract for config diagnostics and runtime."""
+    if pool is None or pool == {}:
+        return []
+    if not isinstance(pool, dict):
+        return ["delegation.model_pool must be a mapping of named tiers."]
+    errors = []
+    for name, profile in pool.items():
+        if not isinstance(name, str) or not name or name != name.strip():
+            errors.append(f"delegation.model_pool has an invalid tier name {name!r}.")
+            continue
+        error = _pool_route_error(name, profile)
+        if error:
+            errors.append(f"delegation.model_pool.{name}: {error}")
+    if "standard" not in pool:
+        errors.append("delegation.model_pool is non-empty but has no 'standard' profile")
+    return errors
+
 def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusive: bool = False) -> dict:
     """``delegation.base_url`` branch: provider/api_mode from URL heuristics."""
     # Shared URL-based api_mode detector so Anthropic-compatible direct endpoints (/anthropic suffix: Azure AI
@@ -356,25 +500,26 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusi
     # Preserve the configured provider's request personality on an explicit endpoint.
     request_overrides = None
     # A named custom endpoint already owns its key. Do not resolve another provider's personality onto it.
-    if v["provider"] and not (exclusive and v["provider"] == "custom"):
+    if v["provider"] and not (exclusive and (v["provider"] == "custom" or v["api_key"])):
         try:
             from hermes_cli.runtime_provider import resolve_runtime_provider
-            runtime = resolve_runtime_provider(
-                requested=v["provider"], target_model=v["model"],
-                **({"explicit_base_url": v["base_url"], "explicit_api_key": v["api_key"]} if exclusive else {}),
+            runtime = (
+                _resolve_pool_runtime(v["provider"], v["model"]) if exclusive
+                else resolve_runtime_provider(requested=v["provider"], target_model=v["model"])
             )
-            if not exclusive or _normalized_runtime_url(runtime.get("base_url")) == _normalized_runtime_url(v["base_url"]):
-                request_overrides = dict(runtime.get("request_overrides") or {}) or None
-
         except Exception as exc:
             if exclusive:
-                raise ValueError(
-                    f"Cannot resolve exclusive delegation endpoint for provider '{v['provider']}'."
-                ) from exc
+                raise
             logger.debug(
                 "delegation.base_url: runtime resolution for provider '%s' failed; proceeding without request_overrides: %s",
                 v["provider"], exc,
             )
+        else:
+            runtime = _validate_delegation_runtime(runtime)
+            if not exclusive or _normalized_runtime_url(runtime.get("base_url")) == _normalized_runtime_url(v["base_url"]):
+                request_overrides = dict(runtime.get("request_overrides") or {}) or None
+                if exclusive and not v["api_key"] and runtime.get("api_key"):
+                    v["api_key"] = runtime["api_key"]
     # api_key None → inherited from parent in _build_child_agent
     return _credential_bundle(
         v["model"], provider, v["base_url"], v["api_key"], api_mode,
@@ -384,20 +529,20 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides, *, exclusi
 def _runtime_provider_credentials(v: dict, explicit_request_overrides, *, exclusive: bool = False) -> dict:
     """``delegation.provider`` branch: full bundle via the runtime provider system."""
     configured_provider = v["provider"]
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(
-            requested=configured_provider, target_model=v["model"],
-            **({"explicit_base_url": v["base_url"], "explicit_api_key": v["api_key"]} if exclusive else {}),
-        )
-    except Exception as exc:
-        raise ValueError(
-            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
-            f"Check that the provider is configured (API key set, valid provider name), "
-            f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
-            f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
-        ) from exc
-
+    if exclusive:
+        runtime = _resolve_pool_runtime(configured_provider, v["model"])
+    else:
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
+                f"Check that the provider is configured (API key set, valid provider name), "
+                f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
+                f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
+            ) from exc
+    runtime = _validate_delegation_runtime(runtime)
     api_key = v["api_key"] or runtime.get("api_key", "")
     if not api_key:
         raise ValueError(

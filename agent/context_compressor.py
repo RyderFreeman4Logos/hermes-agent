@@ -1319,11 +1319,7 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     wire_msg = dict(msg)
     substitute_api_content(wire_msg)
     content = wire_msg.get("content") or ""
-    if isinstance(content, (list, dict)):
-        text_tokens = _content_length_for_budget(content) // _CHARS_PER_TOKEN
-    else:
-        text_tokens = estimate_tokens_rough(content)
-    tokens = text_tokens + 10  # +10 for role/key overhead
+    tokens = (_content_length_for_budget(content) // _CHARS_PER_TOKEN if isinstance(content, (list, dict)) else estimate_tokens_rough(content)) + 10
     tokens += sum(estimate_tokens_rough(str(tc)) for tc in msg.get("tool_calls") or [] if isinstance(tc, dict))
     for key in _ALWAYS_REPLAYED_BUDGET_KEYS:
         # Opaque ciphertext is priced only by real usage (same rule as the preflight estimator).

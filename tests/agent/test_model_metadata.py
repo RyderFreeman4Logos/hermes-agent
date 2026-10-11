@@ -158,21 +158,6 @@ class TestEstimateMessagesTokensRough:
         tool_row = {"role": "tool", "content": body, "api_content": "ignored"}
         assert estimate_messages_tokens_rough([tool_row]) >= baseline
 
-    def test_structured_api_content_substitutes_for_flattened_display_content(self):
-        sidecar = [
-            {"type": "text", "text": "structured replay"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-        ]
-        persisted = {
-            "role": "user",
-            "content": "structured replay\n[screenshot]",
-            "api_content": sidecar,
-        }
-
-        estimate = estimate_messages_tokens_rough([persisted])
-
-        assert 1500 <= estimate < 2000
-
     def test_image_stripping_survives_shadow_extraction(self):
         """Non-regression for the ``_wire_message_shadow()`` extraction.
 

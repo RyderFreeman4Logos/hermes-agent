@@ -83,10 +83,8 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
-        # Append current-start and the latest successful completed-loop stop to each loop input.
-        "loop_timing_context": True,
-        # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
-        # while calling tools or receiving API responses. 0 = unlimited.
+        "loop_timing_context": True,  # current start + last successful stop on each loop input
+        # Gateway inactivity timeout (seconds). Idle only; 0 = unlimited. Not during tools or API calls.
         "gateway_timeout": 1800,
         # Max seconds an alias routing key waits for the active turn holding the same session lease;
         # on expiry the message is rejected with a resend notice. Keep short: Telegram dispatches

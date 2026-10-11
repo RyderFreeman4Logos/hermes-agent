@@ -1602,8 +1602,7 @@ class SessionMessagesMixin:
             # (ACP, gateway, CLI, TUI, compression adoption), never opt-in like ``_row_id``.
             _restore_identity_columns(row, msg)
             msg.update((col, row[col]) for col in ("display_kind",) if row[col])
-            if row["api_content"]:
-                msg["api_content"] = self._decode_content(row["api_content"])
+            msg.update({"api_content": self._decode_content(row["api_content"])} if row["api_content"] else {})
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded
             if include_summary_markers and row["_compressed_summary"]:

@@ -629,7 +629,9 @@ def _resolve_hermes_bin_dir() -> str | None:
         candidate = os.path.dirname(argv0)
     else:
         candidate = exe_dir if exe_dir and os.path.isfile(os.path.join(exe_dir, shim)) else None
-    _HERMES_BIN_DIR = candidate if candidate and os.path.isdir(candidate) else None
+    # which() already proved the shim exists. os.path.isdir here is a second
+    # stat the test home guard does not treat as command lookup.
+    _HERMES_BIN_DIR = candidate if candidate and (which or os.path.isdir(candidate)) else None
     _HERMES_BIN_DIR_IS_PAYLOAD = False
     return _HERMES_BIN_DIR
 

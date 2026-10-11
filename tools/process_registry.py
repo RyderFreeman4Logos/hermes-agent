@@ -36,7 +36,7 @@ from tools.process_registry_notifications import format_process_notification
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
-from tools.process_registry_env_log import log_delta_command
+from tools.process_registry_env_log import log_delta_command, is_wsl_launcher_command, WSL_CHAIN_NOTE
 
 logger = logging.getLogger(__name__)
 
@@ -662,42 +662,6 @@ _CHECKPOINT_DEFAULTS = {
     if f.name in _CHECKPOINT_FIELDS
 }
 
-
-_WSL_LAUNCHER_NAMES = frozenset({"wsl", "wsl.exe"})
-
-_WSL_CHAIN_NOTE = (
-    "Spawned via a wsl[.exe] launcher: the recorded host PID is the short-lived "
-    "launcher, not the Linux-side workers. Inspect them with `wsl -e ps` / "
-    "`wsl --list --running` from the host."
-)
-
-
-def _is_wsl_launcher_command(command: str) -> bool:
-    """True when *command* routes through a ``wsl[.exe]`` launcher chain (#120546).
-
-    The host PID recorded for such a spawn belongs to the short-lived launcher;
-    grandchildren inside the VM outlive it, so the entry must say so instead of
-    letting host-side hunting fail silently.
-    """
-    if not isinstance(command, str) or not command.strip():
-        return False
-    candidates = []
-    try:
-        candidates.append((shlex.split(command, posix=True) or [""])[0])
-    except ValueError:
-        pass
-    # POSIX shlex eats Windows backslashes (``C:\...\wsl.exe``), so also try
-    # the naive first token where path separators survive.
-    words = command.strip().split()
-    if words:
-        candidates.append(words[0])
-    for first in candidates:
-        base = os.path.basename(first.replace("\\", "/")).strip("'\"").lower()
-        if base in _WSL_LAUNCHER_NAMES:
-            return True
-    return False
-
-
 class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
@@ -1113,7 +1077,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
-            wsl_chain=_is_wsl_launcher_command(command),
+            wsl_chain=is_wsl_launcher_command(command),
             started_at=time.time(), **extra)
 
     @staticmethod
@@ -2085,7 +2049,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         """Block until the process exits, the timeout elapses, the user interrupts, or a
         mid-turn user message (steer/redirect → ``request_yield``) releases the wait.
         ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
-        with status exited|timeout|interrupted|not_found|error and an output snapshot."""
+        with status exited|running|timeout|interrupted|not_found|error and an output
+        snapshot. A running notified session returns immediately; its completion is
+        delivered through the existing notification queue. A mid-turn steer/redirect
+        (``request_yield``) still releases a blocking wait."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
 
         try:
@@ -2104,6 +2071,26 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
+        self._reconcile_local_exit(session)  # orphaned-pipe reader guard
+        if session.notify_on_complete and not session.exited:
+            from agent.delegation_context import is_delegated_child_context
+
+            # A native child has no parent notification drain. Deferring its
+            # wait leaves the child looping on wait_deferred until interrupt.
+            if not is_delegated_child_context():
+                return {
+                    "status": "running",
+                    "session_id": session.id,
+                    "command": session.command,
+                    "process_running": True,
+                    "wait_deferred": True,
+                    "notify_on_complete": True,
+                    "note": (
+                        "process.wait was auto-backgrounded because notify_on_complete "
+                        "is set; continue other work and you will be notified exactly "
+                        "once when the process exits."
+                    ),
+                }
         deadline = time.monotonic() + effective_timeout
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
@@ -2440,7 +2427,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 entry["session_scoped"] = True
             if s.wsl_chain:
                 entry["wsl_chain"] = True
-                entry["wsl_note"] = _WSL_CHAIN_NOTE
+                entry["wsl_note"] = WSL_CHAIN_NOTE
             # Trigger metadata for goal-loop judges (a watcher may never exit).
             if s.watch_patterns and not s._watch_disabled:
                 entry.update(watch_patterns=list(s.watch_patterns), watch_hit=s._watch_hits > 0)
@@ -2614,8 +2601,9 @@ PROCESS_SCHEMA = {
         "terminal(background=true)). "
         "Completed results remain retrievable by session_id when resuming their owning conversation "
         "(up to 7 days, newest 64 results per profile; rolling output tail). "
-        "poll: status + new output. log: full output, paged. wait: block "
-        "until exit or timeout (partial output on timeout). write vs "
+        "poll: status + new output. log: full output, paged. wait: return "
+        "immediately for notify_on_complete targets; otherwise block until "
+        "exit or timeout (partial output on timeout). write vs "
         "submit: submit appends Enter — use it to answer prompts; write "
         "sends raw bytes, no newline. close: EOF stdin. kill: terminate. "
         "handoff (subagents only): transfer a running process you started to your parent agent, which then "
@@ -2639,7 +2627,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait'.",
+                "description": "Max seconds for 'wait' when the target is not already configured for completion notification.",
                 "minimum": 1
             },
             "offset": {

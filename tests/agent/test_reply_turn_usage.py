@@ -43,6 +43,7 @@ def _agent():
         _session_db=None,
         verbose_logging=False,
         quiet_mode=True,
+        thinking_callback=None,
         client=None,
         platform="cli",
     )
@@ -99,3 +100,43 @@ def test_usage_less_final_request_does_not_reuse_an_earlier_total():
     assert _reply_cache_counts(agent) == (None, None)
     # The last-request seam is unchanged: a usage-less response does not clear it.
     assert agent._last_turn_usage["cache_read_tokens"] == 800
+
+
+def test_negative_and_nonfinite_cache_counts_are_not_measured_zero():
+    base = {"prompt_tokens": 500, "completion_tokens": 50}
+    for bad in (-1, 1.5, float("inf"), float("nan"), True):
+        usage = normalize_usage(
+            {**base, "prompt_tokens_details": {"cached_tokens": bad}},
+            provider="openai", api_mode="chat_completions",
+        )
+        assert usage.cache_read_known is False
+        assert usage.input_tokens + usage.cache_read_tokens == 500
+    zero = normalize_usage(
+        {**base, "prompt_tokens_details": {"cached_tokens": 0.0}},
+        provider="openai", api_mode="chat_completions",
+    )
+    assert zero.cache_read_known is True
+    assert zero.cache_read_tokens == 0
+
+
+def test_length_continuation_marks_the_turn_incomplete_before_the_stop():
+    from agent.turn_usage import mark_unaccounted_response
+
+    agent = _agent()
+    _record(agent, {"prompt_tokens": 1000, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 800}})
+    # recover_from_truncation returns before record_response_usage. The shared
+    # intake marks that response unaccounted; a later known stop must not
+    # become the whole turn.
+    mark_unaccounted_response(agent)
+    assert _reply_cache_counts(agent) == (None, None)
+    _record(agent, {"prompt_tokens": 400, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 100}})
+    assert _reply_cache_counts(agent) == (None, None)
+
+
+def test_usage_less_length_then_known_stop_stays_incomplete():
+    from agent.turn_usage import mark_unaccounted_response
+
+    agent = _agent()
+    mark_unaccounted_response(agent)
+    _record(agent, {"prompt_tokens": 400, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 100}})
+    assert _reply_cache_counts(agent) == (None, None)

@@ -49,6 +49,9 @@ def test_turn_start_preflight_timeout_returns_typed_result_not_exception():
     agent.context_compressor.get_active_compression_failure_cooldown = MagicMock(
         return_value=None
     )
+    agent._reply_usage = {"cache_read_tokens": 800, "prompt_tokens": 1000}
+    agent._reply_usage_complete = True
+    agent._last_turn_usage = {"cache_read_tokens": 800, "prompt_tokens": 1000}
 
     def _timed_out(messages, _system_message, **_kwargs):
         from agent.conversation_compression import (
@@ -82,3 +85,5 @@ def test_turn_start_preflight_timeout_returns_typed_result_not_exception():
     # The actionable preflight guidance survives into both user-facing fields.
     assert "provider call was not sent" in result["final_response"]
     assert "provider call was not sent" in result["error"]
+    from agent.turn_usage import _reply_cache_counts
+    assert _reply_cache_counts(agent) == (None, None)

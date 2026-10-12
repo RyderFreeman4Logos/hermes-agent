@@ -38,6 +38,15 @@ class ResponseUsageOutcome:
     rearmed: bool = False
 
 
+def mark_unaccounted_response(agent: Any) -> None:
+    """A completed response left the turn before ``record_response_usage``.
+
+    The footer must not present the remaining requests as the whole turn.
+    Numeric session counters stay where they are.
+    """
+    agent._reply_usage_complete = False
+
+
 def _fold_reply_usage(agent: Any, usage_dict: dict, cache_read_known: bool) -> None:
     """Sum this user turn's requests. ``_last_turn_usage`` stays the latest call.
 

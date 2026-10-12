@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone, UTC
@@ -377,11 +378,22 @@ def _usage_field(obj: Any, *path: str) -> int:
         return 0
 
 
-def _cache_read_known(obj: Any, paths: tuple[tuple[str, ...], ...]) -> bool:
-    """True only when a cache-read path exists and holds a real number, including 0.
+def _finite_nonnegative_int(value: Any) -> bool:
+    """True for 0, 1, 2.0. False for bool, negative, fraction, inf, and nan."""
+    if isinstance(value, (bool, str)):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, float):
+        return math.isfinite(value) and value >= 0 and value == math.trunc(value)
+    return False
 
-    A missing hop or a non-numeric value is not a measured zero. Pricing still
-    uses ``_usage_field`` and is unaffected.
+
+def _cache_read_known(obj: Any, paths: tuple[tuple[str, ...], ...]) -> bool:
+    """True only when a cache-read path holds a finite nonnegative integral count.
+
+    Negative, fractional, and non-finite values are not a measured zero.
+    Pricing still uses ``_usage_field`` and is unaffected.
     """
     for path in paths:
         cur = obj
@@ -399,13 +411,8 @@ def _cache_read_known(obj: Any, paths: tuple[tuple[str, ...], ...]) -> bool:
                 break
             else:
                 cur = getattr(cur, hop)
-        if isinstance(cur, bool) or cur is None:
-            continue
-        try:
-            int(cur)
-        except (TypeError, ValueError):
-            continue
-        return True
+        if _finite_nonnegative_int(cur):
+            return True
     return False
 
 

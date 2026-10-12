@@ -1455,7 +1455,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
     return agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_messages_for_non_vision_model(api_messages), tools=tools_for_api,
         reasoning_config=reasoning_config, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, base_url=agent.base_url,
+        cache_scope_id=cache_scope_id, static_system_prefix=getattr(agent, "_cached_system_prompt_static", None), base_url=agent.base_url,
         max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
         provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
@@ -1501,14 +1501,14 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         max_tokens=agent.max_tokens, ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
         request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
+        cache_scope_id=cache_scope_id, static_system_prefix=getattr(agent, "_cached_system_prompt_static", None), ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
         supports_reasoning=agent._supports_reasoning_extra_body(),
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         qwen_session_metadata=_qwen_meta)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
-        return transport.build_kwargs(provider_profile=_profile, **_common)
+        return transport.build_kwargs(provider_profile=_profile, provider_name=getattr(agent, "requested_provider", None), **_common)
 
     # Legacy flag path: only for a provider absent from the providers/ registry.
     return transport.build_kwargs(

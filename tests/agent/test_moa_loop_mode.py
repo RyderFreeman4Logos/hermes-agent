@@ -1143,6 +1143,78 @@ moa:
     assert cost2 is None
 
 
+def test_known_advisor_and_aggregator_keep_the_sum_known():
+    from agent.moa_loop import _sum_reference_accounting, _RefAccounting
+    from agent.turn_usage import _fold_moa_usage, _reply_cache_counts
+    from agent.usage_pricing import CanonicalUsage
+
+    advisor = CanonicalUsage(
+        input_tokens=200, cache_read_tokens=800, output_tokens=10, cache_read_known=True,
+    )
+    total, _cost = _sum_reference_accounting([("advisor", "ok", _RefAccounting(advisor))])
+    aggregator = CanonicalUsage(
+        input_tokens=100, cache_read_tokens=400, output_tokens=10, cache_read_known=True,
+    )
+    folded = aggregator + total
+    assert folded.cache_read_known is True
+    assert folded.cache_read_tokens == 1200
+    agent = SimpleNamespace(client=SimpleNamespace(
+        consume_reference_usage=lambda: (total, None),
+    ))
+    _client, combined, _ref_cost = _fold_moa_usage(agent, aggregator)
+    assert combined.cache_read_known is True
+    agent._reply_usage = None
+    agent._reply_usage_complete = True
+    from agent.turn_usage import _fold_reply_usage
+    _fold_reply_usage(agent, {
+        "cache_read_tokens": combined.cache_read_tokens,
+        "prompt_tokens": combined.prompt_tokens,
+    }, combined.cache_read_known)
+    assert _reply_cache_counts(agent) == (1200, 1500)
+
+
+def test_cache_hit_with_no_new_advisor_does_not_poison_known_aggregator():
+    from agent.moa_loop import MoAChatCompletions
+    from agent.turn_usage import _fold_moa_usage
+    from agent.usage_pricing import CanonicalUsage
+
+    facade = MoAChatCompletions("review")
+    usage, cost = facade.consume_reference_usage()
+    assert cost is None
+    assert usage.input_tokens == 0
+    assert usage.cache_read_known is True
+    aggregator = CanonicalUsage(input_tokens=100, cache_read_tokens=400, cache_read_known=True)
+    _client, combined, _ref_cost = _fold_moa_usage(
+        SimpleNamespace(client=SimpleNamespace(consume_reference_usage=lambda: (usage, cost))),
+        aggregator,
+    )
+    assert combined.cache_read_known is True
+    assert combined.cache_read_tokens == 400
+
+
+def test_usage_less_advisor_poisons_known_aggregator():
+    from agent.moa_loop import _sum_reference_accounting, _RefAccounting
+    from agent.turn_usage import _fold_moa_usage, _fold_reply_usage, _reply_cache_counts
+    from agent.usage_pricing import CanonicalUsage
+
+    ran = _sum_reference_accounting([
+        ("advisor", "ok", _RefAccounting(CanonicalUsage())),
+    ])[0]
+    assert ran.cache_read_known is False
+    aggregator = CanonicalUsage(input_tokens=100, cache_read_tokens=400, cache_read_known=True)
+    _client, combined, _cost = _fold_moa_usage(
+        SimpleNamespace(client=SimpleNamespace(consume_reference_usage=lambda: (ran, None))),
+        aggregator,
+    )
+    assert combined.cache_read_known is False
+    agent = SimpleNamespace(_reply_usage=None, _reply_usage_complete=True)
+    _fold_reply_usage(agent, {
+        "cache_read_tokens": combined.cache_read_tokens,
+        "prompt_tokens": combined.prompt_tokens,
+    }, combined.cache_read_known)
+    assert _reply_cache_counts(agent) == (None, None)
+
+
 class _CountingCtxLen:
     """Stub for get_model_context_length that counts resolutions."""
 

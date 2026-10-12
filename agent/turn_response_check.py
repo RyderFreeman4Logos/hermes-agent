@@ -17,7 +17,7 @@ from agent.error_classifier import FailoverReason
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import invalid_response_failure_reason, provider_label_for, site_copy, stamp_failure
 from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
-from agent.turn_usage import record_response_usage
+from agent.turn_usage import mark_unaccounted_response, record_response_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -145,6 +145,7 @@ def check_api_response(
         retry_count = _iv.retry_count
         compression_attempts = _iv.compression_attempts
         if _iv.action != "fallthrough":
+            mark_unaccounted_response(agent)
             return _verdict(_iv.action, _iv.result)
 
     agent._turn_received_provider_response = True
@@ -165,9 +166,11 @@ def check_api_response(
         thinking_spinner = None
         active_system_prompt = _rv.active_system_prompt
         if _rv.action == "return":
+            mark_unaccounted_response(agent)
             return _verdict("return", _rv.result)
         retry_count = 0
         compression_attempts = 0
+        mark_unaccounted_response(agent)
         return _verdict("break")
 
     if finish_reason == "length":
@@ -188,6 +191,7 @@ def check_api_response(
         retry_count = _tv.retry_count
         compression_attempts = _tv.compression_attempts
         if _tv.action in ("return", "break", "continue"):
+            mark_unaccounted_response(agent)
             return _verdict(_tv.action, _tv.result)
 
     # Fold provider usage into compressor / anchors / session counters / state.db

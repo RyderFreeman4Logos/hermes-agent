@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone, UTC
@@ -71,6 +72,9 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    # Display only. Numeric buckets stay zero when the field is absent so pricing
+    # is unchanged; footer callers must not treat that zero as a measured hit.
+    cache_read_known: bool = False
 
     @property
     def prompt_tokens(self) -> int:
@@ -88,8 +92,8 @@ class CanonicalUsage:
             return NotImplemented
         return CanonicalUsage(**{
             f.name: getattr(self, f.name) + getattr(other, f.name)
-            for f in fields(CanonicalUsage) if f.name != "raw_usage"
-        })
+            for f in fields(CanonicalUsage) if f.name not in ("raw_usage", "cache_read_known")
+        }, cache_read_known=self.cache_read_known and other.cache_read_known)
 
 
 @dataclass(frozen=True)
@@ -372,6 +376,44 @@ def _usage_field(obj: Any, *path: str) -> int:
         return max(0, int(obj or 0))
     except Exception:
         return 0
+
+
+def _finite_nonnegative_int(value: Any) -> bool:
+    """True for 0, 1, 2.0. False for bool, negative, fraction, inf, and nan."""
+    if isinstance(value, (bool, str)):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, float):
+        return math.isfinite(value) and value >= 0 and value == math.trunc(value)
+    return False
+
+
+def _cache_read_known(obj: Any, paths: tuple[tuple[str, ...], ...]) -> bool:
+    """True only when a cache-read path holds a finite nonnegative integral count.
+
+    Negative, fractional, and non-finite values are not a measured zero.
+    Pricing still uses ``_usage_field`` and is unaffected.
+    """
+    for path in paths:
+        cur = obj
+        for hop in path:
+            if cur is None or cur is False or cur == 0 or cur == "":
+                cur = None
+                break
+            if isinstance(cur, dict):
+                if hop not in cur:
+                    cur = None
+                    break
+                cur = cur[hop]
+            elif not hasattr(cur, hop):
+                cur = None
+                break
+            else:
+                cur = getattr(cur, hop)
+        if _finite_nonnegative_int(cur):
+            return True
+    return False
 
 
 def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> int:
@@ -660,6 +702,7 @@ def normalize_usage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
         raw_usage=dict(u) if isinstance(u, dict) else (u.model_dump() if callable(getattr(u, 'model_dump', None)) else None),
+        cache_read_known=_cache_read_known(u, shape[2]),
     )
 
 

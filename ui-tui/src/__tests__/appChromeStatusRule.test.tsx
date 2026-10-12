@@ -208,10 +208,7 @@ describe('StatusRule background-subagent indicator', () => {
     expect(textContent(element)).not.toContain('resumes when')
   })
 
-  it('drops the subagent segment before the bg segment on a narrow terminal', () => {
-    // cols=44 is below the subagents breakpoint (92) but the bg breakpoint
-    // (88) too — both gone. Assert the lower-priority subagent indicator is
-    // not shown when space is tight even with a live count.
+  it('keeps the subagent count when the one-row fitter would have dropped it', () => {
     const element = StatusRule({
       ...baseProps,
       cols: 44,
@@ -219,7 +216,7 @@ describe('StatusRule background-subagent indicator', () => {
       usage: { ...baseProps.usage, active_subagents: 2 }
     })
 
-    expect(textContent(element)).not.toContain('⛓')
+    expect(textContent(element)).toContain('⛓ 2')
   })
 })
 
@@ -251,7 +248,7 @@ describe('StatusRule session count click target', () => {
     expect(openSwitcher).toHaveBeenCalledOnce()
   })
 
-  it('keeps status + model and drops the low-value tail on a narrow terminal', () => {
+  it('keeps status + model and wraps the low-value tail on a narrow terminal', () => {
     const element = StatusRule({
       bgCount: 0,
       busy: false,
@@ -279,11 +276,11 @@ describe('StatusRule session count click target', () => {
 
     const rendered = textContent(element)
 
-    // Must-keep essentials survive intact …
+    // Must-keep essentials survive intact, and the session count wraps
+    // instead of being dropped.
     expect(rendered).toContain('ready')
     expect(rendered).toContain('opus 4.8')
-    // … while the low-value tail (session count) is dropped, not truncated.
-    expect(rendered).not.toContain('3 sessions')
+    expect(rendered).toContain('3 sessions')
   })
 })
 

@@ -243,3 +243,21 @@ def test_compress_wait_budget_follows_config_ceiling(monkeypatch):
     assert server._compute_host_compress_wait_seconds(
         {"compression": {"context_total_ceiling_seconds": 99999}}
     ) == server._COMPUTE_HOST_COMPRESS_WAIT_CAP_SECS
+
+
+def test_compress_wait_budget_accounts_for_auxiliary_fallback_ceilings():
+    # Full config root: aux/fallback ceilings must expand the host RPC wait.
+    # 400s stays below the 630s cap so a sliced compression-only resolve (200+30)
+    # cannot hide behind that cap.
+    cfg = {
+        "compression": {"context_total_ceiling_seconds": 200},
+        "auxiliary": {
+            "compression": {
+                "timeout": 350,
+                "fallback_chain": [
+                    {"provider": "local", "model": "slow", "timeout": 400},
+                ],
+            }
+        },
+    }
+    assert server._compute_host_compress_wait_seconds(cfg) == 430.0

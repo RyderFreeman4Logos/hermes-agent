@@ -36,6 +36,7 @@ class Usage(OpenModel):
     cache_hit_pct: int | None = None
     reply_cache_read: int | None = None
     reply_prompt_tokens: int | None = None
+    reply_elapsed_s: float | None = None
     cache_read: int | None = None
     cache_write: int | None = None
     avg_latency_s: float | None = None

@@ -745,18 +745,17 @@ class CLIChatTurnMixin:
                 except Exception:
                     pass
 
-        # Display only, after the reply. Frozen wall time; last prompt size
-        # already includes cache reads. Missing usage omits the rate.
-        try:
-            from agent.reply_end_line import reply_end_line
-            _last = getattr(self.agent, "_last_turn_usage", None)
-            _line = reply_end_line(
-                elapsed_s=getattr(self, "_prompt_duration", None),
-                cache_read=_last.get("cache_read_tokens") if isinstance(_last, dict) else None,
-                prompt_total=_last.get("prompt_tokens") if isinstance(_last, dict) else None,
-            )
-            if _line:
-                from cli import _DIM, _RST
-                _cprint(f"{_DIM}{_line}{_RST}")
-        except Exception:
-            pass
+        # Display only, after the reply. Frozen wall time; the turn total already
+        # includes each request's cache reads. Unknown or incomplete usage omits the rate.
+        from agent.reply_end_line import reply_end_line
+        from agent.turn_usage import _reply_cache_counts
+        from cli import _DIM, _RST
+        _agent = getattr(self, "agent", None)
+        _read, _total = _reply_cache_counts(_agent) if _agent is not None else (None, None)
+        _line = reply_end_line(
+            elapsed_s=getattr(self, "_prompt_duration", None),
+            cache_read=_read,
+            prompt_total=_total,
+        )
+        if _line:
+            _cprint(f"{_DIM}{_line}{_RST}")

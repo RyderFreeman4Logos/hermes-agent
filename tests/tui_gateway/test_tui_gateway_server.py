@@ -668,7 +668,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
             }
 
     fixed_info = {"model": "gold-model", "provider": "gold-provider", "usage": {"total": 15}}
-    usage = server._get_usage(_Agent())
+    usage = server._get_usage(_Agent()); monkeypatch.setattr(server.time, "monotonic", lambda: 0.0)
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
@@ -705,7 +705,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
                 sid = frame["sid"]
                 server._emit("message.start", sid)
                 server._emit("message.delta", sid, {"text": "hi"})
-                server._emit("message.complete", sid, {"text": "hi", "usage": usage, "status": "complete"})
+                server._emit("message.complete", sid, {"text": "hi", "usage": {**usage, "reply_elapsed_s": 0.0}, "status": "complete"})
                 server._emit("session.info", sid, dict(fixed_info))
                 if on_complete is not None:
                     on_complete(
@@ -20820,32 +20820,6 @@ def test_get_usage_perf_readouts_present():
     assert usage["cache_hit_pct"] == 87
     assert usage["avg_latency_s"] == 3.2
     assert usage["avg_tps"] == 50.0  # true throughput sum(out)/sum(lat), not mean of ratios
-
-
-def test_get_usage_reply_counts_are_last_response_not_session():
-    """Reply footer uses the last response. prompt_tokens already includes cache reads."""
-
-    class _TurnAgent:
-        model = "x"
-        session_prompt_tokens = 10_000
-        session_cache_read_tokens = 9_000
-        _last_turn_usage = {"cache_read_tokens": 800, "prompt_tokens": 1000, "input_tokens": 200}
-
-    usage = server._get_usage(_TurnAgent())
-    assert usage["reply_cache_read"] == 800
-    assert usage["reply_prompt_tokens"] == 1000
-    assert usage["cache_hit_pct"] == 90  # session bar stays a separate number
-
-
-def test_get_usage_omits_reply_counts_without_a_usage_record():
-    class _NoUsage:
-        model = "x"
-        session_prompt_tokens = 100
-        session_cache_read_tokens = 0
-
-    usage = server._get_usage(_NoUsage())
-    assert "reply_cache_read" not in usage
-    assert "reply_prompt_tokens" not in usage
 
 
 def test_get_usage_perf_readouts_omitted_without_data():

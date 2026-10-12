@@ -1,10 +1,9 @@
 """One displayed line after a reply: measured elapsed plus exact cache hit/total.
 
 Display only. Not the status bar, and not written into the transcript.
-``total`` is the last response's prompt size (uncached input + cache read +
-cache write). Cached input is already inside that total, so it is not added
-again. Missing usage or a non-positive total omits the cache clause rather
-than inventing a zero rate.
+``total`` is this turn's prompt tokens (uncached input + cache read + cache
+write, summed across the turn's requests). Cached input is already inside
+that total. Missing or incomplete usage omits the cache clause.
 """
 
 from __future__ import annotations

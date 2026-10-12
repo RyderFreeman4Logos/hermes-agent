@@ -32628,6 +32628,18 @@
             "default": null,
             "title": "Reply Prompt Tokens"
           },
+          "reply_elapsed_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Elapsed S"
+          },
           "cache_read": {
             "anyOf": [
               {
@@ -37846,6 +37858,18 @@
             ],
             "default": null,
             "title": "Reply Prompt Tokens"
+          },
+          "reply_elapsed_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Elapsed S"
           },
           "cache_read": {
             "anyOf": [

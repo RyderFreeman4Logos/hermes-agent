@@ -2220,12 +2220,13 @@ def _get_usage(agent) -> dict:
         _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
         if _prompt_total > 0 and _cache_read > 0:
             usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
-        # Last response only. prompt_tokens already includes cache_read; do not add it again.
-        # Absent when this turn never reported usage — callers must not invent a 0 rate.
-        _last = getattr(agent, "_last_turn_usage", None)
-        if isinstance(_last, dict) and "cache_read_tokens" in _last and "prompt_tokens" in _last:
-            usage["reply_cache_read"] = int(_last["cache_read_tokens"] or 0)
-            usage["reply_prompt_tokens"] = int(_last["prompt_tokens"] or 0)
+        # This turn's requests, not the session bar and not the last call alone.
+        # prompt_tokens already includes cache reads. Incomplete usage omits both.
+        from agent.turn_usage import _reply_cache_counts
+        _read, _total = _reply_cache_counts(agent)
+        if _read is not None and _total is not None:
+            usage["reply_cache_read"] = _read
+            usage["reply_prompt_tokens"] = _total
     with contextlib.suppress(Exception):  # a status-bar readout must never break usage reporting
         _lhist = list(getattr(agent, "_api_latency_history", []) or [])
         _ohist = list(getattr(agent, "_api_output_history", []) or [])

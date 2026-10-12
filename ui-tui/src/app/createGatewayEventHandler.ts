@@ -26,7 +26,7 @@ import { isPaintableHex, setTerminalBackground, setTerminalForeground } from '..
 import { formatAbandonedClarify, formatToolCall } from '../lib/text.js'
 import { bootSeededPin, invalidateBootBackground, writeBootTheme } from '../lib/themeBoot.js'
 import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, themeToneHex } from '../theme.js'
-import type { Msg, SessionInfo, SubagentProgress } from '../types.js'
+import type { SessionInfo, SubagentProgress } from '../types.js'
 
 import { applyConnectionRequest, applyConnectionUpdate } from './connectionOperationStore.js'
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
@@ -35,6 +35,7 @@ import { applyGoalSnapshot } from './goalStatus.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { getOverlayState, patchOverlayState, SENSITIVE_PROMPTS } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
+import { appendReplyEnd, completeMessages } from './replyEnd.js'
 import { forgetServerRequest } from './serverRequestStore.js'
 import { reportStartupLatency } from './startupLatency.js'
 import { markNextSubmitVoice } from './submissionCore.js'
@@ -545,17 +546,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     return fullConfigPromise
   }
 
-  // ── Nudge toward /agents on delegation ───────────────────────────────
-  //
-  // When `display.tui_agents_nudge` is enabled (default true), the first
-  // time a turn starts delegating we drop a single transient activity hint
-  // ("subagents working · /agents to watch live") so the user discovers the
-  // spawn-tree dashboard instead of staring at a quiet transcript — without
-  // hijacking the screen by force-opening an overlay.  Guards:
-  //   • fires at most once per turn (`agentsNudgedThisTurn`)
-  //   • silent if the overlay is already open (nothing to advertise)
-  // Reset on `message.start`.  The config flag is fetched once, lazily;
-  // until it resolves we assume the default (on).
+  // First delegation of a turn: one activity hint toward /agents. At most once,
+  // and never while the overlay is already open. Reset on message.start.
+  // display.tui_agents_nudge === false turns it off; until config loads, on.
   let agentsNudgeEnabled = true
   let agentsNudgeConfigFetched = false
   let agentsNudgedThisTurn = false
@@ -1530,47 +1523,19 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           })
         }
 
+        const payload = ev.payload ?? {}
+
         if (!wasInterrupted) {
-          const payload = ev.payload ?? {}
-          // A failed turn with no reply: the backend's assistant-slot text is
-          // "Error: <raw provider body>". Render the structured error_surface
-          // (layer/code/retryable) as a plain title + Details + next step
-          // instead; a partial reply keeps its streamed text.
           const failed = payload.status === 'error' && !payload.partial && isBareErrorText(finalText, payload.error)
 
-          // Only the trailing bare-error slot is replaced; interim segments the
-          // model streamed before the failure stay in the transcript.
-          const msgs: Msg[] = failed
-            ? [
-                ...finalMessages.filter(
-                  (m, i) =>
-                    !(
-                      i === finalMessages.length - 1 &&
-                      m.role === 'assistant' &&
-                      isBareErrorText(m.text, payload.error)
-                    )
-                ),
-                { role: 'assistant', text: describeTurnFailure(payload) }
-              ]
-            : finalMessages.length
-              ? finalMessages
-              : [{ role: 'assistant', text: finalText }]
+          completeMessages(finalMessages, finalText, failed, describeTurnFailure(payload), text =>
+            isBareErrorText(text, payload.error)
+          ).forEach(appendMessage)
+        }
 
-          msgs.forEach(appendMessage)
+        appendReplyEnd(payload.usage, appendMessage, { finalMessages, finalText, interruptedTo: interruptedReply?.to, wasInterrupted })
 
-          // Display only, after the reply. Counts are the last response's
-          // prompt size (cache reads already included). No usage → no rate.
-          const read = payload.usage?.reply_cache_read
-          const total = payload.usage?.reply_prompt_tokens
-
-          if (typeof read === 'number' && typeof total === 'number' && total > 0) {
-            appendMessage({
-              role: 'system',
-              text: `cache ${read}/${total} (${((100 * read) / total).toFixed(1)}%)`
-            })
-          }
-
-          // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
+        if (!wasInterrupted) {
           flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')
 
           if (bellOnComplete && stdout?.isTTY) {

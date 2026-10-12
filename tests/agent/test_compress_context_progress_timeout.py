@@ -8,6 +8,8 @@ for the owned wrapper used when callers do not pass a ``commit_fence``.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import concurrent.futures
 import threading
 import time
@@ -199,6 +201,43 @@ class TestResolveContextCompressionTimeouts:
     )
     def test_unrepresentable_timeout_values_are_ignored(self, config):
         assert resolve_context_compression_timeouts(config) == (120.0, 600.0)
+
+    def test_loaded_aux_timeout_rejects_overflow_and_nonfinite(self, monkeypatch):
+        """The #114594 floor rereads the loaded auxiliary timeout. A huge or
+        non-finite value must not raise or remove the finite host deadline.
+        """
+        import os
+
+        import agent.auxiliary_client as aux
+        import yaml
+
+        monkeypatch.undo()
+        home_root = os.environ["HERMES_HOME"]
+        monkeypatch.setenv("HERMES_HOME", home_root)
+        base = Path(home_root)
+        newline = chr(10)
+
+        def loaded(raw, name):
+            home = base / name
+            home.mkdir()
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            text = "auxiliary:" + newline + "  compression:" + newline + "    timeout: " + raw + newline
+            config_path = home / "config.yaml"
+            config_path.write_text(text, encoding="utf-8")
+            parsed = yaml.safe_load(text)["auxiliary"]["compression"]["timeout"]
+            return resolve_context_compression_timeouts(), parsed
+
+        result, parsed = loaded("9" * 400, "huge")
+        assert isinstance(parsed, int) and parsed > 10**308
+        assert result == (300.0, 600.0)
+        result, parsed = loaded(".inf", "inf")
+        assert parsed == float("inf")
+        assert result == (300.0, 600.0)
+        result, parsed = loaded(".nan", "nan")
+        assert parsed != parsed
+        assert result == (300.0, 600.0)
+        assert loaded("900", "above")[0] == (900.0, 900.0)
+        assert loaded("120", "below")[0] == (300.0, 600.0)
 
 
 class TestRunCompressContextWithProgressTimeout:

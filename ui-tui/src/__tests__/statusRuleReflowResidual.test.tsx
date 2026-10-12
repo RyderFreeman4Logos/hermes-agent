@@ -97,4 +97,28 @@ describe('status-rule reflow', () => {
     expect(rendered).not.toContain('voice off')
     expect(rendered).not.toContain('2 bg')
   })
+
+  it('keeps a selected tail when a crowded row is at least 72 columns', () => {
+    const lines = renderRule(80, {
+      cwdLabel: '~/src/hermes-agent/apps/desktop (bb/tui-statusbar-responsive)',
+      liveSessionCount: 3,
+      model: 'anthropic/claude-opus-4.8',
+      voiceLabel: 'voice off'
+    })
+
+    const rendered = lines.join('\n')
+
+    expect(rendered).toContain('3 sessions')
+    expect(rendered).toContain('voice off')
+    expect(lines.every(line => stringWidth(line) <= 80)).toBe(true)
+  })
+
+  it('bounds a field wider than the row, including a width narrower than one token', () => {
+    const longCwd = '目录/'.repeat(40) + '分支🌟'
+    const lines = renderRule(8, { cwdLabel: longCwd, model: 'anthropic/claude-opus-4.8-extra-long-name' })
+
+    expect(stringWidth(longCwd)).toBeGreaterThan(8)
+    expect(lines.length).toBeGreaterThan(0)
+    expect(lines.every(line => stringWidth(line) <= 8)).toBe(true)
+  })
 })

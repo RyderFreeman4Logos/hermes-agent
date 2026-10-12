@@ -73,3 +73,66 @@ def test_marked_block_still_routes_without_the_string_prefix(transport):
         )["prompt_cache_key"]
 
     assert key("first volatile suffix") == key("second volatile suffix")
+
+
+def _codex_agent(memory):
+    from tests.agent.transports.test_stable_prefix_cache_key import _prompt_agent
+
+    agent = _prompt_agent(memory)
+    agent.api_mode = "codex_responses"
+    agent.model = "gpt-5.6-luna"
+    agent.base_url = "https://api.openai.com/v1"
+    agent._base_url_lower = agent.base_url.lower()
+    agent._base_url_hostname = "api.openai.com"
+    agent._is_codex_backend = lambda: False
+    return agent
+
+
+def _serialized_codex_key(agent):
+    """Real Codex Responses serializer, local mock transport, no network."""
+    import json
+
+    import httpx
+    from openai import OpenAI
+
+    from agent.chat_completion_helpers import build_api_kwargs
+    from agent.codex_runtime import _sanitize_consumer_codex_request
+    from agent.sdk_transform_bypass import bypass_sdk_request_transform
+
+    prompt = build_system_prompt(agent)
+    request = build_api_kwargs(agent, [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": "same route"},
+    ])
+    stream_kwargs = _sanitize_consumer_codex_request(agent, request)
+    stream_kwargs["stream"] = True
+    captured = {}
+
+    def handler(http_request):
+        captured.update(json.loads(http_request.content))
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=(
+                'data: {"type":"response.completed","response":{"id":"resp_1",'
+                '"output":[],"status":"completed"}}\n\n'
+            ),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = OpenAI(api_key="test-key", base_url=agent.base_url, http_client=http_client)
+        stream = client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        list(stream)
+    return captured.get("prompt_cache_key"), agent._cached_system_prompt_static
+
+
+def test_codex_serialized_body_follows_rebuilt_stable_tier_only():
+    """A rebuilt volatile suffix keeps the serialized Codex key; a rebuilt stable tier changes it."""
+    first_key, stable = _serialized_codex_key(_codex_agent("memory one"))
+    second_key, same_stable = _serialized_codex_key(_codex_agent("memory two"))
+    changed = _codex_agent("memory two")
+    changed.valid_tool_names = ["terminal"]
+    changed_key, new_stable = _serialized_codex_key(changed)
+
+    assert stable and stable == same_stable and new_stable != stable
+    assert first_key and first_key.startswith("pck_") and first_key == second_key
+    assert changed_key != first_key

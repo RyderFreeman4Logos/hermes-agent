@@ -438,9 +438,14 @@ def _content_cache_key(instructions: str, tools: Optional[list[dict[str, Any]]],
 
 
 def _cache_key_instructions(
-    messages: list[dict[str, Any]], instructions: str
+    messages: list[dict[str, Any]], instructions: str, static_prefix: str | None = None,
 ) -> str:
-    """Use the marked stable system prefix for cache routing when present."""
+    """Hash the system-prompt stable tier, else a marked first block, else the full instructions."""
+    if (
+        isinstance(static_prefix, str) and static_prefix
+        and isinstance(instructions, str) and instructions.startswith(static_prefix)
+    ):
+        return static_prefix
     if messages and isinstance(messages[0], dict):
         first = messages[0]
         if first.get("role") in {"system", "developer"}:
@@ -803,7 +808,8 @@ class ResponsesApiTransport(ProviderTransport):
         # compression rotation; session_id itself stays untouched for transcript isolation.
         _cache_scope = _cache_scope_from_session_id(params.get("cache_scope_id") or session_id)
         cache_key = _content_cache_key(
-            _cache_key_instructions(messages, instructions), response_tools, _cache_scope
+            _cache_key_instructions(messages, instructions, params.get("static_system_prefix")),
+            response_tools, _cache_scope,
         ) or _cache_scope
         # xAI takes prompt_cache_key in extra_body (below); GitHub Models opts out entirely.
         if not is_github_responses and not is_xai_responses and cache_key:

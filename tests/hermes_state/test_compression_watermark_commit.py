@@ -14,10 +14,12 @@ import json
 import sqlite3
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
 
+from agent import conversation_compression as cc
 from hermes_state import SessionCompressionInProgressError, SessionDB
 
 
@@ -432,6 +434,129 @@ class TestRotationPathWatermark:
                 source_watermark=signed2,
             )
         assert db.get_session("child2") is None
+        assert db.get_session("sess2")["ended_at"] is None
+
+    def _lease(self, db: SessionDB, sid: str):
+        signed, digest = db.get_active_message_source_snapshot(sid)
+        agent = types.SimpleNamespace(
+            _session_db=db, session_id=sid, platform="cli", model="m",
+            _session_init_model_config=None, working_directory=None,
+            _memory_manager=None, context_compressor=types.SimpleNamespace(),
+            _flush_messages_to_session_db=lambda *a, **k: True,
+            _persist_user_message_idx=None, _session_messages=None,
+            _gateway_session_key=None, _cached_system_prompt="sys",
+            commit_memory_session=lambda *_a, **_k: None,
+        )
+        lease = cc._CompressionLease(
+            agent, db=db, sid=sid, ttl=60.0, refresh_interval=None,
+            commit_fence=None, lifecycle=cc._CompactionLifecycle(agent, False),
+        )
+        lease.holder = "rotator"
+        lease.watermark = signed
+        lease.signed_watermark = signed
+        lease.source_signature = digest
+        return agent, lease
+
+    def _adopt(self, db: SessionDB, sid: str, before: list):
+        agent, lease = self._lease(db, sid)
+        signed = lease.signed_watermark
+        db.append_message(sid, role="user", content="adopted preflush")
+        adopted = cc._adopt_grown_durable_parent(agent, lease, before)
+        assert adopted is not None
+        assert lease.watermark > signed and lease.signed_watermark == signed
+        return agent, lease, adopted
+
+    @pytest.mark.parametrize("mutate", [False, True])
+    def test_rotated_publication_keeps_signed_cutoff_after_adoption(
+        self, db: SessionDB, mutate: bool
+    ) -> None:
+        """Rotation publishes through the real caller after adoption.
+
+        The clone cutoff advances. The signed cutoff does not. A later append
+        is legal; a signed-prefix rewrite still aborts.
+        """
+        _seed(db, 2)
+        before = db.get_messages_as_conversation("sess1")
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        agent, lease = self._lease(db, "sess1")
+        db.append_message("sess1", role="user", content="adopted preflush")
+        adopted = cc._adopt_grown_durable_parent(agent, lease, before)
+        assert adopted is not None
+        assert lease.watermark > lease.signed_watermark
+        db.append_message("sess1", role="user", content="foreign after adoption")
+        if mutate:
+            prefix = next(int(row["id"]) for row in db.get_messages("sess1"))
+            db._conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ?", ("rewritten", prefix),
+            )
+            db._conn.commit()
+            with pytest.raises(SessionCompressionInProgressError, match="source changed"):
+                cc._publish_rotated_compaction(
+                    agent, before, SUMMARY, new_system_prompt="sys", lease=lease,
+                    old_session_id="sess1", compressed_user_turn_outcome="none",
+                )
+            assert agent.session_id == "sess1"
+            assert db.get_session("sess1")["ended_at"] is None
+            return
+        cc._publish_rotated_compaction(
+            agent, before, SUMMARY, new_system_prompt="sys", lease=lease,
+            old_session_id="sess1", compressed_user_turn_outcome="none",
+        )
+        child = [m["content"] for m in db.get_messages_as_conversation(agent.session_id)]
+        assert child == [
+            SUMMARY[0]["content"], SUMMARY[1]["content"], "foreign after adoption",
+        ]
+        assert "adopted preflush" not in child
+
+    def test_inplace_publication_keeps_signed_cutoff_after_adoption(
+        self, db: SessionDB
+    ) -> None:
+        """The in-place caller uses the same signed cutoff after adoption."""
+        _seed(db, 2)
+        before = db.get_messages_as_conversation("sess1")
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        agent, lease, adopted = self._adopt(db, "sess1", before)
+        db.append_message("sess1", role="user", content="foreign after adoption")
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        held = [{**m, _DB_PERSISTED_MARKER: True} for m in adopted]
+        outcome = cc._commit_compaction(
+            agent, held, SUMMARY, in_place=True, lease=lease,
+            new_system_prompt="sys", system_message="sys",
+            compressed_user_turn_outcome="none", messages_before_compression=held,
+            made_progress=True, attempt=cc._Attempt({}, 0, 0.0, {}),
+        )
+        assert outcome.session_commit_succeeded
+        live = [m["content"] for m in db.get_messages_as_conversation("sess1")]
+        assert live == [
+            SUMMARY[0]["content"], SUMMARY[1]["content"], "foreign after adoption",
+        ]
+        assert "adopted preflush" not in live
+
+        db.create_session("sess2", source="test")
+        for i in range(2):
+            db.append_message(
+                "sess2", role="user" if i % 2 == 0 else "assistant", content=f"turn {i}",
+            )
+        before2 = db.get_messages_as_conversation("sess2")
+        assert db.try_acquire_compression_lock("sess2", "rotator") is True
+        prefix = next(int(row["id"]) for row in db.get_messages("sess2"))
+        _agent2, lease2, adopted2 = self._adopt(db, "sess2", before2)
+        db._conn.execute(
+            "UPDATE messages SET content = ? WHERE id = ?", ("rewritten", prefix),
+        )
+        db._conn.commit()
+        held2 = [{**m, _DB_PERSISTED_MARKER: True} for m in adopted2]
+        before_rows = [m["content"] for m in db.get_messages_as_conversation("sess2")]
+        outcome2 = cc._commit_compaction(
+            _agent2, held2, SUMMARY, in_place=True, lease=lease2,
+            new_system_prompt="sys", system_message="sys",
+            compressed_user_turn_outcome="none",
+            messages_before_compression=held2, made_progress=True,
+            attempt=cc._Attempt({}, 0, 0.0, {}),
+        )
+        assert outcome2.session_commit_succeeded is False
+        assert outcome2.split_status == "failed_not_indexed"
+        assert [m["content"] for m in db.get_messages_as_conversation("sess2")] == before_rows
         assert db.get_session("sess2")["ended_at"] is None
 
     def test_ceiling_excludes_the_rotators_own_flush(self, db: SessionDB) -> None:

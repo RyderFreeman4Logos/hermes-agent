@@ -261,3 +261,38 @@ def test_compress_wait_budget_accounts_for_auxiliary_fallback_ceilings():
         },
     }
     assert server._compute_host_compress_wait_seconds(cfg) == 430.0
+
+
+def test_compress_wait_budget_loaded_floor_stays_finite(monkeypatch):
+    """A loaded huge or non-finite auxiliary timeout must not fail the waiter
+    or remove its finite deadline. The real floor stays on.
+    """
+    import os
+    from pathlib import Path
+
+    import yaml
+
+    base = Path(os.environ["HERMES_HOME"])
+    newline = chr(10)
+
+    def loaded(raw, name):
+        home = base / name
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        text = "auxiliary:" + newline + "  compression:" + newline + "    timeout: " + raw + newline
+        config_path = home / "config.yaml"
+        config_path.write_text(text, encoding="utf-8")
+        parsed = yaml.safe_load(text)["auxiliary"]["compression"]["timeout"]
+        return server._compute_host_compress_wait_seconds(), parsed
+
+    result, parsed = loaded("9" * 400, "huge")
+    assert isinstance(parsed, int) and parsed > 10**308
+    assert result == 630.0
+    result, parsed = loaded(".inf", "inf")
+    assert parsed == float("inf")
+    assert result == 630.0
+    result, parsed = loaded(".nan", "nan")
+    assert parsed != parsed
+    assert result == 630.0
+    assert loaded("900", "above")[0] == 630.0
+    assert loaded("120", "below")[0] == 630.0

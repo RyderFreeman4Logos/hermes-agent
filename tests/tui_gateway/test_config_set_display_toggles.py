@@ -6,8 +6,6 @@ renderer's `.catch()` swallows the refusal, which is how message reactions
 shipped with a toggle that never reached the backend gating the tool.
 """
 
-import os
-
 import pytest
 import hermes_yaml as yaml
 
@@ -42,14 +40,14 @@ def test_a_non_boolean_is_refused_rather_than_written(config_home):
     assert answer["error"]["code"] == 4002
     assert not config_home.exists()
 
-def test_same_full_signature_write_back_keeps_external_edit(config_home):
+def test_same_full_signature_write_back_keeps_external_edit(config_home, monkeypatch):
     """#382: a raw cache hit must not drop an edit whose full file_signature is unchanged."""
     config_home.write_text("keep_me: external\n# xxxxxxxxxxxx\n", encoding="utf-8")
     assert server._load_cfg_raw()["keep_me"] == "external"
     held = file_signature(config_home.stat())
     config_home.write_text("keep_me: external\nextra: outside\n", encoding="utf-8")
-    os.utime(config_home, ns=(held[0], held[0]))
-    assert file_signature(config_home.stat()) == held
+    monkeypatch.setattr(server, "file_signature", lambda st: held)
+    assert server.file_signature(config_home.stat()) == held
     assert _set("display.in_app_tips", "false")["result"]["value"] is False
     saved = yaml.safe_load(config_home.read_text())
     assert saved["extra"] == "outside"

@@ -505,6 +505,65 @@ const shortModelLabel = (model: string) =>
 const modelLabel = (model: string, effort?: string, fast?: boolean, effortWire?: string) =>
   [shortModelLabel(model), effortLabel(effort, effortWire), fast ? tr('status.fast') : ''].filter(Boolean).join(' ')
 
+interface StatusRenderItem {
+  id: string
+  node: ReactNode
+  width: number
+}
+
+function packStatusRows(items: readonly StatusRenderItem[], cols: number): StatusRenderItem[][] {
+  const width = Math.max(1, Math.floor(cols || 1))
+  const separatorWidth = stringWidth(' │ ')
+  const rows: StatusRenderItem[][] = []
+  let row: StatusRenderItem[] = []
+  let used = stringWidth('─ ')
+
+  for (const item of items) {
+    const itemWidth = Math.min(item.width, width)
+    const next = used + (row.length ? separatorWidth : 0) + itemWidth
+
+    if (row.length && next > width) {
+      rows.push(row)
+      row = []
+      used = 0
+    }
+
+    row.push(item)
+    used += (row.length > 1 ? separatorWidth : 0) + itemWidth
+  }
+
+  if (row.length) {
+    rows.push(row)
+  }
+
+  return rows
+}
+
+function StatusRows({ cols, items, t }: { cols: number; items: readonly StatusRenderItem[]; t: Theme }) {
+  const width = Math.max(1, Math.floor(cols || 1))
+  const rows = packStatusRows(items, width)
+
+  if (!rows.length) {
+    return null
+  }
+
+  return (
+    <Box flexDirection="column" flexShrink={0} width={width}>
+      {rows.map((row, rowIndex) => (
+        <Box flexDirection="row" flexShrink={0} height={1} key={row.map(item => item.id).join(':')} overflow="hidden">
+          {rowIndex === 0 ? <Text color={t.color.border}>─ </Text> : null}
+          {row.map((item, itemIndex) => (
+            <Box flexDirection="row" flexShrink={0} key={item.id} overflow="hidden">
+              {itemIndex ? <Text color={t.color.muted}> │ </Text> : null}
+              {item.node}
+            </Box>
+          ))}
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
 export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   const [active, setActive] = useState(false)
   const [color, setColor] = useState(t.color.accent)
@@ -709,6 +768,134 @@ export function StatusRule({
   const handleSessionCountClick = (event: { stopImmediatePropagation?: () => void }) => {
     event.stopImmediatePropagation?.()
     onSessionCountClick?.()
+  }
+
+  // Below the context-bar breakpoint the one-row fitter hides tail fields.
+  // Keep the same field gate and wrap the survivors instead of dropping them.
+  if (segs.compactCtx) {
+    const narrowRight = sessionTitle && ok('title') ? ` ${sessionTitle} ` : cwdLabel
+
+    const contextTokens = usage.context_max
+      ? `${contextMark}${compactNumber(usage.context_used ?? 0)} tok`
+      : (usage.total ?? 0) > 0
+        ? `${compactNumber(usage.total)} tok`
+        : ''
+
+    const item = (id: string, node: ReactNode, text: string): StatusRenderItem => ({
+      id,
+      node,
+      width: stringWidth(text)
+    })
+
+    const items: Array<StatusRenderItem | null> = [
+      showBattery ? item('battery', <Text color={batteryColorVal}>{batteryText}</Text>, batteryText) : null,
+      busy
+        ? item(
+            'indicator',
+            <FaceTicker
+              color={statusColor}
+              startedAt={turnStartedAt}
+              style={indicatorStyle}
+              verbOverride={compacting ? T.status.compacting : undefined}
+            />,
+            ' '.repeat(slotWidth)
+          )
+        : showNotice
+          ? item(
+              'notice',
+              <Text color={noticeColor(notice!.level, t)} wrap="truncate-end">
+                {notice!.text}
+              </Text>,
+              notice!.text
+            )
+          : item('status', <Text color={statusColor}>{displayStatus(status)}</Text>, displayStatus(status)),
+      modelText ? item('model', <Text color={t.color.muted}>{modelText}</Text>, modelText) : null,
+      contextTokens && (ok('context_detail') || ok('context_pct'))
+        ? item('context', <Text color={t.color.muted}>{contextTokens}</Text>, contextTokens)
+        : null,
+      showFocus ? item('focus', <Text color={t.color.warn}>◉ focus</Text>, '◉ focus') : null,
+      sessionStartedAt && ok('duration')
+        ? {
+            id: 'duration',
+            node: (
+              <Text color={t.color.muted}>
+                <SessionDuration startedAt={sessionStartedAt} />
+              </Text>
+            ),
+            width: MAX_DURATION_WIDTH
+          }
+        : null,
+      !busy && lastTurnEndedAt != null
+        ? {
+            id: 'idle',
+            node: (
+              <Text color={t.color.muted}>
+                <IdleSince endedAt={lastTurnEndedAt} />
+              </Text>
+            ),
+            width: stringWidth('✓ ') + MAX_DURATION_WIDTH
+          }
+        : null,
+      compressions > 0 && ok('compressions')
+        ? item(
+            'compressions',
+            <Text color={compressions >= 10 ? t.color.error : compressions >= 5 ? t.color.warn : t.color.muted}>
+              {T.status.compressions(compressions)}
+            </Text>,
+            T.status.compressions(compressions)
+          )
+        : null,
+      cacheHitText && ok('cache_hit')
+        ? item('cache', <Text color={t.color.muted}>{cacheHitText}</Text>, cacheHitText)
+        : null,
+      latencyText && ok('latency')
+        ? item('latency', <Text color={t.color.muted}>{latencyText}</Text>, latencyText)
+        : null,
+      tpsText && ok('tps') ? item('tps', <Text color={t.color.muted}>{tpsText}</Text>, tpsText) : null,
+      voiceLabel && ok('voice') ? item('voice', <Text color={t.color.muted}>{voiceLabel}</Text>, voiceLabel) : null,
+      sessionCountText
+        ? item(
+            'sessions',
+            onSessionCountClick ? (
+              <Box flexShrink={0} onClick={handleSessionCountClick}>
+                <Text color={t.color.accent}>{sessionCountText}</Text>
+              </Box>
+            ) : (
+              <Text color={t.color.muted}>{sessionCountText}</Text>
+            ),
+            sessionCountText
+          )
+        : null,
+      bgCount > 0 && ok('bg_tasks')
+        ? item('bg', <Text color={t.color.muted}>{T.status.bgTasks(bgCount)}</Text>, T.status.bgTasks(bgCount))
+        : null,
+      subagentCount > 0 && ok('bg_subagents')
+        ? item('subagents', <Text color={t.color.muted}>⛓ {subagentCount}</Text>, `⛓ ${subagentCount}`)
+        : null,
+      !busy && subagentCount > 0
+        ? item('resume', <Text color={t.color.muted}>{resumeHintText}</Text>, resumeHintText)
+        : null,
+      devCreditsText ? item('credits', <Text color={t.color.accent}>{devCreditsText}</Text>, devCreditsText) : null,
+      narrowRight && (sessionTitle ? ok('title') : true)
+        ? item(
+            'cwd',
+            <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
+              {narrowRight}
+            </Text>,
+            narrowRight
+          )
+        : null
+    ]
+
+    return (
+      <Box flexDirection="column" flexShrink={0}>
+        {StatusRows({
+          cols,
+          items: items.filter((value): value is StatusRenderItem => value !== null),
+          t
+        })}
+      </Box>
+    )
   }
 
   const sessionCountNode = onSessionCountClick ? (

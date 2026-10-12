@@ -630,6 +630,101 @@ _FLAKY_RESULTS: list[tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
 
+def _child_evidence_script(report_path: str, repo_root: Path) -> str:
+    """Run inside the pytest process. Parent-side ``__file__`` is not this evidence."""
+    return (
+        "import hashlib, json, os, pathlib, stat, sys, traceback\n"
+        f"report = pathlib.Path({report_path!r})\n"
+        f"repo = pathlib.Path({str(repo_root)!r}).resolve()\n"
+        "def _write(body):\n"
+        "    report.write_text(json.dumps(body, sort_keys=True) + '\\n', encoding='utf-8')\n"
+        "    os.chmod(report, stat.S_IRUSR | stat.S_IWUSR)\n"
+        "def _row(name, path):\n"
+        "    file = pathlib.Path(path)\n"
+        "    try:\n"
+        "        digest = hashlib.sha256(file.read_bytes()).hexdigest()\n"
+        "    except OSError:\n"
+        "        digest = None\n"
+        "    return {'module': name, 'path': str(file), 'sha256': digest}\n"
+        "def _wanted(session):\n"
+        "    rows = []\n"
+        "    for name in ('tests.conftest', 'tests.home_io_guard'):\n"
+        "        mod = sys.modules.get(name)\n"
+        "        path = getattr(mod, '__file__', None) if mod is not None else None\n"
+        "        if isinstance(path, str):\n"
+        "            rows.append(_row(name, path))\n"
+        "    for arg in getattr(session.config, 'args', ()):\n"
+        "        file = pathlib.Path(str(arg))\n"
+        "        if not file.suffix == '.py':\n"
+        "            continue\n"
+        "        try:\n"
+        "            resolved = file.resolve()\n"
+        "        except OSError:\n"
+        "            continue\n"
+        "        if resolved == repo or repo in resolved.parents:\n"
+        "            rows.append(_row(resolved.stem, str(resolved)))\n"
+        "    rows.sort(key=lambda row: (row['module'], row['path']))\n"
+        "    return rows\n"
+        "def _collect(code, session):\n"
+        "    root = pathlib.Path(os.environ.get('HERMES_TEST_TMP_ROOT') or os.environ['TMPDIR']).resolve()\n"
+        "    tmpdir = pathlib.Path(os.environ['TMPDIR']).resolve()\n"
+        "    guard = sys.modules.get('tests.home_io_guard')\n"
+        "    return {'returncode': code, 'tmpdir': str(tmpdir), 'tmpdir_dev': tmpdir.stat().st_dev,\n"
+        "            'declared_root': str(root), 'declared_dev': root.stat().st_dev,\n"
+        "            'tmpdir_under_declared': tmpdir == root or root in tmpdir.parents,\n"
+        "            'home_guard_loaded': guard is not None and getattr(guard, 'HomeIOGuard', None) is not None,\n"
+        "            'modules': _wanted(session) if session is not None else []}\n"
+        "def _safe(code, session):\n"
+        "    try:\n"
+        "        _write(_collect(code, session))\n"
+        "    except Exception:\n"
+        "        _write({'returncode': code, 'error': traceback.format_exc(), 'modules': []})\n"
+        "import atexit\n"
+        "atexit.register(lambda: _safe(None, None) if not report.exists() else None)\n"
+        "import pytest\n"
+        "def pytest_sessionfinish(session, exitstatus):\n"
+        "    _safe(int(exitstatus), session)\n"
+        "pytest.hookimpl(trylast=True)(pytest_sessionfinish)\n"
+    )
+
+
+def _append_child_evidence(output: str, report: Path, raw_rc: int) -> str:
+    """Read the child's report before ``temproot`` is deleted. Missing file stays missing.
+
+    A passing file's pytest log is not printed by the summary, so the witness
+    lines are printed here. They are the execution binding, not a second reporter.
+    """
+    lines = [f"runner-evidence: raw_exit={raw_rc}"]
+    try:
+        body = json.loads(report.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        lines.append("runner-evidence: child_report=absent")
+        block = "\n".join(lines)
+        print(block, flush=True)
+        return output + block + "\n"
+    if body.get("error"):
+        lines.append("runner-evidence: child_error=" + " ".join(str(body["error"]).splitlines()))
+        block = "\n".join(lines)
+        print(block, flush=True)
+        return output + block + "\n"
+    lines.append(
+        "runner-evidence: "
+        f"tmpdir={body.get('tmpdir')} dev={body.get('tmpdir_dev')} "
+        f"declared={body.get('declared_root')} declared_dev={body.get('declared_dev')} "
+        f"under={body.get('tmpdir_under_declared')} home_guard={body.get('home_guard_loaded')} "
+        f"child_exit={body.get('returncode')}"
+    )
+    for row in body.get("modules") or []:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"runner-evidence: module={row.get('module')} path={row.get('path')} sha256={row.get('sha256')}"
+        )
+    block = "\n".join(lines)
+    print(block, flush=True)
+    return output + block + "\n"
+
+
 def _run_one_file_once(
     file: Path,
     pytest_args: list[str],
@@ -661,6 +756,14 @@ def _run_one_file_once(
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
     env["TMPDIR"] = temproot
+    evidence = Path(temproot) / "runner-evidence.json"
+    # Written into this attempt's temp root and deleted with it. PYTHONPATH is how the
+    # child imports it; no new pytest flag, env allowlist entry, or suite plugin.
+    Path(temproot, "runner_evidence.py").write_text(
+        _child_evidence_script(str(evidence), repo_root), encoding="utf-8"
+    )
+    env["PYTHONPATH"] = temproot + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    cmd[3:3] = ["-p", "runner_evidence"]
 
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -691,18 +794,20 @@ def _run_one_file_once(
 
     try:
         output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
+        raw_rc = proc.returncode if proc.returncode is not None else -1
     except subprocess.TimeoutExpired:
         _kill_tree(proc, pgid=pgid)
         try:
             output, _ = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             output = "(file timeout exceeded; output unavailable)"
+        raw_rc = proc.returncode if proc.returncode is not None else -1
         rc = 124  # de facto convention for "killed by timeout".
         output = (
             f"({file_timeout:.0f}s exceeded; "
             f"process tree SIGKILL'd)\n{output}"
         )
+        output = _append_child_evidence(output, evidence, raw_rc)
     except BaseException:
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
@@ -712,8 +817,9 @@ def _run_one_file_once(
         # Happy path: pytest exited on its own. Kill the group anyway in
         # case it left grandchildren behind; already-dead is a no-op.
         _kill_tree(proc, pgid=pgid)
-
+        rc = raw_rc
         output +=  "\n"
+        output = _append_child_evidence(output, evidence, raw_rc)
     finally:
         _kill_detached_leftovers(temproot)
         # Delete the temp root for this attempt. Nothing reads it after the
@@ -722,8 +828,14 @@ def _run_one_file_once(
         # behind; make them writable and retry instead of skipping them.
         _rmtree_force(temproot)
 
-    if rc not in (0, 5) and not output.strip():
-        output = f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"
+    if rc not in (0, 5) and not any(
+        line.strip() and not line.startswith("runner-evidence:")
+        for line in output.splitlines()
+    ):
+        output = (
+            f"pytest child exited {rc} (0x{rc & 0xffffffff:08x}) with no output: {file}\n"
+            + output
+        )
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a

@@ -753,3 +753,85 @@ def test_slices_partition_the_suite_exactly_even_with_different_duration_caches(
     slices = [rtp._slice_files(list(reversed(files)) if i % 2 else files, i % 3 + 1, 3, caches[i % 3], root)
               for i in range(3)]
     assert sorted(f for s in slices for f in s) == sorted(files)
+
+
+def test_child_evidence_binds_loaded_bytes_exit_and_temp_then_cleanup(tmp_path: Path) -> None:
+    """The worker, not the parent, records the file it ran and the temp it used."""
+    import hashlib
+
+    root = _probe_root(tmp_path)
+    _relax_probe_socket_budget(root)
+    probe = root / "tests"
+    probe.mkdir()
+    target = probe / "test_loaded.py"
+    target.write_text(
+        "def test_loaded():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    declared = tmp_path / "declared-root"
+    declared.mkdir(mode=0o700)
+    declared.chmod(0o700)
+    before = {path.name for path in declared.iterdir()}
+    env = os.environ.copy()
+    env["HERMES_TEST_TMP_ROOT"] = str(declared)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    proc = subprocess.run(
+        [sys.executable, str(root / "scripts" / "run_tests_parallel.py"),
+         "--files", "tests/test_loaded.py", "-j", "1", "--file-timeout", "30",
+         "--file-retries", "0", "-v"],
+        cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding="utf-8", errors="replace", timeout=60, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    assert f"module=test_loaded path={target.resolve()} sha256={digest}" in proc.stdout
+    assert "home_guard=False" in proc.stdout
+    temp_line = next(line for line in proc.stdout.splitlines() if line.startswith("runner-evidence: tmpdir="))
+    assert f"declared={declared.resolve()}" in temp_line
+    assert "under=True" in temp_line
+    assert "raw_exit=0" in proc.stdout
+    assert "module=test_loaded" in proc.stdout and "test_loaded.py" in proc.stdout
+    assert set(declared.iterdir()) == {path for path in map(declared.joinpath, before)}
+
+
+def test_child_evidence_keeps_raw_exit_when_pytest_fails(tmp_path: Path) -> None:
+    root = _probe_root(tmp_path)
+    _relax_probe_socket_budget(root)
+    probe = root / "tests"
+    probe.mkdir()
+    (probe / "test_fails.py").write_text(
+        "def test_fails():\n    assert False, 'evidence-fail'\n", encoding="utf-8",
+    )
+    declared = tmp_path / "declared-root"
+    declared.mkdir(mode=0o700)
+    declared.chmod(0o700)
+    env = os.environ.copy()
+    env["HERMES_TEST_TMP_ROOT"] = str(declared)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    proc = subprocess.run(
+        [sys.executable, str(root / "scripts" / "run_tests_parallel.py"),
+         "--files", "tests/test_fails.py", "-j", "1", "--file-timeout", "30",
+         "--file-retries", "0"],
+        cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding="utf-8", errors="replace", timeout=60, check=False,
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "raw_exit=1" in proc.stdout
+    assert "child_exit=1" in proc.stdout
+    assert "evidence-fail" in proc.stdout
+    assert not any(declared.iterdir())
+
+
+def _relax_probe_socket_budget(root: Path) -> None:
+    """The copied validator still enforces the real 50-byte cap; pytest's temp is longer."""
+    path = root / "scripts" / "test_temp_root.py"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "len(os.fsencode(str(root))) + _CHILD_TEMP_COMPONENT_BYTES > SOCKET_TMPDIR_MAX_LEN",
+            "False",
+            1,
+        ),
+        encoding="utf-8",
+    )
+

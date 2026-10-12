@@ -1558,6 +1558,18 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
           msgs.forEach(appendMessage)
 
+          // Display only, after the reply. Counts are the last response's
+          // prompt size (cache reads already included). No usage → no rate.
+          const read = payload.usage?.reply_cache_read
+          const total = payload.usage?.reply_prompt_tokens
+
+          if (typeof read === 'number' && typeof total === 'number' && total > 0) {
+            appendMessage({
+              role: 'system',
+              text: `cache ${read}/${total} (${((100 * read) / total).toFixed(1)}%)`
+            })
+          }
+
           // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
           flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')
 

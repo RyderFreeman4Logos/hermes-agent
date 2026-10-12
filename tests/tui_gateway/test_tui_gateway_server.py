@@ -20822,6 +20822,32 @@ def test_get_usage_perf_readouts_present():
     assert usage["avg_tps"] == 50.0  # true throughput sum(out)/sum(lat), not mean of ratios
 
 
+def test_get_usage_reply_counts_are_last_response_not_session():
+    """Reply footer uses the last response. prompt_tokens already includes cache reads."""
+
+    class _TurnAgent:
+        model = "x"
+        session_prompt_tokens = 10_000
+        session_cache_read_tokens = 9_000
+        _last_turn_usage = {"cache_read_tokens": 800, "prompt_tokens": 1000, "input_tokens": 200}
+
+    usage = server._get_usage(_TurnAgent())
+    assert usage["reply_cache_read"] == 800
+    assert usage["reply_prompt_tokens"] == 1000
+    assert usage["cache_hit_pct"] == 90  # session bar stays a separate number
+
+
+def test_get_usage_omits_reply_counts_without_a_usage_record():
+    class _NoUsage:
+        model = "x"
+        session_prompt_tokens = 100
+        session_cache_read_tokens = 0
+
+    usage = server._get_usage(_NoUsage())
+    assert "reply_cache_read" not in usage
+    assert "reply_prompt_tokens" not in usage
+
+
 def test_get_usage_perf_readouts_omitted_without_data():
     """Zero cache reads / empty history omit the keys — never fabricate 0s."""
 

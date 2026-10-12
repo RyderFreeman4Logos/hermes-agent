@@ -34,6 +34,8 @@ class Usage(OpenModel):
     context_source: str | None = None
     context_estimated: bool | None = None
     cache_hit_pct: int | None = None
+    reply_cache_read: int | None = None
+    reply_prompt_tokens: int | None = None
     cache_read: int | None = None
     cache_write: int | None = None
     avg_latency_s: float | None = None

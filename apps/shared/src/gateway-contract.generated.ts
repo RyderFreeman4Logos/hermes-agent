@@ -571,6 +571,8 @@ export interface Usage {
   context_source?: string | null
   context_estimated?: boolean | null
   cache_hit_pct?: number | null
+  reply_cache_read?: number | null
+  reply_prompt_tokens?: number | null
   cache_read?: number | null
   cache_write?: number | null
   avg_latency_s?: number | null
@@ -3415,6 +3417,8 @@ export interface SessionUsageResult {
   context_source?: string | null
   context_estimated?: boolean | null
   cache_hit_pct?: number | null
+  reply_cache_read?: number | null
+  reply_prompt_tokens?: number | null
   cache_read?: number | null
   cache_write?: number | null
   avg_latency_s?: number | null

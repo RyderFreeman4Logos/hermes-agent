@@ -32604,6 +32604,30 @@
             "default": null,
             "title": "Cache Hit Pct"
           },
+          "reply_cache_read": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Cache Read"
+          },
+          "reply_prompt_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Prompt Tokens"
+          },
           "cache_read": {
             "anyOf": [
               {
@@ -37798,6 +37822,30 @@
             ],
             "default": null,
             "title": "Cache Hit Pct"
+          },
+          "reply_cache_read": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Cache Read"
+          },
+          "reply_prompt_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Prompt Tokens"
           },
           "cache_read": {
             "anyOf": [

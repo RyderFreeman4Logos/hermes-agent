@@ -6347,14 +6347,18 @@ def _get_task_no_progress_timeout(task: str) -> Optional[float]:
 
 
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
-    """``auxiliary.<task>.timeout`` from config, else *default*."""
+    """``auxiliary.<task>.timeout`` from config, else *default*.
+
+    Overflow and non-finite values are not a timeout: they fall back to *default*
+    instead of raising or becoming an unbounded deadline.
+    """
     if not task:
         return default
     raw = _get_auxiliary_task_config(task).get("timeout")
-    if raw is not None:
-        with contextlib.suppress(ValueError, TypeError):
-            return float(raw)
-    return default
+    if raw is None:
+        return default
+    from agent.conversation_compression_timeouts import _positive_finite
+    return _positive_finite(raw) or default
 
 
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:

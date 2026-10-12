@@ -369,6 +369,71 @@ class TestRotationPathWatermark:
         assert db.get_session("child1") is None
         assert db.get_session("sess1")["ended_at"] is None
 
+    def test_rotation_adoption_keeps_signed_cutoff(
+        self, db: SessionDB
+    ) -> None:
+        """Adoption advances the clone cutoff and keeps the signed digest.
+
+        A later append or preflush is legal. Rewriting a signed prefix still
+        aborts, and the child is not published.
+        """
+        _seed(db, 2)
+        signed, digest = db.get_active_message_source_snapshot("sess1")
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        db.append_message(
+            "sess1", role="user", content="adopted preflush",
+            compression_lock_holder="rotator",
+        )
+        adopted = db.get_active_message_watermark("sess1")
+        assert adopted > signed
+        db.append_message("sess1", role="user", content="foreign after adoption")
+        ceiling = db.get_active_message_watermark("sess1")
+
+        db.publish_compression_child(
+            parent_session_id="sess1",
+            child_session_id="child1",
+            source="test",
+            messages=SUMMARY,
+            compression_lock_holder="rotator",
+            require_compression_lease=True,
+            watermark=adopted,
+            watermark_ceiling=ceiling,
+            source_signature=digest,
+            source_watermark=signed,
+        )
+        child = [m["content"] for m in db.get_messages_as_conversation("child1")]
+        assert child == [
+            SUMMARY[0]["content"],
+            SUMMARY[1]["content"],
+            "foreign after adoption",
+        ]
+        assert "adopted preflush" not in child
+
+        db.create_session("sess2", source="test")
+        for i in range(2):
+            db.append_message("sess2", role="user" if i % 2 == 0 else "assistant", content=f"turn {i}")
+        signed2, digest2 = db.get_active_message_source_snapshot("sess2")
+        assert db.try_acquire_compression_lock("sess2", "rotator") is True
+        prefix = next(int(row["id"]) for row in db.get_messages("sess2"))
+        db.append_message("sess2", role="user", content="adopted tail")
+        adopted2 = db.get_active_message_watermark("sess2")
+        db._conn.execute("UPDATE messages SET content = ? WHERE id = ?", ("rewritten", prefix))
+        db._conn.commit()
+        with pytest.raises(SessionCompressionInProgressError, match="source changed"):
+            db.publish_compression_child(
+                parent_session_id="sess2",
+                child_session_id="child2",
+                source="test",
+                messages=SUMMARY,
+                compression_lock_holder="rotator",
+                require_compression_lease=True,
+                watermark=adopted2,
+                source_signature=digest2,
+                source_watermark=signed2,
+            )
+        assert db.get_session("child2") is None
+        assert db.get_session("sess2")["ended_at"] is None
+
     def test_ceiling_excludes_the_rotators_own_flush(self, db: SessionDB) -> None:
         """Rows the rotation path flushes AFTER the ceiling (its own input
         transcript, already inside the handoff) must NOT be cloned."""

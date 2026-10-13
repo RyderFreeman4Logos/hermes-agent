@@ -1,4 +1,4 @@
-"""Production-seam combined payload: 32K insertion, 8K/16K hints, history_suffix reservation."""
+"""Production-seam combined payload: bounded insertion with official-size hints and history_suffix reservation."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from tools.tool_result_storage import (
 def test_commit_tool_result_reserves_history_suffix_and_recovers_raw_result(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """20–31K high-volume result + 16K nearest-first hints stay within 32K history."""
+    """20–31K high-volume result and two intact area hints share 32K history."""
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -40,9 +40,9 @@ def test_commit_tool_result_reserves_history_suffix_and_recovers_raw_result(
     tracker = SubdirectoryHintTracker(working_dir=str(root))
     expected_hints = tracker.check_tool_call("terminal", {"command": f"cat {target}"})
     assert expected_hints is not None
-    assert len(expected_hints) <= 16_000
+    assert 16_000 < len(expected_hints) < _INSERTION_COMPACT_THRESHOLD_CHARS
     assert expected_hints.index("deep-rules") < expected_hints.index("parent-rules")
-    assert "truncated" in expected_hints.lower()
+    assert "truncated" not in expected_hints.lower()
 
     agent = SimpleNamespace(
         verbose_logging=False,

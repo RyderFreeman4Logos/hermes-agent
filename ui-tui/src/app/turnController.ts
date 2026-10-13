@@ -123,6 +123,18 @@ const finalTail = (finalText: string, segments: Msg[]) => {
   return tail
 }
 
+// Byte-identical sealed commentary collapses. Anything else keeps prefix dedupe.
+const commentaryFinalText = (
+  projection: string,
+  splitText: string,
+  segments: Msg[],
+  interimBoundary: number,
+  previewed: boolean
+) =>
+  textSegments(segments.slice(0, interimBoundary)).includes(projection)
+    ? ''
+    : finalTail(splitText, previewed ? segments : segments.slice(interimBoundary))
+
 const interruptedText = (partial: string) => (partial ? `${partial}\n\n*[interrupted]*` : '*[interrupted]*')
 
 // What interruptTurn sealed into the transcript: `text` is the bubble it
@@ -638,7 +650,8 @@ class TurnController {
     // `text` is `str | JsonValue` on the wire (structured parts stay possible); only a string renders here.
     const wireText = typeof payload.text === 'string' ? payload.text : undefined
     const completionText = wireText ?? payload.rendered
-    const rawText = (completionText ?? this.bufRef).trimStart()
+    const finalTextProjection = completionText ?? this.bufRef
+    const rawText = finalTextProjection.trimStart()
 
     // Text still in `this.bufRef` streamed after the last segment flush; `idle()`
     // below would wipe it (#61520). Flush it as a segment only when the
@@ -652,15 +665,18 @@ class TurnController {
     }
 
     const split = splitReasoning(rawText)
-    // Only dedupe segments AFTER the interim boundary — interim-sealed
-    // segments are preserved even if the final text includes them.
-    // Exception: when response_previewed is true, the final text is the
-    // same model response that was published provisionally as an interim
-    // message. Dedupe against ALL segments (including sealed interims) so
-    // the identical text doesn't render as a duplicate message. (#65919
-    // review: duplicate-message blocker)
-    const dedupeStart = payload.response_previewed ? 0 : (this.interimBoundaryIndex ?? 0)
-    const finalText = finalTail(split.text, this.segmentMessages.slice(dedupeStart))
+    // Sealed commentary collapses only when byte-identical to the final.
+    // Prefix, whitespace, and later turns stay. response_previewed still
+    // prefix-dedupes the whole turn (#65919).
+
+    const finalText = commentaryFinalText(
+      finalTextProjection,
+      split.text,
+      this.segmentMessages,
+      this.interimBoundaryIndex ?? 0,
+      Boolean(payload.response_previewed)
+    )
+
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
     const savedToolTokens = this.toolTokenAcc

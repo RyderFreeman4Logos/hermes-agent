@@ -7,6 +7,7 @@ PR #3526 salvage — user-configurable extra HTTP headers on LLM API calls
 import json
 
 from hermes_cli.config import (
+    _custom_provider_entry_to_provider_config,
     _normalize_custom_provider_entry,
     apply_custom_provider_extra_headers_to_client_kwargs,
     get_custom_provider_extra_headers,
@@ -40,6 +41,31 @@ def test_normalize_entry_keeps_extra_headers():
         "X-Custom-Auth": "tok",
         "X-Client-Name": "hermes",
     }
+
+
+def test_normalize_entry_keeps_explicit_session_id_opt_in():
+    normalized = _normalize_custom_provider_entry(
+        {
+            "name": "pm",
+            "base_url": "https://codex.photonmark.com/openai/v1",
+            "send_session_id": True,
+        }
+    )
+    assert normalized is not None
+    assert normalized["send_session_id"] is True
+
+
+def test_legacy_provider_migration_keeps_session_id_opt_in():
+    migrated = _custom_provider_entry_to_provider_config(
+        {
+            "name": "pm",
+            "base_url": "https://codex.photonmark.com/openai/v1",
+            "send_session_id": True,
+        },
+        provider_key="pm",
+    )
+    assert migrated is not None
+    assert migrated["send_session_id"] is True
 
 
 def test_normalize_entry_drops_invalid_extra_headers():

@@ -44,6 +44,7 @@ class _Agent:
 
     def __init__(self):
         self.refresh_calls = 0
+        self._codex_auth_retry_attempted = False
 
     def _recover_with_credential_pool(self, **kwargs):
         return False, False

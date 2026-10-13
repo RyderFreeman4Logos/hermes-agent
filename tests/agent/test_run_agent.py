@@ -2586,10 +2586,11 @@ class TestHandleMaxIterations:
         )
         assert relay_calls[0]["metadata"]["call_role"] == "iteration_summary"
         assert all(call["defer_logical_completion"] is True for call in relay_calls)
-        complete_logical.assert_called_once_with(
-            relay_calls[0]["metadata"]["api_request_id"],
-            outcome="success",
-        )
+        complete_logical.assert_called_once()
+        assert complete_logical.call_args.args == (relay_calls[0]["metadata"]["api_request_id"],)
+        completion_kwargs = dict(complete_logical.call_args.kwargs)
+        assert completion_kwargs.pop("agent", agent) is agent
+        assert completion_kwargs == {"outcome": "success"}
 
     def test_suppress_status_output_keeps_iteration_warning_off_stdout(self, agent, capsys):
         """Machine-readable mode (-Q/oneshot) must not contaminate stdout (#26155)."""
@@ -2638,7 +2639,9 @@ class TestHandleMaxIterations:
         assert result.strip()
         assert "API down" not in result
         complete_logical.assert_called_once()
-        assert complete_logical.call_args.kwargs == {"outcome": "failed"}
+        completion_kwargs = dict(complete_logical.call_args.kwargs)
+        assert completion_kwargs.pop("agent", agent) is agent
+        assert completion_kwargs == {"outcome": "failed"}
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -3217,7 +3220,7 @@ class TestRunConversation:
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
             patch(
                 "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
+                side_effect=lambda request_id, *, outcome, agent=None: logical_completions.append(
                     (request_id, outcome)
                 ),
             ),
@@ -3320,7 +3323,10 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        # Hooks observe the exact wire prompt, including a configured loop-timing sidecar.
+        sent_messages = agent.client.chat.completions.create.call_args_list[0].kwargs["messages"]
+        assert pre_request_calls[0]["request_messages"] == sent_messages
+        assert any(msg.get("role") == "user" and msg.get("content", "").startswith("search something") for msg in sent_messages)
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
@@ -5204,7 +5210,7 @@ class TestRetryExhaustion:
             patch("agent.relay_llm.execute", side_effect=execute),
             patch(
                 "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
+                side_effect=lambda request_id, *, outcome, agent=None: logical_completions.append(
                     (request_id, outcome)
                 ),
             ),

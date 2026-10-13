@@ -6,6 +6,7 @@ inside the home silently turns the sandbox back into the live install (#111101).
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ def _sibling_root_only(monkeypatch):
     tests use a fake native home under tmp_path and must not create or prune anything real."""
     import os
 
+    monkeypatch.delenv("HERMES_TEST_TMP_ROOT", raising=False)
     real_isdir = os.path.isdir
     monkeypatch.setattr(suite_conftest.os.path, "isdir", lambda p: False if p == "/var/tmp" else real_isdir(p))  # no-tmp: ok — disables the disk-root branch
 
@@ -51,6 +53,30 @@ def test_basetemp_inside_the_native_home_is_relocated_outside_it(tmp_path, monke
     # The sandbox derived from it no longer resolves to the native root.
     monkeypatch.setenv("HERMES_HOME", str(relocated / "t0" / "hermes_test"))
     assert hermes_constants.get_default_hermes_root() == relocated / "t0" / "hermes_test"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode validation")
+def test_explicit_temp_root_is_shared_by_basetemp_relocation(tmp_path, monkeypatch):
+    import os
+    from scripts import test_temp_root
+
+    native = tmp_path.resolve() / "native-home"
+    native.mkdir()
+    root = tmp_path.resolve() / "runner-root"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: native)
+    monkeypatch.setattr(test_temp_root, "SOCKET_TMPDIR_MAX_LEN", len(os.fsencode(str(root))) + 11)
+    monkeypatch.setenv("HERMES_TEST_TMP_ROOT", str(root))
+    config = _config_with_basetemp(native / ".repro")
+
+    suite_conftest._relocate_basetemp_outside_operator_home(config)
+
+    relocated = config._tmp_path_factory._given_basetemp
+    assert relocated is not None and relocated.parent == root
+    assert config.option.basetemp == str(relocated)
+    suite_conftest.pytest_unconfigure(config)
+    assert root.is_dir() and not relocated.exists()
 
 
 def test_basetemp_outside_the_native_home_is_left_alone(tmp_path, monkeypatch):

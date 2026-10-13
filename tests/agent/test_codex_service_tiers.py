@@ -35,7 +35,7 @@ def test_rotation_restores_requested_tier(monkeypatch):
         api_key=token("B"), model="gpt-6-astra-900k", service_tier="ultrafast",
         request_overrides={"service_tier": "ultrafast"}, _client_kwargs={},
         _reapply_route_client_config=lambda **kwargs: None,
-        _replace_primary_openai_client=lambda **kwargs: None,
+        _replace_primary_openai_client=lambda **kwargs: True,
     )
     emitted = []
     for account in ("B", "A", "B"):
@@ -138,3 +138,14 @@ def test_ultrafast_is_offered_on_the_codex_plan_only_when_its_catalog_lists_it(m
     assert ultrafast_offered("gpt-6.1-sol", provider="openai-api", base_url="https://api.openai.com/v1")
     monkeypatch.setattr(mm.model_metadata_http, "get", lambda url, **kw: SimpleNamespace(status_code=503, json=dict))
     assert ultrafast_offered("gpt-6.1-sol", **codex, access_token=token("C"))
+
+
+def test_rotation_reports_failed_client_rebuild():
+    agent = SimpleNamespace(
+        provider="openai-codex", api_mode="codex_responses", base_url=BASE,
+        api_key=token("A"), model="gpt-6-astra", _client_kwargs={},
+        _reapply_route_client_config=lambda **kwargs: None,
+        _replace_primary_openai_client=lambda **kwargs: False,
+    )
+    entry = SimpleNamespace(id="B", access_token=token("B"), base_url=BASE)
+    assert ClientLifecycleMixin._swap_credential(agent, entry) is False

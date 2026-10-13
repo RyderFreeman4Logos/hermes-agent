@@ -1547,9 +1547,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             tail = decoder.decode(responder.flush())
             if tail:
                 ingest(tail)
+        def exit_code():
+            status = getattr(pty, "exitstatus", None)
+            if status is not None:
+                return status
+            signal_status = getattr(pty, "signalstatus", None)
+            if signal_status is not None:
+                return -signal_status
+            return None if hasattr(pty, "exitstatus") else -1
+
         self._finish_reader(
-            session, decoder, ingest, "PTY",
-            pty.wait, lambda: pty.exitstatus if hasattr(pty, 'exitstatus') else -1)
+            session, decoder, ingest, "PTY", pty.wait, exit_code)
 
     def _ingest_output(self, session: ProcessSession, text: str, *, unless_exited: bool = False) -> None:
         """Buffer a freshly-read chunk, then scan watch patterns and stream it live.

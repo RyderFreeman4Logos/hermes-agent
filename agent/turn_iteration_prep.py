@@ -286,14 +286,12 @@ def _previous_tool_round(messages: Any) -> list:
 def _inject_steer_after_newest_tool_result(
     agent: Any, messages: Any, steer_text: str, *, current_turn_user_idx: Any = None
 ) -> None:
-    """Append after a trailing tool row in this turn; never rewrite an existing prefix."""
+    """Keep user steer delivery; admit completions only at this turn's trailing tool row."""
     ingest_completion = getattr(agent, "_completion_steer_ingest", None)
     _turn_start = current_turn_user_idx if isinstance(current_turn_user_idx, int) else -1
-    for _si in range(len(messages) - 1, _turn_start, -1):
+    for _si in range(len(messages) - 1, -1, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
-            if _si != len(messages) - 1:
-                break
             from agent.prompt_builder import steer_user_row
 
             def insert(completion_text: str, _events: list) -> str:
@@ -301,7 +299,10 @@ def _inject_steer_after_newest_tool_result(
                 messages.insert(_si + 1, steer_user_row(text))
                 return "inserted"
 
-            if callable(ingest_completion) and ingest_completion(insert):
+            if (
+                _si > _turn_start and _si == len(messages) - 1
+                and callable(ingest_completion) and ingest_completion(insert)
+            ):
                 return
             if steer_text:
                 messages.insert(_si + 1, steer_user_row(steer_text))

@@ -1252,6 +1252,27 @@ def test_get_usage_projects_live_compression_count(count):
     assert server._get_usage(agent)["compressions"] == count
 
 
+def test_get_usage_projects_reply_footer_only_with_complete_cache_usage(monkeypatch):
+    monkeypatch.delenv("HERMES_DEV_CREDITS", raising=False)
+    agent = types.SimpleNamespace(
+        model="test-model",
+        _reply_elapsed_s=2.5,
+        _reply_usage={"cache_read_tokens": 0, "prompt_tokens": 100},
+        _reply_usage_complete=True,
+    )
+
+    usage = server._get_usage(agent)
+    assert usage["reply_elapsed_s"] == 2.5
+    assert usage["reply_cache_read"] == 0
+    assert usage["reply_prompt_tokens"] == 100
+
+    agent._reply_usage_complete = False
+    usage = server._get_usage(agent)
+    assert usage["reply_elapsed_s"] == 2.5
+    assert "reply_cache_read" not in usage
+    assert "reply_prompt_tokens" not in usage
+
+
 def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
     # The live ticker must nest the snapshot under a "usage" key, matching the
     # message.complete / session.info payloads the desktop & TUI handlers read

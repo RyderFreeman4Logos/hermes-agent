@@ -24,6 +24,7 @@ from hermes_state_common import (
     _json_or, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json)
+from hermes_state_display_metadata import SessionDisplayMetadataMixin, _SET_DISPLAY_META_SQL
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
@@ -66,7 +67,6 @@ _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, messa
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
-_SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
 _SHADOWED_CHECKPOINT_ROWS_SQL = ("SELECT id, codex_reasoning_items FROM messages WHERE session_id = ? AND active = 1 "
     "AND role = 'assistant' AND id < ? AND codex_reasoning_items LIKE '%\"compaction\"%'")
@@ -117,7 +117,7 @@ def _stale_holder(row, now: float) -> bool:
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
 
 
-class SessionMessagesMixin:
+class SessionMessagesMixin(SessionDisplayMetadataMixin):
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
@@ -537,11 +537,6 @@ class SessionMessagesMixin:
                 (_scrub_surrogates(display_kind), self._encode_display_metadata(display_metadata), row[0]))
             return True
         return self._execute_write(_do)
-
-    def _reaction_list(self, meta: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Well-formed (dict) reactions stored under ``REACTIONS_METADATA_KEY``."""
-        reactions = (meta or {}).get(self.REACTIONS_METADATA_KEY)
-        return [r for r in reactions if isinstance(r, dict)] if isinstance(reactions, list) else []
 
     def set_message_reaction(self, session_id: str, message_row_id: int, emoji: Optional[str], *,
                              author: str = "user") -> Optional[list[dict[str, Any]]]:

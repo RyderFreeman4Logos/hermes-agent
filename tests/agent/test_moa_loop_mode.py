@@ -1143,6 +1143,49 @@ moa:
     assert cost2 is None
 
 
+def test_empty_moa_usage_is_neutral_and_unknown_contributors_stay_unknown():
+    from agent import moa_loop
+    from agent.usage_pricing import CanonicalUsage
+
+    known = CanonicalUsage(
+        input_tokens=4, cache_read_tokens=2, cache_read_known=True, prompt_total_known=True
+    )
+    unknown = CanonicalUsage(input_tokens=3, cache_read_tokens=1)
+
+    empty, _ = moa_loop._sum_reference_accounting([])
+    assert empty.input_tokens == 0
+    assert empty.cache_read_known is True
+    assert empty.prompt_total_known is True
+
+    known_sum, _ = moa_loop._sum_reference_accounting([
+        ("known", "", moa_loop._RefAccounting(known))
+    ])
+    assert known_sum.cache_read_known is True
+    assert known_sum.prompt_total_known is True
+
+    mixed_sum, _ = moa_loop._sum_reference_accounting([
+        ("known", "", moa_loop._RefAccounting(known)),
+        ("unknown", "", moa_loop._RefAccounting(unknown)),
+    ])
+    assert mixed_sum.cache_read_known is False
+    assert mixed_sum.prompt_total_known is False
+
+    facade = moa_loop.MoAChatCompletions("review")
+    empty_pending, _ = facade.consume_reference_usage()
+    assert empty_pending.cache_read_known is True
+    assert empty_pending.prompt_total_known is True
+
+    facade._fold_pending_accounting(known, None)
+    known_pending, _ = facade.consume_reference_usage()
+    assert known_pending.cache_read_known is True
+    assert known_pending.prompt_total_known is True
+
+    facade._fold_pending_accounting(unknown, None)
+    unknown_pending, _ = facade.consume_reference_usage()
+    assert unknown_pending.cache_read_known is False
+    assert unknown_pending.prompt_total_known is False
+
+
 class _CountingCtxLen:
     """Stub for get_model_context_length that counts resolutions."""
 

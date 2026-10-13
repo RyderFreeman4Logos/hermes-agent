@@ -136,6 +136,7 @@ export interface Msg {
   panelData?: PanelData
   role: Role
   text: string
+  replyEnd?: string
   // Unix seconds the message was authored (persisted transcript timestamp on
   // rehydrate, wall clock at append time for live rows). Rendered as a dim
   // [HH:MM] label when `display.timestamps` is on (#41531).

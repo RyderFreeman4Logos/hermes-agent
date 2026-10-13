@@ -1609,6 +1609,15 @@ def _run_conversation_turn(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
+    # Clear this turn's display aggregate before preflight. The timeout return
+    # below never reaches the later reset, and both footers would otherwise
+    # print the previous turn as this one.
+    agent._last_turn_usage = None
+    agent._reply_usage = None
+    agent._reply_usage_complete = True
+    agent._reply_started_monotonic = time.monotonic()
+    agent._reply_elapsed_s = None
+
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
         _ctx = build_turn_context(
@@ -1650,7 +1659,6 @@ def _run_conversation_turn(
     agent._compression_adoption_failed = False
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
-    agent._last_turn_usage = None
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,

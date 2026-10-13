@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
-from agent.usage_pricing import estimate_usage_cost, normalize_usage, with_served_service_tier
+from agent.usage_pricing import _finite_nonnegative_int, estimate_usage_cost, normalize_usage, with_served_service_tier
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -36,6 +36,56 @@ class ResponseUsageOutcome:
 
     compression_attempts: int
     rearmed: bool = False
+
+
+def mark_unaccounted_response(agent: Any) -> None:
+    """A completed response left the turn before ``record_response_usage``.
+
+    The footer must not present the remaining requests as the whole turn.
+    Numeric session counters stay where they are.
+    """
+    agent._reply_usage_complete = False
+
+
+def _fold_reply_usage(
+    agent: Any, usage_dict: dict, cache_read_known: bool, prompt_total_known: bool = True,
+) -> None:
+    """Sum this user turn's requests. ``_last_turn_usage`` stays the latest call.
+
+    A missing or invalid cache count, prompt total, or any usage-less request
+    makes the aggregate incomplete. Callers then omit the rate instead of
+    showing a partial total as exact. Reset is the turn-start clear in conversation_loop.
+    """
+    slot = getattr(agent, "_reply_usage", None)
+    if not isinstance(slot, dict):
+        slot = {"cache_read_tokens": 0, "prompt_tokens": 0}
+    known = cache_read_known is True
+    if not known or prompt_total_known is not True:
+        agent._reply_usage_complete = False
+    slot["prompt_tokens"] = int(slot.get("prompt_tokens") or 0) + int(usage_dict.get("prompt_tokens") or 0)
+    if known and getattr(agent, "_reply_usage_complete", True):
+        slot["cache_read_tokens"] = int(slot.get("cache_read_tokens") or 0) + int(usage_dict.get("cache_read_tokens") or 0)
+    else:
+        slot.pop("cache_read_tokens", None)
+    agent._reply_usage = slot
+
+
+def _reply_cache_counts(agent: Any) -> tuple[int | None, int | None]:
+    """Exact hit/total for this turn, or ``(None, None)`` when incomplete."""
+    slot = getattr(agent, "_reply_usage", None)
+    if not isinstance(slot, dict) or not getattr(agent, "_reply_usage_complete", False):
+        return None, None
+    if "cache_read_tokens" not in slot or "prompt_tokens" not in slot:
+        return None, None
+    cache_read = slot["cache_read_tokens"]
+    prompt_total = slot["prompt_tokens"]
+    if (
+        not _finite_nonnegative_int(cache_read)
+        or not _finite_nonnegative_int(prompt_total)
+        or cache_read > prompt_total
+    ):
+        return None, None
+    return int(cache_read), int(prompt_total)
 
 
 def _loop_mod():
@@ -84,6 +134,8 @@ def record_response_usage(
     # must remain observable.
     agent.session_api_calls += 1
     if not (hasattr(response, 'usage') and response.usage):
+        # A later usage-less request must not leave an earlier request displayed as exact.
+        agent._reply_usage_complete = False
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the
             # pending verdict so later readings aren't charged to it and
@@ -156,6 +208,9 @@ def record_response_usage(
 
     # Stash canonical usage for on_turn_complete(); keep the latest call's.
     agent._last_turn_usage = dict(usage_dict)
+    _fold_reply_usage(
+        agent, usage_dict, canonical_usage.cache_read_known, canonical_usage.prompt_total_known,
+    )
     # The parent's CURRENT prompt size for headroom math (delegate summary budgets): the
     # aggregator's own prompt, never the MoA-folded total (advisor prompts are not in this context).
     agent._last_prompt_size_tokens = int(aggregator_usage.prompt_tokens or 0)

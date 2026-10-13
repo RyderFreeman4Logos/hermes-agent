@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone, UTC
@@ -71,6 +72,10 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    # Display only. Numeric buckets stay zero when the field is absent so pricing
+    # is unchanged; footer callers must not treat that zero as a measured hit.
+    cache_read_known: bool = False
+    prompt_total_known: bool = False
 
     @property
     def prompt_tokens(self) -> int:
@@ -88,8 +93,10 @@ class CanonicalUsage:
             return NotImplemented
         return CanonicalUsage(**{
             f.name: getattr(self, f.name) + getattr(other, f.name)
-            for f in fields(CanonicalUsage) if f.name != "raw_usage"
-        })
+            for f in fields(CanonicalUsage)
+            if f.name not in ("raw_usage", "cache_read_known", "prompt_total_known")
+        }, cache_read_known=self.cache_read_known and other.cache_read_known,
+            prompt_total_known=self.prompt_total_known and other.prompt_total_known)
 
 
 @dataclass(frozen=True)
@@ -369,24 +376,42 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         return None
 
 
-def _usage_field(obj: Any, *path: str) -> int:
-    """Non-negative int at ``obj.path[0].path[1]...``; 0 if any hop is falsy or
-    non-numeric. Hops read dicts and attribute objects alike (the Responses API
-    returns either); negative counters from providers are clamped so they cannot
-    corrupt session accounting."""
-    for hop in path:
-        if not obj:
-            return 0
-        obj = obj.get(hop, 0) if isinstance(obj, dict) else getattr(obj, hop, 0)
-    try:
-        return max(0, int(obj or 0))
-    except Exception:
-        return 0
+def _finite_nonnegative_int(value: Any) -> bool:
+    """True for 0, 1, 2.0. False for bool, negative, fraction, inf, and nan."""
+    if isinstance(value, (bool, str)):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    if isinstance(value, float):
+        return math.isfinite(value) and value >= 0 and value == math.trunc(value)
+    return False
 
 
-def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> int:
-    """First non-zero ``_usage_field`` across candidate paths, else 0."""
-    return next((v for v in (_usage_field(obj, *path) for path in paths) if v), 0)
+def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> tuple[int, bool]:
+    """Select the first nonzero counter and its exactness; all-zero uses the first present field."""
+    missing = object()
+    first_zero: tuple[int, bool] | None = None
+    for path in paths:
+        raw: Any = obj
+        for hop in path:
+            if not raw:
+                raw = missing
+                break
+            raw = raw.get(hop, missing) if isinstance(raw, dict) else getattr(raw, hop, missing)
+            if raw is missing:
+                break
+        if raw is missing:
+            continue
+        try:
+            value = max(0, int(raw or 0))
+        except (TypeError, ValueError, OverflowError):
+            value = 0
+        known = _finite_nonnegative_int(raw)
+        if value:
+            return value, known
+        if first_zero is None:
+            first_zero = (value, known)
+    return first_zero if first_zero is not None else (0, False)
 
 
 # Picker slugs → snapshot provider key ("openai-api" is the slug for direct
@@ -637,9 +662,10 @@ def normalize_usage(
         shape = _CODEX_USAGE_SHAPE
     else:
         shape = _CHAT_USAGE_SHAPE
-    prompt_total, output_tokens, cache_read_tokens, cache_write_tokens = (
-        _first_nonzero(u, *paths) for paths in shape
-    )
+    prompt_total, prompt_total_known = _first_nonzero(u, *shape[0])
+    output_tokens, _ = _first_nonzero(u, *shape[1])
+    cache_read_tokens, cache_read_known = _first_nonzero(u, *shape[2])
+    cache_write_tokens, cache_write_known = _first_nonzero(u, *shape[3])
     # Anthropic reports uncached input directly; Codex/Chat totals INCLUDE
     # cached tokens, so the cache buckets are subtracted back out.
     input_tokens = prompt_total if shape is _ANTHROPIC_USAGE_SHAPE else max(
@@ -649,7 +675,7 @@ def normalize_usage(
     # Responses API: output_tokens_details.reasoning_tokens. Chat Completions
     # (OpenAI, OpenRouter, DeepSeek, ...): completion_tokens_details.reasoning_tokens.
     # Hidden thinking dominates output spend on reasoning models, so read both.
-    reasoning_tokens = _first_nonzero(
+    reasoning_tokens, _ = _first_nonzero(
         u, ("output_tokens_details", "reasoning_tokens"), ("completion_tokens_details", "reasoning_tokens")
     )
 
@@ -668,10 +694,21 @@ def normalize_usage(
             cache_read_tokens, cache_write_tokens,
         )
 
+    if shape is _ANTHROPIC_USAGE_SHAPE:
+        # Anthropic's total is derived from all three raw input/cache buckets.
+        prompt_total_known = prompt_total_known and cache_read_known and cache_write_known
+    if (
+        cache_read_known and prompt_total_known and shape is not _ANTHROPIC_USAGE_SHAPE
+        and cache_read_tokens + cache_write_tokens > prompt_total
+    ):
+        cache_read_known = False
+
     return CanonicalUsage(
         input_tokens=input_tokens, output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens, reasoning_tokens=reasoning_tokens,
         raw_usage=dict(u) if isinstance(u, dict) else (u.model_dump() if callable(getattr(u, 'model_dump', None)) else None),
+        cache_read_known=cache_read_known,
+        prompt_total_known=prompt_total_known,
     )
 
 

@@ -2217,6 +2217,19 @@ def _get_usage(agent) -> dict:
         _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
         if _prompt_total > 0 and _cache_read > 0:
             usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+        _reply_elapsed = getattr(agent, "_reply_elapsed_s", None)
+        if (
+            isinstance(_reply_elapsed, (int, float))
+            and not isinstance(_reply_elapsed, bool)
+            and _reply_elapsed == _reply_elapsed
+            and 0 <= _reply_elapsed < 1e6
+        ):
+            usage["reply_elapsed_s"] = float(_reply_elapsed)
+            from agent.turn_usage import _reply_cache_counts
+            _reply_read, _reply_total = _reply_cache_counts(agent)
+            if _reply_read is not None and _reply_total is not None:
+                usage["reply_cache_read"] = _reply_read
+                usage["reply_prompt_tokens"] = _reply_total
     with contextlib.suppress(Exception):  # a status-bar readout must never break usage reporting
         _lhist = list(getattr(agent, "_api_latency_history", []) or [])
         _ohist = list(getattr(agent, "_api_output_history", []) or [])

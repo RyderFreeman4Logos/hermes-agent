@@ -1621,6 +1621,13 @@ def _run_conversation_turn(
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
+    except InterruptedError:
+        # A reclaimed completion never inserted a row; finish as cancellation,
+        # without a crash frame, provider call or turn-end persistence.
+        from agent.agent_runtime_helpers import note_turn_persisted
+        note_turn_persisted(agent)
+        return _partial_turn_result("", list(conversation_history or []), 0, interrupted=True,
+                                    turn_exit_reason="input_admission_interrupted")
     # Voice turns may run on auxiliary.voice_chat: bound after the prompt/row/compaction were settled
     # against the main model, undone in finalize_turn (and run_conversation's finally on early exits).
     from agent.voice_turn_route import begin_voice_turn_route

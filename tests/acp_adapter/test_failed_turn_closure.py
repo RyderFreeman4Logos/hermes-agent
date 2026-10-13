@@ -170,7 +170,16 @@ def test_acp_refusal_closes_the_turn_and_is_not_replayed_into_the_next_prompt(ac
 
     sent = [m for m in provider.requests[-1]["messages"] if m["role"] != "system"]
     assert [m["role"] for m in sent] == ["user", "assistant", "user"], sent
-    assert [m["content"] for m in sent if m["role"] == "user"] == [_REFUSED, _NEW_REQUEST]
+    # Optional loop timing is part of the stable API sidecar, not human input.
+    # Compare both the actual human requests and the exact persisted wire values.
+    user_wire = [m["content"] for m in sent if m["role"] == "user"]
+    assert [content.partition("\n\n[Agent loop timing]\n")[0] for content in user_wire] == [_REFUSED, _NEW_REQUEST]
+    with sqlite3.connect(db.db_path) as c:
+        persisted_wire = [r[0] for r in c.execute(
+            "SELECT COALESCE(api_content, content) FROM messages "
+            "WHERE session_id = ? AND active = 1 AND role = 'user' ORDER BY id", (sid,)
+        )]
+    assert user_wire == persisted_wire
     assert sent[1] == {"role": "assistant", "content": FAILED_TURN_NOTICE}  # the type never reaches the wire
 
     # Turn 3: cancelled mid-turn. The interrupt envelope carries ``final_response=None``
@@ -258,7 +267,7 @@ def test_prompt_after_cancel_keeps_the_unanswered_request(acp):
     turn3 = provider.requests[-1]["messages"]
     assert turn3[:len(turn2)] == turn2
     assert any(
-        msg["role"] == "user" and msg["content"] == "deploy build 42\n\nalso run the smoke tests"
+        msg["role"] == "user" and msg["content"].partition("\n\n[Agent loop timing]\n")[0] == "deploy build 42\n\nalso run the smoke tests"
         for msg in turn2
     )
 

@@ -26,6 +26,10 @@ def _make_parent(depth: int = 0, session_id: str = "parent-1"):
     parent.base_url = "https://openrouter.ai/api/v1"
     parent.api_key = "***"
     parent.provider = "openrouter"
+    parent.requested_provider = "openrouter"
+    parent.request_overrides = {}
+    parent.acp_command = None
+    parent.acp_args = []
     parent.api_mode = "chat_completions"
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"

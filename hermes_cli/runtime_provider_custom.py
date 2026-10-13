@@ -574,7 +574,7 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
         if token_provider is not None:
             api_key = token_provider
     result = _custom_runtime(rp, base_url, api_key, custom_provider.get("api_mode"),
-                             source=f"custom_provider:{custom_provider.get('name', requested_provider)}",
+                             source=f"custom_provider:{custom_provider.get('provider_key') or custom_provider.get('name', requested_provider)}",
                              requested_provider=requested_provider)
     _apply_custom_provider_extras(custom_provider, target_model, result)
     # OpenCode-family custom providers (opencode-go/zen names, or opencode.ai hosts) serve models

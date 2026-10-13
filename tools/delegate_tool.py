@@ -494,7 +494,7 @@ def _credentials_for_model_profile(cfg: dict, parent_agent, profile_name: Option
     api_key = str(profile.get("api_key") or "").strip() or None
     route_keys = {"model", "provider", "base_url", "api_key", "api_mode", "request_overrides", "fallback_providers"}
     merged = {key: value for key, value in cfg.items() if key not in route_keys}
-    merged.update(model=model, provider=provider, base_url=base_url, api_key=api_key)
+    merged.update(model=model, provider=provider, base_url=base_url, api_key=api_key, api_mode=profile.get("api_mode"))
     if isinstance(profile.get("request_overrides"), dict):
         merged["request_overrides"] = profile["request_overrides"]
     if base_url and not api_key and provider:
@@ -504,9 +504,16 @@ def _credentials_for_model_profile(cfg: dict, parent_agent, profile_name: Option
                 or not runtime.get("api_key")):
             raise ValueError(f"{name!r} requires an api_key for its endpoint.")
         merged["api_key"] = runtime["api_key"]
+        from tools.delegate_tool_config import _merge_request_overrides
+        merged["request_overrides"] = _merge_request_overrides(runtime.get("request_overrides"), profile.get("request_overrides"))
     elif api_key and provider and provider != "custom":
         from hermes_cli.providers import get_provider
-        if get_provider(provider, allow_network=False) is None:
+        from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+        try:
+            configured = get_provider(provider, allow_network=False) is not None or _get_named_custom_provider(provider) is not None
+        except (RuntimeError, ValueError, TypeError, OSError) as exc:
+            raise ValueError(f"Cannot resolve delegation provider '{provider}': declaration lookup failed.") from exc
+        if not configured:
             raise ValueError(f"{name!r} provider {provider!r} is not a configured provider.")
     creds = _resolve_delegation_credentials(merged, parent_agent, exclusive=True)
     creds["model"] = model

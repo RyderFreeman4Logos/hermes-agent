@@ -1361,16 +1361,36 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
         if next_at is not None and next_at > time.time():
             # next_available_at does not run the early Codex quota probe select()
             # uses, so a weekly stamp can outlive an already-open window.
-            if primary_provider == "openai-codex" and pool is not None:
-                entry = pool.current()
-                probe = getattr(pool, "_codex_quota_restored_upstream", None)
-                try:
-                    reopened = bool(probe(entry)) if probe is not None else False
-                except Exception:
-                    logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
-                    reopened = False
-                if reopened:
-                    return False, prefetched_pool, prefetched
+            # Optional probe: a pool that only has next_available_at must stay blocked.
+            # Lookup, current(), and the probe share one negative-answer boundary.
+            # A raising descriptor is not an unrelated gate error.
+            probe = None
+            try:
+                if primary_provider == "openai-codex" and pool is not None:
+                    probe = getattr(pool, "_codex_quota_restored_upstream", None)
+                reopened = False
+                if probe is not None:
+                    entry = pool.current()
+                    if entry is not None:
+                        reopened = bool(probe(entry))
+                    if not reopened and entry is None:
+                        # Ordinary 429 rotation clears the cursor. select() is the path
+                        # that probes and clears a future stamp; has_available() does not.
+                        entry = pool.select(model=primary_model or None)
+                        reopened = entry is not None
+                    elif reopened and entry is not None and pool is not None:
+                        # The probe admitted this entry without select(). One select()
+                        # records that same entry. A second select() rotates it away.
+                        entry = pool.select(model=primary_model or None)
+                        reopened = entry is not None
+                    if reopened and entry is not None:
+                        agent._restore_selected_entry_id = getattr(entry, "id", None)
+            except Exception:
+                logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
+                reopened = False
+                agent._restore_selected_entry_id = None
+            if probe is not None and reopened:
+                return False, prefetched_pool, prefetched
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(
@@ -1492,7 +1512,8 @@ def restore_primary_runtime(agent) -> bool:
         key = resolve_runtime_pool_key(primary_pool_owner, primary_runtime_base_url)
         loaded = load_pool(key) if key else None
         return loaded if loaded is not None and _matches_primary(loaded) else None
-    if _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool):
+    if (getattr(agent, "_rate_limited_until", 0) > time.monotonic()
+            and _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool)):
         agent._rate_limited_until = 0
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
@@ -1509,9 +1530,10 @@ def restore_primary_runtime(agent) -> bool:
     provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
     try:
         from agent.route_binding import reinstall_primary_runtime
-        reinstall_primary_runtime(
+        if not reinstall_primary_runtime(
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
-        )
+        ):
+            return False
         if primary_pool_owner is None:
             agent._credential_pool = agent._credential_pool_entry_id = None
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
@@ -1528,6 +1550,7 @@ def restore_primary_runtime(agent) -> bool:
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
+
 
 
 # Transient transport failures worth one more attempt with a rebuilt client / connection pool.
@@ -2129,7 +2152,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     client = process_bootstrap.OpenAI(**client_kwargs)
     # Routing proxies name the deployment they served in a response header (#54864).
     from agent.served_model import install_served_model_capture
-    install_served_model_capture(agent, client)
+    install_served_model_capture(vars(agent).get("_client_owner", agent), client)
     _ra().logger.info("OpenAI client created (%s, shared=%s) %s", reason, shared, agent._client_log_context())
     return client
 

@@ -1217,6 +1217,8 @@ def _run_one_file_once(
         raise
     else:
         # systemd owns Linux scope collection after --wait --collect.
+        if sys.platform != "linux":
+            _kill_tree(proc, pgid=pgid)
         output += "\n"
     finally:
         if watch_fd is not None:

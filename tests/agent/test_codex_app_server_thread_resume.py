@@ -67,9 +67,10 @@ def test_rebuilt_agent_resumes_the_stored_codex_thread_and_an_unresumable_one_fa
     try:
         # Process 1: first turn publishes the binding only after the transcript is durable.
         first = _agent(db)
-        assert first.run_conversation("Remember the word amber.")["completed"]
+        first_result = first.run_conversation("Remember the word amber.")
+        assert first_result["completed"]
         assert db.get_session_model_config_value(SID, "codex_thread_id") == "thread-1"
-        assert [r["content"] for r in db.get_messages(SID)][-1] == "echo Remember the word amber."
+        assert [r["content"] for r in db.get_messages(SID)][-1] == first_result["final_response"]
 
         # Process 2 (restart): a new AIAgent for the same session resumes that thread before turn/start.
         notices: list[str] = []

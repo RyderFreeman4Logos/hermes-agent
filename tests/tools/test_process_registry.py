@@ -73,6 +73,189 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     )
 
 
+def test_transfer_ownership_persists_new_owner_after_releasing_lock(registry, tmp_path, monkeypatch):
+    """Success persists the new owner exactly once, after the registry lock is free.
+
+    An unknown id writes nothing. The checkpoint body is the real writer; only
+    its entry is counted, so a stub cannot satisfy the assertion.
+    """
+    import tools.process_registry as process_registry_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    session = _make_session(sid="proc_handoff", task_id="child")
+    session.owner_task_id = "child"
+    registry._running[session.id] = session
+
+    calls = []
+    real_write = registry._write_checkpoint
+
+    def counted_write(*args, **kwargs):
+        calls.append(registry._lock.locked())
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_write_checkpoint", counted_write)
+
+    assert registry.transfer_ownership(
+        "missing", from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="nope",
+    ) is None
+    assert calls == []
+    assert not checkpoint.exists()
+    assert session.owner_task_id == "child"
+
+    session.exited = True
+    assert registry.transfer_ownership(
+        session.id, from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="late",
+    ) is None
+    assert calls == []
+    assert not checkpoint.exists()
+    session.exited = False
+
+    moved = registry.transfer_ownership(
+        session.id, from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="handoff",
+    )
+    assert moved is session
+    assert calls == [False]
+    assert session.owner_task_id == "parent"
+    assert not registry._lock.locked()
+    stored = json.loads(checkpoint.read_text())
+    assert stored[0]["session_id"] == session.id
+    assert stored[0]["owner_task_id"] == "parent"
+
+
+def test_successive_public_handoffs_keep_first_transfer(tmp_path, monkeypatch):
+    """A second authorized handoff after unlock must not deny the first.
+
+    The barrier sits after the real lock release. Both public results and
+    both child accounting lists succeed, and each transfer checkpoints once.
+    """
+    import traceback
+    import weakref
+
+    import tools.process_registry as process_registry_module
+    from tools.delegate_tool_registry import _register_subagent, _unregister_subagent
+    from tools.process_registry import _handle_process
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    registry = process_registry_module.process_registry
+    calls = []
+    real_write = registry._write_checkpoint
+
+    def counted_write(*args, **kwargs):
+        assert not registry._lock.locked()
+        calls.append(threading.current_thread().name)
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_write_checkpoint", counted_write)
+
+    class Agent:
+        def __init__(self, owner, parent=None):
+            self._current_task_id = owner
+            self.session_id = owner + "-key"
+            if parent is not None:
+                self._delegate_parent_ref = weakref.ref(parent)
+
+    def register(owner, agent):
+        _register_subagent(dict(
+            subagent_id=owner, parent_id=None, depth=0, goal="probe",
+            model="none", started_at=time.time(), status="running",
+            tool_count=0, agent=agent,
+        ))
+
+    grand, middle, leaf = Agent("grand"), None, None
+    middle = Agent("sa-middle", grand)
+    leaf = Agent("sa-leaf", middle)
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c",
+         "import sys; print('READY', flush=True); sys.stdin.readline()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=True,
+    )
+    session = None
+    try:
+        assert proc.stdout.readline().strip() == "READY"
+        register("sa-middle", middle)
+        register("sa-leaf", leaf)
+        session = registry.adopt_local(
+            proc, command="finite handoff probe", cwd=str(tmp_path),
+            task_id="sa-leaf", owner_task_id="sa-leaf", session_key="child-key",
+            output_so_far="READY\n", notify_on_complete=True,
+        )
+        calls.clear()
+        reached, release = threading.Event(), threading.Event()
+        result = {}
+
+        def tracer(frame, event, arg):
+            if (
+                frame.f_code is type(registry).transfer_ownership.__code__
+                and event in ("line", "return")
+                and not reached.is_set()
+            ):
+                local = frame.f_locals.get("session")
+                if (
+                    local is session
+                    and session.owner_task_id == "sa-middle"
+                    and not registry._lock.locked()
+                ):
+                    reached.set()
+                    assert release.wait(8), "release barrier timeout"
+            return tracer
+
+        def first():
+            try:
+                sys.settrace(tracer)
+                result["first"] = json.loads(_handle_process(
+                    dict(action="handoff", session_id=session.id, data="finite probe purpose"),
+                    task_id="sa-leaf",
+                ))
+            except BaseException:
+                result["exception"] = traceback.format_exc()
+            finally:
+                sys.settrace(None)
+
+        worker = threading.Thread(target=first, name="first-handoff", daemon=True)
+        worker.start()
+        assert reached.wait(8), "post-unlock barrier not reached"
+        try:
+            result["second"] = json.loads(_handle_process(
+                dict(action="handoff", session_id=session.id, data="finite probe purpose"),
+                task_id="sa-middle",
+            ))
+        finally:
+            release.set()
+            worker.join(8)
+        assert not worker.is_alive()
+        assert "exception" not in result, result.get("exception")
+        assert result["first"].get("status") == "handed_off", result["first"]
+        assert result["second"].get("status") == "handed_off", result["second"]
+        assert [row["session_id"] for row in leaf._handed_off_processes] == [session.id]
+        assert [row["session_id"] for row in middle._handed_off_processes] == [session.id]
+        assert sorted(calls) == ["MainThread", "first-handoff"]
+        assert session.owner_task_id == "grand"
+        stored = {row["session_id"]: row for row in json.loads(checkpoint.read_text())}
+        assert stored[session.id]["owner_task_id"] == "grand"
+    finally:
+        monkeypatch.setattr(registry, "_write_checkpoint", real_write)
+        if proc.poll() is None:
+            with suppress(Exception):
+                proc.stdin.write("\n")
+                proc.stdin.flush()
+            with suppress(Exception):
+                proc.wait(timeout=8)
+        with suppress(Exception):
+            proc.stdin.close()
+        if session is not None and session._reader_thread is not None:
+            session._reader_thread.join(8)
+        with suppress(Exception):
+            registry.kill_all(source="handoff-race-cleanup")
+        for owner in ("sa-leaf", "sa-middle"):
+            _unregister_subagent(owner)
+
+
 def test_reader_start_failure_rolls_back_exact_registration(registry, monkeypatch):
     session = _make_session(sid="failed-reader")
     other = _make_session(sid="unrelated")

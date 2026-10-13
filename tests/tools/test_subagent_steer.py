@@ -169,6 +169,14 @@ class TestMissedSteerRetention:
         parent._delegate_depth = 0
         parent._session_db = None
         parent.model = "test-model"
+        parent.provider = "openrouter"
+        parent.requested_provider = "openrouter"
+        parent.base_url = "https://openrouter.ai/api/v1"
+        parent.api_key = "fixture-key"
+        parent.api_mode = "chat_completions"
+        parent.request_overrides = {}
+        parent.acp_command = None
+        parent.acp_args = []
         parent.interactive_mode = False
 
         with patch("run_agent.AIAgent") as MockAgent:
@@ -207,6 +215,14 @@ class TestMissedSteerRetention:
         parent._delegate_depth = 0
         parent._session_db = None
         parent.model = "test-model"
+        parent.provider = "openrouter"
+        parent.requested_provider = "openrouter"
+        parent.base_url = "https://openrouter.ai/api/v1"
+        parent.api_key = "fixture-key"
+        parent.api_mode = "chat_completions"
+        parent.request_overrides = {}
+        parent.acp_command = None
+        parent.acp_args = []
         parent.interactive_mode = False
 
         with patch("run_agent.AIAgent") as MockAgent:

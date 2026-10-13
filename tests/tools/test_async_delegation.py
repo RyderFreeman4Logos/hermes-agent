@@ -570,6 +570,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent._active_children = []
     parent._active_children_lock = None
     fake_child = MagicMock()
+    fake_child.model = "m"
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
 
@@ -640,6 +641,7 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     parent._active_children = []
     parent._active_children_lock = None
     fake_child = MagicMock()
+    fake_child.model = "m"
     fake_child._delegate_role = "leaf"
 
     creds = {
@@ -943,6 +945,7 @@ def _grouped_fanout(monkeypatch, tasks, gates):
 
     def build(**kw):
         c = MagicMock()
+        c.model = "m"
         c._delegate_role = "leaf"
         c._subagent_id = f"s{kw['task_index']}"
         return c
@@ -1074,7 +1077,7 @@ def child(task_index, goal, child=None, parent_agent=None, **kw):
     return {"task_index": task_index, "status": "completed", "summary": f"done: {goal}", "api_calls": 1,
             "duration_seconds": 0.1, "model": "m", "exit_reason": "completed"}
 def build(**kw):
-    c = MagicMock(); c._delegate_role = "leaf"; c._subagent_id = f"s{kw['task_index']}"; return c
+    c = MagicMock(); c.model = "m"; c._delegate_role = "leaf"; c._subagent_id = f"s{kw['task_index']}"; return c
 creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api_mode": None, "command": None, "args": None}
 dt._build_child_agent = build; dt._run_single_child = child; dt._resolve_delegation_credentials = lambda *a, **k: creds
 dt.delegate_task(tasks=[{"goal": "fast member of the group task", "group": "g"},
@@ -1120,7 +1123,7 @@ def child(task_index, goal, child=None, parent_agent=None, **kw):
     return {"task_index": task_index, "status": "completed", "summary": f"done: {goal}", "api_calls": 1,
             "duration_seconds": 0.1, "model": "m", "exit_reason": "completed"}
 def build(**kw):
-    c = MagicMock(); c._delegate_role = "leaf"; c._subagent_id = f"s{kw['task_index']}"; return c
+    c = MagicMock(); c.model = "m"; c._delegate_role = "leaf"; c._subagent_id = f"s{kw['task_index']}"; return c
 creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api_mode": None, "command": None, "args": None}
 dt._build_child_agent = build; dt._run_single_child = child; dt._resolve_delegation_credentials = lambda *a, **k: creds
 def held_finalize(*a, **k):

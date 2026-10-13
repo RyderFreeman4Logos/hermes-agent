@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.codex_runtime import (
     _record_codex_app_server_usage,
     make_codex_app_server_event_bridge,
@@ -519,3 +521,17 @@ def test_response_checker_observes_usage_before_length_recovery(monkeypatch):
     )
 
     assert verdict.action == "continue"
+
+
+@pytest.mark.parametrize("input_tokens", [None, True, -1, 2.5, "invalid", 10])
+def test_codex_cache_telemetry_rejects_missing_or_impossible_denominator(input_tokens):
+    events = []
+    agent = _make_agent()
+    agent._tui_cache_callback = lambda *args: events.append(args)
+    raw = {"cachedInputTokens": 20, "outputTokens": 1}
+    if input_tokens is not None:
+        raw["inputTokens"] = input_tokens
+    _record_codex_app_server_usage(agent, SimpleNamespace(token_usage_last=raw))
+    assert events[0][0] == "no_field"
+    assert events[0][4]["pct"] is None
+    assert agent._first_turn_usage["cache_telemetry"] == "unavailable"

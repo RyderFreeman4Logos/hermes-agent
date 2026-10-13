@@ -155,6 +155,8 @@ def _canonical_codex_app_server_usage(raw: dict):
     # inputTokens includes cachedInputTokens. CanonicalUsage.prompt_tokens adds
     # cache_read back, so the input bucket is the uncached remainder.
     cache_read_tokens, cache_valid = _cache_evidence(raw, ("cachedInputTokens",))
+    prompt_tokens, prompt_valid = _cache_evidence(raw, ("inputTokens",))
+    cache_valid = cache_valid and prompt_valid and cache_read_tokens <= prompt_tokens
     return CanonicalUsage(
         input_tokens=max(0, _coerce_usage_int(raw.get("inputTokens")) - cache_read_tokens),
         output_tokens=_coerce_usage_int(raw.get("outputTokens")),
@@ -826,8 +828,8 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     if getattr(turn, "should_retire", False):
         logger.warning("codex app-server session retired (turn error: %s)", turn.error)
         _close_codex_session(agent)
-    # The binding is published only once the projected rows and completion metadata are durable,
-    # and never for a retired thread (the next agent would only resume into the same wedge).
+    # Publish the binding only after projected rows are durable and completion metadata
+    # persistence has been attempted; a retired thread must never be resumed.
     transcript_persisted = _persist_projected_messages(agent, turn, messages)
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,

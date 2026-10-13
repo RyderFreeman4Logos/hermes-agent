@@ -147,13 +147,13 @@ def _notify_tui_cache(agent, canonical_usage=None, *, no_usage: bool = False) ->
         cache_read = canonical_usage.cache_read_tokens
         cache_write = canonical_usage.cache_write_tokens
         prompt_tokens = canonical_usage.prompt_tokens
-        if cache_read:
+        if getattr(canonical_usage, "cache_telemetry", "unavailable") == "unavailable":
+            cache_state, cache_pct = "no_field", 0
+        elif cache_read:
             cache_state = "hit"
             cache_pct = round(100 * cache_read / prompt_tokens) if prompt_tokens else 0
         elif cache_write:
             cache_state, cache_pct = "cold_write", 0
-        elif getattr(canonical_usage, "cache_telemetry", "unavailable") == "unavailable":
-            cache_state, cache_pct = "no_field", 0
         else:
             cache_state, cache_pct = "miss", 0
         cache_callback(

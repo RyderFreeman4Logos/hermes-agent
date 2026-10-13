@@ -2983,6 +2983,15 @@ def _load_resume_transcript(db, stored_id: str, *, model_history_only: bool = Fa
     except TypeError as exc:
         if "max_display_messages" not in str(exc):
             raise
+        from hermes_state import SessionResumeTooLargeError
+        guard = getattr(db, "assert_resume_safe", None)
+        if limit and callable(guard):
+            try:
+                guard(stored_id)
+            except SessionResumeTooLargeError:
+                raw_history = db.get_messages_as_conversation(
+                    stored_id, repair_alternation=True, include_row_ids=True)
+                return raw_history, raw_history, []
         raw_history, display_history = db.get_resume_conversations(stored_id)
     tip_ids = {m.get("_row_id") for m in raw_history if isinstance(m, dict) and m.get("_row_id") is not None}
     prefix = [m for m in display_history if m.get("_row_id") not in tip_ids]

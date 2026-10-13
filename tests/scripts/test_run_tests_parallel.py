@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import shutil
 import os
 import select
 import shutil

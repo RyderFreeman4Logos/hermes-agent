@@ -24,6 +24,7 @@ def _plan(timeout: float = 0.05) -> SimpleNamespace:
         cwd="/tmp",
         effective_timeout=timeout,
         promoted_from_foreground_timeout=None,
+        auto_promoted=False,
     )
 
 

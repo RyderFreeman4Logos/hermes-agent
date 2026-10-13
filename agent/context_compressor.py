@@ -3290,9 +3290,10 @@ class ContextCompressor(
         call_id_to_tool = _tool_calls_by_id(messages)
         protected_skills = _collect_protected_skill_names(messages, tail_start)
         demote_end = max(tail_start, len(messages) - _PRESSURE_KEEP_RECENT_MESSAGES)
+        spared = self._spared_pending_tool_round(messages)
         demoted = 0
         for idx in range(tail_start, demote_end):
-            if self._is_context_summary_message(messages[idx]):
+            if idx in spared or self._is_context_summary_message(messages[idx]):
                 continue
             if self._demote_tool_result_at(
                 messages,

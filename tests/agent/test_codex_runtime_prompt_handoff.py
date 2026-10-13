@@ -29,6 +29,7 @@ class _FakeClient:
 
 def _agent(**overrides):
     base = dict(_codex_session=None, session_cwd="/tmp", tool_progress_callback=None,
+                _reset_stream_delivery_tracking=lambda: None,
                 _cached_system_prompt="SOUL: you are Hermes", ephemeral_system_prompt="Always start with ZZZ")
     base.update(overrides)
     return SimpleNamespace(**base)

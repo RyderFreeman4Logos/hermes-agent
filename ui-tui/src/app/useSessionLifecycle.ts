@@ -169,7 +169,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     turnController.fullReset()
     setVoiceRecording(false)
     setVoiceProcessing(false)
-    patchUiState({ bgTasks: new Set(), info: null, sid: null, storedSid: null, usage: ZERO })
+    patchUiState({ bgTasks: new Set(), cacheStatus: null, info: null, sid: null, storedSid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
     setStickyPrompt('')
@@ -199,7 +199,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       setLastUserMsg('')
       composerActions.setComposerTokens([])
       patchTurnState({ activity: [] })
-      patchUiState({ info, usage: usageFrom(info) })
+      patchUiState({ cacheStatus: null, info, usage: usageFrom(info) })
     },
     [composerActions, setHistoryItems, setLastUserMsg, setStickyPrompt]
   )

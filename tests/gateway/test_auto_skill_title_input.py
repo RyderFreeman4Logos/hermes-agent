@@ -135,7 +135,7 @@ async def test_gateway_titles_original_request_without_changing_model_input(tmp_
                                    title_user_message="Original relay request")
         assert begin_turn.call_args.kwargs["metadata"] is metadata
         assert title_inputs[-1] == "Original relay request"
-        assert model_inputs[-1] == "Enriched relay request"
+        assert model_inputs[-1].startswith("Enriched relay request\n\n[Agent loop timing]\n")
     finally:
         agent.close()
         db.close()

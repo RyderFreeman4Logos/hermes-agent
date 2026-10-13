@@ -15,7 +15,7 @@ from utils import base_url_host_matches
 logger = logging.getLogger(__name__)
 
 
-def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str, *, publish_compression: bool = True) -> Optional[tuple[str, str]]:
+def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str, *, publish_compression: bool = True, accept_resolved=None) -> Optional[tuple[str, str]]:
     """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
     old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
     so the next turn's ``restore_primary_runtime`` reverts it; raises on a failed swap."""
@@ -58,6 +58,12 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
             api_mode = "chat_completions"
         elif not api_mode_explicit and api_mode == "chat_completions":
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
+
+    if accept_resolved is not None and not accept_resolved(client, model, base_url):
+        if client is not getattr(agent, "client", None) and client is not getattr(agent, "_anthropic_client", None):
+            from agent.auxiliary_client import _close_cached_client
+            _close_cached_client(client)
+        return None
 
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
     from agent.agent_runtime_helpers import _copy_request_overrides

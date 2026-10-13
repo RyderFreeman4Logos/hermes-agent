@@ -355,7 +355,7 @@ class _SelectedRouteFailureChild:
 def test_public_background_route_errors_keep_selected_provenance(
     tmp_path, monkeypatch, outcome, expected_status,
 ):
-    """Public result, durable completion, and formatter keep the route selected before the run."""
+    """An unaccepted failure has no billed route; durable dispatch retains selected model."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     cfg = {
         "max_iterations": 4,
@@ -405,20 +405,28 @@ def test_public_background_route_errors_keep_selected_provenance(
             assert event is not None
             (result,) = event["results"]
             assert (result["status"], result["model"], result["provider"]) == (
-                expected_status, "fast-model", "custom",
+                expected_status, None, None,
             )
 
             durable = ad.get_durable_delegation(event["delegation_id"])
             assert durable is not None
             (persisted,) = durable["result"]["results"]
             assert (persisted["status"], persisted["model"], persisted["provider"]) == (
-                expected_status, "fast-model", "custom",
+                expected_status, None, None,
             )
 
             rendered = format_process_notification(event)
+            # The dispatch header remains a selected-route audit, not billed identity.
             assert "Model: fast-model" in rendered
-            assert "Provider: custom" in rendered
-            assert rendered.index("Model: fast-model") < rendered.index("(no summary")
+            task_rendered = rendered.split("---", 1)[-1]
+            assert "Model: fast-model" not in task_rendered
+            assert "Provider: custom" not in rendered
+            with ad._transaction() as conn:
+                (task_json,) = conn.execute(
+                    "SELECT task_json FROM async_delegations WHERE delegation_id = ?",
+                    (event["delegation_id"],),
+                ).fetchone()
+            assert json.loads(task_json)["model"] == "fast-model"
     finally:
         deadline = time.monotonic() + 2.0
         while ad.active_count() and time.monotonic() < deadline:

@@ -136,7 +136,7 @@ def test_unauthenticated_fallback_hop_is_dropped_and_log_has_no_exception_text(c
     assert "AuthError" in caplog.text
 
 
-def test_result_identity_prefers_accepted_route_else_selected():
+def test_result_identity_requires_accepted_route_and_retains_selected_audit():
     from tools.delegate_tool_child_run import _fabricated_entry
 
     child = MagicMock()
@@ -150,15 +150,16 @@ def test_result_identity_prefers_accepted_route_else_selected():
     child.session_completion_tokens = 0
     child._delegate_role = "leaf"
     selected = _fabricated_entry(0, "failed", "boom", child, 1)
-    assert selected["model"] == "fallback-model"
-    assert selected["provider"] == "fallback-provider"
+    assert selected["model"] is None
+    assert selected["provider"] is None
     assert selected["model_profile"] == "complex"
 
     child._delegate_selected_route = ("selected-model", "selected-provider")
     child.model = "mutated-model"
     child.provider = "mutated-provider"
     failed = _fabricated_entry(0, "timeout", "slow", child, 1)
-    assert (failed["model"], failed["provider"]) == ("selected-model", "selected-provider")
+    assert (failed["model"], failed["provider"]) == (None, None)
+    assert child._delegate_selected_route == ("selected-model", "selected-provider")
 
     child._delegate_successful_llm_route = ("accepted-model", "accepted-provider")
     accepted = _fabricated_entry(0, "error", "after accept", child, 1)
@@ -185,7 +186,7 @@ def test_fixed_key_restore_does_not_load_another_pool(monkeypatch):
         raise AssertionError("fixed key must not load a pool")
 
     monkeypatch.setattr("agent.credential_pool.load_pool", _load)
-    monkeypatch.setattr("agent.route_binding.reinstall_primary_runtime", lambda *args, **kwargs: setattr(agent, "model", "std-model"))
+    monkeypatch.setattr("agent.route_binding.reinstall_primary_runtime", lambda *args, **kwargs: (setattr(agent, "model", "std-model"), True)[1])
     assert restore_primary_runtime(agent) is True
     assert agent._credential_pool is None
 
@@ -291,7 +292,8 @@ def test_fallback_success_stamp_is_the_route_that_served():
     child._delegate_successful_llm_route = None
     child.model, child.provider = "mutated-model", "mutated-provider"
     failed = _build_result_entry(child, {"failed": True, "error": "down"}, 0, 1, schema)
-    assert (failed["model"], failed["provider"]) == ("primary-model", "openrouter")
+    assert (failed["model"], failed["provider"]) == (None, None)
+    assert child._delegate_selected_route == ("primary-model", "openrouter")
 
 
 @pytest.mark.parametrize("outcome", ["success", "failed", "cancelled"])

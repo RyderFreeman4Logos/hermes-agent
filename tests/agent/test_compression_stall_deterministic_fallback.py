@@ -80,7 +80,10 @@ def _summary_rows(messages):
 
 @pytest.fixture
 def fast_timeouts(monkeypatch):
-    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (0.4, 4.0))
+    # This wrapper includes real SQLite transcript persistence and source signing.
+    # Let preparation reach the deliberately stalled summary callback before the
+    # watchdog fires; the fence-only tests retain their millisecond deadlines.
+    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (3.0, 12.0))
 
 
 def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp_path, fast_timeouts):

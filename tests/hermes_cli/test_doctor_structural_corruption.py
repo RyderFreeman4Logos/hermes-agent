@@ -27,14 +27,24 @@ def test_integrity_damage_classifier_maps_tree_ids_through_rootpage():
     ]
     master = [(12, "table", "messages_fts_data"), (5, "table", "sessions"),
               (15, "table", "gateway_routing"), (40, "table", "archive_fts_data")]
-    assert integrity_damage_is_structural(fts_only, master) is False
+    assert integrity_damage_is_structural(fts_only, master) is True  # names are not ownership
+    assert integrity_damage_is_structural(
+        fts_only, master, owned_fts={"messages_fts_data", "messages_fts_trigram_idx"}
+    ) is False
+    assert integrity_damage_is_structural(["On tree page 5 cell 0: Offset 65535 out of range 4008..4092"], master)
+    assert integrity_damage_is_structural(
+        ["On tree page 12 cell 0: Offset 65535 out of range 4008..4092"], master,
+        owned_fts={"messages_fts_data"},
+    ) is False
     assert integrity_damage_is_structural(["Tree 5  page 421385: btreeInitPage() returns error code 11"], master)
     assert integrity_damage_is_structural(["Tree 15 page 15 cell 0: 2nd reference to page 5453"], master)
     assert integrity_damage_is_structural(["Tree 40 page 40: btreeInitPage() returns error code 11"], master)
     assert integrity_damage_is_structural(["row 1 missing from index sqlite_autoindex_delivery_obligations_1"], master)
     assert integrity_damage_is_structural(["Freelist: invalid page number 167772160"], master)
     # Unparseable / unknown-tree lines keep the FTS wording (incomplete, never wrong).
-    assert integrity_damage_is_structural(["Tree 999 page 1: garbage", "*** in database main ***"], master) is False
+    assert integrity_damage_is_structural(
+        ["Tree 999 page 1: garbage", "On tree page 999 cell 0: garbage", "*** in database main ***"], master,
+    ) is False
 
 
 def _seed(tmp_path, rows=120):

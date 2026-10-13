@@ -36,7 +36,7 @@ from tools.process_registry_notifications import format_process_notification, is
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
-from tools.process_registry_env_log import log_delta_command
+from tools.process_registry_env_log import log_delta_command, is_wsl_launcher_command, WSL_CHAIN_NOTE
 
 logger = logging.getLogger(__name__)
 
@@ -662,42 +662,6 @@ _CHECKPOINT_DEFAULTS = {
     if f.name in _CHECKPOINT_FIELDS
 }
 
-
-_WSL_LAUNCHER_NAMES = frozenset({"wsl", "wsl.exe"})
-
-_WSL_CHAIN_NOTE = (
-    "Spawned via a wsl[.exe] launcher: the recorded host PID is the short-lived "
-    "launcher, not the Linux-side workers. Inspect them with `wsl -e ps` / "
-    "`wsl --list --running` from the host."
-)
-
-
-def _is_wsl_launcher_command(command: str) -> bool:
-    """True when *command* routes through a ``wsl[.exe]`` launcher chain (#120546).
-
-    The host PID recorded for such a spawn belongs to the short-lived launcher;
-    grandchildren inside the VM outlive it, so the entry must say so instead of
-    letting host-side hunting fail silently.
-    """
-    if not isinstance(command, str) or not command.strip():
-        return False
-    candidates = []
-    try:
-        candidates.append((shlex.split(command, posix=True) or [""])[0])
-    except ValueError:
-        pass
-    # POSIX shlex eats Windows backslashes (``C:\...\wsl.exe``), so also try
-    # the naive first token where path separators survive.
-    words = command.strip().split()
-    if words:
-        candidates.append(words[0])
-    for first in candidates:
-        base = os.path.basename(first.replace("\\", "/")).strip("'\"").lower()
-        if base in _WSL_LAUNCHER_NAMES:
-            return True
-    return False
-
-
 class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
@@ -1113,7 +1077,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
-            wsl_chain=_is_wsl_launcher_command(command),
+            wsl_chain=is_wsl_launcher_command(command),
             started_at=time.time(), **extra)
 
     @staticmethod
@@ -1161,15 +1125,22 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         from contextvars import copy_context
 
         # Reader completion must retain the producer's multiplex profile scope.
+        # Register first so a spawn-advertised notification survives an immediate
+        # reader exit (the reader may finish before start() returns).
         reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
                                   daemon=True, name=reader_name)
         session._reader_thread = reader
         with self._lock:
             self._prune_if_needed()
-            # Completion takes this lock too. Starting here also leaves no
-            # ghost entry if the interpreter cannot start another thread.
-            reader.start()
             self._running[session.id] = session
+        try:
+            reader.start()
+        except Exception:
+            with self._lock:
+                if self._running.get(session.id) is session:
+                    del self._running[session.id]
+            session._reader_thread = None
+            raise
         self._write_checkpoint()
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
@@ -1198,7 +1169,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     def spawn_local(
         self, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
         env_vars: dict | None = None, use_pty: bool = False, owner_task_id: str = "",
-        persist_on_release: bool = False) -> ProcessSession:
+        persist_on_release: bool = False, notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing.
@@ -1210,8 +1181,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
-        session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
-                                    persist_on_release=persist_on_release)
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
+            persist_on_release=persist_on_release, notify_on_complete=notify_on_complete,
+        )
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -1290,14 +1263,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False) -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False,
+        notify_on_complete: bool = False) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
         the correct sandbox context. ``persist_on_release`` keeps the process out of
         agent-lifecycle kill sweeps (#41225)."""
-        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
-                                    persist_on_release=persist_on_release)
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
+            persist_on_release=persist_on_release, notify_on_complete=notify_on_complete,
+        )
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -1430,9 +1406,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
         one U+FFFD instead of vanishing), reap the child (no zombies), record the exit.
 
-        A process may close stdout long before it exits.  The reader owns a dedicated
-        daemon thread, so it must keep waiting rather than publish a false completion
-        and discard the only ``Popen`` handle that can reap the child.
+        Pipe EOF is not completion: a long child can close stdout and stay alive.
+        The reader owns a dedicated daemon thread, so it must keep waiting rather
+        than publish a false completion and discard the only ``Popen`` handle that
+        can reap the child.
         """
         with suppress(Exception):
             tail = decoder.decode(b"", final=True)
@@ -1447,7 +1424,16 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 logger.warning("%s wait failed; leaving process tracked: %s", label, e)
                 return
             logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        self._finish_exited(session, exit_code())
+        rc = exit_code()
+        if rc is None:
+            proc = getattr(session, "process", None)
+            poll = getattr(proc, "poll", None) if proc is not None else None
+            if callable(poll):
+                with suppress(Exception):
+                    rc = poll()
+            if rc is None:
+                return
+        self._finish_exited(session, rc)
 
     _log_delta_command = staticmethod(log_delta_command)
 
@@ -1561,9 +1547,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             tail = decoder.decode(responder.flush())
             if tail:
                 ingest(tail)
+        def exit_code():
+            status = getattr(pty, "exitstatus", None)
+            if status is not None:
+                return status
+            signal_status = getattr(pty, "signalstatus", None)
+            if signal_status is not None:
+                return -signal_status
+            return None if hasattr(pty, "exitstatus") else -1
+
         self._finish_reader(
-            session, decoder, ingest, "PTY",
-            pty.wait, lambda: pty.exitstatus if hasattr(pty, 'exitstatus') else -1)
+            session, decoder, ingest, "PTY", pty.wait, exit_code)
 
     def _ingest_output(self, session: ProcessSession, text: str, *, unless_exited: bool = False) -> None:
         """Buffer a freshly-read chunk, then scan watch patterns and stream it live.
@@ -1820,6 +1814,40 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             return False
 
     @staticmethod
+    def _child_owned_terminal_completion(evt: dict) -> bool:
+        """Well-formed delegated-child terminal outcome stays child-owned.
+
+        Ownership, not the command result, decides. A malformed envelope fails
+        open so the parent still sees one bounded notice. An explicit handoff
+        is parent-owned and never matches.
+        """
+        if not isinstance(evt, dict) or evt.get("type") != "completion":
+            return False
+        if evt.get("handoff_note"):
+            return False
+        owner = str(evt.get("owner_task_id") or evt.get("task_id") or "")
+        if not owner.startswith("sa-"):
+            return False
+        started_at = evt.get("started_at")
+        return (
+            type(evt.get("exit_code")) is int
+            and (evt.get("completion_reason"), evt.get("termination_source")) in {
+                ("exited", ""),
+                ("killed", "process.kill"),
+                ("killed", "kill_all"),
+                ("lost", ""),
+                ("lost", "backend_lost"),
+                ("failed_start", "failed_start"),
+                ("already_exited", ""),
+            }
+            and isinstance(evt.get("session_id"), str) and bool(evt["session_id"])
+            and isinstance(evt.get("command"), str) and bool(evt["command"])
+            and isinstance(started_at, (int, float)) and not isinstance(started_at, bool)
+            and started_at == started_at and started_at not in (float("inf"), float("-inf"))
+            and started_at > 0
+        )
+
+    @staticmethod
     def _owns_event(evt: dict, session_key: str, owns_event, is_async_delegation: bool) -> bool:
         """Routing verdict for one drained event (see drain_notifications); False = requeue."""
         evt_session_key = str(evt.get("session_key") or "")
@@ -1896,7 +1924,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # drain, so a requeue would pin the event forever. 'async_delegation'
             # is the result itself and is NEVER suppressed.
             _evt_task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
-            if is_child_process_notification(evt):
+            if is_child_process_notification(evt) and (
+                evt.get("type") != "completion" or self._child_owned_terminal_completion(evt)
+            ):
                 if surface_child is None:
                     surface_child = self._surface_child_process_notifications()
                 if not should_surface_notification(evt, surface_child=surface_child):
@@ -2085,7 +2115,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         """Block until the process exits, the timeout elapses, the user interrupts, or a
         mid-turn user message (steer/redirect → ``request_yield``) releases the wait.
         ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
-        with status exited|timeout|interrupted|not_found|error and an output snapshot."""
+        with status exited|running|timeout|interrupted|not_found|error and an output
+        snapshot. A running notified session returns immediately; its completion is
+        delivered through the existing notification queue. A mid-turn steer/redirect
+        (``request_yield``) still releases a blocking wait."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
 
         try:
@@ -2104,6 +2137,26 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
+        self._reconcile_local_exit(session)  # orphaned-pipe reader guard
+        if session.notify_on_complete and not session.exited:
+            from agent.delegation_context import is_delegated_child_context
+
+            # A native child has no parent notification drain. Deferring its
+            # wait leaves the child looping on wait_deferred until interrupt.
+            if not is_delegated_child_context():
+                return {
+                    "status": "running",
+                    "session_id": session.id,
+                    "command": session.command,
+                    "process_running": True,
+                    "wait_deferred": True,
+                    "notify_on_complete": True,
+                    "note": (
+                        "process.wait was auto-backgrounded because notify_on_complete "
+                        "is set; continue other work and you will be notified exactly "
+                        "once when the process exits."
+                    ),
+                }
         deadline = time.monotonic() + effective_timeout
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
@@ -2440,7 +2493,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 entry["session_scoped"] = True
             if s.wsl_chain:
                 entry["wsl_chain"] = True
-                entry["wsl_note"] = _WSL_CHAIN_NOTE
+                entry["wsl_note"] = WSL_CHAIN_NOTE
             # Trigger metadata for goal-loop judges (a watcher may never exit).
             if s.watch_patterns and not s._watch_disabled:
                 entry.update(watch_patterns=list(s.watch_patterns), watch_hit=s._watch_hits > 0)
@@ -2505,7 +2558,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
-            return session
+        # Checkpoint takes this same lock. Write after release so the new owner
+        # is durable without re-entering it. Success was decided under the lock;
+        # a later transfer must not make this caller report failure.
+        self._write_checkpoint()
+        return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
         """Active processes for a gateway session key. Processes older than
@@ -2614,8 +2671,9 @@ PROCESS_SCHEMA = {
         "terminal(background=true)). "
         "Completed results remain retrievable by session_id when resuming their owning conversation "
         "(up to 7 days, newest 64 results per profile; rolling output tail). "
-        "poll: status + new output. log: full output, paged. wait: block "
-        "until exit or timeout (partial output on timeout). write vs "
+        "poll: status + new output. log: full output, paged. wait: return "
+        "immediately for notify_on_complete targets; otherwise block until "
+        "exit or timeout (partial output on timeout). write vs "
         "submit: submit appends Enter — use it to answer prompts; write "
         "sends raw bytes, no newline. close: EOF stdin. kill: terminate. "
         "handoff (subagents only): transfer a running process you started to your parent agent, which then "
@@ -2639,7 +2697,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait'.",
+                "description": "Max seconds for 'wait' when the target is not already configured for completion notification.",
                 "minimum": 1
             },
             "offset": {

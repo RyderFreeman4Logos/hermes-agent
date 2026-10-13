@@ -26,7 +26,10 @@ duplicate the user turn (#860 / #42039). This test locks in:
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
+
+import pytest
 
 from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
@@ -73,6 +76,123 @@ def test_codex_success_flushes_and_reports_persisted():
     assert isinstance(result["messages"][-1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+    agent._reset_stream_delivery_tracking.assert_called_once_with()
+
+@pytest.mark.parametrize(
+    ("usage", "expected_counts"),
+    [
+        (
+            {"inputTokens": 30, "cachedInputTokens": 12, "outputTokens": 5, "totalTokens": 35},
+            {"cache_read": 12, "prompt_total": 30},
+        ),
+        (None, {}),
+        ({"inputTokens": 30, "cachedInputTokens": 40, "outputTokens": 5}, {}),
+    ],
+)
+def test_codex_success_persists_reply_end_on_its_projected_assistant_row(
+    monkeypatch, tmp_path, usage, expected_counts,
+):
+    from agent.context_compressor import ContextCompressor
+    from agent.usage_pricing import CostResult
+
+    monkeypatch.setattr(
+        ContextCompressor, "_is_synthetic_compression_user_turn",
+        classmethod(lambda _cls, _message: False),
+    )
+    monkeypatch.setattr("agent.codex_runtime.time.monotonic", lambda: 103.25)
+    monkeypatch.setattr(
+        "agent.usage_pricing.estimate_usage_cost",
+        lambda *_args, **_kwargs: CostResult(None, "unknown", "none", "n/a"),
+    )
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path)
+    sid = "sess-codex-footer"
+    db.create_session(session_id=sid, source="telegram", model="codex")
+    try:
+        agent: Any = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=db,
+            session_id=sid,
+        )
+        agent._session_db_created = True
+        agent._reply_started_monotonic = 100.0
+        agent._reply_usage = None
+        agent._reply_usage_complete = True
+        agent._sync_external_memory_for_turn = lambda **_kwargs: None
+        agent._codex_session = MagicMock()
+        turn = _make_turn()
+        turn.token_usage_last = usage
+        agent._codex_session.run_turn.return_value = turn
+        messages = [{"role": "user", "content": "USER_TURN"}]
+        agent._flush_messages_to_session_db(messages)
+
+        from agent import codex_runtime
+
+        published_reply_ends = []
+        original_store = codex_runtime._store_codex_thread_id
+
+        def check_reply_end_before_thread_publish(target_agent, thread_id):
+            row = next(row for row in db.get_messages(sid) if row["role"] == "assistant")
+            published_reply_ends.append((row.get("display_metadata") or {}).get("reply_end"))
+            original_store(target_agent, thread_id)
+
+        monkeypatch.setattr(codex_runtime, "_store_codex_thread_id", check_reply_end_before_thread_publish)
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="USER_TURN",
+            original_user_message="USER_TURN",
+            messages=messages,
+            effective_task_id="task-1",
+        )
+
+        assert result["completed"] is True
+        expected = {"elapsed_s": 3.25, **expected_counts}
+        assert messages[-1]["display_metadata"]["reply_end"] == expected
+        assert published_reply_ends == [expected]
+        db.close()
+        db = SessionDB(db_path)
+        assistant_row = next(row for row in db.get_messages(sid) if row["role"] == "assistant")
+        assert assistant_row["display_metadata"]["reply_end"] == expected
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("interrupted,error", [(True, None), (False, "turn failed")])
+def test_codex_interrupted_or_error_turn_does_not_attach_reply_end(interrupted, error):
+    agent = _make_agent(session_db=None)
+    agent._reply_started_monotonic = 100.0
+    turn = _make_turn()
+    turn.projected_messages = [{"role": "assistant", "content": "partial"}]
+    turn.final_text = "partial"
+    turn.interrupted = interrupted
+    turn.error = error
+    agent._codex_session.run_turn.return_value = turn
+    if interrupted:
+        agent._interrupt_requested = True
+        agent._interrupt_message = "stop"
+
+        def clear_interrupt():
+            agent._interrupt_requested = False
+            agent._interrupt_message = None
+
+        agent.clear_interrupt.side_effect = clear_interrupt
+    messages = [{"role": "user", "content": "question"}]
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="question",
+        original_user_message="question",
+        messages=messages,
+        effective_task_id="task-1",
+    )
+
+    assert result["completed"] is False
+    assert "display_metadata" not in messages[-1]
+
 
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)

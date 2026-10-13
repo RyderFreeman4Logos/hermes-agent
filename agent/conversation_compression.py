@@ -766,39 +766,11 @@ def _get_compress_timeout_executor():
 
 
 def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None) -> tuple[float, float]:
-    """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
-    ``idle_timeout_seconds <= 0`` disables the progress-aware wrapper. The ceiling is clamped to at least one
-    idle window when the idle budget is positive."""
-    idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
-    ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
-    cfg = compression_cfg
-    if cfg is None:
-        cfg = {}
-        with contextlib.suppress(Exception):
-            from hermes_cli.config import load_config
-            raw = load_config()
-            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
-            cfg = maybe if isinstance(maybe, dict) else {}
-    if isinstance(cfg, dict):
-        # Explicit 0/negative idle disables; a non-positive ceiling is ignored.
-        with contextlib.suppress(TypeError, ValueError):
-            if cfg.get("context_timeout_seconds") is not None:
-                idle = float(cfg["context_timeout_seconds"])
-        with contextlib.suppress(TypeError, ValueError):
-            if cfg.get("context_total_ceiling_seconds") is not None and float(cfg["context_total_ceiling_seconds"]) > 0:
-                ceiling = float(cfg["context_total_ceiling_seconds"])
-    if idle > 0:
-        ceiling = max(ceiling, idle)
-        # #114594: the aux summary attempt legitimately needs up to its own budget (floor 300s), while the
-        # host idle watchdog defaults to 120s. Clamp the idle window up to at least the effective aux
-        # compression timeout so prep/chunking work with no streamed tokens yet is not cut off. Only raises:
-        # an explicit cfg value above the aux budget is kept, and idle never exceeds the ceiling.
-        from agent.auxiliary_client import _effective_aux_timeout
-        _aux_budget = float(_effective_aux_timeout("compression", None))
-        if _aux_budget > 0:
-            ceiling = max(ceiling, _aux_budget)
-            idle = max(idle, min(_aux_budget, ceiling))
-    return idle, ceiling
+    """Return ``(idle_timeout_seconds, total_ceiling_seconds)``. See the timeouts sibling."""
+    from agent.conversation_compression_timeouts import (
+        resolve_context_compression_timeouts as _resolve,
+    )
+    return _resolve(compression_cfg)
 
 
 def compression_attempt_stalled(
@@ -896,8 +868,8 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         try:
             api_key = _fallback_entry_api_key(entry)
         except Exception:
-            logger.debug("compression fallback_chain[%d] api key resolution failed", index, exc_info=True)
-            api_key = None
+            logger.debug("compression fallback_chain[%d] api key resolution failed; skipping entry", index)
+            continue
         from agent.auxiliary_client import _coerce_positive_timeout
         timeout = _coerce_positive_timeout(entry.get("timeout"))
         return {
@@ -2614,6 +2586,8 @@ class _CompressionLease:
         self._lifecycle = lifecycle
         self.holder: Optional[str] = None
         self.watermark: Optional[int] = None
+        self.signed_watermark: Optional[int] = None
+        self.source_signature: Optional[str] = None
         self._refresher: Optional[_CompressionLockLeaseRefresher] = None
         self._released = False
         self._release_guard = threading.Lock()
@@ -2719,7 +2693,14 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
         acquired = try_acquire(lease.sid, lease.holder, ttl_seconds=lease.ttl)
         if acquired:
             try:
-                lease.watermark = lease.db.get_active_message_watermark(lease.sid)
+                snapshot = getattr(lease.db, "get_active_message_source_snapshot", None)
+                if callable(snapshot):
+                    lease.watermark, lease.source_signature = snapshot(lease.sid)
+                    lease.signed_watermark = lease.watermark
+                else:
+                    lease.watermark = lease.db.get_active_message_watermark(lease.sid)
+                    lease.signed_watermark = None
+                    lease.source_signature = None
                 # A captured watermark makes the commit safe against later rows on BOTH commit
                 # paths; tell the fence so a host may keep this attempt's admission.
                 if commit_fence is not None:
@@ -2731,6 +2712,8 @@ def _try_acquire_durable_lock(lease: _CompressionLease, try_acquire: Any, commit
                     "will be archived with the snapshot", lease.sid, _wm_err,
                 )
                 lease.watermark = None
+                lease.signed_watermark = None
+                lease.source_signature = None
         return acquired
     except Exception as _lock_err:
         with _swallow('compression lock cleanup after failed acquire failed: %s'):
@@ -3339,8 +3322,6 @@ def _publish_rotated_compaction(
         _foreign_tail_ceiling = agent._session_db.get_active_message_watermark(agent.session_id)
     with contextlib.suppress(Exception):  # best-effort — don't block compression on a flush error
         agent._flush_messages_to_session_db(messages, conversation_history=persisted_history)
-    # Publish closure + child + handoff in one transaction so no reader sees an empty child. Child stays on the
-    # parent's profile ("default" persists as NULL) and keeps a live /yolo; publish COALESCEs from the parent row.
     _profile_for_child = None
     with contextlib.suppress(Exception):
         from hermes_cli.profiles import get_active_profile_name
@@ -3350,16 +3331,19 @@ def _publish_rotated_compaction(
     new_session_id = mint_session_id()
     from agent.context_compressor import _DB_PERSISTED_MARKER
     from tools.approval_yolo import with_session_yolo
+    from agent.loop_timing import model_config_for_compression_child as _child_cfg  # one txn; child keeps parent profile (default NULL), live /yolo, COALESCE
     agent._session_db.publish_compression_child(
         parent_session_id=old_session_id, child_session_id=new_session_id,
         source=_compression_child_source(agent, old_session_id), model=agent.model,
-        model_config=with_session_yolo(agent._session_init_model_config, old_session_id),
+        model_config=_child_cfg(agent, with_session_yolo(agent._session_init_model_config, old_session_id)),
         system_prompt=new_system_prompt, messages=compressed,
         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,
         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
         watermark=(lease.watermark if _foreign_tail_ceiling is not None else None),
         watermark_ceiling=_foreign_tail_ceiling,
+        source_signature=lease.source_signature,
+        source_watermark=lease.signed_watermark,
     )
     # `already_present` stamping is done by run_agent's _sync_persisted_markers;
     # this branch covers inserted/merged only; direct callers must use that wrapper.
@@ -3779,6 +3763,7 @@ def _commit_compaction(
                     watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
                     lock_holder=lease.holder, tail_count=tail_count, carried_messages=carried_messages,
                     covered_ids=covered_ids, unresolved_held=unresolved_held,
+                    source_signature=lease.source_signature, source_watermark=lease.signed_watermark,
                 )
                 compressed = persisted
                 split_status = "in_place_committed"

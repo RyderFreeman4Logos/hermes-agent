@@ -469,6 +469,9 @@ def _child_completion_evt(task_id="sa-9-supp0001", sid="proc_childnoise01"):
         "command": "npm ci",
         "exit_code": 0,
         "output": "added 1500 packages",
+        "started_at": 1.0,
+        "completion_reason": "exited",
+        "termination_source": "",
     }
 
 

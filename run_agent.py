@@ -274,7 +274,7 @@ class AIAgent(
         checkpoint_max_total_size_mb: int = 500, checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False, requested_provider: str | None = None,
         capabilities: dict[str, bool] | None = None, cwd: str | None = None,
-        side_agent: bool = False, memory_manager=None,
+        side_agent: bool = False, memory_manager=None, memory_provider_mode_override: str | None = None,
         tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
@@ -1339,7 +1339,8 @@ class AIAgent(
             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
             background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
             action=function_args.get("action"),
-            subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
+            subagent_id=function_args.get("subagent_id"), message=function_args.get("message"),
+            model_profile=function_args.get("model_profile"), parent_agent=self,
         )
 
     _invoke_tool = _forward("agent.agent_runtime_helpers", "invoke_tool")

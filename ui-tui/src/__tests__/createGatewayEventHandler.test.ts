@@ -310,6 +310,44 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual(todos)
   })
 
+  it.each(['cache 95%', 'cache unavailable'])(
+    'keeps %s as telemetry while operational status advances',
+    cacheStatus => {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      vi.useFakeTimers()
+
+      try {
+        onEvent({ payload: {}, type: 'message.start' } as any)
+        onEvent({ payload: { kind: 'cache_hit', text: cacheStatus }, type: 'status.update' } as any)
+        expect(getUiState().status).toBe(cacheStatus)
+        expect(getUiState().cacheStatus).toBe(cacheStatus)
+
+        vi.advanceTimersByTime(4000)
+        expect(getUiState().status).toBe(cacheStatus)
+
+        onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+        expect(getUiState().status).toBe('ready')
+        expect(getUiState().cacheStatus).toBe(cacheStatus)
+
+        serverRequest('clarify', { questions: [{ choices: ['a'], qid: 'q0', question: 'pick' }] }, 'q-cache')
+        expect(getUiState().status).toBe('waiting for input…')
+        expect(getUiState().cacheStatus).toBe(cacheStatus)
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  )
+
+  it('clears prior-session cache telemetry when a new turn starts', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    patchUiState({ cacheStatus: 'cache 95%', sid: 'session-b' })
+    onEvent({ session_id: 'session-b', payload: {}, type: 'message.start' } as any)
+
+    expect(getUiState().cacheStatus).toBeNull()
+  })
+
   it('prints compaction progress status into the transcript', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)
@@ -2302,7 +2340,7 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
 
-    it('keeps identical interim and terminal replies as separate messages without response_previewed', () => {
+    it('collapses identical interim and terminal replies in one turn', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))
 
@@ -2311,7 +2349,7 @@ describe('createGatewayEventHandler', () => {
       onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
 
       const assistantMsgs = appended.filter(m => m.role === 'assistant' && m.text)
-      expect(assistantMsgs).toHaveLength(2)
+      expect(assistantMsgs).toEqual([{ role: 'assistant', text: 'same reply' }])
     })
 
     it('settles identical terminal reply onto interim when response_previewed', () => {
@@ -2422,6 +2460,35 @@ describe('createGatewayEventHandler', () => {
         onEvent({ payload: { id: 'code-1' }, type: 'request.cancel' } as any)
         expect(getOverlayState().vaultCode).toBeNull()
       })
+    })
+  })
+
+  describe('per-loop completion footnote (#126)', () => {
+    it('explains a low first-request hit caused by compression', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: {
+              compression_bound: true,
+              pct: 0,
+              prompt_tokens: 4_000,
+              read_tokens: 3,
+              state: 'hit'
+            },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended.at(-1)?.text).toContain('because of compression')
+      } finally {
+        formatTime.mockRestore()
+      }
     })
   })
 })

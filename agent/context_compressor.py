@@ -42,7 +42,7 @@ from agent.model_metadata import (
     strip_opaque_replay_items,
 )
 from agent.redact import redact_sensitive_text
-from agent.turn_context import drop_stale_api_content
+from agent.turn_context import drop_stale_api_content, substitute_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -1296,10 +1296,10 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     the full shape; a mismatched size class protects blob-heavy rows as "small" and compaction re-fires.
     ``charge_stale_thinking=False`` skips newest-turn-only thinking keys. Accounting only; never mutates."""
     # Charge the wire substitute, not both it and the clean display content.
-    sidecar = msg.get("api_content")
-    content = sidecar if isinstance(sidecar, str) and sidecar and msg.get("role") in ("user", "assistant") else msg.get("content") or ""
-    text_tokens = estimate_tokens_rough(content) if isinstance(content, str) else _content_length_for_budget(content) // _CHARS_PER_TOKEN
-    tokens = text_tokens + 10  # +10 for role/key overhead
+    wire_msg = dict(msg)
+    substitute_api_content(wire_msg)
+    content = wire_msg.get("content") or ""
+    tokens = (_content_length_for_budget(content) // _CHARS_PER_TOKEN if isinstance(content, (list, dict)) else estimate_tokens_rough(content)) + 10
     tokens += sum(estimate_tokens_rough(str(tc)) for tc in msg.get("tool_calls") or [] if isinstance(tc, dict))
     for key in _ALWAYS_REPLAYED_BUDGET_KEYS:
         # Opaque ciphertext is priced only by real usage (same rule as the preflight estimator).
@@ -2230,15 +2230,19 @@ class ContextCompressor(
     @property
     def tail_token_budget(self) -> int:
         if self._tail_token_budget is None:
-            if getattr(self, "tail_mode", "lean") == "lean":
-                # Lean mode: tail is a small clamped recency window; the summary carries continuity.
-                budget = max(LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(self.context_length * 0.025)))
-            else:
-                budget = int(self.threshold_tokens * self.summary_target_ratio)
-            if self.context_length > 0:
-                budget = min(budget, int(self.context_length * TAIL_MAX_CONTEXT_FRACTION))
-            self._tail_token_budget = max(1, budget)
+            self._tail_token_budget = self._compute_tail_token_budget(
+                self.context_length, self.threshold_tokens if getattr(self, "tail_mode", "lean") != "lean" else 0)
         return self._tail_token_budget
+
+    def _compute_tail_token_budget(self, context_length: int, threshold_tokens: int) -> int:
+        if getattr(self, "tail_mode", "lean") == "lean":
+            # Lean mode: tail is a small clamped recency window; the summary carries continuity.
+            budget = max(LEAN_TAIL_FLOOR_TOKENS, min(LEAN_TAIL_CAP_TOKENS, int(context_length * 0.025)))
+        else:
+            budget = int(threshold_tokens * self.summary_target_ratio)
+        if context_length > 0:
+            budget = min(budget, int(context_length * TAIL_MAX_CONTEXT_FRACTION))
+        return max(1, budget)
 
     @tail_token_budget.setter
     def tail_token_budget(self, value: int) -> None:
@@ -2648,7 +2652,7 @@ class ContextCompressor(
             logger.debug("compression cancellation check failed", exc_info=True)
             return False
 
-    def _derive_trigger(self, model: str, context_length: int, provider: str) -> tuple[float, float, int]:
+    def _derive_trigger(self, model: str, context_length: int, provider: str, max_tokens: int | None) -> tuple[float, float, int]:
         """``(base_percent, effective_percent, threshold_tokens)`` for a model/window, from the raw config
         value so a switch away from an overridden model falls back correctly. Pure: the one place the
         trigger math lives, shared by ``update_model`` and the switch guard's preview so the number the
@@ -2656,7 +2660,7 @@ class ContextCompressor(
         ceiling, which the feasibility probe re-derives per runtime."""
         base_percent = resolve_model_threshold(model, self.model_thresholds, self._config_threshold_percent, provider)
         effective_percent = self._effective_threshold_percent(context_length, base_percent)
-        threshold = self._compute_threshold_tokens(context_length, effective_percent, self.max_tokens)
+        threshold = self._compute_threshold_tokens(context_length, effective_percent, max_tokens)
         cap = self._effective_threshold_cap(context_length)
         if cap is not None:
             threshold = min(threshold, cap)
@@ -2669,32 +2673,41 @@ class ContextCompressor(
 
     def preview_threshold_tokens(self, model: str, context_length: int, provider: str = "") -> int:
         """The trigger ``update_model`` would install, without mutating state."""
-        return self._derive_trigger(model, context_length, provider)[2]
+        return self._derive_trigger(model, context_length, provider, self.max_tokens)[2]
 
     def update_model(
         self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "",
         api_mode: str = "", max_tokens: int | None = None,
     ) -> None:
-        """Update model info after a model switch or fallback activation."""
+        """Validate limits before publication; subsequent reset failures do not reject the runtime.
+
+        ``_model_update_token`` changes at the commit point, before any durable reset.
+        Callers rolling back agent fields must retain this runtime if that token changed.
+        Durable bookkeeping remains best-effort, not a reversible transaction.
+        """
         runtime_changed = (model, provider, base_url, api_mode) != (self.model, self.provider, self.base_url, self.api_mode)
-        self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
-        self.context_length = context_length
         # max_tokens=None means "unspecified": keep the existing output reservation.
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
-        if max_tokens is not None:
-            self.max_tokens = self._coerce_max_tokens(max_tokens)
+        output_reservation = self.max_tokens if max_tokens is None else self._coerce_max_tokens(max_tokens)
+        base_percent, percent, threshold = self._derive_trigger(model, context_length, provider, output_reservation)
+        aux_ceiling = None if runtime_changed else self._aux_context_ceiling
+        if isinstance(aux_ceiling, int) and 0 < aux_ceiling < threshold:
+            threshold = aux_ceiling
+        tail_budget = self._compute_tail_token_budget(context_length, threshold)
+        summary_budget = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+
+        self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        # Install the already-derived budgets directly: context_length's lazy setter would
+        # recompute/log against the previous threshold before the commit point.
+        self._resolved_context_length, self.max_tokens = context_length, output_reservation
         if runtime_changed:
             # The aux ceiling was probed against the previous main runtime (an "auto" aux route follows the
             # main model); the caller re-runs the feasibility probe. A same-runtime recompute (overflow-reported
             # window, grown local window, tier cap) keeps it: the summariser did not change (#114707).
             self._aux_context_ceiling = None
-        self._base_threshold_percent, self.threshold_percent, self.threshold_tokens = self._derive_trigger(
-            model, context_length, provider)
-        self._apply_threshold_tokens_cap()
-        # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
-        self._tail_token_budget = None
-        _ = self.tail_token_budget  # eager recompute, same timing as before
-        self.max_summary_tokens = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
+        self._base_threshold_percent, self.threshold_percent, self.threshold_tokens = base_percent, percent, threshold
+        self._tail_token_budget, self.max_summary_tokens = tail_budget, summary_budget
+        self._model_update_token = object()
         # Old usage cannot price a new model. Clear it without arming the post-compaction
         # latch: the next response supplies usage or enables the usage-less fallback.
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
@@ -2713,6 +2726,7 @@ class ContextCompressor(
         # Runway was computed against the previous model's trigger; clear the durable copy too.
         self._reset_proactive_prune_rearm()
         self._clear_durable_proactive_prune_rearm()
+        self._emit_init_summary_once()
 
     # When the MINIMUM_CONTEXT_LENGTH floor binds on a small window, trigger near the top instead.
     _MIN_CTX_TRIGGER_RATIO = 0.85
@@ -3260,6 +3274,57 @@ class ContextCompressor(
                 "Pre-compression pressure demotion: reclaimed protected-tail tool output (%d change(s); "
                 "protected region now ~%s tokens, soft ceiling %s)",
                 demoted, f"{_protected_region_tokens():,}", f"{soft_ceiling:,}",
+            )
+        return demoted
+
+    def _demote_post_summary_protected_tail(
+        self,
+        messages: list[dict[str, Any]],
+        tail_start: int,
+    ) -> int:
+        """Demote bulky retained-tail tools before the single compression commit.
+
+        Bounded to the final protected tail. The compressor already invalidates the
+        prompt prefix once, so this rewrite is coalesced into that same durable
+        commit (Unit C). Unlike pre-compress pressure demote, this uses the raw
+        tail budget (1.0x), not the 1.5x soft ceiling.
+        """
+        if tail_start >= len(messages):
+            return 0
+
+        def _tail_tokens() -> int:
+            return sum(
+                _estimate_msg_budget_tokens(messages[idx])
+                for idx in range(tail_start, len(messages))
+            )
+
+        if _tail_tokens() <= self.tail_token_budget:
+            return 0
+
+        call_id_to_tool = _tool_calls_by_id(messages)
+        protected_skills = _collect_protected_skill_names(messages, tail_start)
+        demote_end = max(tail_start, len(messages) - _PRESSURE_KEEP_RECENT_MESSAGES)
+        spared = self._spared_pending_tool_round(messages)
+        demoted = 0
+        for idx in range(tail_start, demote_end):
+            if idx in spared or self._is_context_summary_message(messages[idx]):
+                continue
+            if self._demote_tool_result_at(
+                messages,
+                idx,
+                call_id_to_tool,
+                _PRUNE_MIN_CHARS,
+                protected_skills,
+            ):
+                demoted += 1
+                if _tail_tokens() <= self.tail_token_budget:
+                    break
+        if demoted and not self.quiet_mode:
+            logger.info(
+                "Post-summary protected-tail demotion: reclaimed %d tool result(s) "
+                "before the compression commit (tail now ~%s tokens)",
+                demoted,
+                f"{_tail_tokens():,}",
             )
         return demoted
 
@@ -3893,11 +3958,17 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         routes through main-model fallback + cooldown instead of wiping the compacted turns."""
         # call_llm writes the route it actually selected; never pre-resolve a second, stale pair.
         _aux_route: dict[str, str] = {}
+        from agent.auxiliary_client import _runtime_main_value
+
+        _session_id = _runtime_main_value("session_id") or getattr(self, "_session_id", "")
+        _cache_scope = _runtime_main_value("cache_scope") or _session_id
         call_kwargs: dict[str, Any] = {
             "task": "compression",
             "main_runtime": {
                 "model": self.model, "provider": self.provider, "base_url": self.base_url, "api_key": self.api_key,
                 "api_mode": self.api_mode,
+                "session_id": _session_id,
+                "cache_scope": _cache_scope,
             },
             "messages": [{"role": "user", "content": prompt}], "route_info": _aux_route,
             # NO max_tokens: Anthropic/NIM wires forward it and a hard cap truncates summaries
@@ -5182,12 +5253,16 @@ Write only the summary body. Do not include any preamble or prefix."""
                 cut_idx = asst_anchored_cut
 
         # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
-        # the assistant anchor could re-trigger its forward turn-pair push. Runs even under the split: the
-        # N-user promise (#70250) is a user-facing setting and must outrank the budget, so it pulls the cut
-        # back to the Nth user turn — which is why the split only ever relaxes the single-user anchor.
+        # the assistant anchor could re-trigger its forward turn-pair push. The N-user promise
+        # (#70250) is a user-facing setting and must outrank the single-user budget exception,
+        # so it also runs under the split.
         # getattr: plugin engines and __new__ doubles skip __init__.
         _min_tail_users = getattr(self, "min_tail_user_messages", 1)
-        if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
+        if (
+            isinstance(_min_tail_users, int)
+            and not isinstance(_min_tail_users, bool)
+            and _min_tail_users > 1
+        ):
             cut_idx = self._ensure_last_n_user_messages_in_tail(messages, cut_idx, head_end, _min_tail_users)
 
         # Floor guarantees progress (>= 1 message claimed); re-align FORWARD only so a raised cut
@@ -5661,6 +5736,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Default carrier is tail[0]: an exempt row absorbs the summary invisibly. The forced repair
         # path needs a non-empty role=user row, so it targets the template-visible row.
         merge_target_idx = first_tail_visible_idx if force_user_leading and first_tail_visible_idx is not None else 0
+        post_summary_tail_start = len(compressed)
         for tail_idx, msg in enumerate(tail_messages):
             # Tag carried-forward tail rows so archive_and_compact treats their originals as
             # superseded duplicates (#86366).
@@ -5669,6 +5745,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             if merge_into_tail and tail_idx == merge_target_idx:
                 self._merge_summary_into_tail_row(msg, summary, summary_role, force_user_leading)
             compressed.append(msg)
+        self._demote_post_summary_protected_tail(compressed, post_summary_tail_start)
         return compressed
 
 

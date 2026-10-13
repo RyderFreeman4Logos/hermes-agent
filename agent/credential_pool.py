@@ -1181,8 +1181,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         self._replace_entry(entry, updated)
         if persist:
             self._persist()
-            # _persist may have swapped in a peer's newer token generation; hand callers
-            # the live entry so they don't rebind the client to the stale pair.
             return self._find(lambda e: e.id == updated.id) or updated
         return updated
 
@@ -1975,8 +1973,15 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 token = entry.access_token or token
             # The row keeps the canonical URL; a gateway key belongs to its route host (#121486).
             from hermes_cli.auth_codex import _codex_pool_route_base_url
-            return bool(auth_mod._probe_codex_quota_restored(
+            restored = bool(auth_mod._probe_codex_quota_restored(
                 token, base_url=_codex_pool_route_base_url(entry.base_url)))
+            # A true answer is an admission: the refreshed pair is the credential
+            # callers must adopt. Leaving the future stamp keeps has_available()
+            # false, so restore rebinds the stale snapshot instead.
+            if restored:
+                self._adopt(entry, access_token=token, **_MARK_OK)
+                self._current_id = entry.id
+            return restored
         except Exception:
             logger.debug("Codex quota-restored probe failed", exc_info=True)
             return False

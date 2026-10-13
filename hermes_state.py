@@ -7,6 +7,7 @@ splits sessions via parent_session_id chains; sessions are source-tagged
 
 import asyncio
 import atexit
+import errno
 import hashlib
 import json
 import logging
@@ -21,7 +22,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, mkdir_under_hermes_home
@@ -39,10 +40,10 @@ from hermes_state_health import (
     STORAGE_CORRUPT, mark_storage_corrupt, note_storage_error, storage_corrupt_reason, storage_state,
 )
 from hermes_state_errors import (
-    _DELETED_WAL_GENERATION_MSG, _DISK_IO_ERROR_MARKER, _STATE_DB_CORRUPT_MSG, _STATE_DB_GENERATION_KEY,
+    _DELETED_WAL_GENERATION_MSG, _STATE_DB_CORRUPT_MSG, _STATE_DB_GENERATION_KEY,
     _STATE_DB_REPLACED_MSG, DeletedWalGenerationError, SessionCompressionInProgressError, StateDbCorruptError,
     StateDbReplacedError, _is_no_more_rows, classify_persistence_error, is_malformed_db_error,
-    is_malformed_schema_error, is_sqlite_lock_error,
+    is_malformed_schema_error, is_sqlite_io_error, is_sqlite_lock_error,
 )
 from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
@@ -452,6 +453,63 @@ def _foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     return _state_holders.foreign_state_db_holders(db_path)
 
 
+_advisory_write_owners = threading.local()
+
+
+@contextmanager
+def _session_db_advisory_write_lock(
+    db_path: Path, *, deadline: float, patience_s: float
+):
+    """Serialize SessionDB writers across processes with a sidecar flock.
+
+    The OFD guard in hermes_state_lockguard keeps a live WAL generation; it is
+    not a writer mutex. This sidecar is. Nested scopes in the owning thread
+    borrow outer custody by actual sidecar inode; forked children are not owners.
+    """
+    if sys.platform == "win32":
+        yield
+        return
+    import fcntl
+
+    lock_path = Path(str(db_path) + ".write.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        identity = os.fstat(handle.fileno())
+        owner_key = (os.getpid(), identity.st_dev, identity.st_ino)
+        held = getattr(_advisory_write_owners, "held", None)
+        if held is None:
+            held = _advisory_write_owners.held = set()
+        if owner_key in held:
+            yield
+            return
+        acquired = False
+        try:
+            while not acquired:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        raise sqlite3.OperationalError(
+                            "database is locked (another Hermes process held the "
+                            f"state.db write lock for over {patience_s:.0f}s)"
+                        ) from exc
+                    time.sleep(min(0.02, remaining_s))
+                    if time.monotonic() >= deadline:
+                        raise sqlite3.OperationalError(
+                            "database is locked (write lock retry deadline expired)"
+                        ) from exc
+            held.add(owner_key)
+            yield
+        finally:
+            if acquired and owner_key[0] == os.getpid():
+                held.discard(owner_key)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 # ── Process-wide shared SessionDB registry (#90837) ── lives in hermes_state_registry.py (acquire /
 # release / close_all / release_or_close). Long-lived in-process callers (gateway, tui_gateway, cron,
 # in-process tools) share ONE writer connection per resolved path via hermes_state_registry.acquire(); CLI
@@ -559,6 +617,17 @@ class SessionDB(
                     if isinstance(value, str) and value.strip():
                         data["_branched_from"] = value.strip()
         return data
+
+    @contextmanager
+    def _advisory_write_lock(self, deadline: Optional[float] = None):
+        """Use the shared sidecar lock for SessionDB write/maintenance admission."""
+        patience_s = self._WRITE_PATIENCE_S
+        with _session_db_advisory_write_lock(
+            self.db_path,
+            deadline=deadline if deadline is not None else time.monotonic() + patience_s,
+            patience_s=patience_s,
+        ):
+            yield
 
     @staticmethod
     def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> None:
@@ -748,7 +817,7 @@ class SessionDB(
                 # classifying the store as failed (#100436; see _READ_ONLY_IOERR_RETRY_ATTEMPTS).
                 # A lock is NOT retried here: the connection already waited _READ_BUSY_TIMEOUT_S,
                 # and a retry would multiply that wait on blocking callers (TUI, `hermes status`).
-                transient = _DISK_IO_ERROR_MARKER in str(ioerr).lower()
+                transient = is_sqlite_io_error(ioerr)
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or not transient:
                     raise
                 time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
@@ -785,12 +854,13 @@ class SessionDB(
         if qpath is None and self.db_path.exists() and has_invalid_sqlite_header_preopen(self.db_path):
             raise sqlite3.DatabaseError(msg)
 
-    def _open_writer_conn(self) -> sqlite3.Connection:
+    def _open_writer_conn(self, *, handoff=None, timeout: float = 1.0) -> sqlite3.Connection:
         """Connect + WAL/pragma/tokenizer setup for a writer connection (no schema init). Short timeout:
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
         conn = _connect_tracked_db(
-            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            str(self.db_path), check_same_thread=False, timeout=timeout, isolation_level=None,
+            **({"handoff": handoff} if handoff is not None else {}),
         )
         try:
             conn.row_factory = sqlite3.Row
@@ -806,20 +876,25 @@ class SessionDB(
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
             self._fts_cjk_loaded = load_fts5_cjk_extension(conn)
+            # Budgeted reopen tries setup without SQLite contention waits; subsequent
+            # owners still start with the normal writer setting, not that temporary cap.
+            if timeout != 1.0:
+                conn.execute("PRAGMA busy_timeout=1000")
         except BaseException:
             self._close_connection_quietly(conn)
             raise
         return conn
 
-    def _connect_and_init(self) -> None:
+    def _connect_and_init(self, *, deadline: Optional[float] = None) -> None:
         # Refuse before sqlite3.connect (under the startup lock) so we cannot mint
         # a replacement WAL while a live writer still holds a deleted sidecar inode.
         refuse_deleted_wal_generation(self.db_path)
         # Create/tighten the main database before sqlite3.connect() so a
         # permissive process umask can never expose a fresh profile store.
         _secure_state_db_files(self.db_path, create_main=True)
-        self._conn = self._open_writer_conn()
-        self._init_schema()
+        with self._advisory_write_lock(deadline=deadline):
+            self._conn = self._open_writer_conn()
+            self._init_schema()
 
     def _connect_and_init_with_lock_patience(self) -> None:
         """Open + init, waiting out a sibling's write lock with jittered patience:
@@ -835,7 +910,7 @@ class SessionDB(
         deadline = time.monotonic() + self._WRITE_PATIENCE_S
         while True:
             try:
-                self._connect_and_init()
+                self._connect_and_init(deadline=deadline)
                 return
             except sqlite3.OperationalError as exc:
                 if not is_sqlite_lock_error(exc):
@@ -856,6 +931,8 @@ class SessionDB(
         writer, so reads skip self._lock; under DELETE journal mode (NFS fallback)
         readers hit SQLITE_BUSY storms, so the legacy locked path stays. Autocommit
         reads see everything committed so far (read-your-writes for flush-then-search)."""
+        from hermes_cli.sqlite_safe_read import ConnectionAdmissionError
+
         if not self._wal_active or self.read_only:
             return None
         with self._read_conns_lock:
@@ -883,7 +960,7 @@ class SessionDB(
             if conn is not None:
                 self._close_conn_logged(conn, "partially-opened read conn")
             self._read_budget.release()
-            if not isinstance(exc, sqlite3.Error):
+            if not isinstance(exc, (sqlite3.Error, ConnectionAdmissionError)):
                 raise
             with self._read_conns_lock:
                 self._read_open_failed_at = time.monotonic()
@@ -958,7 +1035,10 @@ class SessionDB(
                 with suppress(sqlite3.Error):
                     conn.execute(f"PRAGMA busy_timeout={int(previous_ms)}")
 
-    def _reopen_after_close_locked(self, context: str = "write") -> None:
+    def _reopen_after_close_locked(
+        self, context: str = "write", *, timeout: float = 1.0,
+        deadline: Optional[float] = None, immediate: bool = False,
+    ) -> None:
         """Reopen the writer after ``close()`` raced a live caller (a teardown owner
         set ``_conn = None`` while a worker still had a transcript flush to land).
         Loud (WARNING) and bounded (only after an explicit close()). Caller holds
@@ -981,28 +1061,119 @@ class SessionDB(
             "state.db connection for %s was closed while a %s was still in "
             "flight — reopening (teardown/worker race, #94736)", self.db_path, context,
         )
+        if deadline is not None:
+            self._remaining_write_budget(deadline, immediate=immediate)
         try:
-            self._conn = self._open_writer_conn()
+            self._conn = self._open_writer_conn(**({"timeout": timeout} if timeout != 1.0 else {}))
         except Exception as exc:
-            raise sqlite3.OperationalError(
+            err = sqlite3.OperationalError(
                 f"state.db connection was closed while a {context} was still "
                 f"in flight (a session-teardown path called close() before "
                 f"this worker finished — #94736) and the automatic reopen failed: {exc}"
-            ) from exc
+            )
+            if isinstance(exc, sqlite3.Error):
+                for attr in ("sqlite_errorcode", "sqlite_errorname"):
+                    if getattr(exc, attr, None) is not None:
+                        setattr(err, attr, getattr(exc, attr))
+                # Preserve a genuine legacy IOERR at this transparent wrapper only.
+                # Never infer retry provenance from arbitrary cause/context chains.
+                if getattr(exc, "sqlite_errorcode", None) is None and is_sqlite_io_error(exc):
+                    err.sqlite_errorcode = sqlite3.SQLITE_IOERR
+                    err.sqlite_errorname = "SQLITE_IOERR"
+            raise err from exc
         if self._wal_active:  # a reopened writer is a live generation holder like the first open
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
+    @staticmethod
+    def _remaining_write_budget(deadline: float, *, immediate: bool = False) -> float:
+        if immediate:
+            return 0.0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise sqlite3.OperationalError("database is locked (write retry deadline expired)")
+        return remaining
+
+    @contextmanager
+    def _write_transaction(self, *, deadline: float, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        """Bound contention/admission for canonical and FTS-recovery transactions.
+
+        Not a whole-operation deadline: admitted healthy callbacks may finish late.
+        SQLite waits are capped; filesystem work, scheduling and callbacks cannot be
+        preempted. Restore the actual connection setting before releasing custody.
+        """
+        self._remaining_write_budget(deadline, immediate=immediate)
+        with self._advisory_write_lock(deadline=deadline):
+            if not self._lock.acquire(timeout=self._remaining_write_budget(deadline, immediate=immediate)):
+                raise sqlite3.OperationalError("database is locked (writer mutex deadline expired)")
+            try:
+                self._remaining_write_budget(deadline, immediate=immediate)
+                self._raise_if_db_replaced()
+                if self._conn is None:
+                    self._remaining_write_budget(deadline, immediate=immediate)
+                    self._reopen_after_close_locked(
+                        context="write", timeout=0.0, deadline=deadline, immediate=immediate,
+                    )
+                conn = cast(sqlite3.Connection, self._conn)
+                previous_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                primary: Optional[BaseException] = None
+                try:
+                    try:
+                        remaining = self._remaining_write_budget(deadline, immediate=immediate)
+                        conn.execute(f"PRAGMA busy_timeout={min(previous_ms, int(remaining * 1000))}")
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._remaining_write_budget(deadline, immediate=immediate)
+                        yield conn
+                        # No new waiting budget at COMMIT, but a healthy late commit is allowed.
+                        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                        conn.execute(f"PRAGMA busy_timeout={min(previous_ms, remaining_ms)}")
+                        conn.commit()
+                    except BaseException as caught:
+                        primary = caught
+                        if conn.in_transaction:
+                            rollback_error = None
+                            try:
+                                conn.rollback()
+                            except Exception as rollback_exc:
+                                if conn.in_transaction:
+                                    primary.add_note(
+                                        "state.db rollback failed; write settlement is unknown: "
+                                        + str(rollback_exc)
+                                    )
+                                    raise primary
+                                rollback_error = rollback_exc
+                            if rollback_error is not None:
+                                primary.add_note("state.db cleanup failed after rollback: " + str(rollback_error))
+                        raise
+                    primary = None
+                finally:
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={int(previous_ms)}")
+                    except sqlite3.Error as restore_exc:
+                        if primary is None:
+                            # This can follow a successful COMMIT; never enter SQLite retry.
+                            raise RuntimeError("state.db busy timeout restoration failed") from restore_exc
+                        primary.add_note("state.db busy timeout restoration failed: " + str(restore_exc))
+                    if primary is not None:
+                        raise primary
+            finally:
+                self._lock.release()
+
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        *, deadline: Optional[float] = None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
         immediately; on locked/busy the Python lock is released, a jitter slept,
-        and the WHOLE callback retried — *fn* must stay idempotent under retry."""
+        and the WHOLE callback retried — *fn* must stay idempotent under retry.
+        An optional absolute deadline caps (never renews) the caller's remaining
+        patience. Zero patience without a deadline still permits one immediate attempt."""
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
-        deadline = time.monotonic() + patience_s
+        immediate = deadline is None and patience_s <= 0
+        own_deadline = time.monotonic() + patience_s
+        deadline = min(deadline, own_deadline) if deadline is not None else own_deadline
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -1011,6 +1182,7 @@ class SessionDB(
         # settlement unknown and must propagate — this helper owns non-idempotent transcript/counter
         # mutations, not just idempotent UPSERTs.
         ioerr_begin_retried = False
+        last_retry_error: Optional[BaseException] = None
         while True:
             self._raise_if_db_corrupt(storage=True)
             # NOTE: the replaced/generation live probe runs INSIDE the lock below,
@@ -1025,21 +1197,9 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._lock:
-                    self._raise_if_db_replaced()
-                    if self._conn is None:  # close() raced this writer
-                        self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                with self._write_transaction(deadline=deadline, immediate=immediate) as conn:
+                    fn_started = True
+                    result = fn(conn)
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -1047,7 +1207,7 @@ class SessionDB(
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
-            except SessionCompressionInProgressError:
+            except SessionCompressionInProgressError as exc:
                 # Transient (see _COMPRESSION_BUSY_WAIT_S): a steer landing mid-compression must not abort.
                 # A live foreign compression lock is transient: the compressor publishes in a couple of
                 # seconds. Without any wait, a steer that lands mid-compression aborts the user's turn as
@@ -1058,21 +1218,26 @@ class SessionDB(
                 # finally lets go.
                 if compression_deadline is None:
                     compression_deadline = min(time.monotonic() + self._COMPRESSION_BUSY_WAIT_S, deadline)
+                deadline = compression_deadline
                 if self._sleep_before_write_retry(
                     compression_deadline, self._COMPRESSION_BUSY_WAIT_S
                 ):
+                    last_retry_error = exc
                     continue
                 raise
             except sqlite3.Error as exc:
                 # 'no more rows' is a transient engine error on contended WAL appends (some builds
                 # raise it as InterfaceError, a sibling of DatabaseError): retry like locked/busy.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                    last_retry_error = exc
                     continue
-                err_msg = str(exc).lower()
                 if isinstance(exc, sqlite3.OperationalError):
                     if is_sqlite_lock_error(exc):
                         if self._sleep_before_write_retry(deadline, patience_s):
+                            last_retry_error = exc
                             continue
+                        if not fn_started and last_retry_error is not None:
+                            raise last_retry_error from exc
                         # Say what actually happened, not disk/permission damage. The holder goes to
                         # the log, not the message: classify_persistence_error() buckets by phrase and
                         # a holder's argv (a worktree named fix-corrupt-db) would flip the bucket.
@@ -1085,30 +1250,26 @@ class SessionDB(
                             "process; the database itself is healthy)"
                         ) from exc
                     if (
-                        _DISK_IO_ERROR_MARKER in err_msg and not fn_started and not ioerr_begin_retried
+                        is_sqlite_io_error(exc) and not fn_started and not ioerr_begin_retried
                         and self._sleep_before_write_retry(deadline, patience_s)
                     ):
                         # Retry on the SAME connection: close()+reopen would cancel this process's
                         # POSIX locks for every sibling (howtocorrupt §2.2).
                         ioerr_begin_retried = True
+                        last_retry_error = exc
                         continue
                     raise  # non-lock error, callback already ran, or patience exhausted
                 if isinstance(exc, sqlite3.DatabaseError):
-                    # An out-of-band replace surfaces as this same corruption class; in-file repair
-                    # on a NEW generation amplifies the damage.
-                    if (
-                        "not a database" in err_msg or is_malformed_db_error(exc)
-                        or self._is_fts_write_corruption_error(exc)
-                    ):
-                        with self._lock:
-                            self._raise_if_db_replaced()
                     # Corrupt FTS shadow tables fail every write via the sync triggers while canonical
                     # rows are intact: detach the derived indexes atomically and retry (never rebuild here).
                     if self._enter_fts_fail_open(exc, deadline=deadline, patience_s=patience_s):
+                        last_retry_error = exc
                         continue
                     # What survives both checks is structural damage: quarantine.
                     if self._is_structural_corruption_error(exc):
-                        self._halt_db_corrupt(exc)
+                        with self._lock:
+                            self._raise_if_db_replaced()
+                            self._halt_db_corrupt(exc)
                 raise
 
     def _write_sql(
@@ -1152,7 +1313,7 @@ class SessionDB(
                 with self._read_ctx() as conn:
                     return fn(conn)
             except sqlite3.OperationalError as exc:
-                if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
+                if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or not is_sqlite_io_error(exc):
                     note_storage_error(self.db_path, exc)
                     raise
                 time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
@@ -1445,8 +1606,8 @@ class SessionDB(
             (self._WRITE_RETRY_SLOW_MIN_S, self._WRITE_RETRY_SLOW_MAX_S) if slow
             else (self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S)
         ))
-        time.sleep(min(jitter, max(deadline - now, 0.001)))
-        return True
+        time.sleep(min(jitter, deadline - now))
+        return time.monotonic() < deadline
 
     def _foreign_state_db_holders(self) -> list[tuple[int, str]]:
         """Foreign processes holding this DB or its WAL sidecars (see hermes_state_holders)."""
@@ -1477,14 +1638,16 @@ class SessionDB(
         if self._quarantine_reason() is not None:
             return
         try:
-            with self._lock:
-                if self._conn is None:
-                    return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
-                if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-                if result and result[1] > 0:
-                    logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
+            # The caller's write is already committed: maintenance must not renew its patience.
+            with self._advisory_write_lock(deadline=time.monotonic()):
+                with self._lock:
+                    if self._conn is None:
+                        return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
+                    if self._wal_lock_guard:
+                        _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
+                    result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    if result and result[1] > 0:
+                        logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
@@ -1531,44 +1694,70 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
-        with self._lock:
-            if self._conn:
-                generation_lost = not self.read_only and (
-                    self._db_wal_generation_lost
-                    or (bool(self._db_sidecar_identity) and self._wal_generation_was_lost())
-                )
-                # Loss is settled here, not at exit: the unlinked WAL inode dies with this process's
-                # last descriptor (the capture raises and the handle stays open when it fails).
-                retire_without_close = generation_lost and self._settle_lost_generation_locked()
-                quarantine_reason = None if generation_lost else self._quarantine_reason()
-                if quarantine_reason is not None:
-                    logger.warning(
-                        "Skipping the close-time WAL checkpoint for %s: this "
-                        "handle observed %s. Take a snapshot of state.db, -wal and -shm "
-                        "before restarting, then run `hermes sessions recover --source %s --inspect-only`.",
-                        self.db_path, quarantine_reason, self.db_path,
-                    )
-                elif not self.read_only and not generation_lost:  # PASSIVE, not TRUNCATE (see docstring)
-                    try:
-                        # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
-                        # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
-                        # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
-                        # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
-                        # on a sole-opener/quiescent connection.
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except Exception as exc:
-                        logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
-                _lockguard.release(self._wal_lock_guard)  # before the close: see release()
-                if retire_without_close:
-                    self._pin_connection(self._conn)
-                    self._conn = None
-                else:
-                    conn, self._conn = self._conn, None
-                    self._close_connection_quietly(conn)
-                    # Only a clean close ends the generation; retain the recorded
-                    # identity when retiring an unsafe handle.
-                    self._db_sidecar_identity = {}
+        # Teardown must not wait write patience. Checkpoint only while the sidecar
+        # flock is held; still close/clear the writer if flock or checkpoint fails.
+        closed = False
+        write_lock = (
+            _session_db_advisory_write_lock(
+                self.db_path, deadline=time.monotonic(), patience_s=0.0,
+            )
+            if not self.read_only
+            else nullcontext()
+        )
+        try:
+            with write_lock:
+                self._close_writer_locked(checkpoint=True)
+                closed = True
+        except sqlite3.OperationalError:
+            logger.debug(
+                "Skipping the close-time WAL checkpoint for %s: write lock unavailable",
+                self.db_path,
+            )
+        finally:
+            if not closed:
+                self._close_writer_locked(checkpoint=False)
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
+
+    def _close_writer_locked(self, *, checkpoint: bool) -> None:
+        """Drop the writer under ``self._lock``. Checkpoint only when *checkpoint* is true."""
+        with self._lock:
+            if not self._conn:
+                return
+            generation_lost = not self.read_only and (
+                self._db_wal_generation_lost
+                or (bool(self._db_sidecar_identity) and self._wal_generation_was_lost())
+            )
+            # Loss is settled here, not at exit: the unlinked WAL inode dies with this process's
+            # last descriptor (the capture raises and the handle stays open when it fails).
+            retire_without_close = generation_lost and self._settle_lost_generation_locked()
+            quarantine_reason = None if generation_lost else self._quarantine_reason()
+            if quarantine_reason is not None:
+                logger.warning(
+                    "Skipping the close-time WAL checkpoint for %s: this "
+                    "handle observed %s. Take a snapshot of state.db, -wal and -shm "
+                    "before restarting, then run `hermes sessions recover --source %s --inspect-only`.",
+                    self.db_path, quarantine_reason, self.db_path,
+                )
+            elif checkpoint and not self.read_only and not generation_lost:
+                try:
+                    # Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires
+                    # a full WAL reset many times/hour, racing the gateway's long-lived writer on large
+                    # WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's
+                    # own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only
+                    # on a sole-opener/quiescent connection.
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error as exc:
+                    logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+            _lockguard.release(self._wal_lock_guard)  # before the close: see release()
+            if retire_without_close:
+                self._pin_connection(self._conn)
+                self._conn = None
+            else:
+                conn, self._conn = self._conn, None
+                self._close_connection_quietly(conn)
+                # Only a clean close ends the generation; retain the recorded
+                # identity when retiring an unsafe handle.
+                self._db_sidecar_identity = {}
 
     def __del__(self) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays

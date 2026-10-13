@@ -858,7 +858,7 @@ def _join_reference_outputs(outputs: list[tuple[str, str, Any]], degraded: str =
 
 def _sum_reference_accounting(outputs: list[tuple[str, str, Any]]) -> tuple[Any, Any]:
     """Sum fan-out usage AND cost in dollars (each advisor priced at its OWN rate)."""
-    usage = CanonicalUsage()
+    usage = CanonicalUsage(cache_read_known=True, prompt_total_known=True)  # empty sum is not a usage-less request
     cost: Any = None
     for _lbl, _txt, acct in outputs:
         if isinstance(acct, _RefAccounting):
@@ -1058,7 +1058,7 @@ class MoAChatCompletions:
         self._ref_cache_outputs: list[tuple[str, str, Any]] = []
         # Fan-out spend awaiting consume_reference_usage (nothing deposited on a HIT so
         # spend counts once); the lock guards late-accounting callbacks on worker threads.
-        self._pending_reference_usage: Any = CanonicalUsage()
+        self._pending_reference_usage: Any = CanonicalUsage(cache_read_known=True, prompt_total_known=True)
         self._pending_reference_cost: Any = None
         self._accounting_lock = threading.Lock()
         # Real aggregator slot so cost accounting prices the acting turn at its model.
@@ -1082,9 +1082,9 @@ class MoAChatCompletions:
         """Pop pending fan-out ``(CanonicalUsage, cost_usd_or_None)`` and reset both
         (so a streaming retry re-entering accounting cannot double-count)."""
         with self._accounting_lock:
-            usage = self._pending_reference_usage or CanonicalUsage()
+            usage = self._pending_reference_usage or CanonicalUsage(cache_read_known=True, prompt_total_known=True)
             cost = self._pending_reference_cost
-            self._pending_reference_usage = CanonicalUsage()
+            self._pending_reference_usage = CanonicalUsage(cache_read_known=True, prompt_total_known=True)
             self._pending_reference_cost = None
         return usage, cost
 
@@ -1102,7 +1102,7 @@ class MoAChatCompletions:
     def _fold_pending_accounting(self, usage: Any, cost: Any) -> None:
         """Add (never overwrite) fan-out spend so late interrupted-reference deposits survive."""
         with self._accounting_lock:
-            self._pending_reference_usage = (self._pending_reference_usage or CanonicalUsage()) + usage
+            self._pending_reference_usage = (self._pending_reference_usage or CanonicalUsage(cache_read_known=True, prompt_total_known=True)) + usage
             if cost is not None:
                 self._pending_reference_cost = (self._pending_reference_cost or 0) + cost
 
@@ -1504,9 +1504,11 @@ _RELAY_EVENTS: dict[str, tuple[str, str | None, dict[str, str]]] = {
 def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
     """Single construction point for ``MoAClient``: a bare ``MoAClient(preset)`` would
     drop the ``reference_callback`` relay and silence display events for the session.
-    The relay reads ``agent.tool_progress_callback`` at emit time."""
+    Runtime staging supplies configuration; callbacks and interrupts retain the live owner."""
+    owner = vars(agent).get("_client_owner", agent)
+
     def _moa_reference_relay(event: str, **kwargs: Any) -> None:
-        cb = getattr(agent, "tool_progress_callback", None)
+        cb = getattr(owner, "tool_progress_callback", None)
         spec = _RELAY_EVENTS.get(event)
         if cb is None or spec is None:
             return
@@ -1529,8 +1531,8 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
             resolved_preset = moa_cfg.get("default_preset") or "default"
     except Exception:
         resolved_preset = "default"
-    # ``agent`` lets the fan-out wait be aborted on a user interrupt.
-    return MoAClient(resolved_preset, reference_callback=_moa_reference_relay, agent=agent)
+    # The live owner lets the fan-out observe later user interrupts.
+    return MoAClient(resolved_preset, reference_callback=_moa_reference_relay, agent=owner)
 
 
 def bind_moa_runtime(agent, preset_name: Any, api_key: Any = None) -> None:

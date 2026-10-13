@@ -1,7 +1,7 @@
 """A configured memory provider that cannot be recovered at agent start is shown to the user,
 never only logged (#119769): the CLI prints it; other drivers get a warn notice, which a
 messaging-gateway agent (callbacks wired per turn) replays on its first turn."""
-from agent.agent_init import _init_memory
+from agent.agent_init import _init_memory, _resolve_memory_runtime
 from agent.status_output import StatusOutputMixin
 from hermes_cli import memory_provider_migration as mig
 
@@ -16,6 +16,7 @@ class StartupAgent(StatusOutputMixin):
     def __init__(self, platform):
         self.platform = platform
         self.printed = []
+        self._session_init_model_config = {}
 
     def _vprint(self, message, **kwargs):
         self.printed.append(message)
@@ -27,7 +28,9 @@ def _start(tmp_path, monkeypatch, platform):
     monkeypatch.setattr("pm.install.lazy_installs_allowed", lambda: False)
     agent = StartupAgent(platform)
     monkeypatch.setattr(agent, "_warning_presentation_enabled", lambda: True)
-    _init_memory(agent, {"memory": {"provider": "scout_missing_provider"}}, False, platform)
+    config = {"memory": {"provider": "scout_missing_provider"}}
+    memory_config, mode = _resolve_memory_runtime(agent, config, False)
+    _init_memory(agent, config, False, platform, memory_config=memory_config, resolved_mode=mode)
     assert agent._memory_manager is None and not (tmp_path / "plugins").exists()
     return agent
 

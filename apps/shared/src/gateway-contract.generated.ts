@@ -571,6 +571,9 @@ export interface Usage {
   context_source?: string | null
   context_estimated?: boolean | null
   cache_hit_pct?: number | null
+  reply_cache_read?: number | null
+  reply_prompt_tokens?: number | null
+  reply_elapsed_s?: number | null
   cache_read?: number | null
   cache_write?: number | null
   avg_latency_s?: number | null
@@ -3425,6 +3428,9 @@ export interface SessionUsageResult {
   context_source?: string | null
   context_estimated?: boolean | null
   cache_hit_pct?: number | null
+  reply_cache_read?: number | null
+  reply_prompt_tokens?: number | null
+  reply_elapsed_s?: number | null
   cache_read?: number | null
   cache_write?: number | null
   avg_latency_s?: number | null
@@ -4697,6 +4703,8 @@ export interface MessageCompletePayload {
   error_surface?: ErrorSurface | null
   partial?: boolean | null
   persisted_turn?: PersistedTurn | null
+  cache_info?: CacheInfo | null
+  completed_at?: number | null
 }
 /** ``prompt_turn._result_status``. */
 export type TurnStatus = 'complete' | 'error' | 'interrupted'
@@ -4727,10 +4735,19 @@ export interface PersistedTurn {
   user_row_id?: number | null
   final_assistant_row_id?: number | null
 }
+/** First-response cache observation on ``message.complete``. */
+export interface CacheInfo {
+  state: string
+  pct?: number
+  read_tokens?: number | null
+  prompt_tokens?: number | null
+  compression_bound?: boolean | null
+}
 /** ``server._status_update`` and the direct emitters (goal / loop / heartbeat / process). */
 export interface StatusUpdatePayload {
   kind: string
   text: string
+  cache_record?: Record<string, unknown> | null
 }
 /** ``server._start_usage_ticker``. */
 export interface SessionUsagePayload {

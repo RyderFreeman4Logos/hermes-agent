@@ -36,6 +36,7 @@ _XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
 _STRIP_MSG_KEYS = (
     "codex_reasoning_items", "codex_message_items", "tool_name", "effect_disposition", "timestamp",
     "platform_message_id", "api_content", "anthropic_content_blocks", "bedrock_content_blocks", MESSAGE_UID,
+    "display_kind", "display_metadata",
 )
 _STRIP_TC_KEYS = ("call_id", "response_item_id")
 _HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
@@ -54,14 +55,32 @@ def _rename_tool_search_bridge_for_xai(tools: list[dict[str, Any]]) -> tuple[lis
     )
 
 
-def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
+def _static_prompt_instructions(
+    messages: list[dict[str, Any]], static_prefix: str | None = None,
+) -> str:
     """Stable leading system/developer prefix used for cache routing (later messages are conversation state)."""
     first = messages[0] if messages and isinstance(messages[0], dict) else {}
     if first.get("role") not in {"system", "developer"}:
         return ""
     content = first.get("content")
+    # OpenAI/Codex keep the prompt one string. The system-prompt builder's stable
+    # tier is the reusable prefix; the rebuilt volatile suffix stays out of the key.
+    if (
+        isinstance(static_prefix, str) and static_prefix
+        and isinstance(content, str) and content.startswith(static_prefix)
+    ):
+        return static_prefix
     if isinstance(content, str):
         return content
+    if isinstance(content, list) and content:
+        # Anthropic/Qwen cache plans mark that same prefix in the first block.
+        first_block = content[0]
+        if (
+            isinstance(first_block, dict)
+            and "cache_control" in first_block
+            and isinstance(first_block.get("text"), str)
+        ):
+            return first_block["text"]
     try:
         return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
@@ -72,6 +91,7 @@ def _add_prompt_cache_key(
     api_kwargs: dict[str, Any], *, messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None, supports_prompt_cache_key: bool,
     session_id: str | None = None, cache_scope_id: str | None = None,
+    static_prefix: str | None = None,
 ) -> None:
     """Add a content-addressed ``prompt_cache_key`` only for a capable endpoint.
 
@@ -104,7 +124,8 @@ def _add_prompt_cache_key(
     if not supports_prompt_cache_key:
         return
     cache_key = _content_cache_key(
-        _static_prompt_instructions(messages), tools, _cache_scope_from_session_id(cache_scope_id or session_id),
+        _static_prompt_instructions(messages, static_prefix), tools,
+        _cache_scope_from_session_id(cache_scope_id or session_id),
     )
     if cache_key:
         api_kwargs["prompt_cache_key"] = cache_key
@@ -383,6 +404,7 @@ def _finish_kwargs(api_kwargs: dict[str, Any], sanitized: list, params: dict, *,
     _add_prompt_cache_key(
         api_kwargs, messages=sanitized, tools=api_kwargs.get("tools"), supports_prompt_cache_key=supports_prompt_cache_key,
         session_id=params.get("session_id"), cache_scope_id=params.get("cache_scope_id"),
+        static_prefix=params.get("static_system_prefix"),
     )
     return api_kwargs
 
@@ -563,7 +585,8 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs.update(params["request_overrides"])
         return _finish_kwargs(
             api_kwargs, sanitized, params,
-            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key")) or _is_openai_api_base_url(base_url),
+            supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
+            or _is_openai_api_base_url(base_url),
         )
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
@@ -616,7 +639,8 @@ class ChatCompletionsTransport(ProviderTransport):
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
         return _finish_kwargs(
-            api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
+            api_kwargs, sanitized, params,
+            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
         )
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

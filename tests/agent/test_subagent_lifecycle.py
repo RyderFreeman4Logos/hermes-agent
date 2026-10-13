@@ -326,7 +326,7 @@ def test_routing_unknown_provider_refuses_before_registration(routing_lifecycle,
     if per_launch:
         request["provider"] = "fixture-missing"
     records, correlations = dict(_REGISTRY.records), dict(_REGISTRY.correlations)
-    with pytest.raises(SubagentLifecycleError, match="Unknown provider fixture-missing"):
+    with pytest.raises(SubagentLifecycleError, match="Cannot resolve delegation provider 'fixture-missing'"):
         service.launch(request)
     assert _REGISTRY.records == records
     assert _REGISTRY.correlations == correlations

@@ -151,6 +151,17 @@ class TestPoolFailureReason:
             classified_reason=FailoverReason.billing,
             billing_unverified=billing_unverified,
         )
+        if billing_unverified:
+            # PR212 retries an ambiguous verdict once on the same session before
+            # rotating; that retry must neither bench nor replace its credential.
+            assert recovered is False
+            assert captured == {}
+            agent._swap_credential.assert_not_called()
+            recovered, _ = recover_with_credential_pool(
+                agent, status_code=400, has_retried_429=True,
+                classified_reason=FailoverReason.billing,
+                billing_unverified=True,
+            )
         assert recovered is True
         return captured
 

@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -69,6 +71,206 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, "-c", f"import time; time.sleep({seconds})"],
     )
+
+
+def test_transfer_ownership_persists_new_owner_after_releasing_lock(registry, tmp_path, monkeypatch):
+    """Success persists the new owner exactly once, after the registry lock is free.
+
+    An unknown id writes nothing. The checkpoint body is the real writer; only
+    its entry is counted, so a stub cannot satisfy the assertion.
+    """
+    import tools.process_registry as process_registry_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    session = _make_session(sid="proc_handoff", task_id="child")
+    session.owner_task_id = "child"
+    registry._running[session.id] = session
+
+    calls = []
+    real_write = registry._write_checkpoint
+
+    def counted_write(*args, **kwargs):
+        calls.append(registry._lock.locked())
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_write_checkpoint", counted_write)
+
+    assert registry.transfer_ownership(
+        "missing", from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="nope",
+    ) is None
+    assert calls == []
+    assert not checkpoint.exists()
+    assert session.owner_task_id == "child"
+
+    session.exited = True
+    assert registry.transfer_ownership(
+        session.id, from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="late",
+    ) is None
+    assert calls == []
+    assert not checkpoint.exists()
+    session.exited = False
+
+    moved = registry.transfer_ownership(
+        session.id, from_owner="child", to_owner="parent",
+        to_task_id="parent-task", to_session_key="parent-key", note="handoff",
+    )
+    assert moved is session
+    assert calls == [False]
+    assert session.owner_task_id == "parent"
+    assert not registry._lock.locked()
+    stored = json.loads(checkpoint.read_text())
+    assert stored[0]["session_id"] == session.id
+    assert stored[0]["owner_task_id"] == "parent"
+
+
+def test_successive_public_handoffs_keep_first_transfer(tmp_path, monkeypatch):
+    """A second authorized handoff after unlock must not deny the first.
+
+    The barrier sits after the real lock release. Both public results and
+    both child accounting lists succeed, and each transfer checkpoints once.
+    """
+    import traceback
+    import weakref
+
+    import tools.process_registry as process_registry_module
+    from tools.delegate_tool_registry import _register_subagent, _unregister_subagent
+    from tools.process_registry import _handle_process
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    registry = process_registry_module.process_registry
+    calls = []
+    real_write = registry._write_checkpoint
+
+    def counted_write(*args, **kwargs):
+        assert not registry._lock.locked()
+        calls.append(threading.current_thread().name)
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "_write_checkpoint", counted_write)
+
+    class Agent:
+        def __init__(self, owner, parent=None):
+            self._current_task_id = owner
+            self.session_id = owner + "-key"
+            if parent is not None:
+                self._delegate_parent_ref = weakref.ref(parent)
+
+    def register(owner, agent):
+        _register_subagent(dict(
+            subagent_id=owner, parent_id=None, depth=0, goal="probe",
+            model="none", started_at=time.time(), status="running",
+            tool_count=0, agent=agent,
+        ))
+
+    grand, middle, leaf = Agent("grand"), None, None
+    middle = Agent("sa-middle", grand)
+    leaf = Agent("sa-leaf", middle)
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c",
+         "import sys; print('READY', flush=True); sys.stdin.readline()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=True,
+    )
+    session = None
+    try:
+        assert proc.stdout.readline().strip() == "READY"
+        register("sa-middle", middle)
+        register("sa-leaf", leaf)
+        session = registry.adopt_local(
+            proc, command="finite handoff probe", cwd=str(tmp_path),
+            task_id="sa-leaf", owner_task_id="sa-leaf", session_key="child-key",
+            output_so_far="READY\n", notify_on_complete=True,
+        )
+        calls.clear()
+        reached, release = threading.Event(), threading.Event()
+        result = {}
+
+        def tracer(frame, event, arg):
+            if (
+                frame.f_code is type(registry).transfer_ownership.__code__
+                and event in ("line", "return")
+                and not reached.is_set()
+            ):
+                local = frame.f_locals.get("session")
+                if (
+                    local is session
+                    and session.owner_task_id == "sa-middle"
+                    and not registry._lock.locked()
+                ):
+                    reached.set()
+                    assert release.wait(8), "release barrier timeout"
+            return tracer
+
+        def first():
+            try:
+                sys.settrace(tracer)
+                result["first"] = json.loads(_handle_process(
+                    dict(action="handoff", session_id=session.id, data="finite probe purpose"),
+                    task_id="sa-leaf",
+                ))
+            except BaseException:
+                result["exception"] = traceback.format_exc()
+            finally:
+                sys.settrace(None)
+
+        worker = threading.Thread(target=first, name="first-handoff", daemon=True)
+        worker.start()
+        assert reached.wait(8), "post-unlock barrier not reached"
+        try:
+            result["second"] = json.loads(_handle_process(
+                dict(action="handoff", session_id=session.id, data="finite probe purpose"),
+                task_id="sa-middle",
+            ))
+        finally:
+            release.set()
+            worker.join(8)
+        assert not worker.is_alive()
+        assert "exception" not in result, result.get("exception")
+        assert result["first"].get("status") == "handed_off", result["first"]
+        assert result["second"].get("status") == "handed_off", result["second"]
+        assert [row["session_id"] for row in leaf._handed_off_processes] == [session.id]
+        assert [row["session_id"] for row in middle._handed_off_processes] == [session.id]
+        assert sorted(calls) == ["MainThread", "first-handoff"]
+        assert session.owner_task_id == "grand"
+        stored = {row["session_id"]: row for row in json.loads(checkpoint.read_text())}
+        assert stored[session.id]["owner_task_id"] == "grand"
+    finally:
+        monkeypatch.setattr(registry, "_write_checkpoint", real_write)
+        if proc.poll() is None:
+            with suppress(Exception):
+                proc.stdin.write("\n")
+                proc.stdin.flush()
+            with suppress(Exception):
+                proc.wait(timeout=8)
+        with suppress(Exception):
+            proc.stdin.close()
+        if session is not None and session._reader_thread is not None:
+            session._reader_thread.join(8)
+        with suppress(Exception):
+            registry.kill_all(source="handoff-race-cleanup")
+        for owner in ("sa-leaf", "sa-middle"):
+            _unregister_subagent(owner)
+
+
+def test_reader_start_failure_rolls_back_exact_registration(registry, monkeypatch):
+    session = _make_session(sid="failed-reader")
+    other = _make_session(sid="unrelated")
+    registry._running[other.id] = other
+
+    def fail_start(_thread):
+        assert registry._running[session.id] is session
+        raise RuntimeError("thread capacity")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread capacity"):
+        registry._track_started(session, lambda _session: None, "reader")
+    assert session.id not in registry._running
+    assert registry._running[other.id] is other
+    assert session._reader_thread is None
 
 
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
@@ -1694,6 +1896,305 @@ class TestTerminateHostPidPosix:
             if parent.poll() is None:
                 parent.kill()
             parent.wait()
+    def test_posix_grandchild_signal_error_still_terminates_owner(self, monkeypatch):
+        """A reparented/foreign grandchild must not abort the owner SIGTERM.
+
+        Official close-reclaim: psutil.Process.terminate() calls os.kill;
+        tests/conftest.py _guarded_kill raises RuntimeError for a PID outside
+        the pytest subtree. suppress(NoSuchProcess, AccessDenied, OSError)
+        does not catch RuntimeError, so the owner Popen was never signaled
+        and poll() stayed running.
+        """
+        from tools import process_registry as pr
+        import psutil
+
+        terminate_order = []
+
+        class _FakeChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                terminate_order.append(self.pid)
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                raise AssertionError("grace=0 must not SIGKILL")
+
+        class _FakeParent:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [_FakeChild(101)]
+
+            def terminate(self):
+                terminate_order.append(self.pid)
+
+            def kill(self):
+                raise AssertionError("grace=0 must not SIGKILL")
+
+        monkeypatch.setattr(psutil, "Process", _FakeParent)
+        monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                            staticmethod(lambda: 0.0))
+        pr.ProcessRegistry._terminate_host_pid(12345)
+        assert terminate_order == [12345, 101], (
+            "Parent receives SIGTERM first; a grandchild signal error must not abort it"
+        )
+
+    def test_posix_denied_descendant_is_not_escalated_via_sigkill(self, monkeypatch):
+        """Finding 2: a non-gone descendant denial must not retry SIGKILL.
+
+        The SIGTERM pass continues so the owned root still gets terminate().
+        The denied PID stays out of the SIGKILL pass and is not retried via
+        os.kill / killpg.
+        """
+        from tools import process_registry as pr
+        import psutil
+
+        calls = []
+        os_kills = []
+
+        class _DeniedChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                calls.append(("terminate", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                calls.append(("kill", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 9)"
+                )
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return "running"
+
+        class _FakeParent:
+            def __init__(self, pid):
+                self.pid = pid
+                self._terminated = False
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [_DeniedChild(101)]
+
+            def terminate(self):
+                calls.append(("terminate", self.pid))
+                self._terminated = True
+
+            def kill(self):
+                calls.append(("kill", self.pid))
+
+            def is_running(self):
+                return not self._terminated
+
+            def status(self):
+                return "running" if not self._terminated else "zombie"
+
+        def fake_os_kill(target, sig, *a, **kw):
+            os_kills.append((int(target), int(sig)))
+            raise AssertionError("denied descendant must not be retried via os.kill")
+
+        monkeypatch.setattr(psutil, "Process", _FakeParent)
+        monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                            staticmethod(lambda: 0.12))
+        monkeypatch.setattr(pr.os, "kill", fake_os_kill)
+        pr.ProcessRegistry._terminate_host_pid(12345)
+        assert ("terminate", 101) in calls
+        assert ("terminate", 12345) in calls
+        assert ("kill", 101) not in calls
+        assert os_kills == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-owned-process tree kill")
+    def test_posix_owner_signal_failure_keeps_root_running_and_retryable(self, registry, monkeypatch):
+        """Findings 1+3: owner RuntimeError must not invent whole-tree success.
+
+        Root-session contract: kill_process reports error while waitable.poll()
+        is None; poll stays running; completion stays unconsumed so close()/
+        kill_all can retry. Whole-tree contract: descendant denial does not
+        prevent owned-root SIGTERM, but owner signal failure is not success.
+        """
+        from tools import process_registry as pr
+        import psutil
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        session = _make_session(sid="proc_owner_denied", command="sleep 60")
+        session.process = proc
+        session.pid = proc.pid
+        session.pid_scope = "host"
+        session.host_start_time = ProcessRegistry._safe_host_start_time(proc.pid)
+        registry._running[session.id] = session
+        RealProcess = psutil.Process
+        orig_children = RealProcess.children
+        orig_terminate = RealProcess.terminate
+        orig_kill = RealProcess.kill
+        calls = []
+        owner_pid = proc.pid
+
+        class _DeniedChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                calls.append(("terminate", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                calls.append(("kill", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 9)"
+                )
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return "running"
+
+        def children(self, recursive=False):
+            if int(self.pid) == int(owner_pid):
+                assert recursive is True
+                return [_DeniedChild(101)]
+            return orig_children(self, recursive=recursive)
+
+        def terminate(self):
+            calls.append(("terminate", self.pid))
+            if int(self.pid) == int(owner_pid):
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+            return orig_terminate(self)
+
+        def kill(self):
+            calls.append(("kill", self.pid))
+            if int(self.pid) == int(owner_pid):
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 9)"
+                )
+            return orig_kill(self)
+
+        try:
+            monkeypatch.setattr(RealProcess, "children", children)
+            monkeypatch.setattr(RealProcess, "terminate", terminate)
+            monkeypatch.setattr(RealProcess, "kill", kill)
+            monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                                staticmethod(lambda: 0.12))
+            result = registry.kill_process(session.id, source="test", consume_output=True)
+            poll = registry.poll(session.id)
+            assert result["status"] == "error"
+            assert poll["status"] == "running"
+            assert session.exited is False
+            assert proc.poll() is None
+            assert session.id not in registry._completion_consumed
+            assert session.id in registry._running
+            assert ("kill", 101) not in calls
+            assert ("terminate", proc.pid) in calls
+        finally:
+            if proc.poll() is None:
+                with suppress(Exception):
+                    proc.kill()
+            with suppress(Exception):
+                proc.wait(timeout=2)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX real-owned-process tree kill")
+    def test_posix_descendant_denial_still_reaps_owned_root(self, registry, monkeypatch):
+        """Finding 1 inverted: descendant refusal must not prevent owned root cleanup."""
+        from tools import process_registry as pr
+        import psutil
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        session = _make_session(sid="proc_root_reaped", command="sleep 60")
+        session.process = proc
+        session.pid = proc.pid
+        session.pid_scope = "host"
+        session.host_start_time = ProcessRegistry._safe_host_start_time(proc.pid)
+        registry._running[session.id] = session
+        RealProcess = psutil.Process
+        orig_children = RealProcess.children
+        orig_terminate = RealProcess.terminate
+        orig_kill = RealProcess.kill
+        calls = []
+        owner_pid = proc.pid
+
+        class _DeniedChild:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                calls.append(("terminate", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 15)"
+                )
+
+            def kill(self):
+                calls.append(("kill", self.pid))
+                raise RuntimeError(
+                    f"tests/conftest.py live-system guard: blocked os.kill({self.pid}, 9)"
+                )
+
+            def is_running(self):
+                return True
+
+            def status(self):
+                return "running"
+
+        def children(self, recursive=False):
+            if int(self.pid) == int(owner_pid):
+                assert recursive is True
+                return [_DeniedChild(101)]
+            return orig_children(self, recursive=recursive)
+
+        def terminate(self):
+            calls.append(("terminate", self.pid))
+            return orig_terminate(self)
+
+        def kill(self):
+            calls.append(("kill", self.pid))
+            return orig_kill(self)
+
+        try:
+            monkeypatch.setattr(RealProcess, "children", children)
+            monkeypatch.setattr(RealProcess, "terminate", terminate)
+            monkeypatch.setattr(RealProcess, "kill", kill)
+            monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
+                                staticmethod(lambda: 0.12))
+            result = registry.kill_process(session.id, source="test", consume_output=True)
+            deadline = time.monotonic() + 2.0
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert ("terminate", 101) in calls
+            assert ("terminate", proc.pid) in calls
+            assert ("kill", 101) not in calls
+            assert proc.poll() is not None
+            assert result["status"] == "killed"
+            assert session.exited is True
+        finally:
+            if proc.poll() is None:
+                with suppress(Exception):
+                    proc.kill()
+            with suppress(Exception):
+                proc.wait(timeout=2)
 
     def test_posix_oserror_falls_back_to_os_kill(self, monkeypatch):
         from tools import process_registry as pr
@@ -2119,6 +2620,60 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+
+
+@pytest.mark.platforms("linux")
+class TestSpawnLocalFalseCompleteWhileAlive:
+    """Managed background must not complete while the launched PID still lives.
+
+    Issue #132: a long child (``hermes chat``) can close stdout while remaining
+    ``S``. The reader then treats pipe EOF + ``wait(timeout=5)`` as exit and
+    enqueues ``proc_* exit=None`` even though ``/proc/<pid>`` is still live.
+    """
+
+    def test_spawn_local_does_not_complete_while_pid_lives(self, registry, tmp_path):
+        child_script = (
+            "import os, time\n"
+            "os.close(1)\n"
+            "os.close(2)\n"
+            "time.sleep(30)\n"
+        )
+        # exec: Popen.pid is the long-lived process (wrapper/hermes-chat shape).
+        cmd = f"exec {shlex.quote(sys.executable)} -c {shlex.quote(child_script)}"
+        session = registry.spawn_local(
+            cmd,
+            cwd=str(tmp_path),
+            notify_on_complete=True,
+        )
+        pid = session.pid
+        try:
+            deadline = time.monotonic() + 8.0
+            completions = []
+            while time.monotonic() < deadline:
+                completions.extend(registry.drain_notifications())
+                if completions:
+                    break
+                time.sleep(0.05)
+
+            os.kill(pid, 0)
+            assert completions == [], (
+                "process-complete while launched PID still lives "
+                f"(exit={completions[0][0].get('exit_code')!r})"
+            )
+
+            os.kill(pid, signal.SIGTERM)
+            done = _wait_until(
+                lambda: bool(registry.drain_notifications()),
+                timeout=5.0,
+                interval=0.05,
+            )
+            assert done, "no completion after launched PID became terminal"
+        finally:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            registry.kill_process(session.id)
 
 # =========================================================================
 # systemd cgroup isolation for gateway-spawned local executors (#70716)

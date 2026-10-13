@@ -121,6 +121,13 @@ done
 _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 [ -z "$_pf86" ] || WIN_ENV+=("ProgramFiles(x86)=$_pf86")
 
+# POSIX tempfile.gettempdir() reads TMPDIR. env -i dropped it, so nested
+# runner probes landed in host /tmp and pytest collected that directory.
+TMP_ENV=()
+if [ -n "${TMPDIR:-}" ]; then
+  TMP_ENV+=("TMPDIR=$TMPDIR")
+fi
+
 # ── Test-runner knobs (computed before we drop env) ────────────────────────
 # The runner's own documented environment knobs must survive the hermetic
 # `env -i` below, or they are silent no-ops for anyone invoking this script:
@@ -149,6 +156,9 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 #     tests/tools/test_docker_backend_real.py); remote-backends.yml points them at
 #     a throwaway sshd container and a small public image. The key is a
 #     per-run throwaway, never a credential.
+#   * HERMES_TEST_TMP_ROOT is an existing POSIX directory owned by this user,
+#     mode 0700, canonical, non-hidden, and short enough to keep per-file roots
+#     within the AF_UNIX socket path budget.
 #
 # These are test-infrastructure knobs, not credentials — same class as the
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
@@ -160,7 +170,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # credential can leak" property stays auditable at a glance.
 TEST_ENV=()
 for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
+  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE HERMES_TEST_TMP_ROOT \
   SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
   HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
@@ -169,6 +179,19 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi
 done
+
+# ── User-systemd session location (computed before we drop env) ─────────────
+# The Linux runner uses transient user services for cgroup containment. These
+# are session coordinates, not credentials; preserve them so `env -i` does not
+# turn an available user manager into an unexplained "Failed to connect"
+# failure.
+SYSTEMD_ENV=()
+for _systemd_var in XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS; do
+  if [ -n "${!_systemd_var:-}" ]; then
+    SYSTEMD_ENV+=("$_systemd_var=${!_systemd_var}")
+  fi
+done
+
 
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
@@ -190,7 +213,9 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${SYSTEMD_ENV[@]+"${SYSTEMD_ENV[@]}"} \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
+  ${TMP_ENV[@]+"${TMP_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \

@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 
 import { fmtMsgTimestamp, MessageLine } from '../components/messageLine.js'
 import { MAX_HISTORY } from '../config/limits.js'
-import { toTranscriptMessages } from '../domain/messages.js'
+import { replyEndLine, toTranscriptMessages } from '../domain/messages.js'
 import { appendTranscriptMessage, capTranscriptHistory, upsert } from '../lib/messages.js'
 import { DEFAULT_THEME } from '../theme.js'
 
@@ -97,6 +97,56 @@ describe('toTranscriptMessages', () => {
     expect(result[0]?.text).toBeTruthy()
     expect(result[0]?.text).not.toBe('event')
   })
+
+  it('restores reply footer once and leaves missing cache counts unknown', () => {
+    const [known] = toTranscriptMessages([
+      {
+        role: 'assistant',
+        text: 'done',
+        display_metadata: { reply_end: { elapsed_s: 2.34, cache_read: 0, prompt_total: 10 } }
+      }
+    ])
+
+    const [unknown] = toTranscriptMessages([
+      { role: 'assistant', text: 'done', display_metadata: { reply_end: { elapsed_s: 2.34 } } }
+    ])
+
+    expect(known?.replyEnd).toBe('2.3s · cache 0/10 (0.0%)')
+    expect(unknown?.replyEnd).toBe('2.3s')
+    expect(
+      replyEndLine({ reply_elapsed_s: 2.34, reply_cache_read: 0, reply_prompt_tokens: 0 })
+    ).toBe('2.3s · cache 0/0')
+    expect(replyEndLine({ reply_elapsed_s: 2.34, reply_cache_read: 0, reply_prompt_tokens: 10 })).toBe(
+      '2.3s · cache 0/10 (0.0%)'
+    )
+    expect(replyEndLine({ reply_elapsed_s: 2.34 })).toBe('2.3s')
+
+    const [impossibleHistory] = toTranscriptMessages([
+      {
+        role: 'assistant',
+        text: 'done',
+        display_metadata: { reply_end: { elapsed_s: 2.34, cache_read: 11, prompt_total: 10 } }
+      }
+    ])
+
+    expect(impossibleHistory?.replyEnd).toBe('2.3s')
+    expect(replyEndLine({ reply_elapsed_s: 2.34, reply_cache_read: 11, reply_prompt_tokens: 10 })).toBe(
+      '2.3s'
+    )
+
+    const [zeroTotalHistory] = toTranscriptMessages([
+      {
+        role: 'assistant',
+        text: 'done',
+        display_metadata: { reply_end: { elapsed_s: 2.34, cache_read: 1, prompt_total: 0 } }
+      }
+    ])
+
+    expect(zeroTotalHistory?.replyEnd).toBe('2.3s')
+    expect(
+      replyEndLine({ reply_elapsed_s: 2.34, reply_cache_read: 1, reply_prompt_tokens: 0 })
+    ).toBe('2.3s')
+  })
 })
 
 describe('MessageLine', () => {
@@ -169,10 +219,10 @@ describe('MessageLine', () => {
       }
     )
 
+    const rendered = stripAnsi(output)
+
     instance.unmount()
     instance.cleanup()
-
-    const rendered = stripAnsi(output)
 
     expect(rendered).not.toContain('step one')
     expect(rendered).not.toContain('step two')
@@ -206,13 +256,48 @@ describe('MessageLine', () => {
       }
     )
 
+    const rendered = stripAnsi(output)
+
     instance.unmount()
     instance.cleanup()
 
-    const rendered = stripAnsi(output)
-
     expect(rendered).toContain('step one')
     expect(rendered).toContain('step two')
+  })
+
+  it('renders one completed-reply footer under the assistant text', () => {
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+    let output = ''
+
+    Object.assign(stdout, { columns: 80, isTTY: false, rows: 24 })
+    Object.assign(stdin, { isTTY: false })
+    Object.assign(stderr, { isTTY: false })
+    stdout.on('data', chunk => {
+      output += chunk.toString()
+    })
+
+    const instance = renderSync(
+      React.createElement(MessageLine, {
+        cols: 80,
+        msg: { role: 'assistant', text: 'Done.', replyEnd: '2.3s · cache 0/10 (0.0%)' },
+        t: DEFAULT_THEME
+      }),
+      {
+        patchConsole: false,
+        stderr: stderr as NodeJS.WriteStream,
+        stdin: stdin as NodeJS.ReadStream,
+        stdout: stdout as NodeJS.WriteStream
+      }
+    )
+
+    const rendered = stripAnsi(output)
+
+    instance.unmount()
+    instance.cleanup()
+    expect(rendered.split('cache 0/10 (0.0%)').length - 1).toBe(1)
+    expect(rendered.indexOf('Done.')).toBeLessThan(rendered.indexOf('2.3s'))
   })
 })
 

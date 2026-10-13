@@ -2530,7 +2530,11 @@ def _count_image_tokens(msg: dict[str, Any], cost_per_image: int) -> int:
     """Count image-like content parts in a message; return their token cost."""
     if not isinstance(msg, dict):
         return 0
-    content = msg.get("content")
+    from agent.turn_context import substitute_api_content
+
+    wire = dict(msg)
+    substitute_api_content(wire)
+    content = wire.get("content") or msg.get("content")
     count = _count_parts(content, _IMAGE_PART_TYPES)
     count += _count_parts(msg.get("_anthropic_content_blocks"), {"image"})
     # Multimodal tool results that haven't been converted yet.
@@ -2556,9 +2560,8 @@ def strip_opaque_replay_items(items: Any) -> Any:
 
 def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
-    * ``api_content`` SUBSTITUTES ``content`` (mirrors ``turn_context.substitute_api_content`` exactly):
-      only a non-empty STRING sidecar on a user/assistant row displaces content; substituting any
-      other shape would UNDERcount — the dangerous direction.
+    * ``api_content`` SUBSTITUTES ``content`` (``turn_context.substitute_api_content``): a non-empty
+      string or structured sidecar on a user/assistant row displaces content.
     * Base64 images become a placeholder; ``_count_image_tokens`` charges them flat.
     * ``reasoning`` never ships as-is (request builds pop it after optionally promoting it into
       ``reasoning_content``); counting both inflated estimates up to +53%.
@@ -2566,20 +2569,17 @@ def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
       ciphertext the provider prices by its OWN token count, never by bytes; a native compaction
       checkpoint alone can be 5M chars (#100611). They contribute 0 here: only real usage ever
       prices them, and the usage anchor carries that price forward."""
-    sidecar = msg.get("api_content")
-    sidecar_wins = isinstance(sidecar, str) and bool(sidecar) and msg.get("role") in ("user", "assistant")
-    _rc = msg.get("reasoning_content")
+    from agent.turn_context import substitute_api_content
+
+    wire = dict(msg)
+    substitute_api_content(wire)
+    _rc = wire.get("reasoning_content")
     drop_reasoning_dup = isinstance(_rc, str) and bool(_rc.strip())
     shadow: dict[str, Any] = {}
-    for k, v in msg.items():
+    for k, v in wire.items():
         if k in UNPRICED_REPLAY_FIELDS or k in PERSISTENCE_ONLY_MESSAGE_FIELDS or (k == "reasoning" and drop_reasoning_dup):
             continue
-        if k == "api_content":
-            if sidecar_wins:
-                shadow["content"] = v
-        elif k == "content" and sidecar_wins:
-            continue
-        elif k == "content" and isinstance(v, list):
+        if k in ("content", "output") and isinstance(v, list):
             shadow[k] = [
                 {"type": part.get("type"), "image": "[stripped]"}
                 if isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES
@@ -2588,16 +2588,6 @@ def _wire_message_shadow(msg: dict[str, Any]) -> dict[str, Any]:
             ]
         elif k == "content" and isinstance(v, dict) and v.get("_multimodal"):
             shadow[k] = v.get("text_summary", "")
-        elif k == "output" and isinstance(v, list):
-            # Responses ``function_call_output`` output parts: strip the image
-            # payload like the ``content`` branch above so encoded bytes are
-            # priced by the flat per-image model, never as text.
-            shadow[k] = [
-                {"type": part.get("type"), "image": "[stripped]"}
-                if isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES
-                else part
-                for part in v
-            ]
         elif k == "codex_reasoning_items":
             shadow[k] = strip_opaque_replay_items(v)
         elif k == "encrypted_content":  # a Responses reasoning/compaction item passed as a row

@@ -31,6 +31,7 @@ from agent.error_classifier import (
     _extract_status_code)
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
@@ -1455,7 +1456,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
     return agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_messages_for_non_vision_model(api_messages), tools=tools_for_api,
         reasoning_config=reasoning_config, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, base_url=agent.base_url,
+        cache_scope_id=cache_scope_id, static_system_prefix=getattr(agent, "_cached_system_prompt_static", None), base_url=agent.base_url,
         max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
         provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
@@ -1503,14 +1504,14 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         max_tokens=agent.max_tokens, ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
         request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
+        cache_scope_id=cache_scope_id, static_system_prefix=getattr(agent, "_cached_system_prompt_static", None), ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
         supports_reasoning=agent._supports_reasoning_extra_body(),
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         qwen_session_metadata=_qwen_meta)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
-        return transport.build_kwargs(provider_profile=_profile, **_common)
+        return transport.build_kwargs(provider_profile=_profile, provider_name=getattr(agent, "requested_provider", None), **_common)
 
     # Legacy flag path: only for a provider absent from the providers/ registry.
     return transport.build_kwargs(
@@ -1972,9 +1973,20 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     return until is None or until - time.time() > 600
 
 
-def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
-    """True when the entry is already unavailable, malformed, locally unusable, or resolves
-    to the backend that just failed (falling back to it would loop the failure)."""
+def _fallback_failure_scope(reason: FailoverReason | None):
+    """Return the identity axis invalidated by a failed fallback attempt."""
+    from agent.backend_identity import FailureScope
+
+    reason_value = getattr(reason, "value", reason)
+    if reason_value in {"auth", "auth_permanent", "billing"}:
+        return FailureScope.CREDENTIAL
+    if reason_value == "ssl_cert_verification":
+        return FailureScope.ENDPOINT
+    return FailureScope.MODEL
+
+
+def _should_skip_unresolved_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
+    """Reject entries that cannot be resolved without constructing their client."""
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
@@ -1992,15 +2004,56 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         unavailable.add(fb_key)
         logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
         return True
-    # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
-    # are owned by agent.backend_identity — do not re-implement comparisons here.
-    # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
-    # See #22548, #62984, #70893.
+    return False
+
+
+def _fallback_has_explicit_credential(fb: dict) -> bool:
+    return any(str(fb.get(field) or "").strip() for field in ("api_key", "key_env", "api_key_env"))
+
+
+def _raw_fallback_is_exact_self(fb: dict, candidate, failed) -> bool:
+    exact_self = candidate.provider == failed.provider and candidate.model == failed.model
+    return bool(
+        exact_self and not _fallback_has_explicit_credential(fb)
+        and not (candidate.base_url and failed.base_url and candidate.base_url != failed.base_url)
+    )
+
+
+def _raw_fallback_identity_is_known(fb: dict, candidate, failed, failure_scope) -> bool:
+    """True when raw fields are sufficient for the selected failure axis."""
+    from agent.backend_identity import FailureScope
+
+    if not failed.credential_fingerprint and _raw_fallback_is_exact_self(fb, candidate, failed):
+        return True
+    if failure_scope is FailureScope.ENDPOINT:
+        return bool(candidate.base_url and failed.base_url)
+    # Labels/URLs cannot establish the candidate's configured credential.
+    return False
+
+
+def _should_skip_fallback_candidate(
+    agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set,
+    *, pre_resolution: bool = False, candidate_api_key=None,
+) -> bool:
+    """True when raw or resolved fields prove an entry repeats a failed backend."""
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
-        model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
-    fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
-    if should_skip_candidate(fb_ident, current_ident):
+        model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""),
+        api_key=getattr(agent, "api_key", None))
+    fb_ident = BackendIdentity.build(
+        provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""), api_key=candidate_api_key,
+    )
+    runtime_failures = getattr(agent, "_runtime_failed_backend_identities", ())
+    if runtime_failures:
+        for failed_ident, failure_scope in runtime_failures:
+            if pre_resolution and not _raw_fallback_identity_is_known(fb, fb_ident, failed_ident, failure_scope):
+                continue
+            if should_skip_candidate(fb_ident, failed_ident, failure_scope):
+                logger.warning(
+                    "Fallback skip: chain entry %s/%s repeats a failed backend (%s)",
+                    fb_provider, fb_model, failed_ident.provider or "unnamed route")
+                return True
+    elif should_skip_candidate(fb_ident, current_ident):
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider)
@@ -2026,6 +2079,11 @@ def _update_fallback_context_compressor(agent) -> None:
         model=agent.model, context_length=fb_context_length, base_url=agent.base_url,
         api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
     )
+    _finalize_fallback_compression_feasibility(agent)
+
+
+def _finalize_fallback_compression_feasibility(agent) -> None:
+    """Refresh a prior verdict after publication, including an interrupted durable reset."""
     # Fallback activation is an error path: refresh an EXISTING verdict eagerly (the ceiling was voided by
     # update_model()), but a session that never probed keeps its lazy compaction-time probe rather than
     # resolving an auxiliary client while the primary route is failing (#114707).
@@ -2083,6 +2141,55 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
+_FALLBACK_SNAPSHOT_FIELDS = (
+    "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
+    "_client_kwargs", "request_overrides", "_fallback_activated", "_reasoning_echo_flag",
+    "_config_context_length", "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url",
+    "_is_anthropic_oauth", "_credential_pool", "_credential_pool_entry_id",
+    "_use_prompt_caching", "_use_native_cache_layout", "reasoning_config", "runtime_capabilities",
+    "_provider_fallback_active", "_provider_fallback_route", "_cached_system_prompt",
+    "_pending_fallback_notice", "_retry_status_buffer", "_consecutive_stale_streams",
+    "_primary_runtime",
+)
+_FALLBACK_COPY_FIELDS = {
+    "_client_kwargs", "request_overrides", "reasoning_config", "runtime_capabilities",
+    "_primary_runtime",
+}
+
+
+def _snapshot_fallback_runtime(agent) -> dict:
+    """Capture the finite runtime owners mutated by one fallback activation."""
+    from agent.agent_runtime_helpers import _MISSING, _copy_request_overrides
+
+    values = {}
+    for name in _FALLBACK_SNAPSHOT_FIELDS:
+        value = getattr(agent, name, _MISSING)
+        if name in _FALLBACK_COPY_FIELDS and value is not _MISSING and value is not None:
+            value = _copy_request_overrides(value)
+        elif name in {"_pending_fallback_notice", "_retry_status_buffer"} and isinstance(value, list):
+            value = list(value)
+        values[name] = value
+    cache = getattr(agent, "_transport_cache", _MISSING)
+    cache_contents = dict(cache) if isinstance(cache, dict) else cache
+    return {"values": values, "transport_cache": cache_contents}
+
+
+def _restore_fallback_runtime(agent, snapshot: dict) -> None:
+    """Restore a rejected candidate before the loop considers its successor."""
+    from agent.agent_runtime_helpers import _MISSING
+
+    for name, value in snapshot["values"].items():
+        if value is _MISSING:
+            with contextlib.suppress(AttributeError):
+                delattr(agent, name)
+        else:
+            setattr(agent, name, value)
+    cache = snapshot["transport_cache"]
+    if isinstance(cache, dict) and isinstance(getattr(agent, "_transport_cache", None), dict):
+        agent._transport_cache.clear()
+        agent._transport_cache.update(cache)
+
+
 def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=None) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
@@ -2091,6 +2198,18 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    from agent.backend_identity import BackendIdentity
+    runtime_failures = getattr(agent, "_runtime_failed_backend_identities", None)
+    if not isinstance(runtime_failures, set):
+        runtime_failures = set()
+        agent._runtime_failed_backend_identities = runtime_failures
+    current_ident = BackendIdentity.build(
+        provider=getattr(agent, "provider", ""), model=getattr(agent, "model", ""),
+        base_url=str(getattr(agent, "base_url", "") or ""),
+        api_key=getattr(agent, "api_key", None),
+    )
+    if current_ident.provider or current_ident.model or current_ident.base_url:
+        runtime_failures.add((current_ident, _fallback_failure_scope(reason)))
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)
@@ -2102,12 +2221,31 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
         unavailable = agent._unavailable_fallback_keys
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
-        if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+        if _should_skip_unresolved_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+            continue
+        if _should_skip_fallback_candidate(
+            agent, fb, fb_key, fb_provider, fb_model, unavailable, pre_resolution=True,
+        ):
             continue
 
+        runtime_snapshot = None
+        compressor = getattr(agent, "context_compressor", None)
+        compressor_update_token = getattr(compressor, "_model_update_token", None)
         try:
+            runtime_snapshot = _snapshot_fallback_runtime(agent)
             from agent.route_binding import bind_route_entry
-            bound = bind_route_entry(agent, fb, fb_provider, fb_model)
+            def accept_resolved(client, resolved_model, resolved_url):
+                resolved_fb = {**fb, "model": resolved_model, "base_url": resolved_url}
+                identity_key = vars(client).get("_api_key_provider") or getattr(client, "api_key", None)
+                return not _should_skip_fallback_candidate(
+                    agent, resolved_fb, fb_key, fb_provider, resolved_model, unavailable,
+                    candidate_api_key=identity_key,
+                )
+
+            bound = bind_route_entry(
+                agent, fb, fb_provider, fb_model, publish_compression=False,
+                accept_resolved=accept_resolved,
+            )
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
@@ -2136,8 +2274,19 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            # Publish compression only after candidate admission. update_model also resets durable
+            # cooldown/strike/runway state, which an agent-field rollback cannot restore.
+            _update_fallback_context_compressor(agent)
             return True
         except Exception as e:
+            if getattr(compressor, "_model_update_token", None) is not compressor_update_token:
+                # The publisher committed: durable resets cannot be undone by restoring agent fields.
+                logger.warning("Fallback %s is active; post-publication compression update failed: %s", fb_model, e)
+                _finalize_fallback_compression_feasibility(agent)
+                return True
+            if runtime_snapshot is not None:
+                with contextlib.suppress(Exception):
+                    _restore_fallback_runtime(agent, runtime_snapshot)
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)
@@ -2288,7 +2437,10 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
     # prompt_cache_key, xAI alias, Moonshot sanitization). Do not omit tools or force
     # tool_choice="none" here: SGLang renders the prompt with tools=None in that mode and the KV
     # prefix diverges. (cache_control breakpoint decoration is not re-applied on this path.)
-    summary_kwargs = agent._build_api_kwargs(api_messages)
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    wire_messages = ChatCompletionsTransport().convert_messages(api_messages, model=agent.model)
+    summary_kwargs = agent._build_api_kwargs(wire_messages)
     # The summary now carries ``tools``; on cache-planned routes the main loop scrubbed a deep
     # copy, so ``agent.tools`` may still hold bytes the provider 400s on.
     sanitize_outbound_kwargs(agent, summary_kwargs)
@@ -2341,6 +2493,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
             if text:
                 summary_call_outcome = "success"
+                if hasattr(agent, "_delegate_successful_llm_route"):
+                    agent._delegate_successful_llm_route = (agent.model, agent.provider)
                 append_message(messages, {"role": "assistant", "content": text})
                 final_response = text
             break
@@ -2358,7 +2512,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
     finally:
         from agent import relay_llm
-        relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
+        relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome, agent=agent)
 
     return final_response
 
@@ -2789,8 +2943,12 @@ class _StreamingCall(StreamingWaitMonitor):
     @staticmethod
     def _quiet(fn, *args) -> None:
         """Best-effort callback: never let a display hook break the stream."""
-        with contextlib.suppress(Exception):
+        try:
             fn(*args)
+        except StreamPayloadBoundExceeded:
+            raise
+        except Exception:
+            pass
 
     def _set_managed_stream(self, stream: Any) -> Any:
         self.managed_stream_holder["stream"] = stream
@@ -2878,7 +3036,8 @@ class _StreamingCall(StreamingWaitMonitor):
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
         if self.agent.stream_delta_callback:
-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+            self._quiet(self.agent.stream_delta_callback, text)
+            self.agent._record_streamed_assistant_text(text)
 
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
@@ -3756,6 +3915,9 @@ class _StreamingCall(StreamingWaitMonitor):
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    self.result["error"] = e
+                    return
                 except Exception as e:
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
@@ -3763,6 +3925,9 @@ class _StreamingCall(StreamingWaitMonitor):
                     if self._route_switched_under_request():
                         self.result["error"] = e
                         return
+        except StreamPayloadBoundExceeded as e:
+            self.result["error"] = e
+            return
         except InterruptedError as e:
             # Fast pre-retry interrupt surfaces through the normal result channel.
             self.result["error"] = e
@@ -3974,6 +4139,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
             self.worker.start()
             self._monitor_loop()
+        if isinstance(self.result["error"], StreamPayloadBoundExceeded):
+            raise self.result["error"]
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag

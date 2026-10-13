@@ -19,6 +19,7 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 from agent.sdk_transform_bypass import bypass_sdk_request_transform
 from agent.stream_diag import buffer_connect_exhausted_notice
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.usage_anchor import set_usage_anchor
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ def _call_guarded(fn: Callable | None, fail_msg: str, *fail_args: Any, args: tup
         return
     try:
         fn(*args, **(kwargs or {}))
+    except StreamPayloadBoundExceeded:
+        raise
     except Exception:
         logger.debug(fail_msg, *fail_args, exc_info=True)
 
@@ -124,10 +127,10 @@ def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, int):
         return max(value, 0)
     if isinstance(value, float):
-        return max(int(value), 0)
+        with suppress(ValueError, OverflowError):
+            return max(int(value), 0)
     if isinstance(value, str):
-        # Only the str->int parse is guarded; a float NaN still raises like it always has.
-        with suppress(ValueError):
+        with suppress(ValueError, OverflowError):
             return max(int(value), 0)
     return 0
 
@@ -146,6 +149,33 @@ def _queue_token_counts(agent, fail_msg: str, *fail_extra: Any, counts: Callable
         logger.debug(fail_msg, agent.session_id, *fail_extra, exc)
 
 
+def _canonical_codex_app_server_usage(raw: dict):
+    from agent.usage_pricing import CanonicalUsage, _cache_evidence
+
+    # inputTokens includes cachedInputTokens. CanonicalUsage.prompt_tokens adds
+    # cache_read back, so the input bucket is the uncached remainder.
+    cache_read_tokens, cache_valid = _cache_evidence(raw, ("cachedInputTokens",))
+    prompt_tokens, prompt_valid = _cache_evidence(raw, ("inputTokens",))
+    cache_valid = cache_valid and prompt_valid and cache_read_tokens <= prompt_tokens
+    return CanonicalUsage(
+        input_tokens=max(0, _coerce_usage_int(raw.get("inputTokens")) - cache_read_tokens),
+        output_tokens=_coerce_usage_int(raw.get("outputTokens")),
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=0,
+        reasoning_tokens=_coerce_usage_int(raw.get("reasoningOutputTokens")),
+        raw_usage=raw,
+        cache_telemetry="reported" if cache_valid else "unavailable",
+    )
+
+
+def _observe_codex_app_server_usage(agent, raw: Any) -> None:
+    from agent.turn_usage import _capture_first_turn_usage, _notify_tui_cache
+
+    canonical = _canonical_codex_app_server_usage(raw) if isinstance(raw, dict) else None
+    if _capture_first_turn_usage(agent, canonical):
+        _notify_tui_cache(agent, canonical, no_usage=canonical is None)
+
+
 def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting. Prompt bucket = uncached + cached
     input (the protocol exposes no cache-write tokens); a turn with no usage still counts as one API call.
@@ -154,11 +184,17 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     estimate grows monotonically and hermes-mode fires thread compaction on tiny threads (#100381)."""
     agent.session_api_calls += 1
     usage = getattr(turn, "token_usage_last", None)
+    first_usage = getattr(turn, "token_usage_first", None)
     compressor = getattr(agent, "context_compressor", None)
 
     def billing(**extra):
         return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
     if not isinstance(usage, dict) or not usage:
+        from agent.turn_usage import mark_unaccounted_response
+
+        mark_unaccounted_response(agent)
+        _observe_codex_app_server_usage(agent, None)
+
         if compressor is not None and getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage cannot adjudicate the pending compaction; unlatch preflight deferral.
             compressor.update_from_response({})
@@ -167,23 +203,45 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
         _queue_token_counts(agent, "Codex app-server api-call persistence failed (session=%s): %s",
                             counts=lambda: billing(billing_mode="subscription_included"))
         return {}
-    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-    # ``inputTokens`` is INCLUSIVE of ``cachedInputTokens`` (same contract as the Responses API, see
-    # normalize_usage's codex_responses branch); CanonicalUsage.prompt_tokens re-adds cache_read on top of
-    # input_tokens, so the canonical input bucket must be the UNCACHED remainder or cached tokens count twice.
-    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    from agent.turn_usage import _fold_reply_usage
+    from agent.usage_pricing import _finite_nonnegative_int, CanonicalUsage, estimate_usage_cost
+    # ``inputTokens`` includes cached input. Footer precision requires both raw fields
+    # to be measured integral counts and a cache count no greater than the prompt total.
+    raw_prompt_total = usage.get("inputTokens")
+    raw_cache_read = usage.get("cachedInputTokens")
+    prompt_total_known = _finite_nonnegative_int(raw_prompt_total)
+    cache_read_tokens = _coerce_usage_int(raw_cache_read)
+    cache_read_known = (
+        prompt_total_known and _finite_nonnegative_int(raw_cache_read)
+        and cache_read_tokens <= _coerce_usage_int(raw_prompt_total)
+    )
+    _fold_reply_usage(
+        agent,
+        {"prompt_tokens": _coerce_usage_int(raw_prompt_total), "cache_read_tokens": cache_read_tokens},
+        cache_read_known,
+        prompt_total_known,
+    )
+    # CanonicalUsage.prompt_tokens re-adds cache_read on top of input_tokens, so the canonical input
+    # bucket must be the UNCACHED remainder or cached tokens count twice.
     canonical_usage = CanonicalUsage(
-        input_tokens=max(0, _coerce_usage_int(usage.get("inputTokens")) - cache_read_tokens),
+        input_tokens=max(0, _coerce_usage_int(raw_prompt_total) - cache_read_tokens),
         output_tokens=_coerce_usage_int(usage.get("outputTokens")),
         cache_read_tokens=cache_read_tokens, cache_write_tokens=0,
         reasoning_tokens=_coerce_usage_int(usage.get("reasoningOutputTokens")), raw_usage=usage,
+        cache_read_known=cache_read_known, prompt_total_known=prompt_total_known,
+        cache_telemetry=_canonical_codex_app_server_usage(usage).cache_telemetry,
     )
+    cache_telemetry = canonical_usage.cache_telemetry
+
     prompt_tokens = canonical_usage.prompt_tokens
     total_tokens = _coerce_usage_int(usage.get("totalTokens")) or canonical_usage.total_tokens
     token_counts = {f: getattr(canonical_usage, f) for f in
                     ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")}
     usage_dict = {"prompt_tokens": prompt_tokens, "completion_tokens": canonical_usage.output_tokens,
                   "total_tokens": total_tokens, **token_counts}
+    _observe_codex_app_server_usage(agent, first_usage if isinstance(first_usage, dict) else usage)
+    turn_usage = {**usage_dict, "cache_telemetry": cache_telemetry}
+    agent._last_turn_usage = dict(turn_usage)
     if compressor is not None:
         try:
             compressor.update_from_response(usage_dict)
@@ -213,7 +271,7 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
         counts=lambda: billing(**token_counts, **cost_fields,
                                billing_mode="subscription_included" if cost_result.status == "included" else None),
     )
-    return {**usage_dict, "last_prompt_tokens": prompt_tokens, **cost_fields}
+    return {**turn_usage, "last_prompt_tokens": prompt_tokens, **cost_fields}
 
 
 def _record_codex_app_server_compaction(agent, turn, *, approx_tokens: int | None = None, force: bool = False) -> bool:
@@ -384,7 +442,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     started: dict[str, tuple[str, dict, float]] = {}
 
     def agent_cb(attr: str, fail_msg: str, *fail_args: Any, args: tuple = (), kwargs: dict | None = None) -> None:
-        _call_guarded(getattr(agent, attr, None), fail_msg, *fail_args, args=args, kwargs=kwargs)
+        try:
+            _call_guarded(getattr(agent, attr, None), fail_msg, *fail_args, args=args, kwargs=kwargs)
+        except StreamPayloadBoundExceeded:
+            # The app-server turn owner persists its bounded explanation from
+            # projected messages; retire this request's recorder accounting now.
+            agent._current_streamed_assistant_text = ""
+            raise
 
     def _fire_tool_started(item: dict) -> None:
         item_id, name = item.get("id") or "", _codex_item_to_tool_name(item)
@@ -442,11 +506,21 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             (_fire_tool_completed if completed else _fire_tool_started)(item)
         elif completed and item_type == "agentMessage":
             _fire_agent_message_completed(item)
+
+    def _on_usage(params: dict) -> None:
+        usage = params.get("tokenUsage")
+        if not isinstance(usage, dict):
+            return
+        last = usage.get("last")
+        if isinstance(last, dict) and last:
+            _observe_codex_app_server_usage(agent, last)
+
     handlers: dict[str, Callable[[dict], None]] = {
         method: functools.partial(_fire_delta, attr=attr) for method, attr in _CODEX_TEXT_DELTA_METHODS
     }
     handlers["item/started"] = lambda p: _on_item(p, completed=False)
     handlers["item/completed"] = lambda p: _on_item(p, completed=True)
+    handlers["thread/tokenUsage/updated"] = _on_usage
 
     def on_event(note: dict) -> None:
         if not isinstance(note, dict):
@@ -735,6 +809,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     _ensure_codex_session(agent, messages)
     try:
         _start_codex_thread(agent)
+        agent._reset_stream_delivery_tracking()
         wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
         turn = agent._codex_session.run_turn(
             user_input=user_message,
@@ -753,13 +828,21 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     if getattr(turn, "should_retire", False):
         logger.warning("codex app-server session retired (turn error: %s)", turn.error)
         _close_codex_session(agent)
-    # The binding is published only once the transcript it belongs to is durable, and never for a
-    # retired thread (the next agent would only resume into the same wedge).
-    if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
-        _store_codex_thread_id(agent, turn.thread_id)
+    # Publish the binding only after projected rows are durable and completion metadata
+    # persistence has been attempted; a retired thread must never be resumed.
+    transcript_persisted = _persist_projected_messages(agent, turn, messages)
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
+    from agent.turn_finalizer import _attach_reply_end_metadata, _persist_reply_end_metadata
+
+    reply_end_attachment = _attach_reply_end_metadata(
+        agent, messages, turn.final_text,
+        completed=not turn.interrupted and turn.error is None,
+    )
+    _persist_reply_end_metadata(agent, reply_end_attachment, logger)
+    if transcript_persisted and not getattr(turn, "should_retire", False):
+        _store_codex_thread_id(agent, turn.thread_id)
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
@@ -871,6 +954,7 @@ class _CodexResponseAssembler:
         # back in stream order.
         self.output_indexes, self.output_sequences = [], []
         self.text_deltas, self.commentary_text_deltas = [], []
+        self.has_output_text_deltas = False
         # pending_function_calls: announced-but-unconfirmed function calls keyed by item id. announced_output_order:
         # first-observed (sequence, output_index) per announced item id so a later .done keeps its announced position.
         self.pending_function_calls: dict[str, dict[str, Any]] = {}
@@ -914,6 +998,7 @@ class _CodexResponseAssembler:
         elif self.active_message_phase == "analysis":
             self._safe(self.on_reasoning_delta, "on_reasoning_delta", delta_text)
         else:
+            self.has_output_text_deltas = True
             self.text_deltas.append(delta_text)
             if self.has_tool_calls:
                 return
@@ -1078,8 +1163,10 @@ class _CodexResponseAssembler:
         output: list[Any] = self._settled_output() if self.saw_response_completed else list(self.output_items)
         # With only plain text deltas (no tool calls), synthesize one message item.
         if not output and self.text_deltas and not self.has_tool_calls:
-            content = [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
-            output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
+            text = "".join(self.text_deltas)
+            part = (SimpleNamespace(type="output_text", text=text) if self.has_output_text_deltas
+                    else SimpleNamespace(type="refusal", refusal=text))
+            output = [SimpleNamespace(type="message", role="assistant", status="completed", content=[part])]
         # No terminal frame AND no usable content = truncated / rejected stream.
         if not self.saw_terminal and not output:
             raise RuntimeError("Codex Responses stream did not emit a terminal response")
@@ -1165,6 +1252,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # claims the sink supersedes this token; that only silences OUR live callbacks — consumption continues,
     # because stopping here handed the gateway a "completed" response missing its tail (#69486).
     writer_token = {"value": None, "raw_stream": None, "superseded_logged": False}
+    diagnostic_context = None
+
+    def _finish_diagnostic(response=None, error=None):
+        if diagnostic_context is not None:
+            relay_llm._finish_diagnostic(diagnostic_context, response=response, error=error)
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -1227,6 +1319,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         return bool(agent._interrupt_requested)
 
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+        nonlocal diagnostic_context
         from hermes_cli.providers import is_actual_route
 
         if is_actual_route(
@@ -1238,7 +1331,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        final_kwargs = bypass_sdk_request_transform(stream_kwargs)
+        diagnostic_context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        remove = (relay_llm._arm_dispatch(active_client, diagnostic_context)
+                  if diagnostic_context is not None else lambda: None)
+        try:
+            return active_client.responses.create(**final_kwargs)
+        finally:
+            remove()
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
@@ -1259,7 +1359,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         logger.debug("Codex stream opened (attempt=%s/%s, model=%s)",
             attempt + 1, max_stream_retries + 1, model)
 
-    def _drain_for_finalizer(event_stream: Any) -> None:
+    def _drain_for_finalizer(event_stream: Any) -> BaseException | None:
         # The final response is already assembled. Keep the finalizer drain on THIS owner thread:
         # moving the reader to a daemon thread and later closing from here releases the FD under that
         # thread's SSL BIO (#127390, same class as #29507). A tiny watchdog may only shutdown() the
@@ -1281,6 +1381,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                          agent._client_log_context())
             return
 
+        drain_error: BaseException | None = None
         timed_out = threading.Event()
 
         def _wake_owner() -> None:
@@ -1301,6 +1402,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             # A timeout-triggered shutdown is the expected wakeup, not another provider failure. Other
             # transport failures still get the old diagnostic, but none may discard the completed response.
             if not timed_out.is_set():
+                drain_error = exc
                 if not isinstance(exc, transport_errors):
                     _log_failure(exc)
                 logger.warning(
@@ -1308,7 +1410,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     "received; returning the completed response instead of retrying. %s error=%s",
                     agent._client_log_context(), exc,
                 )
-        except Exception:
+        except Exception as exc:
+            drain_error = exc
             logger.debug("Codex Responses stream finalization failed after a terminal response", exc_info=True)
         finally:
             # cancel() wins if the budget has not fired; join() also waits for an already-running shutdown
@@ -1324,6 +1427,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 "(agent.stream_drain_timeout); shut down its socket and completed cleanup on the owner thread. %s",
                 budget, agent._client_log_context(),
             )
+            return TimeoutError("Codex Responses stream drain did not complete after a terminal response")
+        return drain_error
 
     def _close_event_stream(event_stream: Any) -> None:
         close_fn = getattr(event_stream, "close", None)  # None while connect never succeeded
@@ -1379,6 +1484,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
+                _finish_diagnostic(error=exc)
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1390,18 +1496,23 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 if not intercepted_events:  # zero-event attempt: never resend a pathological payload silently
                     api_kwargs = _prune_zero_event_retry_payload(api_kwargs, attempt + 1, max_stream_retries + 1)
                 continue
+            except StreamPayloadBoundExceeded:
+                raise
             except RuntimeError:
                 # "No terminal response"; Relay may still hold a finalizer-assembled response.
                 if event_stream is not None and event_stream.final_response is not None:
+                    _finish_diagnostic(response=event_stream.final_response)
                     return event_stream.final_response
+                _finish_diagnostic(error=RuntimeError("stream did not produce a terminal response"))
                 raise
             except _APIConnectionError as exc:
-                # The SDK wraps every connect/receive failure (``raise APIConnectionError from err``), so the
-                # raw ``transport_errors`` branch above never sees a pre-stream failure. Before the stream
-                # opened nothing is billed, so one fresh physical request is safe (#103673); once the writer
-                # token is claimed the inference may already be billed, so mid-stream failures still raise.
+                _finish_diagnostic(error=exc)
+                # Preserve the pre-stream transport retry policy (#103673), except WriteError:
+                # a partial write may already have reached the provider. Neither opening a stream
+                # nor a diagnostic request hook establishes completed writes or server acceptance.
                 if (attempt < max_stream_retries and writer_token["value"] is None
-                        and isinstance(exc.__cause__, _httpx.TransportError)):
+                        and isinstance(exc.__cause__, _httpx.TransportError)
+                        and not isinstance(exc.__cause__, _httpx.WriteError)):
                     logger.debug(
                         "Codex Responses pre-stream connect failed (attempt %s/%s); retrying. %s error=%s",
                         attempt + 1, max_stream_retries + 1, agent._client_log_context(), exc,
@@ -1409,8 +1520,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     continue
                 _log_failure(exc)
                 raise
+            except BaseException as exc:
+                _finish_diagnostic(error=exc)
+                raise
             if not agent._interrupt_requested:
-                _drain_for_finalizer(event_stream)
+                drain_error = _drain_for_finalizer(event_stream)
+            else:
+                drain_error = None
+            _finish_diagnostic(response=final, error=drain_error)
             if final.status in {"incomplete", "failed"}:
                 logger.warning("Codex Responses stream terminal status=%s "
                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",

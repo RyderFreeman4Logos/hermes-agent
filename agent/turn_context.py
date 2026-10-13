@@ -130,11 +130,16 @@ def compose_user_api_content(
     return None if injection is None else content + "\n\n" + injection
 
 
-def substitute_api_content(api_msg: dict[str, Any]) -> Optional[str]:
+def _supported_api_content(sidecar: Any) -> bool:
+    """A non-empty string or structured sidecar is the exact value sent on the wire."""
+    return isinstance(sidecar, (str, list, dict)) and bool(sidecar)
+
+
+def substitute_api_content(api_msg: dict[str, Any]) -> Any:
     """Pop the ``api_content`` sidecar and substitute it into ``content`` (keeps the
     prompt-cache prefix byte-stable). Returns the popped sidecar, or ``None``."""
     sidecar = api_msg.pop("api_content", None)
-    if isinstance(sidecar, str) and sidecar and api_msg.get("role") in ("user", "assistant"):
+    if _supported_api_content(sidecar) and api_msg.get("role") in ("user", "assistant"):
         api_msg["content"] = sidecar
     return sidecar
 
@@ -145,10 +150,10 @@ def drop_stale_api_content(msg: dict[str, Any]) -> None:
     msg.pop("api_content", None)
 
 
-def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
-    """Extract the ``api_content`` sidecar; ``None`` when absent/non-string."""
+def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Any:
+    """Extract a supported ``api_content`` sidecar; ``None`` when absent."""
     v = msg.get("api_content")
-    return v if isinstance(v, str) else None
+    return v if _supported_api_content(v) else None
 
 
 def _pop_turn_note(agent: Any, attr: str) -> str:
@@ -1045,6 +1050,10 @@ def build_turn_context(
     compression."""
     from agent.turn_context_compaction import run_turn_start_compaction
 
+    # Keep this turn's receipt even if Stop/reset clears the live agent hook
+    # while prompt preparation is blocked. A cancelled input cannot become human input.
+    completion_ingest = getattr(agent, "_completion_queue_ingest", None)
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -1057,6 +1066,20 @@ def build_turn_context(
     recovered_history = recover_rotated_compression_session(agent)
     if recovered_history is not None:
         conversation_history = recovered_history
+
+    # The public facade marks one external loop start. Tool/LLM continuations stay
+    # inside the loop and direct internal projections do not acquire a new start.
+    if getattr(agent, "_loop_timing_external_start", False):
+        from agent.loop_timing import decorate_loop_start_input
+        from agent.message_content import flatten_message_text
+
+        # Auto-titles describe user intent, not the appended clock metadata.
+        if title_user_message is None:
+            title_user_message = flatten_message_text(user_message)
+        user_message, persist_user_message = decorate_loop_start_input(
+            agent, user_message, persist_user_message
+        )
+        agent._loop_timing_external_start = False
 
     # Tag log records on this thread with the session ID for ``hermes logs``; bind the
     # skill write-origin ContextVar; restore the primary runtime after a fallback turn.
@@ -1110,8 +1133,13 @@ def build_turn_context(
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)
-    # Append the user message now that close persistence is safe.
-    append_message(messages, user_msg)
+    # Completion ownership must cover the actual append, not just its later ACK:
+    # Stop/reset may reclaim the receipt while this worker prepares its input.
+    if callable(completion_ingest):
+        if not completion_ingest(lambda: append_message(messages, user_msg)):
+            raise InterruptedError("Completion input was reclaimed before insertion")
+    else:
+        append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
@@ -1269,6 +1297,11 @@ def build_api_messages(
 
     api_messages = []
     for idx, msg in enumerate(canonical_messages):
+        # Hidden system rows are durable internal bookkeeping, not conversation
+        # history. The effective system prompt is supplied separately below; keep
+        # ordinary system rows and hidden user/assistant replay semantics intact.
+        if msg.get("role") == "system" and msg.get("display_kind") == "hidden":
+            continue
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
         # persisted history via nested containers; see _clone_message_for_send.
         api_msg = _clone_message_for_send(msg)
@@ -1284,7 +1317,7 @@ def build_api_messages(
         # Inject ephemeral context (memory prefetch + pre_llm_call user hooks)
         # at API time only; `messages` is untouched beyond the api_content stamp.
         if msg is current_turn_message and msg.get("role") == "user":
-            if isinstance(_api_content, str) and _api_content:
+            if _supported_api_content(_api_content):
                 # Reuse the prologue's stamp so sidecar and wire cannot drift
                 # and every pass this turn sends identical bytes.
                 api_msg["content"] = _api_content
@@ -1296,7 +1329,7 @@ def build_api_messages(
                 if _composed is not None:
                     api_msg["content"] = _composed
         elif (
-            isinstance(_api_content, str) and _api_content
+            _supported_api_content(_api_content)
             and msg.get("role") in ("user", "assistant")
         ):
             # Historical row: replay the exact bytes sent live so the prompt-cache

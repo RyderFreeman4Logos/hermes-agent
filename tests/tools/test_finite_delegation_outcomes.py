@@ -145,7 +145,11 @@ def test_finite_batch_returns_success_and_child_failure(harness, outcome):
     _parent, children, dispatch = harness
     result = dispatch("completed", outcome)
     _joined(result, ["completed", outcome])
-    assert "synthetic" in result["results"][1]["error"]
+    if outcome == "error":
+        assert result["results"][1]["error"] == "Subagent raised RuntimeError"
+        assert "synthetic" not in result["results"][1]["error"]
+    else:
+        assert "synthetic" in result["results"][1]["error"]
     assert result["results"][1]["exit_reason"] == "error"
     assert all(child.closed.is_set() for child in children)
 

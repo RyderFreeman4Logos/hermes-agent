@@ -5,6 +5,7 @@ Mixin bound onto ``SessionDB`` via the MRO, built on its ``_read_ctx`` /
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -249,7 +250,9 @@ class SessionCompressionMixin:
         system_prompt: str | None = None, cwd: str | None = None, profile_name: str | None = None,
         compression_lock_holder: str | None = None, require_compression_lease: bool = True,
         require_lease_refresh: bool = False, lease_ttl_seconds: float = 300.0,
-        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None) -> None:
+        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None,
+        source_ids: Optional[list[int]] = None, source_signature: Optional[str] = None,
+        source_watermark: Optional[int] = None) -> None:
         """Atomically close a parent and publish its durable compression child: closure, child row, and
         handoff commit in one transaction, so readers see the live parent or a complete child, never an
         ended parent with a missing/empty child. *watermark* (the parent's highest row already represented
@@ -264,6 +267,7 @@ class SessionCompressionMixin:
 
         See #75316.
         ``None`` = unbounded (no internal flush happened). See #47202.
+        *source_signature*, when set, must match the active pre-watermark source.
         """
         from hermes_state_errors import CompressionSessionBusyError
         def _do(conn):
@@ -279,6 +283,8 @@ class SessionCompressionMixin:
             ):
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}")
+            self._assert_pre_watermark_source_unchanged(
+                conn, parent_session_id, watermark, source_ids, source_signature, source_watermark)
             parent = conn.execute(
                 """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
@@ -336,6 +342,83 @@ class SessionCompressionMixin:
                 # closure above the child is linked into the lineage walk (#117713).
                 self._unarchive_auto_archived_lineage(conn, child_session_id)
         self._execute_transcript_write(_do, messages)
+
+    def get_active_message_source_snapshot(self, session_id: str) -> tuple[int, str]:
+        """Atomically capture a compression watermark and durable source digest."""
+        if not session_id:
+            return 0, self._message_source_signature(())
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT messages.*, MAX(id) OVER () AS _compression_watermark "
+                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        if not rows:
+            return 0, self._message_source_signature(())
+        return (
+            int(rows[-1]["_compression_watermark"]),
+            self._message_source_signature(rows, skip_column="_compression_watermark"),
+        )
+
+    def _assert_pre_watermark_source_unchanged(
+        self, conn, session_id: str, watermark: Optional[int],
+        source_ids: Optional[list[int]], source_signature: Optional[str],
+        source_watermark: Optional[int] = None,
+    ) -> None:
+        if watermark is None and source_watermark is None:
+            return
+        from hermes_state import SessionCompressionInProgressError
+        guard_watermark = int(source_watermark if source_watermark is not None else watermark)
+        if source_ids is not None:
+            current_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                    "AND id <= ? ORDER BY id",
+                    (session_id, guard_watermark),
+                ).fetchall()
+            ]
+            if current_ids != source_ids:
+                raise SessionCompressionInProgressError(
+                    f"Compression source changed before publication: {session_id}"
+                )
+        if source_signature is not None and (
+            self._pre_watermark_source_signature(conn, session_id, guard_watermark)
+            != source_signature
+        ):
+            raise SessionCompressionInProgressError(
+                f"Compression source changed before publication: {session_id}"
+            )
+
+    @staticmethod
+    def _message_source_signature(rows, skip_column: Optional[str] = None) -> str:
+        """Hash every durable message field with an unambiguous type boundary."""
+        digest = hashlib.sha256()
+        for row in rows:
+            for column in row.keys():
+                if column == skip_column:
+                    continue
+                value = row[column]
+                if isinstance(value, bytes):
+                    encoded = value
+                elif value is None:
+                    encoded = b""
+                else:
+                    encoded = str(value).encode("utf-8", "surrogatepass")
+                digest.update(column.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(type(value).__name__.encode("ascii"))
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        return digest.hexdigest()
+
+    def _pre_watermark_source_signature(self, conn, session_id: str, watermark: int) -> str:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? AND active = 1 "
+            "AND id <= ? ORDER BY id",
+            (session_id, int(watermark)),
+        ).fetchall()
+        return self._message_source_signature(rows)
 
     def _write_sql_logged(self, op: str, session_id: str, sql: str, params) -> None:
         """``_write_sql`` that logs (never raises) on ``sqlite3.Error``."""

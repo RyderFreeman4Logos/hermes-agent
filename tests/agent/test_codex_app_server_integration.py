@@ -26,7 +26,10 @@ def fake_session(monkeypatch):
     """Replace CodexAppServerSession with a stub that returns a fixed
     TurnResult, so we can drive AIAgent without spawning real codex."""
 
+    sent_inputs = []
+
     def fake_run_turn(self, user_input: str, **kwargs):
+        sent_inputs.append(user_input)
         return TurnResult(
             final_text=f"echo: {user_input}",
             projected_messages=[
@@ -48,6 +51,7 @@ def fake_session(monkeypatch):
     monkeypatch.setattr(
         CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
     )
+    return sent_inputs
 
 
 def _make_codex_agent(**kwargs):
@@ -138,7 +142,8 @@ class TestRunConversationCodexPath:
         # No background review fork during tests
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello there")
-        assert result["final_response"] == "echo: hello there"
+        assert fake_session[0].startswith("hello there")
+        assert result["final_response"] == f"echo: {fake_session[0]}"
         assert result["completed"] is True
         assert result["partial"] is False
         assert result["error"] is None
@@ -256,10 +261,11 @@ class TestRunConversationCodexPath:
         # User message + 3 projected (assistant tool_call + tool + assistant text)
         assert len(msgs) >= 4
         assert msgs[0]["role"] == "user"
-        assert msgs[0]["content"] == "hello"
+        assert fake_session[0].startswith("hello")
+        assert msgs[0]["content"] == fake_session[0]
         # Last assistant message has the final text
         final = [m for m in msgs if m.get("role") == "assistant"
-                 and m.get("content") == "echo: hello"]
+                 and m.get("content") == f"echo: {fake_session[0]}"]
         assert final, f"expected final assistant message in {msgs}"
 
     def test_projected_messages_are_synced_to_external_memory(self, fake_session):
@@ -301,7 +307,7 @@ class TestRunConversationCodexPath:
             result = agent.run_conversation("ping unique 12345")
         user_count = sum(
             1 for m in result["messages"]
-            if m.get("role") == "user" and m.get("content") == "ping unique 12345"
+            if m.get("role") == "user" and m.get("content") == fake_session[0]
         )
         assert user_count == 1, f"user message appeared {user_count}× in {result['messages']}"
 

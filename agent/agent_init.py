@@ -1952,7 +1952,7 @@ def _capture_checkpoint_code_snapshot() -> dict[str, Any]:
         def git(*args: str) -> str:
             return subprocess.run(
                 ["git", "-C", str(root), *args], check=True, text=True,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             ).stdout.strip()
         head = git("rev-parse", "HEAD")
         tree = git("rev-parse", "HEAD^{tree}")

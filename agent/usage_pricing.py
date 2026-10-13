@@ -76,6 +76,8 @@ class CanonicalUsage:
     # is unchanged; footer callers must not treat that zero as a measured hit.
     cache_read_known: bool = False
     prompt_total_known: bool = False
+    cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
+
 
     @property
     def prompt_tokens(self) -> int:
@@ -91,12 +93,21 @@ class CanonicalUsage:
         combined figure covers."""
         if not isinstance(other, CanonicalUsage):
             return NotImplemented
-        return CanonicalUsage(**{
+        summed = {
             f.name: getattr(self, f.name) + getattr(other, f.name)
-            for f in fields(CanonicalUsage)
-            if f.name not in ("raw_usage", "cache_read_known", "prompt_total_known")
-        }, cache_read_known=self.cache_read_known and other.cache_read_known,
-            prompt_total_known=self.prompt_total_known and other.prompt_total_known)
+            for f in fields(CanonicalUsage) if f.name not in ("raw_usage", "cache_telemetry", "cache_read_known", "prompt_total_known")
+        }
+        return CanonicalUsage(
+            **summed,
+            cache_read_known=self.cache_read_known and other.cache_read_known,
+            prompt_total_known=self.prompt_total_known and other.prompt_total_known,
+            cache_telemetry=(
+                "reported"
+                if self.cache_telemetry == "reported" or other.cache_telemetry == "reported"
+                else "unavailable"
+            ),
+        )
+
 
 
 @dataclass(frozen=True)
@@ -414,6 +425,57 @@ def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> tuple[int, bool]:
     return first_zero if first_zero is not None else (0, False)
 
 
+def _usage_present(obj: Any, *path: str) -> bool:
+    """True when ``obj.path`` exists and is not None (explicit 0 still counts)."""
+    for hop in path:
+        if obj is None:
+            return False
+        if isinstance(obj, dict):
+            if hop not in obj:
+                return False
+            obj = obj[hop]
+        else:
+            if not hasattr(obj, hop):
+                return False
+            obj = getattr(obj, hop)
+        if obj is None:
+            return False
+    return True
+
+
+def _cache_evidence(obj: Any, *paths: tuple[str, ...]) -> tuple[int, bool]:
+    """Return the established positive alias, or a valid all-zero observation."""
+    saw_valid_zero = False
+    for path in paths:
+        value = obj
+        present = True
+        for hop in path:
+            if isinstance(value, dict):
+                if hop not in value:
+                    present = False
+                    break
+                value = value[hop]
+            elif value is not None and hasattr(value, hop):
+                value = getattr(value, hop)
+            else:
+                present = False
+                break
+        if not present:
+            continue
+        if value is None or isinstance(value, (bool, list, tuple, dict, set)):
+            continue
+        try:
+            number = Decimal(str(value))
+        except Exception:
+            continue
+        if not number.is_finite() or number < 0 or number != number.to_integral_value():
+            continue
+        if number:
+            return int(number), True
+        saw_valid_zero = True
+    return 0, saw_valid_zero
+
+
 # Picker slugs → snapshot provider key ("openai-api" is the slug for direct
 # api.openai.com). Google and Fireworks are matched by name OR host below.
 _SNAPSHOT_PROVIDER_ALIASES = {
@@ -666,6 +728,10 @@ def normalize_usage(
     output_tokens, _ = _first_nonzero(u, *shape[1])
     cache_read_tokens, cache_read_known = _first_nonzero(u, *shape[2])
     cache_write_tokens, cache_write_known = _first_nonzero(u, *shape[3])
+    cache_read_tokens, cache_read_valid = _cache_evidence(u, *shape[2])
+    cache_write_tokens, cache_write_valid = _cache_evidence(u, *shape[3])
+    cache_telemetry = "reported" if cache_read_valid or cache_write_valid else "unavailable"
+
     # Anthropic reports uncached input directly; Codex/Chat totals INCLUDE
     # cached tokens, so the cache buckets are subtracted back out.
     input_tokens = prompt_total if shape is _ANTHROPIC_USAGE_SHAPE else max(
@@ -709,6 +775,8 @@ def normalize_usage(
         raw_usage=dict(u) if isinstance(u, dict) else (u.model_dump() if callable(getattr(u, 'model_dump', None)) else None),
         cache_read_known=cache_read_known,
         prompt_total_known=prompt_total_known,
+        cache_telemetry=cache_telemetry,
+
     )
 
 
@@ -816,3 +884,14 @@ def format_token_count_compact(value: int) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return f"{sign}{text}{suffix}"
+
+
+def format_cache_hit_pct(read_tokens: int, prompt_tokens: int) -> str:
+    """Rounded hit percent. A positive read below 0.5% stays '<1', not '0'."""
+    read = max(0, int(read_tokens or 0))
+    prompt = max(0, int(prompt_tokens or 0))
+    if read <= 0 or prompt <= 0:
+        return "0"
+    if read * 100 < prompt:
+        return "<1"
+    return str(round(100 * read / prompt))

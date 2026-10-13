@@ -188,13 +188,13 @@ const layoutProps: AppLayoutProps = {
 }
 
 /** Mount the real AppLayout with the given overlay + ui state applied first. */
-const mountLayout = (overlay: Partial<OverlayState> = {}, ui: Partial<UiState> = {}) => {
+const mountLayout = (overlay: Partial<OverlayState> = {}, ui: Partial<UiState> = {}, cols = 120) => {
   patchUiState({ sessionTitle: 'test', sid: 'sid-1', status: 'ready', ...ui })
   patchOverlayState(overlay)
 
   return mountTree(
     <GatewayProvider value={gatewayStub}>
-      <AppLayout {...layoutProps} />
+      <AppLayout {...layoutProps} composer={{ ...layoutProps.composer, cols }} />
     </GatewayProvider>,
     { interactive: true }
   )
@@ -248,10 +248,10 @@ describe('status-chrome timers under an occluding overlay', () => {
     expect(oneSecondTimers(intervalSpy)).toBeGreaterThan(0)
   })
 
-  it('freezes the FaceTicker verb on compacting and skips verb rotation (#97239)', () => {
+  it('freezes the FaceTicker verb on compacting and skips verb rotation (#97239)', async () => {
     const { output } = mount({ ...busyProps, compacting: true })
 
-    expect(output()).toContain('compacting')
+    await vi.waitFor(() => expect(output()).toContain('compacting'), { interval: 10, timeout: 5_000 })
     // Glyph still ticks at the kaomoji cadence; the rotating-verb timer does not.
     expect(armedDelays(intervalSpy).filter(delay => delay === 2500)).toHaveLength(1)
     expect(oneSecondTimers(intervalSpy)).toBeGreaterThan(0)
@@ -297,8 +297,14 @@ describe('status-chrome timers under an occluding overlay', () => {
 
     const rule = mount(idleProps)
 
-    expect(rule.output()).toContain('1m 0s')
-    expect(rule.output()).toContain('✓ 5s')
+    await vi.waitFor(
+      () => {
+        const initial = rule.output()
+        expect(initial).toContain('1m 0s')
+        expect(initial).toContain('✓ 5s')
+      },
+      { interval: 10, timeout: 5_000 }
+    )
 
     // Five minutes of wall clock elapse while the overlay covers the rule.
     nowSpy.mockReturnValue(T0 + 300_000)
@@ -410,6 +416,27 @@ describe('status-chrome timers track the current overlay model', () => {
 // above ComposerPane) and FloatingOverlays (absolute, growing upward), then
 // assert on what is actually on screen rather than on the store alone.
 describe('AppLayout status-rule visibility', () => {
+  it('keeps status rows inside the composer content width', async () => {
+    const model = 'abcdefghijklmnopqrstuvwxy'
+
+    const layout = mountLayout(
+      {},
+      {
+        info: { model } as UiState['info'],
+        sessionTitle: '',
+        statusBarSegments: ['indicator', 'model', 'cwd']
+      },
+      44
+    )
+
+    await flush()
+
+    const lines = layout.output().split('\n')
+    expect(lines.findIndex(line => line.includes(model))).not.toBe(
+      lines.findIndex(line => line.includes('~/repo'))
+    )
+  })
+
   it('keeps the status rule on screen AND its clock advancing under a flow-layout approval prompt', async () => {
     const layout = mountLayout({ approval: { command: 'rm -rf /', requestId: 'a-1' } as OverlayState['approval'] })
 

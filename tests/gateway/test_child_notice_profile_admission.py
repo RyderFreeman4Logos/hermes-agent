@@ -192,8 +192,9 @@ async def test_process_watcher_follows_the_owning_profile(
             clock.setattr(asyncio, "sleep", tick)
             await rig.runner._run_process_watcher(leg.watcher)
         own_profile_surfaces = surface_a if leg.name == "a" else not surface_a
-        expected_admissions = int(leg.surfaced and path == "agent")
-        expected_sends = 0
+        expected_admissions = int(leg.surfaced and path == "agent" and owner != "child")
+        # Child terminal receipts stay visible without waking the parent model.
+        expected_sends = int(path == "agent" and owner == "child")
         if leg.surfaced and path == "raw":
             if mode == "all":
                 expected_sends = 1 if owner == "live_handoff" and not own_profile_surfaces else 2
@@ -237,7 +238,8 @@ async def test_registry_drain_follows_the_owning_profile(
     async def consume(leg):
         evt = _consumer_event(rig, leg, owner, "registry")
         evt["type"] = "completion"
-        evt["exit_code"] = 0
+        evt.update(exit_code=0, completion_reason="exited", termination_source="",
+                   started_at=leg.proc.started_at)
         rig.registry.completion_queue.put(evt)
         with _profile_runtime_scope(rig.homes[leg.name]):
             drained = rig.registry.drain_notifications(session_key=leg.entry.session_key)
@@ -284,6 +286,7 @@ async def test_batched_completions_follow_the_owning_profile(
         if owner == "live_handoff":
             _transfer_to_parent(rig, leg)
         leg.proc.output_buffer = "PROCESS_RESULT"
+        leg.proc.mark_exited(0)
         evt = runner._build_process_completion_event(leg.watcher, leg.proc, leg.proc.id)
         companion = {**evt, "session_id": f"companion-{leg.name}-{leg.index}",
                      "owner_task_id": "parent-owner", "output": "COMPANION_RESULT"}

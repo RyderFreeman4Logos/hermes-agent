@@ -6,6 +6,8 @@ server.py the same way (tests monkeypatching ``server.X`` still intercept)."""
 
 import contextlib
 
+from hermes_state_sessions import _parse_model_config as _parse_session_model_config
+
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -242,7 +244,7 @@ def _billing_pending_change(result: dict) -> dict:
 # ── session.create / list / most_recent / facts ──────────────────────
 def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list, *, source, cwd, profile_name,
                     model: str, copy_fields=(), compensate: bool = False, title_source: str = "user",
-                    user_id: str | None = None) -> None:
+                    user_id: str | None = None, memory_provider_mode: str | None = None) -> str | None:
     """Branch child row + parent transcript (bounded-chunk transactions) + title. ``_branched_from`` keeps the
     row visible in list_sessions_rich() (the live parent never matches the legacy end_reason='branched'
     heuristic); NULL ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate``
@@ -259,7 +261,15 @@ def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list
         parent_prompt = (db.get_session(parent_key) or {}).get("system_prompt")
     except Exception:
         logger.debug("branch: parent system prompt read failed for %s", parent_key, exc_info=True)
-    db.create_session(new_key, source=source, model=model, model_config={"_branched_from": parent_key},
+    parent_row = {}
+    with contextlib.suppress(Exception):
+        parent_row = db.get_session(parent_key) or {}
+    parent_config = _parse_session_model_config(parent_row.get("model_config")) if parent_row else {}
+    branch_config = {"_branched_from": parent_key}
+    mode = memory_provider_mode or parent_config.get("memory_provider_mode")
+    if mode in {"authoritative", "hybrid"}:
+        branch_config["memory_provider_mode"] = mode
+    db.create_session(new_key, source=source, model=model, model_config=branch_config,
                       parent_session_id=parent_key, cwd=cwd, profile_name=profile_name, user_id=user_id,
                       system_prompt=parent_prompt or None)
     try:
@@ -286,6 +296,7 @@ def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list
             except Exception:
                 logger.debug("branch seed compensation delete failed for %s", new_key, exc_info=True)
         raise
+    return mode if mode in {"authoritative", "hybrid"} else None
 
 
 def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: list, source: str, profile_home):
@@ -296,10 +307,12 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
         with _session_db(record) as db:
             if db is None:
                 return
-            _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
+            mode = _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
                             source=source, cwd=None if _is_remote_launch_cwd(record) else record["cwd"],
                             profile_name=profile_name_for_home(profile_home) or _current_profile_name(),
                             model=_session_default_route(record)[0], compensate=True, title_source="derived", user_id=_session_auth_user_id(record))
+            if mode is not None:
+                record["resume_runtime_overrides"] = {"memory_provider_mode_override": mode}
             record["pending_title"] = None
             # The first submit's _persist_branch_seed is the fallback for a failed seed, not a second copy.
             record["_branch_seed_persisted"] = True

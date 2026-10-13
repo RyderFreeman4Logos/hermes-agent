@@ -17,6 +17,17 @@ def _visible_branch_history(messages) -> list:
             and _coerce_message_text(message.get("content")).strip()]
 
 
+def _session_frozen_memory_provider_mode(session: dict | None) -> str | None:
+    agent = (session or {}).get("agent")
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        mode = init_config.get("memory_provider_mode")
+        if mode in {"authoritative", "hybrid"}:
+            return mode
+    mode = getattr(agent, "_memory_provider_mode", None)
+    return mode if mode in {"authoritative", "hybrid"} else None
+
+
 def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list, source: str):
     """Build + register the branched agent in the parent's profile; the DEDICATED db handle is ours until
     ``_transfer_db_to_agent`` (released here on failure)."""
@@ -28,7 +39,8 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
             agent = _make_agent_in_context(new_sid, new_key, session_db=branch_db, platform_override=source,
                                            cwd_override=_session_cwd(session),
                                            context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
-                                           auth_user_id=parent_user_id)
+                                           auth_user_id=parent_user_id,
+                                           memory_provider_mode_override=_session_frozen_memory_provider_mode(session))
             _init_session(new_sid, new_key, agent, list(history), cols=session.get("cols", 80),
                           cwd=_session_cwd(session), session_db=branch_db, source=source, profile_home=parent_home,
                           explicit_cwd=bool(session.get("explicit_cwd")))
@@ -108,7 +120,8 @@ def _branch_live(rid, params: dict, session: dict, *, omit_messages: bool = Fals
                             profile_name=profile_name_for_home(home) or _current_profile_name(),
                             model=_session_default_route(session)[0], copy_fields=_BRANCH_COPY_FIELDS,
                             title_source="user" if params.get("name") else "derived",
-                            user_id=_session_auth_user_id(session))
+                            user_id=_session_auth_user_id(session),
+                            memory_provider_mode=_session_frozen_memory_provider_mode(session))
         except Exception as e:
             return _err(rid, 5008, f"branch failed: {e}")
     try:

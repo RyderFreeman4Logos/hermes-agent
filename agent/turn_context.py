@@ -1071,6 +1071,11 @@ def build_turn_context(
     # inside the loop and direct internal projections do not acquire a new start.
     if getattr(agent, "_loop_timing_external_start", False):
         from agent.loop_timing import decorate_loop_start_input
+        from agent.message_content import flatten_message_text
+
+        # Auto-titles describe user intent, not the appended clock metadata.
+        if title_user_message is None:
+            title_user_message = flatten_message_text(user_message)
         user_message, persist_user_message = decorate_loop_start_input(
             agent, user_message, persist_user_message
         )

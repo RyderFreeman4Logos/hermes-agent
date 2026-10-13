@@ -124,10 +124,10 @@ def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, int):
         return max(value, 0)
     if isinstance(value, float):
-        return max(int(value), 0)
+        with suppress(ValueError, OverflowError):
+            return max(int(value), 0)
     if isinstance(value, str):
-        # Only the str->int parse is guarded; a float NaN still raises like it always has.
-        with suppress(ValueError):
+        with suppress(ValueError, OverflowError):
             return max(int(value), 0)
     return 0
 
@@ -159,6 +159,9 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     def billing(**extra):
         return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
     if not isinstance(usage, dict) or not usage:
+        from agent.turn_usage import mark_unaccounted_response
+
+        mark_unaccounted_response(agent)
         if compressor is not None and getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage cannot adjudicate the pending compaction; unlatch preflight deferral.
             compressor.update_from_response({})
@@ -167,16 +170,32 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
         _queue_token_counts(agent, "Codex app-server api-call persistence failed (session=%s): %s",
                             counts=lambda: billing(billing_mode="subscription_included"))
         return {}
-    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-    # ``inputTokens`` is INCLUSIVE of ``cachedInputTokens`` (same contract as the Responses API, see
-    # normalize_usage's codex_responses branch); CanonicalUsage.prompt_tokens re-adds cache_read on top of
-    # input_tokens, so the canonical input bucket must be the UNCACHED remainder or cached tokens count twice.
-    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    from agent.turn_usage import _fold_reply_usage
+    from agent.usage_pricing import _finite_nonnegative_int, CanonicalUsage, estimate_usage_cost
+    # ``inputTokens`` includes cached input. Footer precision requires both raw fields
+    # to be measured integral counts and a cache count no greater than the prompt total.
+    raw_prompt_total = usage.get("inputTokens")
+    raw_cache_read = usage.get("cachedInputTokens")
+    prompt_total_known = _finite_nonnegative_int(raw_prompt_total)
+    cache_read_tokens = _coerce_usage_int(raw_cache_read)
+    cache_read_known = (
+        prompt_total_known and _finite_nonnegative_int(raw_cache_read)
+        and cache_read_tokens <= _coerce_usage_int(raw_prompt_total)
+    )
+    _fold_reply_usage(
+        agent,
+        {"prompt_tokens": _coerce_usage_int(raw_prompt_total), "cache_read_tokens": cache_read_tokens},
+        cache_read_known,
+        prompt_total_known,
+    )
+    # CanonicalUsage.prompt_tokens re-adds cache_read on top of input_tokens, so the canonical input
+    # bucket must be the UNCACHED remainder or cached tokens count twice.
     canonical_usage = CanonicalUsage(
-        input_tokens=max(0, _coerce_usage_int(usage.get("inputTokens")) - cache_read_tokens),
+        input_tokens=max(0, _coerce_usage_int(raw_prompt_total) - cache_read_tokens),
         output_tokens=_coerce_usage_int(usage.get("outputTokens")),
         cache_read_tokens=cache_read_tokens, cache_write_tokens=0,
         reasoning_tokens=_coerce_usage_int(usage.get("reasoningOutputTokens")), raw_usage=usage,
+        cache_read_known=cache_read_known, prompt_total_known=prompt_total_known,
     )
     prompt_tokens = canonical_usage.prompt_tokens
     total_tokens = _coerce_usage_int(usage.get("totalTokens")) or canonical_usage.total_tokens
@@ -753,13 +772,21 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     if getattr(turn, "should_retire", False):
         logger.warning("codex app-server session retired (turn error: %s)", turn.error)
         _close_codex_session(agent)
-    # The binding is published only once the transcript it belongs to is durable, and never for a
-    # retired thread (the next agent would only resume into the same wedge).
-    if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
-        _store_codex_thread_id(agent, turn.thread_id)
+    # The binding is published only once the projected rows and completion metadata are durable,
+    # and never for a retired thread (the next agent would only resume into the same wedge).
+    transcript_persisted = _persist_projected_messages(agent, turn, messages)
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
+    from agent.turn_finalizer import _attach_reply_end_metadata, _persist_reply_end_metadata
+
+    reply_end_attachment = _attach_reply_end_metadata(
+        agent, messages, turn.final_text,
+        completed=not turn.interrupted and turn.error is None,
+    )
+    _persist_reply_end_metadata(agent, reply_end_attachment, logger)
+    if transcript_persisted and not getattr(turn, "should_retire", False):
+        _store_codex_thread_id(agent, turn.thread_id)
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.

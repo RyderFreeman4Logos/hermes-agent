@@ -32710,6 +32710,42 @@
             "default": null,
             "title": "Cache Hit Pct"
           },
+          "reply_cache_read": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Cache Read"
+          },
+          "reply_prompt_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Prompt Tokens"
+          },
+          "reply_elapsed_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Elapsed S"
+          },
           "cache_read": {
             "anyOf": [
               {
@@ -37904,6 +37940,42 @@
             ],
             "default": null,
             "title": "Cache Hit Pct"
+          },
+          "reply_cache_read": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Cache Read"
+          },
+          "reply_prompt_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Prompt Tokens"
+          },
+          "reply_elapsed_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reply Elapsed S"
           },
           "cache_read": {
             "anyOf": [

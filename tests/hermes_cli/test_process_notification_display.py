@@ -115,13 +115,14 @@ def test_process_completion_display_keeps_payload_separate_across_surfaces(monke
     entries, _, _ = _collect_resume_entries(cli.conversation_history, {}, lambda text: text)
     assert entries == [("event", expected)]
 
-    # TUI gateway: the status line and the persisted turn carry the same compact title.
+    # TUI post-turn drain: status and persisted turn carry the same compact title.
+    # Live polling instead buffers completions for the owned idle-boundary flush.
     emitted, submitted = [], []
     monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
     monkeypatch.setattr(server, "_notif_submit", lambda *args, **kw: submitted.append((args, kw)))
     monkeypatch.setattr(server, "_notif_claim_turn", lambda session: True)
     session = {"session_key": "display-session", "history_lock": threading.RLock()}
-    server._notif_handle_ready("ui-session", session, events, set(), registry, format_process_notification, None,
+    server._notif_handle_ready("ui-session", session, events, set(), registry, format_process_notification, [],
                                owned=True)
     assert emitted[0][2] == {"kind": "process", "text": expected}
     (_rid, _sid, _session, text, _what), kwargs = submitted[0]

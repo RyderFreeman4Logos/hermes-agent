@@ -15,7 +15,7 @@ from utils import base_url_host_matches
 logger = logging.getLogger(__name__)
 
 
-def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
+def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str, *, publish_compression: bool = True) -> Optional[tuple[str, str]]:
     """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
     old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
     so the next turn's ``restore_primary_runtime`` reverts it; raises on a failed swap."""
@@ -60,6 +60,13 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
 
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+    from agent.agent_runtime_helpers import _copy_request_overrides
+    if not getattr(agent, "_fallback_activated", False):
+        primary_runtime = getattr(agent, "_primary_runtime", None)
+        if isinstance(primary_runtime, dict):
+            primary_runtime["request_overrides"] = _copy_request_overrides(
+                getattr(agent, "request_overrides", {}) or {}
+            )
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
     agent._config_context_length = None
@@ -87,7 +94,8 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
         provider=provider, base_url=base_url, api_mode=api_mode, model=model)
     agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
-    _update_fallback_context_compressor(agent)
+    if publish_compression:
+        _update_fallback_context_compressor(agent)
     _reresolve_fallback_reasoning_config(agent)
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     return old_model, old_provider

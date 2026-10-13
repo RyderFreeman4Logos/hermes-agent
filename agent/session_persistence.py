@@ -438,7 +438,15 @@ class SessionPersistenceMixin:
         if not (isinstance(msg, dict) and msg.get("role") == "user"):
             return
         if _override_replaces_content(msg, msg.get("content"), override):
-            msg["content"] = _content_with_turn_override(msg, msg.get("content"), override)
+            # Alternation repair can merge this turn after the prologue stamped
+            # its sidecar. Preserve the merged wire bytes before cleaning the
+            # returned live history, just as the durable flush does.
+            content, api_content = durable_user_row_content(
+                self, msg, msg.get("content"), msg.get("api_content")
+            )
+            if api_content is not None and api_content != content:
+                msg["api_content"] = api_content
+            msg["content"] = content
         if timestamp is not None:
             msg["timestamp"] = timestamp
         if platform_id is not None:  # load-bearing for restart drain-window recovery dedup (has_platform_message_id)

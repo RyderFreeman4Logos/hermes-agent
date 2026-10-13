@@ -93,7 +93,9 @@ def test_corrupt_fts_detach_can_nest_under_existing_writer(tmp_path, table):
             ).fetchone()
         assert corrupt.value.sqlite_errorcode == sqlite3.SQLITE_CORRUPT_VTAB
         with db._advisory_write_lock(deadline=time.monotonic()):
-            assert db._enter_fts_fail_open(corrupt.value, deadline=time.monotonic())
+            # Nesting must not re-acquire flock, but actual FTS detachment is
+            # optional recovery work and needs an unexpired SQLite budget.
+            assert db._enter_fts_fail_open(corrupt.value, deadline=time.monotonic() + 5)
             assert _rival_process(path) == 23
         assert _rival_process(path) == 0
         assert db.get_meta("fts_stale") == "1"

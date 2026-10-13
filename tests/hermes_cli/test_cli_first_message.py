@@ -1,4 +1,4 @@
-"""A fresh install's first CLI message reaches the model exactly as typed.
+"""A fresh install's first CLI message reaches the model without onboarding.
 
 The first-contact note (the profile-build offer or the plain intro) is sent by the messaging gateway and
 the TUI/desktop backend. The CLI never sent one. A one-shot ``hermes chat -q`` in a fresh home, which is
@@ -8,6 +8,7 @@ how kanban workers and scripted runs start, must not gain that note or record
 
 from __future__ import annotations
 
+from datetime import datetime
 import os
 import subprocess
 import sys
@@ -42,5 +43,9 @@ def test_first_cli_message_in_a_fresh_home_reaches_the_model_unchanged(tmp_path)
     assert proc.returncode == 0, proc.stderr[-3000:]
     assert requests, f"the model was never called; stderr tail: {proc.stderr[-2000:]}"
     users = [m["content"] for m in requests[0]["messages"] if m.get("role") == "user"]
-    assert users == [PROMPT]
+    assert len(users) == 1
+    original, timing = users[0].split("\n\n[Agent loop timing]\n")
+    assert original == PROMPT
+    assert timing.startswith("Current loop started: ")
+    assert datetime.fromisoformat(timing.removeprefix("Current loop started: ")).tzinfo is not None
     assert not is_seen(load_user_config_effective(home / "config.yaml"), PROFILE_BUILD_FLAG)

@@ -706,6 +706,11 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
     from agent.notification_presentation import event_presentation_muted
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
+        stamp = globals().get("_stamp_loop_cache_info")
+        if callable(stamp):
+            stamp(sid, payload)
     if event_presentation_muted(event, sid):
         return False
     return write_json(_event_frame(event, sid, payload))
@@ -1301,16 +1306,13 @@ def _load_cfg_raw() -> dict:
     """The active profile's config.yaml EXACTLY as written — the write-back primitive, ONLY for
     read→mutate→``_save_cfg`` round-trips and raw inspection (defaults / managed overlay / ``${VAR}``
     expansion applied here would be persisted on the next save). Behavioral reads use :func:`_load_cfg`.
-    Cache keyed on the resolved path so profiles don't clobber."""
+    Always reread the file: raw write-back must preserve external edits even when stat fields match."""
     global _cfg_cache, _cfg_sig, _cfg_path
     from hermes_cli.config import read_user_config_raw
     from hermes_cli.config_read_errors import FailedConfigRead
     try:
         p = _active_config_path()
         sig = file_signature(p.stat()) if p.exists() else None
-        with _cfg_lock:
-            if _cfg_cache is not None and _cfg_sig == sig and _cfg_path == p:
-                return copy.deepcopy(_cfg_cache)
         data = read_user_config_raw(p) if p.exists() else {}
     except Exception as exc:
         return FailedConfigRead(error=exc)  # readable as {}, refused by _save_cfg
@@ -2220,6 +2222,19 @@ def _get_usage(agent) -> dict:
         _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
         if _prompt_total > 0 and _cache_read > 0:
             usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+        _reply_elapsed = getattr(agent, "_reply_elapsed_s", None)
+        if (
+            isinstance(_reply_elapsed, (int, float))
+            and not isinstance(_reply_elapsed, bool)
+            and _reply_elapsed == _reply_elapsed
+            and 0 <= _reply_elapsed < 1e6
+        ):
+            usage["reply_elapsed_s"] = float(_reply_elapsed)
+            from agent.turn_usage import _reply_cache_counts
+            _reply_read, _reply_total = _reply_cache_counts(agent)
+            if _reply_read is not None and _reply_total is not None:
+                usage["reply_cache_read"] = _reply_read
+                usage["reply_prompt_tokens"] = _reply_total
     with contextlib.suppress(Exception):  # a status-bar readout must never break usage reporting
         _lhist = list(getattr(agent, "_api_latency_history", []) or [])
         _ohist = list(getattr(agent, "_api_output_history", []) or [])
@@ -2663,7 +2678,7 @@ def _make_agent(
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
     from run_agent import AIAgent
     # MCP discovery runs in a daemon thread (a dead server can't freeze the shell); the agent snapshots its tool
     # list once, so briefly wait for in-flight discovery. Dashboard /api/ws uses mcp_startup; TUI stdio uses entry.
@@ -2715,7 +2730,7 @@ def _make_agent(
     if fallback_notice:
         # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
         agent._pending_fallback_notice = fallback_notice
-    return agent
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | None) -> None:
@@ -2952,29 +2967,26 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
 
 
 def _load_resume_transcript(db, stored_id: str, *, model_history_only: bool = False) -> tuple[list, list, list]:
-    """(raw_history, display_history, ancestor_prefix) for a cold resume. The full lineage is materialized
-    only while it fits sessions.max_resume_messages (the transcript is REST-paginated), else the tip alone."""
-    from hermes_state import SessionResumeTooLargeError
+    """(raw_history, display_history, ancestor_prefix) for a cold resume.
+
+    Display history uses the same SQL window as a cold resume (``max_display_messages``).
+    Ancestor prefix is the non-tip rows already in that window — no second lineage scan.
+    """
     if model_history_only:
         raw_history = db.get_messages_as_conversation(
             stored_id, repair_alternation=True, include_row_ids=True)
         return raw_history, [], []
-    prefix_fits = True
-    guard = getattr(db, "assert_resume_safe", None)
-    if callable(guard):
-        try:
-            guard(stored_id)
-        except SessionResumeTooLargeError as exc:
-            prefix_fits = False
-            logger.info("resume %s: compression lineage exceeds the resume limit (%s); hydrating the tip segment only",
-                        stored_id, exc)
-        except Exception:
-            logger.debug("resume lineage guard failed; loading full lineage", exc_info=True)
-    if prefix_fits:
+    from hermes_state import resolved_max_resume_messages
+    limit = resolved_max_resume_messages() or None
+    try:
+        raw_history, display_history = db.get_resume_conversations(stored_id, max_display_messages=limit)
+    except TypeError as exc:
+        if "max_display_messages" not in str(exc):
+            raise
         raw_history, display_history = db.get_resume_conversations(stored_id)
-        return raw_history, display_history, db.get_ancestor_display_prefix(stored_id)
-    raw_history = db.get_messages_as_conversation(stored_id, repair_alternation=True, include_row_ids=True)
-    return raw_history, raw_history, []
+    tip_ids = {m.get("_row_id") for m in raw_history if isinstance(m, dict) and m.get("_row_id") is not None}
+    prefix = [m for m in display_history if m.get("_row_id") not in tip_ids]
+    return raw_history, display_history, prefix
 
 
 def _schedule_resume_hydration(sid: str, stored_id: str, db, *, close_db: bool = False,
@@ -3146,8 +3158,11 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
         try:
             # include_compacted: a compacted session's archived turns are still the user's
             # conversation; without them a warm switch repainted the chat as summary + tail only.
-            display = db.get_messages_as_conversation(
-                key, include_ancestors=True, include_row_ids=True, include_compacted=True)
+            if limit := session.get("display_history_limit"):
+                _model, display = db.get_resume_conversations(key, max_display_messages=limit)
+            else:
+                display = db.get_messages_as_conversation(
+                    key, include_ancestors=True, include_row_ids=True, include_compacted=True)
             # See #92080.
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
@@ -3669,7 +3684,7 @@ from . import (
     methods_complete as _methods_complete, methods_config as _methods_config,
     methods_config_set as _methods_config_set, methods_images as _methods_images,
     methods_profiles as _methods_profiles, methods_prompt as _methods_prompt, methods_session as _methods_session,
-    methods_tools as _methods_tools, prompt_turn as _prompt_turn, billing_view as _billing_view,
+    methods_tools as _methods_tools, prompt_turn as _prompt_turn, cache_telemetry as _cache_telemetry, billing_view as _billing_view,
     methods_projects as _methods_projects, methods_session_foreign as _methods_session_foreign,
     methods_session_control as _methods_session_control, methods_subagents as _methods_subagents,
     methods_vault as _methods_vault, methods_free_tier as _methods_free_tier,
@@ -3685,7 +3700,7 @@ for _m in (
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,
     _methods_browser_control, _methods_session, _methods_prompt, _methods_config,
     _methods_config_set, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
-    _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
+    _methods_bot_relay, _prompt_turn, _cache_telemetry, _billing_view, _methods_projects, _methods_session_foreign,
     _methods_session_control, _methods_subagents, _methods_vault, _methods_free_tier, _methods_connectors,
     _methods_connectors_account, _methods_display, _methods_display_watch, _methods_onboarding,
     _methods_i18n, _methods_shared_metrics, _methods_start_chat):

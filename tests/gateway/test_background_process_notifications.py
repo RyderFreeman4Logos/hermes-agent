@@ -18,6 +18,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
 from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
+from tools.process_registry import ProcessRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +36,8 @@ class AdmittingHandler(AsyncMock):
 
 class _FakeRegistry:
     """Return pre-canned sessions, then None once exhausted."""
+
+    _child_owned_terminal_completion = staticmethod(ProcessRegistry._child_owned_terminal_completion)
 
     def __init__(self, sessions, consumed=False):
         self._sessions = list(sessions)

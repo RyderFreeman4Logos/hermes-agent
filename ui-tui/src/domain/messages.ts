@@ -17,6 +17,37 @@ export const userDisplay = (text: string) => {
   return t('libText.messages.longMessage', prefix || t('libText.messages.messageFallback'))
 }
 
+export const replyEndLine = (value: unknown): string | undefined => {
+  if (!value || typeof value !== 'object') {
+    return undefined
+  }
+
+  const fields = value as Record<string, unknown>
+  const elapsed = fields.elapsed_s ?? fields.reply_elapsed_s
+  const cacheRead = fields.cache_read ?? fields.reply_cache_read
+  const promptTotal = fields.prompt_total ?? fields.reply_prompt_tokens
+  const parts: string[] = []
+
+  if (typeof elapsed === 'number' && Number.isFinite(elapsed) && elapsed >= 0) {
+    parts.push(`${elapsed.toFixed(1)}s`)
+  }
+
+  if (
+    typeof cacheRead === 'number' &&
+    Number.isSafeInteger(cacheRead) &&
+    cacheRead >= 0 &&
+    typeof promptTotal === 'number' &&
+    Number.isSafeInteger(promptTotal) &&
+    promptTotal >= 0 &&
+    cacheRead <= promptTotal
+  ) {
+    const rate = promptTotal > 0 ? ` (${((100 * cacheRead) / promptTotal).toFixed(1)}%)` : ''
+    parts.push(`cache ${cacheRead}/${promptTotal}${rate}`)
+  }
+
+  return parts.length ? parts.join(' · ') : undefined
+}
+
 export const toTranscriptMessages = (rows: unknown): Msg[] => {
   if (!Array.isArray(rows)) {
     return []
@@ -99,7 +130,14 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
     }
 
     if (role === 'assistant') {
-      out.push({ role, text, ...(createdAt !== undefined && { createdAt }), ...(pending.length && { tools: pending }) })
+      const replyEnd = replyEndLine((row as TranscriptRow).display_metadata?.reply_end)
+      out.push({
+        role,
+        text,
+        ...(createdAt !== undefined && { createdAt }),
+        ...(replyEnd && { replyEnd }),
+        ...(pending.length && { tools: pending })
+      })
       pending = []
     } else if (role === 'user' || role === 'system') {
       out.push({ role, text, ...(createdAt !== undefined && { createdAt }) })

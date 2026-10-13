@@ -676,6 +676,25 @@ class TestSteerSurvivesRedirectRebuild:
         assert result["completed"] is True
 
 
+def test_redirected_user_steer_does_not_admit_old_turn_completion():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from agent.turn_iteration_prep import _inject_steer_after_newest_tool_result
+
+    ingest = Mock()
+    agent = SimpleNamespace(_completion_steer_ingest=ingest)
+    messages = [
+        {"role": "user", "content": "original request"},
+        {"role": "tool", "content": "read result", "tool_call_id": "call-1"},
+        {"role": "user", "content": "redirect"},
+    ]
+    _inject_steer_after_newest_tool_result(agent, messages, "accepted steer", current_turn_user_idx=2)
+    assert "accepted steer" in messages[2]["content"]
+    assert messages[3]["content"] == "redirect"
+    ingest.assert_not_called()
+
+
 class TestPreApiCallSteerDrain:
     """Test that steers arriving during an API call are drained before the
     next API call — not deferred until the next tool batch.  This is the

@@ -56,6 +56,91 @@ const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
+type CacheInfo = {
+  compression_bound?: boolean | null
+  pct?: number | null
+  prompt_tokens?: number | null
+  read_tokens?: number | null
+  state?: string | null
+}
+
+const compressionReason = (cacheInfo: Pick<CacheInfo, 'compression_bound' | 'pct' | 'state'>): string => {
+  if (!cacheInfo.compression_bound) {
+    return ''
+  }
+
+  return cacheInfo.state === 'miss' ||
+    (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50)
+    ? ' because of compression'
+    : ''
+}
+
+const cacheFootnote = (cacheInfo?: CacheInfo | null): null | string => {
+  if (!cacheInfo) {
+    return null
+  }
+
+  if (cacheInfo.state === 'hit') {
+    const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
+    const pair = hasCounts ? ` ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : ''
+
+    return hasCounts && cacheInfo.read_tokens! * 100 < cacheInfo.prompt_tokens!
+      ? `cache <1%${pair}${compressionReason(cacheInfo)}`
+      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}${compressionReason(cacheInfo)}`
+  }
+
+  if (cacheInfo.state === 'miss') {
+    const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
+
+    return hasCounts
+      ? `cache miss ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}${compressionReason(cacheInfo)}`
+      : `cache miss${compressionReason(cacheInfo)}`
+  }
+
+  return cacheInfo.state === 'cold_write' ? 'cache COLD_WRITE' : `cache ${cacheInfo.state}`
+}
+
+const isLowCacheHit = (cacheInfo?: Pick<CacheInfo, 'pct' | 'state'> | null): boolean => {
+  if (!cacheInfo) {
+    return false
+  }
+
+  return (
+    cacheInfo.state === 'miss' || (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50)
+  )
+}
+
+const completionFootnote = (completedAt?: number | null): null | string => {
+  if (!Number.isFinite(completedAt)) {
+    return null
+  }
+
+  const time = new Date(completedAt! * 1_000).toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    hour12: false,
+    minute: '2-digit',
+    second: '2-digit'
+  })
+
+  return `agent loop stop at ${time}`
+}
+
+const turnCompletionLine = (payload: { cache_info?: CacheInfo | null; completed_at?: number | null }): Msg | null => {
+  const completion = completionFootnote(payload.completed_at)
+  const cache = cacheFootnote(payload.cache_info)
+
+  if (!completion && !cache) {
+    return null
+  }
+
+  return {
+    kind: 'event',
+    role: 'system',
+    text: [completion, cache].filter(Boolean).join('  '),
+    ...(isLowCacheHit(payload.cache_info) ? { eventTone: 'warn' as const } : {})
+  }
+}
+
 // Extracts the raw patch from a diff-only segment produced by
 // pushInlineDiffSegment. Used at message.complete to dedupe against final
 // assistant text that narrates the same patch. Returns null for anything
@@ -122,6 +207,18 @@ const finalTail = (finalText: string, segments: Msg[]) => {
 
   return tail
 }
+
+// Byte-identical sealed commentary collapses. Anything else keeps prefix dedupe.
+const commentaryFinalText = (
+  projection: string,
+  splitText: string,
+  segments: Msg[],
+  interimBoundary: number,
+  previewed: boolean
+) =>
+  textSegments(segments.slice(0, interimBoundary)).includes(projection)
+    ? ''
+    : finalTail(splitText, previewed ? segments : segments.slice(interimBoundary))
 
 const interruptedText = (partial: string) => (partial ? `${partial}\n\n*[interrupted]*` : '*[interrupted]*')
 
@@ -638,7 +735,8 @@ class TurnController {
     // `text` is `str | JsonValue` on the wire (structured parts stay possible); only a string renders here.
     const wireText = typeof payload.text === 'string' ? payload.text : undefined
     const completionText = wireText ?? payload.rendered
-    const rawText = (completionText ?? this.bufRef).trimStart()
+    const finalTextProjection = completionText ?? this.bufRef
+    const rawText = finalTextProjection.trimStart()
 
     // Text still in `this.bufRef` streamed after the last segment flush; `idle()`
     // below would wipe it (#61520). Flush it as a segment only when the
@@ -652,15 +750,18 @@ class TurnController {
     }
 
     const split = splitReasoning(rawText)
-    // Only dedupe segments AFTER the interim boundary — interim-sealed
-    // segments are preserved even if the final text includes them.
-    // Exception: when response_previewed is true, the final text is the
-    // same model response that was published provisionally as an interim
-    // message. Dedupe against ALL segments (including sealed interims) so
-    // the identical text doesn't render as a duplicate message. (#65919
-    // review: duplicate-message blocker)
-    const dedupeStart = payload.response_previewed ? 0 : (this.interimBoundaryIndex ?? 0)
-    const finalText = finalTail(split.text, this.segmentMessages.slice(dedupeStart))
+    // Sealed commentary collapses only when byte-identical to the final.
+    // Prefix, whitespace, and later turns stay. response_previewed still
+    // prefix-dedupes the whole turn (#65919).
+
+    const finalText = commentaryFinalText(
+      finalTextProjection,
+      split.text,
+      this.segmentMessages,
+      this.interimBoundaryIndex ?? 0,
+      Boolean(payload.response_previewed)
+    )
+
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
     const savedToolTokens = this.toolTokenAcc
@@ -714,6 +815,17 @@ class TurnController {
 
     if (finalText) {
       finalMessages.push({ role: 'assistant', text: finalText })
+    }
+
+    const footnote = turnCompletionLine({
+      cache_info: payload.cache_info,
+      completed_at: payload.completed_at
+    })
+
+    const hasTime = Number.isFinite(payload.completed_at)
+
+    if (footnote && (hasTime || finalMessages.some(message => message.role === 'assistant'))) {
+      finalMessages.push(footnote)
     }
 
     const wasInterrupted = this.interrupted

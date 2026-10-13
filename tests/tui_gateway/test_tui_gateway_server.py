@@ -705,7 +705,8 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
                 sid = frame["sid"]
                 server._emit("message.start", sid)
                 server._emit("message.delta", sid, {"text": "hi"})
-                server._emit("message.complete", sid, {"text": "hi", "usage": usage, "status": "complete"})
+                server._emit("message.complete", sid, {"text": "hi", "usage": usage, "status": "complete",
+                                                       "cache_info": {"state": "unavailable", "pct": 0}})
                 server._emit("session.info", sid, dict(fixed_info))
                 if on_complete is not None:
                     on_complete(
@@ -1250,6 +1251,27 @@ def test_get_usage_projects_live_compression_count(count):
     )
 
     assert server._get_usage(agent)["compressions"] == count
+
+
+def test_get_usage_projects_reply_footer_only_with_complete_cache_usage(monkeypatch):
+    monkeypatch.delenv("HERMES_DEV_CREDITS", raising=False)
+    agent = types.SimpleNamespace(
+        model="test-model",
+        _reply_elapsed_s=2.5,
+        _reply_usage={"cache_read_tokens": 0, "prompt_tokens": 100},
+        _reply_usage_complete=True,
+    )
+
+    usage = server._get_usage(agent)
+    assert usage["reply_elapsed_s"] == 2.5
+    assert usage["reply_cache_read"] == 0
+    assert usage["reply_prompt_tokens"] == 100
+
+    agent._reply_usage_complete = False
+    usage = server._get_usage(agent)
+    assert usage["reply_elapsed_s"] == 2.5
+    assert "reply_cache_read" not in usage
+    assert "reply_prompt_tokens" not in usage
 
 
 def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
@@ -3631,8 +3653,8 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
     build_started = threading.Event()
     history_calls = []
     auto_continue_calls = []
-    ancestor = {"role": "assistant", "content": "ancestor"}
-    loaded = {"role": "user", "content": "loaded"}
+    ancestor = {"role": "assistant", "content": "ancestor", "_row_id": 1}
+    loaded = {"role": "user", "content": "loaded", "_row_id": 2}
 
     class FakeDB:
         def get_session(self, target):
@@ -3699,7 +3721,6 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         assert build_started.wait(timeout=1.0)
         assert history_calls == [
             ("resume", "large-session"),
-            ("prefix", "large-session"),
         ]
         assert server._sessions[sid]["history"] == [loaded]
         assert server._sessions[sid]["display_history_prefix"] == [ancestor]
@@ -19256,14 +19277,13 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
     try:
         server._notification_poller_loop(stop, "sid_busy", sess)
 
-        # Status update was emitted (user sees it)
+        # Shutdown requeues the unsteered completion for the next poller; it
+        # must not be emitted as a one-off turn while this session is busy.
         status_calls = [a for a in emitted if a[0] == "status.update"]
-        assert len(status_calls) == 1
-
-        # Event was requeued (agent was busy, no turn triggered)
-        assert not isolated_queue.empty()
-        requeued = isolated_queue.get_nowait()
-        assert requeued["session_id"] == "proc_busy_test"
+        assert status_calls == []
+        assert sess.get("_completion_pending") == []
+        assert isolated_queue.get_nowait() == evt
+        assert isolated_queue.empty()
     finally:
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():

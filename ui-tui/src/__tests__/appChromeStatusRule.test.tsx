@@ -1,6 +1,11 @@
+import { PassThrough } from 'stream'
+
+import { renderSync, stringWidth } from '@hermes/ink'
+import { stripAnsi } from '@hermes/shared/ansi'
 import React from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
+import { getDelegationState, patchDelegationState } from '../app/delegationStore.js'
 import { StatusRule } from '../components/appChrome.js'
 import { DEFAULT_THEME } from '../theme.js'
 
@@ -102,6 +107,31 @@ const baseProps = {
   turnStartedAt: null,
   usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 },
   voiceLabel: ''
+}
+
+const renderStatus = (props: Parameters<typeof StatusRule>[0]): string => {
+  const stdout = Object.assign(new PassThrough(), { columns: props.cols, isTTY: false, rows: 24 })
+  const stdin = Object.assign(new PassThrough(), { isTTY: false })
+  const stderr = new PassThrough()
+  let output = ''
+
+  stdout.on('data', chunk => {
+    output += chunk.toString()
+  })
+
+  const instance = renderSync(React.createElement(StatusRule, props), {
+    patchConsole: false,
+    stderr: stderr as NodeJS.WriteStream,
+    stdin: stdin as NodeJS.ReadStream,
+    stdout: stdout as NodeJS.WriteStream
+  })
+
+  const frame = output
+
+  instance.unmount()
+  instance.cleanup()
+
+  return stripAnsi(frame).replace(/\r/g, '').trim()
 }
 
 describe('StatusRule model label', () => {
@@ -208,10 +238,7 @@ describe('StatusRule background-subagent indicator', () => {
     expect(textContent(element)).not.toContain('resumes when')
   })
 
-  it('drops the subagent segment before the bg segment on a narrow terminal', () => {
-    // cols=44 is below the subagents breakpoint (92) but the bg breakpoint
-    // (88) too — both gone. Assert the lower-priority subagent indicator is
-    // not shown when space is tight even with a live count.
+  it('retains the subagent segment on a narrow terminal', () => {
     const element = StatusRule({
       ...baseProps,
       cols: 44,
@@ -219,7 +246,7 @@ describe('StatusRule background-subagent indicator', () => {
       usage: { ...baseProps.usage, active_subagents: 2 }
     })
 
-    expect(textContent(element)).not.toContain('⛓')
+    expect(textContent(element)).toContain('⛓ 2')
   })
 })
 
@@ -251,7 +278,7 @@ describe('StatusRule session count click target', () => {
     expect(openSwitcher).toHaveBeenCalledOnce()
   })
 
-  it('keeps status + model and drops the low-value tail on a narrow terminal', () => {
+  it('keeps status, model, and the present tail when a narrow terminal reflows', () => {
     const element = StatusRule({
       bgCount: 0,
       busy: false,
@@ -282,8 +309,8 @@ describe('StatusRule session count click target', () => {
     // Must-keep essentials survive intact …
     expect(rendered).toContain('ready')
     expect(rendered).toContain('opus 4.8')
-    // … while the low-value tail (session count) is dropped, not truncated.
-    expect(rendered).not.toContain('3 sessions')
+    // The complete tail moves to another row instead of disappearing.
+    expect(rendered).toContain('3 sessions')
   })
 })
 
@@ -445,6 +472,16 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     expect(rendered).toContain('↑ 50 t/s')
   })
 
+  it('renders a positive cache-hit ratio rounded to zero as <1%', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 160,
+      usage: { ...perfUsage, cache_hit_pct: 0 }
+    })
+
+    expect(textContent(element)).toContain('◎ <1%')
+  })
+
   it('self-hides when the server omits the keys', () => {
     const element = StatusRule({ ...baseProps, cols: 160 })
     const rendered = textContent(element)
@@ -478,5 +515,102 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     })
 
     expect(textContent(element)).not.toContain('weekly-digest')
+  })
+
+  it('uses the legacy segment list as an ordered visibility contract', () => {
+    const rendered = textContent(
+      StatusRule({
+        ...baseProps,
+        cols: 160,
+        statusBarSegments: ['cwd', 'model']
+      })
+    )
+
+    expect(rendered).toContain('~/repo')
+    expect(rendered).toContain('opus 4.8')
+    expect(rendered.indexOf('~/repo')).toBeLessThan(rendered.indexOf('opus 4.8'))
+    expect(rendered).not.toContain('ready')
+    expect(rendered).not.toContain('50k')
+  })
+})
+
+describe('StatusRule wrapped rows', () => {
+  it.each([80, 120])('keeps present tail fields when %i columns require more rows', cols => {
+    const rendered = renderStatus({
+      ...baseProps,
+      cols,
+      bgCount: 2,
+      liveSessionCount: 3,
+      voiceLabel: 'voice off',
+      usage: { ...baseProps.usage, compressions: 3, active_subagents: 2 }
+    })
+
+    for (const field of ['cmp 3', 'voice off', '3 sessions', '2 bg', '⛓ 2']) {
+      expect(rendered).toContain(field)
+    }
+
+    expect(rendered.split('\n').every(line => stringWidth(line) <= cols)).toBe(true)
+  })
+
+  it('wraps the narrow status line without dropping filtered pinned fields', () => {
+    const lines = renderStatus({
+      ...baseProps,
+      cols: 44,
+      sessionTitle: 'weekly-digest',
+      statusBarFields: new Set(['indicator', 'model', 'context_detail', 'context_pct', 'title'])
+    })
+      .split('\n')
+      .filter(Boolean)
+
+    const rendered = lines.join(' ')
+
+    expect(lines.length).toBeGreaterThan(1)
+    expect(lines.every(line => stringWidth(line) <= 44)).toBe(true)
+    expect(rendered).toContain('ready')
+    expect(rendered).toContain('opus 4.8')
+    expect(rendered).toContain('50k tok')
+    expect(rendered).toContain('weekly-digest')
+    expect(rendered.indexOf('ready')).toBeLessThan(rendered.indexOf('opus 4.8'))
+    expect(rendered.indexOf('opus 4.8')).toBeLessThan(rendered.indexOf('50k tok'))
+    expect(rendered.indexOf('50k tok')).toBeLessThan(rendered.indexOf('weekly-digest'))
+  })
+
+  it('retains wide sibling fields, their order, and cache/voice colors', () => {
+    const props = {
+      ...baseProps,
+      cols: 160,
+      sessionTitle: 'weekly-digest',
+      statusBarFields: new Set(['model', 'context_detail', 'context_pct', 'cache_hit', 'voice', 'title']),
+      usage: { ...baseProps.usage, avg_latency_s: 3.2, avg_tps: 50.4, cache_hit_pct: 87 },
+      voiceLabel: '◉ voice'
+    }
+
+    const lines = renderStatus(props).split('\n').filter(Boolean)
+    const rendered = lines.join(' ')
+    const tree = StatusRule(props)
+    const cache = findElementWithText(tree, '◎ 87%')
+    const voice = findElementWithText(tree, '◉ voice')
+
+    expect(lines.every(line => stringWidth(line) <= 160)).toBe(true)
+    expect(rendered).toContain('◎ 87%')
+    expect(rendered).toContain('◉ voice')
+    expect(rendered).toContain('weekly-digest')
+    expect(rendered).not.toContain('◷ 3.2s')
+    expect(rendered).not.toContain('50 t/s')
+    expect(rendered.indexOf('◎ 87%')).toBeLessThan(rendered.indexOf('◉ voice'))
+    expect(rendered.indexOf('◉ voice')).toBeLessThan(rendered.indexOf('weekly-digest'))
+    expect(cache?.props.color).toBe(DEFAULT_THEME.color.statusGood)
+    expect(voice?.props.color).toBe(DEFAULT_THEME.color.warn)
+  })
+
+  it('keeps the live SpawnHud tail visible after wrapped fields', () => {
+    const previous = getDelegationState()
+    patchDelegationState({ paused: true })
+
+    try {
+      expect(renderStatus({ ...baseProps, cols: 160 })).toContain('paused')
+    } finally {
+      patchDelegationState(previous)
+    }
   })
 })

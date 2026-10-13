@@ -852,6 +852,75 @@ def test_consume_codex_stream_collects_refusal_deltas_as_text(monkeypatch):
     assert response.output_text == "I can't help with that."
     # Synthesized message item so downstream normalization has content.
     assert response.output and response.output[0].type == "message"
+    part = response.output[0].content[0]
+    assert part.type == "refusal" and part.refusal == response.output_text
+
+
+def test_consume_codex_stream_keeps_refusal_provenance():
+    """Explicit refusal provenance survives with or without a done item.
+
+    Ordinary text and mixed output/refusal stay ordinary message text. A
+    nonstandard terminal status is preserved. Duplicate delta and terminal
+    text is not concatenated.
+    """
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    def consume(events):
+        return _consume_codex_event_stream(_FakeCreateStream(events), model="gpt-5-codex")
+
+    def terminal(output, status="completed"):
+        return SimpleNamespace(
+            type="response." + status,
+            response=SimpleNamespace(status=status, output=output),
+        )
+
+    sole = [SimpleNamespace(type="refusal", refusal="I can't help with that.")]
+    done = SimpleNamespace(
+        type="response.output_item.done",
+        item=SimpleNamespace(type="message", role="assistant", status="completed", content=sole),
+    )
+    with_done = consume([
+        SimpleNamespace(type="response.refusal.delta", delta="I can't help with that."),
+        done,
+        terminal(sole),
+    ])
+    omitted = consume([
+        SimpleNamespace(type="response.refusal.delta", delta="I can't"),
+        SimpleNamespace(type="response.refusal.delta", delta=" help with that."),
+        terminal(sole),
+    ])
+    for response in (with_done, omitted):
+        part = response.output[0].content[0]
+        assert part.type == "refusal" and part.refusal == "I can't help with that."
+        assert response.output_text == part.refusal
+
+    ordinary = consume([
+        SimpleNamespace(type="response.output_text.delta", delta="hello"),
+        terminal([SimpleNamespace(type="output_text", text="hello")]),
+    ])
+    assert ordinary.output[0].content[0].type == "output_text"
+
+    mixed_done = SimpleNamespace(
+        type="response.output_item.done",
+        item=SimpleNamespace(type="message", content=[
+            SimpleNamespace(type="output_text", text="Hello. "),
+            SimpleNamespace(type="refusal", refusal="But no more."),
+        ]),
+    )
+    mixed = consume([
+        SimpleNamespace(type="response.output_text.delta", delta="Hello. "),
+        SimpleNamespace(type="response.refusal.delta", delta="But no more."),
+        mixed_done,
+        terminal([]),
+    ])
+    assert [part.type for part in mixed.output[0].content] == ["output_text", "refusal"]
+
+    failed = consume([
+        SimpleNamespace(type="response.refusal.delta", delta="blocked"),
+        terminal(sole, status="failed"),
+    ])
+    assert failed.status == "failed"
+    assert failed.output[0].content[0].type == "refusal"
 
 
 def test_extract_responses_message_text_reads_refusal_parts():

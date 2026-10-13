@@ -476,8 +476,11 @@ def _run_post_turn_followups(
     # drains the rest from its own followups. A turn that already finished
     # (a refused @file turn) leaves the queue here.
     started = _drain_queued_prompt(rid, sid, session)
-    if started and session.get("running"):
-        return
+    if started:
+        # The queued turn owns its followups even if it finishes synchronously.
+        goal_followup = None
+        if session.get("running"):
+            return
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:

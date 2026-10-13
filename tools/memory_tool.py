@@ -5,6 +5,7 @@ mid-session writes hit disk but never change the prompt (prefix cache intact).
 Single `memory` tool: add/replace/remove or a batch `operations` list."""
 
 import copy
+import contextlib
 import json
 import logging
 from contextvars import ContextVar
@@ -32,7 +33,15 @@ logger = logging.getLogger(__name__)
 # One tool-definition pass must use ONE config decision for availability and the
 # dynamic target schema: the check_fn result flows to the immediately following
 # dynamic_schema_overrides call; ContextVar isolates concurrent profile builds.
-_memory_surface_flags: ContextVar[Optional[tuple[bool, bool]]] = ContextVar("memory_surface_flags", default=None)
+_memory_surface_snapshot: ContextVar[Optional[tuple[str, bool, bool]]] = ContextVar(
+    "memory_surface_snapshot", default=None
+)
+_memory_surface_bound: ContextVar[bool] = ContextVar("memory_surface_bound", default=False)
+
+
+def memory_surface_cache_key() -> Optional[tuple[str, bool, bool]]:
+    """Session-local memory surface identity for the outer tool-definition memo."""
+    return _memory_surface_snapshot.get() if _memory_surface_bound.get() else None
 
 
 def get_memory_dir() -> Path:
@@ -81,7 +90,7 @@ def _pin_matched_entries(store: MemoryStore, payload: dict[str, Any]) -> Optiona
     return None if result.get("success") else json.dumps(result, ensure_ascii=False)
 
 
-def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[str, Any]) -> Optional[str]:
+def _gate_or_stage(store: Optional["MemoryStore"], summary: str, detail: str, payload: dict[str, Any]) -> Optional[str]:
     """JSON tool-result string when the write must NOT proceed (blocked or staged
     for approval), None to proceed. Fails open if the gate module can't load."""
     try:
@@ -94,8 +103,11 @@ def _gate_or_stage(store: MemoryStore, summary: str, detail: str, payload: dict[
     if decision.blocked:
         FAILURE_CLASS.set("gate_refused")
         return tool_error(decision.message, success=False)
-    if (unmatched := _pin_matched_entries(store, payload)) is not None:
-        return unmatched
+    if payload.get("memory_provider_mode") != "authoritative":
+        if store is None:
+            return tool_error("Memory store unavailable for approval review.", success=False)
+        if (unmatched := _pin_matched_entries(store, payload)) is not None:
+            return unmatched
     FAILURE_CLASS.set("staged")
     record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message},
@@ -123,16 +135,21 @@ def _batch_op_line(op: dict[str, Any]) -> str:
             else f"- {act}: {content}")
 
 
-def _apply_write_gate(store: MemoryStore, action: str, target: str, content: Optional[str],
-                      old_text: Optional[str], operations: Optional[list[dict[str, Any]]] = None) -> Optional[str]:
+def _apply_write_gate(store: "MemoryStore", action: str, target: str, content: Optional[str],
+                      old_text: Optional[str], operations: Optional[list[dict[str, Any]]] = None,
+                      payload_extra: Optional[dict[str, Any]] = None) -> Optional[str]:
     """Gate one mutating op, or (``operations`` set) a whole batch as a single unit."""
     label = "user profile" if target == "user" else "memory"
+    payload = ({"action": "batch", "target": target, "operations": operations}
+               if operations is not None else
+               {"action": action, "target": target, "content": content, "old_text": old_text})
+    payload.update(payload_extra or {})
     if operations is not None:
         return _gate_or_stage(store, f"apply {len(operations)} op(s) to {label}",
                               "\n".join(_batch_op_line(op) for op in operations),
-                              {"action": "batch", "target": target, "operations": operations})
+                              payload)
     return _gate_or_stage(store, *_STORE_ACTIONS[action][1](label, content, old_text),
-                          {"action": action, "target": target, "content": content, "old_text": old_text})
+                          payload)
 
 
 def _validate_single_op(store, action, target, content, old_text) -> Optional[str]:
@@ -169,7 +186,7 @@ def destructive_ops(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _background_delete_gate(store, action, operations, target="memory", content=None,
-                            old_text=None) -> Optional[str]:
+                            old_text=None, payload_extra=None) -> Optional[str]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
     stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
     single or inside a batch — are never applied unattended. The op is staged in the pending
@@ -185,11 +202,15 @@ def _background_delete_gate(store, action, operations, target="memory", content=
                {"action": action, "target": target, "content": content, "old_text": old_text})
     if not destructive_ops(payload):
         return None
+    payload.update(payload_extra or {})
     detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
               else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
     try:
-        if (unmatched := _pin_matched_entries(store, payload)) is not None:
-            return unmatched
+        if payload.get("memory_provider_mode") != "authoritative":
+            if store is None:
+                return tool_error("Memory store unavailable for approval review.", success=False)
+            if (unmatched := _pin_matched_entries(store, payload)) is not None:
+                return unmatched
         from tools import write_approval as wa
         FAILURE_CLASS.set("staged")
         record = wa.stage_write(
@@ -209,6 +230,24 @@ def _background_delete_gate(store, action, operations, target="memory", content=
         return tool_error(
             "Background review may not delete memory entries ('replace'/'remove', including in a "
             "batch); 'add' is still available.", success=False)
+
+
+def authorize_memory_write(request: dict[str, Any], *, provider_mode: str = "hybrid",
+                           store: Optional["MemoryStore"] = None) -> Optional[str]:
+    """Apply shared background and approval policy to a validated core write."""
+    request = dict(request or {})
+    target = request.get("target") or "memory"
+    operations = request.get("operations")
+    action = "batch" if operations is not None else request.get("action")
+    extra = {"memory_provider_mode": "authoritative"} if provider_mode == "authoritative" else {}
+    return (
+        _background_delete_gate(
+            store, action, operations, target, request.get("content"), request.get("old_text"), extra
+        )
+        or _apply_write_gate(
+            store, action, target, request.get("content"), request.get("old_text"), operations, extra
+        )
+    )
 
 
 def memory_tool(action: str | None = None, target: str = "memory", content: str | None = None, old_text: str | None = None,
@@ -253,13 +292,11 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
     if operations:
         if not isinstance(operations, list):
             return _invalid("operations must be a list of {action, content?, old_text?} objects.")
-        denied = _background_delete_gate(store, action, operations, target)
+        denied = authorize_memory_write(
+            {"action": "batch", "target": target, "operations": operations}, store=store,
+        )
         if denied is not None:
             return "rejected", denied
-        # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
-        gate_result = _apply_write_gate(store, "batch", target, None, None, operations)
-        if gate_result is not None:
-            return "rejected", gate_result
         return _applied(store.apply_batch(target, operations))
     # Reject calls that provide neither action (single-op) nor operations
     # (batch).  Without this guard the dispatch falls through to the generic
@@ -273,8 +310,10 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
     if action not in _STORE_ACTIONS:
         return _invalid(f"Unknown action '{action}'. Use: add, replace, remove")
     invalid = (_validate_single_op(store, action, target, content, old_text)
-               or _background_delete_gate(store, action, None, target, content, old_text)
-               or _apply_write_gate(store, action, target, content, old_text))
+               or authorize_memory_write(
+                   {"action": action, "target": target, "content": content, "old_text": old_text},
+                   store=store,
+               ))
     if invalid is not None:
         return "rejected", invalid
     return _applied(_STORE_ACTIONS[action][0](store, target, content, old_text))
@@ -300,13 +339,49 @@ def get_builtin_memory_store_flags(config: Optional[dict[str, Any]] = None) -> t
     return tuple(is_truthy_value(section.get(k), default=True) for k in ("memory_enabled", "user_profile_enabled"))
 
 
+def get_memory_provider_mode(memory_config: Optional[dict[str, Any]] = None) -> str:
+    """Return the profile's frozen memory routing mode."""
+    memory_config = memory_config or {}
+    if "provider_mode" in memory_config:
+        mode = str(memory_config.get("provider_mode") or "hybrid").strip().lower()
+        return "authoritative" if mode == "authoritative" else "hybrid"
+    provider = str(memory_config.get("provider") or "").strip().lower()
+    if (
+        provider == "mempal"
+        and not memory_config.get("memory_enabled", True)
+        and not memory_config.get("user_profile_enabled", True)
+    ):
+        return "authoritative"
+    return "hybrid"
+
+
+@contextlib.contextmanager
+def memory_surface_scope(config: Optional[dict[str, Any]], *, mode: str,
+                         flags: Optional[tuple[bool, bool]] = None):
+    """Bind one mode/target decision across check, schema construction, and memoization."""
+    flags = flags or get_builtin_memory_store_flags(config)
+    token = _memory_surface_snapshot.set((mode, bool(flags[0]), bool(flags[1])))
+    bound_token = _memory_surface_bound.set(True)
+    try:
+        yield
+    finally:
+        _memory_surface_bound.reset(bound_token)
+        _memory_surface_snapshot.reset(token)
+
+
 @no_cache_check_fn
 def check_memory_requirements() -> bool:
-    """Snapshot store flags and report whether the built-in tool is available."""
-    _memory_surface_flags.set(None)
-    flags = get_builtin_memory_store_flags()
-    _memory_surface_flags.set(flags)
-    return flags[0] or flags[1]
+    """Expose the core memory tool for built-in or authoritative storage."""
+    snapshot = _memory_surface_snapshot.get() if _memory_surface_bound.get() else None
+    if snapshot is None:
+        section = get_builtin_memory_config()
+        flags = get_builtin_memory_store_flags()
+        snapshot = (get_memory_provider_mode(section), bool(flags[0]), bool(flags[1]))
+        _memory_surface_snapshot.set(snapshot)
+    available = snapshot[0] == "authoritative" or snapshot[1] or snapshot[2]
+    if not available:
+        _memory_surface_snapshot.set(None)
+    return available
 
 
 def _memory_target_error(store: MemoryStore, target: str) -> Optional[dict[str, Any]]:
@@ -429,9 +504,14 @@ _SINGLE_TARGET_TEXT = {
 
 def _build_memory_schema_overrides() -> dict[str, Any]:
     """Narrow the advertised target surface using the availability snapshot."""
-    flags = _memory_surface_flags.get() or get_builtin_memory_store_flags()
-    _memory_surface_flags.set(None)
-    targets = [t for t, on in zip(("memory", "user"), flags) if on]
+    snapshot = _memory_surface_snapshot.get()
+    if snapshot is None:
+        section = get_builtin_memory_config()
+        flags = get_builtin_memory_store_flags()
+        snapshot = (get_memory_provider_mode(section), bool(flags[0]), bool(flags[1]))
+    _memory_surface_snapshot.set(None)
+    targets = (["memory", "user"] if snapshot[0] == "authoritative" else
+               [t for t, on in zip(("memory", "user"), snapshot[1:]) if on])
     parameters = copy.deepcopy(MEMORY_SCHEMA["parameters"])
     target_schema, description = parameters["properties"]["target"], MEMORY_SCHEMA["description"]
     target_schema["enum"] = targets

@@ -362,6 +362,7 @@ class ComputeHost:
                 sid, key, session_id=key, model_override=frame.get("model_override"),
                 reasoning_config_override=frame.get("reasoning_config_override"),
                 service_tier_override=frame.get("service_tier_override"),
+                memory_provider_mode_override=frame.get("memory_provider_mode_override"),
                 platform_override=frame.get("source"),
                 cwd_override=str(frame.get("cwd") or "") or None,
                 context_cwd_is_launch_artifact=bool(
@@ -416,6 +417,8 @@ class ComputeHost:
         # switch crosses the process boundary and applies at this child's turn start.
         if frame.get("pending_model_switch"):
             session["pending_model_switch"] = dict(frame["pending_model_switch"])
+        with contextlib.suppress(Exception):
+            server._persist_live_session_runtime(session)
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:

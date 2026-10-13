@@ -270,7 +270,7 @@ def test_compress_wait_budget_loaded_floor_stays_finite(monkeypatch):
     import os
     from pathlib import Path
 
-    import yaml
+    import hermes_yaml as yaml
 
     base = Path(os.environ["HERMES_HOME"])
     newline = chr(10)

@@ -209,7 +209,7 @@ class TestResolveContextCompressionTimeouts:
         import os
 
         import agent.auxiliary_client as aux
-        import yaml
+        import hermes_yaml as yaml
 
         monkeypatch.undo()
         home_root = os.environ["HERMES_HOME"]

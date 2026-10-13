@@ -714,6 +714,14 @@ class _Resume:
             # Lightweight stores from older adapters expose the pre-bound method shape.
             if "max_display_messages" not in str(exc):
                 raise
+            from hermes_state import SessionResumeTooLargeError
+            guard = getattr(self.db, "assert_resume_safe", None)
+            if self.display_limit() and callable(guard):
+                try:
+                    guard(self.target)
+                except SessionResumeTooLargeError:
+                    tip = self.child_history(repair=True)
+                    return tip, tip
             return self.db.get_resume_conversations(self.target)
 
     def display_prefix(self, display: list, raw: list) -> list:

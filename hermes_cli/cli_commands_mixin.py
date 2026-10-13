@@ -1007,13 +1007,21 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
             return _cp(f"  {kanban_refusal}")
         if target_id == self.session_id:
             return _cp(f"  {_t('resume.already_on')}")
+        try:
+            self._session_db.assert_resume_safe(target_id, tip_only=True)
+        except Exception as exc:
+            from hermes_state import SessionResumeTooLargeError
+            if isinstance(exc, SessionResumeTooLargeError):
+                return _cp(f"  Cannot resume session: {exc}")
         old_session_id = self.session_id
         _end_current_session(self, "resumed_other")
         self.session_id, self._resumed, self._pending_title = target_id, True, None
         _sync_process_session_id(target_id)
         # One lineage SELECT, two projections: model_history is alternation-repaired for live
         # replay (heals a durable user;user once); display_history is verbatim (as startup --resume).
-        model_history, display_history = self._session_db.get_resume_conversations(target_id)
+        from hermes_state import resolved_max_resume_messages
+        model_history, display_history = self._session_db.get_resume_conversations(
+            target_id, max_display_messages=resolved_max_resume_messages() or None)
         self.conversation_history = _without_session_meta(model_history)
         self._resume_display_history = _without_session_meta(display_history)
         with suppress(Exception):  # re-open the target session so it's not marked as ended
@@ -1037,9 +1045,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         # -c`/`--resume`. The startup resume paths already call this; without it, the terminal/code-exec
         # tools and relative-path resolution keep operating in the wrong repo. Idempotent and a no-op when
         # the session recorded no cwd. See #38562.
-        self._restore_session_cwd(session_meta)
-        self._restore_session_yolo(session_meta)
-        self._restore_session_model(session_meta)
+        self._restore_session_state(session_meta)
 
     def _resolve_resume_target(self, target: str):
         """``(session_id, meta)`` for a numbered selection, title, or id; None after printing why
@@ -1113,11 +1119,18 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                 parent_prompt = (self._session_db.get_session(parent_session_id) or {}).get("system_prompt")
         from tools.approval_yolo import transfer_session_yolo, with_session_yolo
         try:
+            live_agent = getattr(self, "agent", None)
+            init_config = getattr(live_agent, "_session_init_model_config", None)
+            memory_provider_mode = (
+                init_config.get("memory_provider_mode") if isinstance(init_config, dict) else None
+            ) or getattr(live_agent, "_memory_provider_mode", None)
+            if memory_provider_mode not in {"authoritative", "hybrid"}:
+                memory_provider_mode = None
             self._session_db.create_session(
                 session_id=new_session_id, source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model, parent_session_id=parent_session_id, system_prompt=parent_prompt or None,
                 model_config=with_session_yolo({"max_iterations": self.max_turns, "reasoning_config":
-                                                self.reasoning_config, "_branched_from": parent_session_id}, parent_session_id))
+                                                self.reasoning_config, "memory_provider_mode": memory_provider_mode, "_branched_from": parent_session_id}, parent_session_id))
         except Exception as e:
             return _cp(f"  {_gt('branch.create_failed', error=e)}")
         _end_current_session(self, "branched")
@@ -1581,10 +1594,13 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
 
     def _handle_memory_command(self, cmd: str):
         """Handle /memory slash command — pending review + approval-gate toggle."""
-        from hermes_cli.write_approval_commands import handle_pending_subcommand
+        from hermes_cli.write_approval_commands import (
+            handle_pending_subcommand, load_authoritative_memory_manager,
+        )
         from tools import write_approval as wa
         args = cmd.strip().split()[1:]
-        store = getattr(self.agent, "_memory_store", None) if getattr(self, "agent", None) else None
+        live_agent = getattr(self, "agent", None)
+        store = getattr(live_agent, "_memory_store", None) if live_agent else None
         if store is None:
             # No live agent store (e.g. Desktop GUI): use a fresh on-disk store, as the gateway
             # does — same MEMORY/USER.md, same configured char limits.
@@ -1596,6 +1612,10 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
             store = load_on_disk_store()
         out = handle_pending_subcommand(
             wa.MEMORY, args, memory_store=store,
+            memory_manager=getattr(live_agent, "_memory_manager", None) if live_agent else None,
+            memory_manager_factory=lambda: load_authoritative_memory_manager(
+                session_id=str(getattr(self, "session_id", "") or ""), platform="cli",
+            ),
             set_mode_fn=lambda enabled: self._save_write_approval("memory", enabled))
         print(out if out is not None else _t("memory.unknown_subcommand"))
 

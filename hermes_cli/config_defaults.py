@@ -312,6 +312,7 @@ DEFAULT_CONFIG = {
         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.
         "font_family": "",
         "timeout": 180,
+        "auto_background_timeout_threshold": 200,
         # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons). 0
         # = SIGTERM only.
         "daemon_term_grace_seconds": 2.0,
@@ -1299,6 +1300,17 @@ DEFAULT_CONFIG = {
     # plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        "checkpoint": {
+            "mode": "shadow",
+            "trace": False,
+            "structured_output": "required",
+            "target_wire_tokens": 48000,
+            "hard_max_wire_tokens": 60000,
+            "map_concurrency": 2,
+            "map": {
+                "max_output_tokens": 16384,
+            },
+        },
         # Return freed glibc pages at agent/TUI cleanup boundaries (no-op elsewhere).
         "memory_trim": {
             "enabled": True,

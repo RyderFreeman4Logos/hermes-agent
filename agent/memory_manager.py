@@ -18,7 +18,14 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.redact import redact_for_egress
 
-from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_provider import (
+    MemoryProvider,
+    MemoryProviderExecutionContext,
+    PRE_COMPRESS_CHECKPOINT_API_VERSION,
+    ctx_bound,
+    current_memory_provider_execution_context,
+    spawn_context_thread,
+)
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
@@ -395,8 +402,13 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None, provider_mode: str = "hybrid") -> None:
         self._providers: list[MemoryProvider] = []
+        self.provider_mode = (
+            "authoritative"
+            if str(provider_mode or "hybrid").strip().lower() == "authoritative"
+            else "hybrid"
+        )
         self._tool_to_provider: dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[dict[str, Any]] = None
         self._has_external: bool = False
@@ -591,6 +603,16 @@ class MemoryManager:
         ), kind="prefetch")
 
     @staticmethod
+    def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+        """Whether a callable accepts ``keyword`` (uninspectable -> assume yes)."""
+        params = _signature_params(fn)
+        return params is None or _has_var_kwargs(params) or keyword in params
+
+    @staticmethod
+    def _provider_accepts_keyword(provider: MemoryProvider, hook_name: str, keyword: str) -> bool:
+        return MemoryManager._accepts_keyword(getattr(provider, hook_name), keyword)
+
+    @staticmethod
     def _provider_sync_accepts(provider: MemoryProvider, keyword: str) -> bool:
         """Whether ``sync_turn`` accepts ``keyword`` (uninspectable → assume yes)."""
         params = _signature_params(provider.sync_turn)
@@ -712,6 +734,178 @@ class MemoryManager:
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self._tool_to_provider
 
+    _AUTHORITATIVE_RECEIPT_KEYS = {
+        "drawer_id",
+        "operation_id",
+        "operation_ids",
+        "error_class",
+    }
+
+    def authoritative_memory_write(self, args: dict[str, Any], *, authorization_callback=None, **kwargs) -> str:
+        """Route the core ``memory`` write shape to the external provider.
+
+        This path never touches ``MemoryStore``. Providers must implement a
+        dedicated ``authoritative_memory_write`` capability; generic tool
+        dispatch is not a fallback. Receipts are reduced to scalar fields so
+        backend payloads never enter the model-visible tool result.
+        """
+        if self.provider_mode != "authoritative":
+            return tool_error(
+                "Authoritative memory routing is not enabled.",
+                success=False,
+                error_class="invalid_provider_mode",
+            )
+        request = dict(args or {})
+        target = request.get("target") or "memory"
+        if target not in {"memory", "user"}:
+            return tool_error(
+                "Invalid target. Use 'memory' or 'user'.",
+                success=False,
+                error_class="invalid_target",
+            )
+        request["target"] = target
+        if request.get("content") is None and request.get("new_text") is not None:
+            request["content"] = request["new_text"]
+        operations = request.get("operations")
+        if operations is not None:
+            if not isinstance(operations, list) or not operations:
+                return tool_error(
+                    "operations must be a non-empty list.",
+                    success=False,
+                    error_class="invalid_operations",
+                )
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    return tool_error(
+                        "Each operation must be an object.",
+                        success=False,
+                        error_class="invalid_operations",
+                    )
+                operation_action = operation.get("action")
+                if operation_action not in {"add", "replace", "remove"}:
+                    return tool_error(
+                        "Each operation must use add, replace, or remove.",
+                        success=False,
+                        error_class="invalid_action",
+                    )
+                if operation.get("content") is None and operation.get("new_text") is not None:
+                    operation["content"] = operation["new_text"]
+                if operation_action in {"replace", "remove"} and not operation.get("old_text"):
+                    return tool_error(
+                        "old_text is required for replace/remove.",
+                        success=False,
+                        error_class="missing_old_text",
+                    )
+                if operation_action in {"add", "replace"} and not operation.get("content"):
+                    return tool_error(
+                        "content is required for add/replace.",
+                        success=False,
+                        error_class="missing_content",
+                    )
+        else:
+            action = request.get("action")
+            if action not in {"add", "replace", "remove"}:
+                return tool_error(
+                    "Use add, replace, or remove.",
+                    success=False,
+                    error_class="invalid_action",
+                )
+            if action in {"replace", "remove"} and not request.get("old_text"):
+                return tool_error(
+                    "old_text is required for replace/remove.",
+                    success=False,
+                    error_class="missing_old_text",
+                )
+            if action in {"add", "replace"} and not request.get("content"):
+                return tool_error(
+                    "content is required for add/replace.",
+                    success=False,
+                    error_class="missing_content",
+                )
+        if authorization_callback is not None:
+            gate_result = authorization_callback(request)
+            if gate_result is not None:
+                return gate_result
+        provider = next((c for c in self._providers if c.name != "builtin"), None)
+        if provider is None:
+            return tool_error(
+                "Authoritative memory provider is unavailable.",
+                success=False,
+                error_class="provider_unavailable",
+            )
+        try:
+            capability = getattr(provider, "authoritative_memory_write", None)
+            if not callable(capability):
+                return tool_error(
+                    "Authoritative memory provider lacks core write capability.",
+                    success=False,
+                    error_class="provider_capability_missing",
+                )
+            execution_context = kwargs.pop("execution_context", None) or current_memory_provider_execution_context()
+            if execution_context is not None and self._accepts_keyword(capability, "execution_context"):
+                kwargs["execution_context"] = execution_context
+            raw_result = capability(request, **kwargs)
+        except NotImplementedError:
+            return tool_error(
+                "Authoritative memory provider lacks core write capability.",
+                success=False,
+                error_class="provider_capability_missing",
+            )
+        except Exception:
+            logger.warning(
+                "Authoritative memory provider '%s' rejected a core write",
+                provider.name,
+                exc_info=True,
+            )
+            return tool_error(
+                "Authoritative memory provider failed.",
+                success=False,
+                error_class="provider_error",
+            )
+        return self._authoritative_receipt(provider.name, raw_result, request)
+
+    @classmethod
+    def _authoritative_receipt(cls, provider_name: str, raw_result: Any, request: dict[str, Any]) -> str:
+        """Return a content-free provider receipt or truthful protocol error."""
+        if isinstance(raw_result, str):
+            try:
+                raw_result = json.loads(raw_result)
+            except (TypeError, ValueError):
+                raw_result = None
+        if not isinstance(raw_result, dict) or not isinstance(raw_result.get("success"), bool):
+            return tool_error(
+                "Authoritative memory provider returned an invalid receipt.",
+                success=False,
+                error_class="provider_protocol_error",
+            )
+        success = raw_result["success"] is True
+        partial_write = bool(raw_result.get("partial_write"))
+        receipt: dict[str, Any] = {
+            "success": success and not partial_write,
+            "provider": provider_name,
+            "provider_mode": "authoritative",
+            "target": request.get("target", "memory"),
+        }
+        if request.get("action"):
+            receipt["action"] = request["action"]
+        if isinstance(request.get("operations"), list):
+            receipt["operation_count"] = len(request["operations"])
+        scalar_types = (str, int, float, bool)
+        for key in cls._AUTHORITATIVE_RECEIPT_KEYS:
+            value = raw_result.get(key)
+            if key == "operation_ids":
+                if isinstance(value, list) and all(isinstance(item, scalar_types) for item in value):
+                    receipt[key] = value
+            elif isinstance(value, scalar_types):
+                receipt[key] = value
+        if partial_write:
+            receipt["success"] = False
+            receipt["error_class"] = "partial_write"
+        if not receipt["success"]:
+            receipt.setdefault("error_class", "provider_rejected")
+            receipt["error"] = "Authoritative memory provider rejected the operation."
+        return json.dumps(receipt, ensure_ascii=False)
+
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""
         provider = self._tool_to_provider.get(tool_name)
@@ -720,6 +914,11 @@ class MemoryManager:
         args = _redact_for_provider(args)
         from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
         try:
+            execution_context = kwargs.pop("execution_context", None) or current_memory_provider_execution_context()
+            if execution_context is not None and self._provider_accepts_keyword(
+                provider, "handle_tool_call", "execution_context"
+            ):
+                kwargs["execution_context"] = execution_context
             result = provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
             logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
@@ -851,19 +1050,41 @@ class MemoryManager:
         accepted = sum(p.kind is not inspect.Parameter.VAR_POSITIONAL for p in params.values())
         return "positional" if accepted >= 4 else "legacy"
 
-    def on_memory_write(self, action: str, target: str, content: str,
-                        metadata: Optional[dict[str, Any]] = None) -> None:
-        """Notify external providers when the built-in memory tool writes (skips builtin, the source)."""
+    @staticmethod
+    def _provider_memory_write_context_mode(provider: MemoryProvider) -> bool:
+        return MemoryManager._provider_accepts_keyword(provider, "on_memory_write", "execution_context")
+
+    def on_memory_write(
+        self, action: str, target: str, content: str,
+        metadata: Optional[dict[str, Any]] = None,
+        execution_context: Optional[MemoryProviderExecutionContext] = None,
+    ) -> None:
+        """Notify external providers after a built-in memory write commits."""
         content, metadata = _redact_for_provider(content, dict(metadata or {}))
+        execution_context = execution_context or current_memory_provider_execution_context()
+        base_metadata = dict(metadata or {})
+        if execution_context is not None and execution_context.operation_key is not None:
+            base_metadata.setdefault("operation_key", execution_context.operation_key)
 
         def _notify(provider: MemoryProvider) -> None:
+            provider_metadata = dict(base_metadata)
             mode = self._provider_memory_write_metadata_mode(provider)
+            context = execution_context if self._provider_memory_write_context_mode(provider) else None
             if mode == "legacy":
                 provider.on_memory_write(action, target, content)
             elif mode == "positional":
-                provider.on_memory_write(action, target, content, dict(metadata or {}))
+                if context is None:
+                    provider.on_memory_write(action, target, content, provider_metadata)
+                else:
+                    provider.on_memory_write(
+                        action, target, content, provider_metadata, execution_context=context,
+                    )
+            elif context is None:
+                provider.on_memory_write(action, target, content, metadata=provider_metadata)
             else:
-                provider.on_memory_write(action, target, content, metadata=dict(metadata or {}))
+                provider.on_memory_write(
+                    action, target, content, metadata=provider_metadata, execution_context=context,
+                )
 
         external = [p for p in self._providers if p.name != "builtin"]
         self._each_provider("on_memory_write failed", _notify, providers=external)
@@ -883,8 +1104,11 @@ class MemoryManager:
                 return False
         return isinstance(result, dict) and result.get("success") is True and result.get("staged") is not True
 
-    def notify_memory_tool_write(self, tool_result: Any, tool_args: dict[str, Any], *,
-                                 build_metadata: Optional[Callable[[], dict[str, Any]]] = None) -> None:
+    def notify_memory_tool_write(
+        self, tool_result: Any, tool_args: dict[str, Any], *,
+        build_metadata: Optional[Callable[[], dict[str, Any]]] = None,
+        execution_context: Optional[MemoryProviderExecutionContext] = None,
+    ) -> None:
         """Mirror a built-in memory tool call to external providers.
 
         Gates on a committed write, expands single-op and batched ``operations`` shapes, keeps only
@@ -892,8 +1116,11 @@ class MemoryManager:
         ``previous_content`` comes only from the committed store result, never the search
         argument: a partial provider registry cannot safely resolve that argument itself.
         """
+        if self.provider_mode == "authoritative":
+            return
         if not self._memory_tool_result_succeeded(tool_result):
             return
+        execution_context = execution_context or current_memory_provider_execution_context()
         result = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
         target = str(tool_args.get("target") or "memory")
         operations = tool_args.get("operations")
@@ -905,6 +1132,8 @@ class MemoryManager:
             try:
                 metadata = dict(build_metadata() if build_metadata else {})
                 metadata.pop("previous_content", None)
+                if execution_context is None and tool_args.get("operation_key") is not None:
+                    metadata["operation_key"] = tool_args["operation_key"]
                 old_text = op.get("old_text")
                 if old_text:
                     metadata["old_text"] = str(old_text)
@@ -917,7 +1146,21 @@ class MemoryManager:
                         previous = result.get(f"{field}_entry")
                     if isinstance(previous, str) and previous:
                         metadata["previous_content"] = previous
-                self.on_memory_write(action, target, str(op.get("content") or op.get("new_text") or ""), metadata=metadata)
+                if self._accepts_keyword(self.on_memory_write, "execution_context"):
+                    self.on_memory_write(
+                        action,
+                        target,
+                        str(op.get("content") or op.get("new_text") or ""),
+                        metadata=metadata,
+                        execution_context=execution_context,
+                    )
+                else:
+                    self.on_memory_write(
+                        action,
+                        target,
+                        str(op.get("content") or op.get("new_text") or ""),
+                        metadata=metadata,
+                    )
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
 

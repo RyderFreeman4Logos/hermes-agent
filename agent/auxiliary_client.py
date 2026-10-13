@@ -20,7 +20,8 @@ import re
 import threading
 import time
 import uuid
-from types import SimpleNamespace
+from collections.abc import Mapping
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import urlparse, parse_qs, urlunparse
 
@@ -1489,7 +1490,12 @@ class _CodexCompletionsAdapter:
         # headers via the SDK kwarg — forward them.
         if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
             resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
-        # The Codex endpoint rejects max_output_tokens/temperature (400) — omit.
+        max_tokens = kwargs.get("max_completion_tokens")
+        if max_tokens is None:
+            max_tokens = kwargs.get("max_tokens")
+        # Generic Codex calls omit unsupported output caps. Structured checkpoint
+        # requests require an explicit bounded output budget; forward it with the schema.
+        # Temperature remains unsupported and is omitted.
         extra_body = kwargs.get("extra_body") or {}
         if isinstance(extra_body, dict):
             # service_tier (fast mode) is a top-level Responses field; xAI's endpoint rejects it.
@@ -1497,6 +1503,9 @@ class _CodexCompletionsAdapter:
             if isinstance(service_tier, str) and service_tier.strip() and not is_xai:
                 resp_kwargs["service_tier"] = service_tier.strip()
             reasoning_cfg = extra_body.get("reasoning")
+            reasoning_effort = kwargs.get("reasoning_effort")
+            if reasoning_effort is not None:
+                reasoning_cfg = {"effort": reasoning_effort}
             if isinstance(reasoning_cfg, dict):
                 # Shared per-model vocabulary with the main transport ("max" only where the model publishes it; "minimal"/"ultra"
                 # clamp to a listed level; ``()`` = the model takes no ``reasoning`` field at all — gpt-4o/4.1 on api.openai.com,
@@ -1512,6 +1521,44 @@ class _CodexCompletionsAdapter:
                     resp_kwargs["include"] = ["reasoning.encrypted_content"]
                 elif "none" in supported and not is_xai:
                     resp_kwargs["reasoning"] = {"effort": "none"}
+        response_format_present = "response_format" in kwargs
+        response_format = kwargs.get("response_format")
+        if isinstance(extra_body, dict) and "response_format" in extra_body:
+            extra_response_format = extra_body["response_format"]
+            if response_format_present and response_format != extra_response_format:
+                raise ValueError("Conflicting Codex response_format values")
+            response_format_present = True
+            response_format = extra_response_format
+        if response_format_present:
+            if (
+                not isinstance(response_format, dict)
+                or response_format.get("type") != "json_schema"
+            ):
+                raise ValueError("Codex Responses requires a json_schema response_format")
+            json_schema = response_format.get("json_schema")
+            if not isinstance(json_schema, dict):
+                raise ValueError("Codex json_schema response_format is malformed")
+            name = json_schema.get("name")
+            schema = json_schema.get("schema")
+            strict = json_schema.get("strict", True)
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(schema, dict)
+                or not isinstance(strict, bool)
+            ):
+                raise ValueError("Codex json_schema response_format is malformed")
+            if max_tokens is not None:
+                resp_kwargs["max_output_tokens"] = max_tokens
+            resp_kwargs["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": name,
+                    "schema": schema,
+                    "strict": strict,
+                },
+            }
+
         if wire_tools:
             resp_kwargs["tools"] = wire_tools
         if wire_aliases:
@@ -2555,6 +2602,8 @@ def _relay_aux_call_scope(args: tuple, kwargs: dict):
         "model": "",
         "response_model": None,
         "api_mode": "chat_completions",
+        "checkpoint_attempts": kwargs.get("checkpoint_attempts"),
+        "structured_output_required": bool(kwargs.get("structured_output_required")),
     })
     try:
         yield
@@ -2637,27 +2686,91 @@ def _relay_sync_completion(
     relay_context["stream_provider"] = provider or relay_context.get("provider")
     callback = create or (lambda request: _create_with_progress(client, request, task))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
-    # Isolate only the provider callback so the owning thread can unwind its lease/DB
-    # transaction on hard cancel without touching the shared client.
-    if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
-    provider_name, fallback_model, metadata = route
-    from agent import relay_llm
-    from agent.auxiliary_hooks import run_with_aux_hooks
-    model_name = str(kwargs.get("model") or fallback_model)
+    # Isolate only the provider callback so cancellation stays on the owning thread.
+    started_at = time.monotonic()
     try:
-        return run_with_aux_hooks(
-            lambda: relay_llm.execute_current(
-                kwargs, lambda request: _run_protected_sync_provider_call(callback, request),
-                name=provider_name, model_name=model_name, metadata=metadata,
-                defer_logical_completion=True,
-            ),
-            aux_task=str(metadata.get("auxiliary_task") or ""), metadata=metadata, client=client, kwargs=kwargs,
-            provider=provider_name, model=model_name, api_mode=str(metadata.get("api_mode") or ""),
-        )
+        if route is None:
+            response = _run_protected_sync_provider_call(callback, kwargs)
+        else:
+            provider_name, fallback_model, metadata = route
+            from agent import relay_llm
+            from agent.auxiliary_hooks import run_with_aux_hooks
+            model_name = str(kwargs.get("model") or fallback_model)
+            response = run_with_aux_hooks(
+                lambda: relay_llm.execute_current(
+                    kwargs, lambda request: _run_protected_sync_provider_call(callback, request),
+                    name=provider_name, model_name=model_name, metadata=metadata,
+                    defer_logical_completion=True,
+                ),
+                aux_task=str(metadata.get("auxiliary_task") or ""), metadata=metadata, client=client, kwargs=kwargs,
+                provider=provider_name, model=model_name, api_mode=str(metadata.get("api_mode") or ""),
+            )
     except Exception as exc:
         _note_relay_auxiliary_error(exc)
+        _record_checkpoint_attempt(kwargs, provider, started_at, error=exc)
         raise
+    _record_checkpoint_attempt(kwargs, provider, started_at, response=response)
+    return response
+
+
+def _record_checkpoint_attempt(
+    kwargs: Mapping[str, Any],
+    provider: str | None,
+    started_at: float,
+    *,
+    response: Any = None,
+    error: Exception | None = None,
+) -> None:
+    """Capture one checkpoint request at the dispatch boundary, if requested."""
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    attempts = context.get("checkpoint_attempts") if context else None
+    if not isinstance(attempts, list):
+        return
+    extra_body = kwargs.get("extra_body")
+    wire_mode = (
+        "structured"
+        if isinstance(extra_body, Mapping) and extra_body.get("response_format")
+        else "prompt_only"
+    )
+    content = ""
+    usage = choice = None
+    if response is not None:
+        try:
+            content = extract_content_or_reasoning(response)
+            usage = getattr(response, "usage", None)
+            choice = (getattr(response, "choices", None) or [None])[0]
+        except (AttributeError, IndexError, TypeError):
+            pass
+    rejection = None
+    if error is not None:
+        retry_class = "transient" if _is_transient_transport_error(error) else "rejected"
+        rejection = f"{retry_class}: {type(error).__name__}: {error}"
+    attempts.append(MappingProxyType({
+        "configured_route": provider or None,
+        "physical_model": kwargs.get("model") or None,
+        "actual_wire_mode": wire_mode,
+        "fallback_rejection": rejection,
+        "input_tokens": getattr(usage, "prompt_tokens", None),
+        "output_tokens": getattr(usage, "completion_tokens", None),
+        "latency_ms": int((time.monotonic() - started_at) * 1000),
+        "finish_reason": getattr(choice, "finish_reason", None),
+        "response_hash": hashlib.sha256(content.encode()).hexdigest() if response is not None else None,
+    }))
+
+
+def _amend_checkpoint_attempt_validation_rejection(error: Exception) -> None:
+    """Classify the just-recorded physical response before fallback can run."""
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    attempts = context.get("checkpoint_attempts") if context else None
+    if not isinstance(attempts, list) or not attempts:
+        return
+    attempt = attempts[-1]
+    if not isinstance(attempt, Mapping) or attempt.get("fallback_rejection") is not None:
+        return
+    attempts[-1] = MappingProxyType({
+        **attempt,
+        "fallback_rejection": f"rejected: {type(error).__name__}: {error}",
+    })
 
 
 async def _relay_async_completion(
@@ -3410,6 +3523,11 @@ def _is_structured_output_rejection(exc: Exception) -> bool:
     if _contains_any(err_lower, ("response mime type", "response_schema", "response_json_schema")):
         return True
     return _is_unsupported_parameter_error(exc, "response_format") or _is_unsupported_parameter_error(exc, "output_config")
+
+
+def _structured_output_required() -> bool:
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    return bool(context and context.get("structured_output_required"))
 
 
 def _without_structured_output_format(kwargs: dict) -> Optional[dict]:
@@ -6597,7 +6715,7 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
         or _nous_on_messages_wire(provider_norm, model)
         or provider_norm in _NVIDIA_PROVIDER_NAMES
         or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
-        or str(task) == "moa_reference"
+        or str(task) in {"moa_reference", "checkpoint"}
         or _is_gemini_native_route(provider_norm, effective_base)
         or provider_norm == "openrouter"
         or base_url_host_matches(effective_base, "openrouter.ai")
@@ -6783,7 +6901,7 @@ def _build_call_kwargs(
     projection = _project_provider_profile(provider, provider_norm, model, effective_base, reasoning_config)
     kwargs.update(projection.top_level)
     merged_extra = _merge_aux_extra_body(extra_body, projection, reasoning_config, provider_norm)
-    if "response_format" in merged_extra:
+    if "response_format" in merged_extra and not _structured_output_required():
         from agent.auxiliary_structured_output import without_unsupported_response_format
         merged_extra = without_unsupported_response_format(merged_extra, provider_norm, effective_base, model, task)
     if merged_extra:
@@ -6821,9 +6939,11 @@ def _validate_llm_response(
     an empty route. See #23270.
     """
     if response is None:
-        raise RuntimeError(
+        error = RuntimeError(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
+        _amend_checkpoint_attempt_validation_rejection(error)
+        raise error
     response = _unwrap_data_envelope(response, task)
     from agent.aux_accounting import record_aux_usage
     record_aux_usage(response, task, provider=provider, base_url=base_url)
@@ -6845,6 +6965,7 @@ def _validate_llm_response(
             from agent import auxiliary_call_outcome
             setattr(invalid, auxiliary_call_outcome.PROVIDER_ERROR_ATTR,
                     auxiliary_call_outcome.embedded_provider_error(response))
+            _amend_checkpoint_attempt_validation_rejection(invalid)
             _note_relay_auxiliary_error(invalid)
             raise invalid from exc
         response = recovered
@@ -6853,6 +6974,7 @@ def _validate_llm_response(
         # HTTP-200 router failure shim (#68396): invalid like a malformed shape so the
         # auxiliary fallback chain moves to the next candidate instead of titling with it.
         shim = RuntimeError(f"Auxiliary {task or 'call'}: provider returned a timeout shim instead of a completion")
+        _amend_checkpoint_attempt_validation_rejection(shim)
         _note_relay_auxiliary_error(shim)
         raise shim
     # Retain the provider-reported model for terminal relay route attribution.
@@ -7687,6 +7809,8 @@ def _ladder_parameter_rungs(
     client, task, tag = route.client, route.task, route.tag
     rungs = list(_parameter_rungs(client, max_tokens))
     while rungs:
+        if _structured_output_required() and _is_structured_output_rejection(first_err):
+            raise first_err
         hit = next((rung for rung in rungs
                     if rung[0](first_err) and rung[1](kwargs) is not None), None)
         if hit is None:
@@ -8048,6 +8172,8 @@ def call_llm(
     extra_headers: Optional[dict[str, str]] = None, api_mode: str | None = None, stream: bool = False,
     stream_options: dict | None = None, route_info: Optional[dict[str, str]] = None,
     latency_info: Optional[dict[str, int]] = None,
+    structured_output_required: bool = False,
+    checkpoint_attempts: Optional[list[Any]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()

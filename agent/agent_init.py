@@ -10,6 +10,9 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 from __future__ import annotations
 
 import logging
+import hashlib
+import subprocess
+from pathlib import Path
 import os
 import re
 import sys
@@ -1293,11 +1296,34 @@ def _memory_provider_init_kwargs(agent, platform) -> dict[str, Any]:
     return kwargs
 
 
-def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
+def _memory_toolset_requested(agent) -> bool:
+    return (
+        "memory" in (agent.enabled_toolsets or [])
+        and "memory" not in (agent.disabled_toolsets or [])
+    )
+
+
+def _resolve_memory_runtime(agent, agent_config, skip_memory, mode_override=None):
+    """Return one config/mode decision for tool publication and runtime dispatch."""
+    from tools.memory_tool import get_builtin_memory_config, get_memory_provider_mode
+
+    memory_config = get_builtin_memory_config(agent_config)
+    mode = mode_override if mode_override in {"authoritative", "hybrid"} else get_memory_provider_mode(memory_config)
+    # Explicit-memory background roles intentionally retain only the built-in
+    # store. They must not advertise an authoritative route that cannot load a
+    # provider, and must never load one merely to satisfy that route.
+    if skip_memory and _memory_toolset_requested(agent):
+        mode = "hybrid"
+    return memory_config, mode
+
+
+def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None, *,
+                 memory_config=None, resolved_mode="hybrid"):
     # Persistent memory (MEMORY.md + USER.md) — loaded from disk
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
+    agent._memory_provider_mode = resolved_mode
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
@@ -1308,17 +1334,15 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     # request: a caller that denylists memory while its default toolset still names it must not get
     # MEMORY.md loaded by an enabled-only check. (Cron agents now run with skip_memory=False and take the
     # normal path here.)
-    _memory_toolset_requested = (
-        "memory" in (agent.enabled_toolsets or [])
-        and "memory" not in (agent.disabled_toolsets or [])
-    )
-    if not skip_memory or _memory_toolset_requested:
+    requested = _memory_toolset_requested(agent)
+    mem_config = memory_config or {}
+    if not skip_memory or requested:
         # Memory is optional — don't break agent init
         with suppress(Exception):
             from tools.memory_tool import (
-                MemoryStore, get_builtin_memory_config, get_builtin_memory_store_flags,
+                MemoryStore, get_builtin_memory_store_flags,
             )
-            mem_config = get_builtin_memory_config(_agent_cfg)
+            agent._session_init_model_config["memory_provider_mode"] = agent._memory_provider_mode
             agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
                 _agent_cfg
             )
@@ -1342,12 +1366,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     elif not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-            if not is_core_memory_provider(_mem_provider_name):
+            if (not is_core_memory_provider(_mem_provider_name)) or agent._memory_provider_mode == "authoritative":
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp is None:
+                agent._memory_manager = _MemoryManager(provider_mode=agent._memory_provider_mode)
+                _mp = _load_mem(_mem_provider_name) if _mem_provider_name else None
+                if _mp is None and _mem_provider_name:
                     # The provider left core for the catalog (or was never installed): fetch it once.
                     from hermes_cli.memory_provider_migration import recover_at_startup
                     if recover_at_startup(_mem_provider_name, say=agent._emit_startup_warning):
@@ -1366,11 +1390,37 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
-                    agent._memory_manager = None
+                    if agent._memory_provider_mode != "authoritative":
+                        agent._memory_manager = None
         except Exception as _mpe:
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
-            agent._memory_manager = None
+            if agent._memory_provider_mode != "authoritative":
+                agent._memory_manager = None
 
+    from agent.memory_manager import inject_memory_provider_tools
+    inject_memory_provider_tools(agent)
+
+
+def apply_memory_provider_mode(agent, mode: str) -> None:
+    """Apply a resumed session's frozen mode to every live routing copy."""
+    if mode not in {"authoritative", "hybrid"}:
+        return
+    agent._memory_provider_mode = mode
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is not None:
+        manager.provider_mode = mode
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        init_config["memory_provider_mode"] = mode
+    if not hasattr(agent, "enabled_toolsets"):
+        return
+    from tools.memory_tool import memory_surface_scope
+    flags = (
+        bool(getattr(agent, "_memory_enabled", False)),
+        bool(getattr(agent, "_user_profile_enabled", False)),
+    )
+    with memory_surface_scope(None, mode=mode, flags=flags):
+        _load_tools(agent, agent.enabled_toolsets, agent.disabled_toolsets)
     from agent.memory_manager import inject_memory_provider_tools
     inject_memory_provider_tools(agent)
 
@@ -1893,7 +1943,58 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     return _config_context_length, _custom_providers, _effective_context_length, _model_cfg
 
 
-def _select_context_engine(_agent_cfg):
+def _capture_checkpoint_code_snapshot() -> dict[str, Any]:
+    """Capture code identity once at engine construction, never per checkpoint."""
+    root = Path(__file__).resolve().parents[1]
+    try:
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(root), *args], check=True, text=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            ).stdout.strip()
+        head = git("rev-parse", "HEAD")
+        tree = git("rev-parse", "HEAD^{tree}")
+        diff = git("diff", "--no-ext-diff")
+        return {"head": head, "tree": tree, "dirty": bool(diff),
+                "dirty_diff_hash": hashlib.sha256(diff.encode()).hexdigest()}
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+
+def _build_checkpoint_map_caller(agent: Any) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """Bind checkpoint Map calls to the configured auxiliary provider route."""
+    code_snapshot = _capture_checkpoint_code_snapshot()
+
+    def call(request: dict[str, Any]) -> dict[str, Any]:
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+        from agent.checkpoint_engine import CheckpointMapCallRejected
+
+        attempts: list[dict[str, Any]] = []
+
+        def identities() -> tuple[dict[str, Any], ...]:
+            return tuple({**attempt, "code_snapshot": code_snapshot} for attempt in attempts)
+
+        try:
+            response = call_llm(
+                task="checkpoint", model=request.get("model"), messages=request["messages"],
+                max_tokens=int(request["max_tokens"]),
+                extra_body={"response_format": request["response_format"]},
+                main_runtime={
+                    "provider": getattr(agent, "provider", ""), "model": getattr(agent, "model", ""),
+                    "base_url": getattr(agent, "base_url", ""), "api_key": getattr(agent, "api_key", ""),
+                    "api_mode": getattr(agent, "api_mode", ""),
+                }, checkpoint_attempts=attempts, structured_output_required=True,
+            )
+        except Exception as exc:
+            raise CheckpointMapCallRejected({"_checkpoint_attempt_identities": identities()}, exc) from exc
+        return {
+            "content": extract_content_or_reasoning(response),
+            "_checkpoint_attempt_identities": identities(),
+        }
+    return call
+
+
+def _select_context_engine(_agent_cfg, agent=None):
     """Config-driven context engine: ``context.engine`` → plugins/context_engine/<name>/ →
     general plugin system → None (built-in ContextCompressor)."""
     _engine_name = "compressor"
@@ -1906,7 +2007,15 @@ def _select_context_engine(_agent_cfg):
     _copy_failed = False
     try:
         from plugins.context_engine import load_context_engine
-        _selected_engine = load_context_engine(_engine_name)
+        if _engine_name == "checkpoint":
+            from agent.checkpoint_engine import CheckpointContextEngine
+            _selected_engine = CheckpointContextEngine(
+                _ctx_cfg.get("checkpoint", {}),
+                session_id=getattr(agent, "session_id", "default") or "default",
+                map_caller=_build_checkpoint_map_caller(agent),
+            )
+        else:
+            _selected_engine = load_context_engine(_engine_name)
     except Exception as _ce_load_err:
         _ra().logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
 
@@ -1960,7 +2069,7 @@ def _compressor_max_tokens(agent):
 
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
-    _selected_engine = _select_context_engine(_agent_cfg)
+    _selected_engine = _select_context_engine(_agent_cfg, agent)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex
@@ -2393,7 +2502,7 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
-    side_agent: bool = False, memory_manager=None,
+    side_agent: bool = False, memory_manager=None, memory_provider_mode_override: str | None = None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
     _install_safe_stdio()
@@ -2462,21 +2571,35 @@ def init_agent(
     _set_defaults(agent, _STREAM_STATE)
     _build_client(agent, api_key, base_url, fallback_model)
     _init_fallback_chain(agent, fallback_model)
-    _load_tools(agent, enabled_toolsets, disabled_toolsets)
-    _init_session_state(
-        agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
-        checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
-    )
-
-    # Load config once for memory, skills, and compression sections
+    # Memory mode changes core-tool availability and its target schema, so resolve
+    # it before the immutable tool snapshot is built.
     try:
         from hermes_cli.config import load_config_readonly as _load_agent_config
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
 
+    try:
+        _memory_config, _resolved_memory_mode = _resolve_memory_runtime(
+            agent, _agent_cfg, skip_memory, memory_provider_mode_override
+        )
+    except Exception:
+        _memory_config, _resolved_memory_mode = {}, "hybrid"
+    agent._memory_provider_mode = _resolved_memory_mode
+    from tools.memory_tool import memory_surface_scope
+    with memory_surface_scope(_agent_cfg, mode=_resolved_memory_mode):
+        _load_tools(agent, enabled_toolsets, disabled_toolsets)
+    _init_session_state(
+        agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
+        checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
+    )
+    agent._session_init_model_config["memory_provider_mode"] = _resolved_memory_mode
+
     _apply_display_config(agent, _agent_cfg, platform)
-    _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
+    _init_memory(
+        agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager,
+        memory_config=_memory_config, resolved_mode=_resolved_memory_mode,
+    )
     _apply_agent_section(agent, _agent_cfg)
     cs = _parse_compression_config(agent, _agent_cfg)
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(

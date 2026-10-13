@@ -17467,11 +17467,12 @@ def test_model_save_key_reconciles_the_launch_profiles_stale_setup_record(monkey
 
 
 def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_path):
-    """The post-turn heap trim follows cleared history snapshots: assert the finisher locals are empty,
-    and verify the old large message is reclaimable before trim."""
+    """The old large message must be reclaimable before heap trim.
+
+    Observe its weak reference without retaining the finisher's local frame.
+    """
     import contextlib
     import gc
-    import inspect
     import weakref
 
     class _Msg(dict):
@@ -17487,15 +17488,6 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
 
     def _trim(**_kwargs):
         order.append("trim")
-        frame = inspect.currentframe()
-        assert frame is not None and frame.f_back is not None
-        caller_locals = frame.f_back.f_locals
-        assert "history" in caller_locals and "run_kwargs" in caller_locals, (
-            "expected locals not found in _run_prompt_submit's finally frame — "
-            "renamed? update this test"
-        )
-        observed["history"] = caller_locals["history"]
-        observed["run_kwargs"] = caller_locals["run_kwargs"]
         gc.collect()
         observed["alive_at_trim"] = old_ref() is not None
 
@@ -17524,8 +17516,6 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
 
         assert resp is not None and resp.get("result")
         assert observed["persist_user_message"] == "hi"
-        assert not observed["history"]
-        assert not observed["run_kwargs"]
         assert order[-2:] == ["trim", "reset_home"]
         assert observed["alive_at_trim"] is False, "a pre-turn history snapshot survived to the heap trim"
     finally:

@@ -1042,14 +1042,18 @@ def _pytest_disk_temp_root(native: Path) -> Path:
     """The root for relocated basetemps: the disk-backed runner root when the host has
     one (``scripts/run_tests_parallel.py::_runner_scratch_root``), else a plain (not
     dot-prefixed — hidden-dir search tests would see every fixture as hidden) sibling of
-    the native home. Entries idle for a day are swept on the way in."""
+    the native home. An explicit validated ``HERMES_TEST_TMP_ROOT`` overrides the root;
+    entries idle for a day are swept on the way in."""
     from hermes_constants_scratch import prune_idle_entries
+    from scripts.test_temp_root import configured_test_temp_root
 
-    if os.name != "nt" and os.path.isdir("/var/tmp"):  # no-tmp: ok — disk-backed FHS root
-        root = Path("/var/tmp/hermes-pytest")  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
-    else:
-        root = native.parent / "hermes-pytest"
-    root.mkdir(parents=True, exist_ok=True)
+    root = configured_test_temp_root()
+    if root is None:
+        if os.name != "nt" and os.path.isdir("/var/tmp"):  # no-tmp: ok — disk-backed FHS root
+            root = Path("/var/tmp/hermes-pytest")  # no-tmp: ok — disk-backed FHS root
+        else:
+            root = native.parent / "hermes-pytest"
+        root.mkdir(parents=True, exist_ok=True)
     prune_idle_entries(root, 24, frozenset())
     return root
 

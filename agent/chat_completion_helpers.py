@@ -31,6 +31,7 @@ from agent.error_classifier import (
     _extract_status_code)
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
@@ -1455,7 +1456,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
     return agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_messages_for_non_vision_model(api_messages), tools=tools_for_api,
         reasoning_config=reasoning_config, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, base_url=agent.base_url,
+        cache_scope_id=cache_scope_id, static_system_prefix=getattr(agent, "_cached_system_prompt_static", None), base_url=agent.base_url,
         max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
         provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
@@ -1503,14 +1504,14 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         max_tokens=agent.max_tokens, ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
         request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
+        cache_scope_id=cache_scope_id, static_system_prefix=getattr(agent, "_cached_system_prompt_static", None), ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
         supports_reasoning=agent._supports_reasoning_extra_body(),
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         qwen_session_metadata=_qwen_meta)
     if _profile:
         # Profiles handle per-provider quirks via hooks fed the context above.
-        return transport.build_kwargs(provider_profile=_profile, **_common)
+        return transport.build_kwargs(provider_profile=_profile, provider_name=getattr(agent, "requested_provider", None), **_common)
 
     # Legacy flag path: only for a provider absent from the providers/ registry.
     return transport.build_kwargs(
@@ -2789,8 +2790,12 @@ class _StreamingCall(StreamingWaitMonitor):
     @staticmethod
     def _quiet(fn, *args) -> None:
         """Best-effort callback: never let a display hook break the stream."""
-        with contextlib.suppress(Exception):
+        try:
             fn(*args)
+        except StreamPayloadBoundExceeded:
+            raise
+        except Exception:
+            pass
 
     def _set_managed_stream(self, stream: Any) -> Any:
         self.managed_stream_holder["stream"] = stream
@@ -2878,7 +2883,8 @@ class _StreamingCall(StreamingWaitMonitor):
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
         if self.agent.stream_delta_callback:
-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+            self._quiet(self.agent.stream_delta_callback, text)
+            self.agent._record_streamed_assistant_text(text)
 
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
@@ -3756,6 +3762,9 @@ class _StreamingCall(StreamingWaitMonitor):
                     self.result["response"] = _with_stream_emitters(
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    self.result["error"] = e
+                    return
                 except Exception as e:
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
@@ -3763,6 +3772,9 @@ class _StreamingCall(StreamingWaitMonitor):
                     if self._route_switched_under_request():
                         self.result["error"] = e
                         return
+        except StreamPayloadBoundExceeded as e:
+            self.result["error"] = e
+            return
         except InterruptedError as e:
             # Fast pre-retry interrupt surfaces through the normal result channel.
             self.result["error"] = e
@@ -3974,6 +3986,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
             self.worker.start()
             self._monitor_loop()
+        if isinstance(self.result["error"], StreamPayloadBoundExceeded):
+            raise self.result["error"]
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag

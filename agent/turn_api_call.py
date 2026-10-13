@@ -174,8 +174,6 @@ def handle_api_interrupt(
     """``InterruptedError`` during the provider call: a pending redirect keeps its correction
     queued for the outer-loop rebuild; otherwise keep any streamed partial text so the next
     turn has a record of the half-finished reply."""
-    from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
     # redirect() cancelled only this request: keep the correction queued, clear the
     # cancellation bit, let the outer loop rebuild. Never materialize incomplete
@@ -199,13 +197,12 @@ def handle_api_interrupt(
         # transcript, a neutral api_content so the pre-call sanitizer does not re-heal it.
         append_message(messages, hidden_interrupt_placeholder_row())
         final_response = REPETITION_LOOP_INTERRUPTED
-    elif _partial:
-        append_message(messages, {
-            "role": "assistant", "content": _partial, "display_metadata": {"interrupted": True},
-        })
-        final_response = _partial
     else:
-        final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
+        from agent.stream_payload_bound import persist_interrupted_stream_partial
+
+        final_response = persist_interrupted_stream_partial(agent, messages, elapsed=api_elapsed)
+        if _partial and messages and messages[-1].get("role") == "assistant":
+            messages[-1].setdefault("display_metadata", {})["interrupted"] = True
     agent._persist_session(messages, conversation_history)
     return ApiInterruptVerdict("break", thinking_spinner, interrupted, final_response)
 

@@ -19,6 +19,7 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 from agent.sdk_transform_bypass import bypass_sdk_request_transform
 from agent.stream_diag import buffer_connect_exhausted_notice
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.usage_anchor import set_usage_anchor
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ def _call_guarded(fn: Callable | None, fail_msg: str, *fail_args: Any, args: tup
         return
     try:
         fn(*args, **(kwargs or {}))
+    except StreamPayloadBoundExceeded:
+        raise
     except Exception:
         logger.debug(fail_msg, *fail_args, exc_info=True)
 
@@ -384,7 +387,13 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     started: dict[str, tuple[str, dict, float]] = {}
 
     def agent_cb(attr: str, fail_msg: str, *fail_args: Any, args: tuple = (), kwargs: dict | None = None) -> None:
-        _call_guarded(getattr(agent, attr, None), fail_msg, *fail_args, args=args, kwargs=kwargs)
+        try:
+            _call_guarded(getattr(agent, attr, None), fail_msg, *fail_args, args=args, kwargs=kwargs)
+        except StreamPayloadBoundExceeded:
+            # The app-server turn owner persists its bounded explanation from
+            # projected messages; retire this request's recorder accounting now.
+            agent._current_streamed_assistant_text = ""
+            raise
 
     def _fire_tool_started(item: dict) -> None:
         item_id, name = item.get("id") or "", _codex_item_to_tool_name(item)
@@ -735,6 +744,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     _ensure_codex_session(agent, messages)
     try:
         _start_codex_thread(agent)
+        agent._reset_stream_delivery_tracking()
         wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
         turn = agent._codex_session.run_turn(
             user_input=user_message,
@@ -1165,6 +1175,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # claims the sink supersedes this token; that only silences OUR live callbacks — consumption continues,
     # because stopping here handed the gateway a "completed" response missing its tail (#69486).
     writer_token = {"value": None, "raw_stream": None, "superseded_logged": False}
+    diagnostic_context = None
+
+    def _finish_diagnostic(response=None, error=None):
+        if diagnostic_context is not None:
+            relay_llm._finish_diagnostic(diagnostic_context, response=response, error=error)
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -1227,6 +1242,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         return bool(agent._interrupt_requested)
 
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+        nonlocal diagnostic_context
         from hermes_cli.providers import is_actual_route
 
         if is_actual_route(
@@ -1238,7 +1254,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        final_kwargs = bypass_sdk_request_transform(stream_kwargs)
+        diagnostic_context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        remove = (relay_llm._arm_dispatch(active_client, diagnostic_context)
+                  if diagnostic_context is not None else lambda: None)
+        try:
+            return active_client.responses.create(**final_kwargs)
+        finally:
+            remove()
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
@@ -1259,7 +1282,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         logger.debug("Codex stream opened (attempt=%s/%s, model=%s)",
             attempt + 1, max_stream_retries + 1, model)
 
-    def _drain_for_finalizer(event_stream: Any) -> None:
+    def _drain_for_finalizer(event_stream: Any) -> BaseException | None:
         # The final response is already assembled. Keep the finalizer drain on THIS owner thread:
         # moving the reader to a daemon thread and later closing from here releases the FD under that
         # thread's SSL BIO (#127390, same class as #29507). A tiny watchdog may only shutdown() the
@@ -1281,6 +1304,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                          agent._client_log_context())
             return
 
+        drain_error: BaseException | None = None
         timed_out = threading.Event()
 
         def _wake_owner() -> None:
@@ -1301,6 +1325,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             # A timeout-triggered shutdown is the expected wakeup, not another provider failure. Other
             # transport failures still get the old diagnostic, but none may discard the completed response.
             if not timed_out.is_set():
+                drain_error = exc
                 if not isinstance(exc, transport_errors):
                     _log_failure(exc)
                 logger.warning(
@@ -1308,7 +1333,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     "received; returning the completed response instead of retrying. %s error=%s",
                     agent._client_log_context(), exc,
                 )
-        except Exception:
+        except Exception as exc:
+            drain_error = exc
             logger.debug("Codex Responses stream finalization failed after a terminal response", exc_info=True)
         finally:
             # cancel() wins if the budget has not fired; join() also waits for an already-running shutdown
@@ -1324,6 +1350,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 "(agent.stream_drain_timeout); shut down its socket and completed cleanup on the owner thread. %s",
                 budget, agent._client_log_context(),
             )
+            return TimeoutError("Codex Responses stream drain did not complete after a terminal response")
+        return drain_error
 
     def _close_event_stream(event_stream: Any) -> None:
         close_fn = getattr(event_stream, "close", None)  # None while connect never succeeded
@@ -1379,6 +1407,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
+                _finish_diagnostic(error=exc)
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
@@ -1390,18 +1419,23 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 if not intercepted_events:  # zero-event attempt: never resend a pathological payload silently
                     api_kwargs = _prune_zero_event_retry_payload(api_kwargs, attempt + 1, max_stream_retries + 1)
                 continue
+            except StreamPayloadBoundExceeded:
+                raise
             except RuntimeError:
                 # "No terminal response"; Relay may still hold a finalizer-assembled response.
                 if event_stream is not None and event_stream.final_response is not None:
+                    _finish_diagnostic(response=event_stream.final_response)
                     return event_stream.final_response
+                _finish_diagnostic(error=RuntimeError("stream did not produce a terminal response"))
                 raise
             except _APIConnectionError as exc:
-                # The SDK wraps every connect/receive failure (``raise APIConnectionError from err``), so the
-                # raw ``transport_errors`` branch above never sees a pre-stream failure. Before the stream
-                # opened nothing is billed, so one fresh physical request is safe (#103673); once the writer
-                # token is claimed the inference may already be billed, so mid-stream failures still raise.
+                _finish_diagnostic(error=exc)
+                # Preserve the pre-stream transport retry policy (#103673), except WriteError:
+                # a partial write may already have reached the provider. Neither opening a stream
+                # nor a diagnostic request hook establishes completed writes or server acceptance.
                 if (attempt < max_stream_retries and writer_token["value"] is None
-                        and isinstance(exc.__cause__, _httpx.TransportError)):
+                        and isinstance(exc.__cause__, _httpx.TransportError)
+                        and not isinstance(exc.__cause__, _httpx.WriteError)):
                     logger.debug(
                         "Codex Responses pre-stream connect failed (attempt %s/%s); retrying. %s error=%s",
                         attempt + 1, max_stream_retries + 1, agent._client_log_context(), exc,
@@ -1409,8 +1443,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     continue
                 _log_failure(exc)
                 raise
+            except BaseException as exc:
+                _finish_diagnostic(error=exc)
+                raise
             if not agent._interrupt_requested:
-                _drain_for_finalizer(event_stream)
+                drain_error = _drain_for_finalizer(event_stream)
+            else:
+                drain_error = None
+            _finish_diagnostic(response=final, error=drain_error)
             if final.status in {"incomplete", "failed"}:
                 logger.warning("Codex Responses stream terminal status=%s "
                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",

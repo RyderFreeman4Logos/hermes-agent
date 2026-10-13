@@ -633,14 +633,6 @@ def _is_codex_spark(model: Optional[str], provider: Optional[str] = None) -> boo
     return _codex_route_bare_model(model, provider) == "gpt-5.3-codex-spark"
 
 
-def _is_openai_default_temperature_only(model: Optional[str]) -> bool:
-    """True for OpenAI reasoning families that 400 (``unsupported_value``) on any non-default
-    ``temperature``: gpt-5.x (incl. dated snapshots, ``-pro``, ``-codex``), o1/o3/o4. The
-    ``gpt-5-chat`` non-reasoning line still accepts it (#51083)."""
-    bare = _bare_model(model)
-    return bare.startswith(("gpt-5", "o1", "o3", "o4")) and not bare.startswith("gpt-5-chat")
-
-
 # Routes (host + model) that rejected ``temperature`` at runtime; the next call omits it up front
 # instead of paying the 400 round-trip again (the retry alone left #51083's first call to time out).
 _TEMPERATURE_REJECTED_ROUTES: set = set()
@@ -661,6 +653,7 @@ def _fixed_temperature_for_model(
     if _is_kimi_model(model):
         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
         return OMIT_TEMPERATURE
+    from agent.auxiliary_temperature import is_openai_default_temperature_only as _is_openai_default_temperature_only
     if _is_openai_default_temperature_only(model):
         logger.debug("Omitting temperature for %r (accepts only the default)", model)
         return OMIT_TEMPERATURE
@@ -1607,6 +1600,10 @@ class _CodexCompletionsAdapter:
         finally:
             guard.finish()
         # Shape the result like chat.completions.
+        from agent import relay_llm
+        context = relay_llm._PHYSICAL_DIAGNOSTICS.get()
+        if context is not None:
+            relay_llm._finish_diagnostic(context, response=final)
         message = SimpleNamespace(
             role="assistant", content="".join(text_parts).strip() or None,
             tool_calls=tool_calls_raw or None,
@@ -2594,12 +2591,44 @@ def _set_relay_auxiliary_route(provider: str | None, model: str | None, api_mode
 
 
 def _record_route_info(
-    route_info: Optional[dict[str, str]], provider: Optional[str], model: Optional[str]
+    route_info: Optional[dict[str, Any]], provider: Optional[str], model: Optional[str], *,
+    base_url: Optional[str] = None, api_key: Optional[str] = None,
+    api_mode: Optional[str] = None, timeout: Optional[float] = None,
+    fallback_label: Optional[str] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
-        route_info["provider"] = provider or "auto"
-        route_info["model"] = model or "default"
+        route_info.clear()
+        route_info.update(provider=provider or "auto", model=model or "default")
+        if fallback_label and str(fallback_label).startswith("fallback_chain["):
+            route_info["fallback_label"] = fallback_label
+        for key, value in (
+            ("base_url", base_url), ("api_key", api_key),
+            ("api_mode", api_mode), ("timeout", timeout),
+        ):
+            if value not in (None, ""):
+                route_info[key] = value
+
+
+def _record_physical_route(
+    route_info: Optional[dict[str, Any]], provider: Optional[str], client: Any,
+    request_kwargs: dict[str, Any], api_mode: Optional[str], *,
+    fallback_label: Optional[str] = None,
+) -> None:
+    """Publish the concrete destination immediately before a physical retry."""
+    concrete_provider = _fallback_provider_from_label(
+        _effective_provider_for_client(client, provider or "auto")
+    )
+    model = request_kwargs.get("model")
+    _set_relay_auxiliary_route(concrete_provider, model, api_mode)
+    _record_route_info(
+        route_info, concrete_provider, model,
+        base_url=str(getattr(client, "base_url", "") or ""),
+        api_key=str(getattr(client, "api_key", "") or ""),
+        api_mode=api_mode,
+        timeout=request_kwargs.get("timeout"),
+        fallback_label=fallback_label,
+    )
 
 
 def _relay_auxiliary_metadata(
@@ -3804,19 +3833,27 @@ def _prepare_same_provider_retry(
     return retry_client, retry_kwargs
 
 
-def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+def _retry_same_provider_sync(
+    *, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str],
+    route_info: Optional[dict[str, Any]] = None, **prep,
+) -> Any:
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
     )
+    _record_physical_route(route_info, resolved_provider, retry_client, retry_kwargs, resolved_api_mode)
     return _validate_llm_response(
         _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
     )
 
 
-async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+async def _retry_same_provider_async(
+    *, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str],
+    route_info: Optional[dict[str, Any]] = None, **prep,
+) -> Any:
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=True, **prep,
     )
+    _record_physical_route(route_info, resolved_provider, retry_client, retry_kwargs, resolved_api_mode)
     return _validate_llm_response(
         await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
         task,
@@ -4046,14 +4083,17 @@ def _fallback_request_kwargs(
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task)
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task,
+        no_progress_timeout=(
+            _get_task_no_progress_timeout(task or "") if destination.api_mode == "codex_responses" else None
+        ))
     return fb_kwargs
 
 
 def _plan_fallback_candidate(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str],
     effective_timeout: float, apply_fast_lane: bool, **request,
-) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], dict[str, Any]]]:
+) -> tuple[_FallbackDestination, dict[str, Any], Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]]]:
     """Resolve the destination + first-attempt kwargs for a fallback candidate.
 
     Returns ``(destination, kwargs, rebuild)`` where ``rebuild(provider, client, model)`` produces
@@ -4126,6 +4166,7 @@ def _call_fallback_candidate_sync(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    route_info: Optional[dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery: on an auth error refresh its
     credentials and retry once with a rebuilt client; if that also auth-fails, quarantine the
@@ -4145,6 +4186,10 @@ def _call_fallback_candidate_sync(
     )
 
     def _send(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
+        _record_physical_route(
+            route_info, dest.provider, client, request_kwargs, dest.api_mode,
+            fallback_label=fb_label,
+        )
         return _validate_llm_response(
             _relay_sync_completion(
                 client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode,
@@ -4191,6 +4236,7 @@ async def _call_fallback_candidate_async(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    route_info: Optional[dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire)."""
     destination, fb_kwargs, rebuild = _plan_fallback_candidate(
@@ -4201,6 +4247,10 @@ async def _call_fallback_candidate_async(
     )
 
     async def _send(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
+        _record_physical_route(
+            route_info, dest.provider, client, request_kwargs, dest.api_mode,
+            fallback_label=fb_label,
+        )
         return _validate_llm_response(
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
             task,
@@ -6351,14 +6401,18 @@ def _get_task_no_progress_timeout(task: str) -> Optional[float]:
 
 
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
-    """``auxiliary.<task>.timeout`` from config, else *default*."""
+    """``auxiliary.<task>.timeout`` from config, else *default*.
+
+    Overflow and non-finite values are not a timeout: they fall back to *default*
+    instead of raising or becoming an unbounded deadline.
+    """
     if not task:
         return default
     raw = _get_auxiliary_task_config(task).get("timeout")
-    if raw is not None:
-        with contextlib.suppress(ValueError, TypeError):
-            return float(raw)
-    return default
+    if raw is None:
+        return default
+    from agent.conversation_compression_timeouts import _positive_finite
+    return _positive_finite(raw) or default
 
 
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
@@ -8127,11 +8181,13 @@ def _plan_aux_call(
         task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, effective_timeout=req.effective_timeout,
         effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
+        route_info=route_info,
     )
     retry_kwargs = dict(
         candidate_kwargs, resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         main_runtime=main_runtime, final_model=req.final_model, extra_headers=extra_headers,
+        route_info=route_info,
     )
     return req, retry_kwargs, candidate_kwargs
 
@@ -8259,6 +8315,7 @@ def _call_llm_impl(
         def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
+                _record_physical_route(route_info, kw["provider"], args[0], args[1], kw["api_mode"])
                 return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
             if kind == "retry":
                 return _retry_same_provider_sync(**kw)
@@ -8405,6 +8462,7 @@ async def _async_call_llm_impl(
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
+                _record_physical_route(route_info, kw["provider"], args[0], args[1], kw["api_mode"])
                 return _validate_llm_response(await _relay_async_completion(*args, **kw), task)
             if kind == "retry":
                 return await _retry_same_provider_async(**kw)

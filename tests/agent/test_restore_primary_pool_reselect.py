@@ -440,7 +440,7 @@ def test_later_persisted_generation_is_not_overwritten(monkeypatch):
 
     entry = _codex_entry("owned-1", _EXPIRED, status="exhausted", reset_at=time.time() + 86400)
     pool = CredentialPool("openai-codex", [entry])
-    _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
+    calls = _patch_probe(monkeypatch, fresh=(_FRESH, "fixture-refresh-2"), open_=True)
     selected = pool.select(model="gpt-5.5")
     assert selected is not None and selected.access_token == _FRESH
     newer = replace(

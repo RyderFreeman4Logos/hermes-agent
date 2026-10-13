@@ -84,4 +84,13 @@ describe('TUI bundle (issue #31227)', () => {
       `Found ${matches.length} async __esm wrappers — these can deadlock #31227. First few:\n${matches.slice(0, 3).join('\n')}`
     ).toEqual([])
   })
+
+  it('does not bundle the upstream ink package or ink-text-input', () => {
+    expect(bundleSrc.includes('node_modules/ink/build/index.js')).toBe(false)
+    expect(bundleSrc.includes('node_modules/ink-text-input/build/index.js')).toBe(false)
+  })
+
+  it('bundles one React instance for Ink and app hooks', () => {
+    expect(bundleSrc.match(/^\/\/ .*node_modules\/react\/index\.js$/gm)).toHaveLength(1)
+  })
 })

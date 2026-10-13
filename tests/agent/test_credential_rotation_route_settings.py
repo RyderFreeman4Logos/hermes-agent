@@ -20,7 +20,7 @@ def test_credential_rotation_replaces_route_scoped_tls_settings():
             "ssl_ca_cert": "/a.pem",
         },
         _apply_client_headers_for_base_url=MagicMock(),
-        _replace_primary_openai_client=MagicMock(),
+        _replace_primary_openai_client=MagicMock(return_value=True),
     )
     agent._reapply_route_client_config = MethodType(
         AIAgent._reapply_route_client_config,
@@ -64,7 +64,7 @@ def test_credential_rotation_does_not_carry_global_headers_across_routes():
             "base_url": "https://a.example/v1",
             "default_headers": {"Authorization": "old-secret"},
         },
-        _replace_primary_openai_client=MagicMock(),
+        _replace_primary_openai_client=MagicMock(return_value=True),
     )
     agent._apply_client_headers_for_base_url = MethodType(
         AIAgent._apply_client_headers_for_base_url,
@@ -124,7 +124,7 @@ def test_codex_rotation_keeps_proxy_override(monkeypatch):
         api_mode="codex_responses", provider="openai-codex", model="gpt-5.3-codex", api_key="tok-first",
         base_url="http://127.0.0.1:8787/backend-api/codex",
         _client_kwargs={"api_key": "tok-first", "base_url": "http://127.0.0.1:8787/backend-api/codex"},
-        _reapply_route_client_config=MagicMock(), _replace_primary_openai_client=MagicMock(),
+        _reapply_route_client_config=MagicMock(), _replace_primary_openai_client=MagicMock(return_value=True),
     )
 
     assert AIAgent._swap_credential(agent, entry) is True

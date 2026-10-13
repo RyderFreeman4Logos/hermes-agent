@@ -191,6 +191,10 @@ def test_abandoned_retry_preserves_operation_identity_and_context(tmp_path, monk
         assert first_messages[0]["effect_disposition"] == "unknown"
         assert "op-1" not in first_messages[0]["content"]
 
+        # Only the deliberately blocked first call needs the short abandonment
+        # deadline. Real synchronous SQLite admission can exceed 200ms under
+        # concurrent disk load; subsequent calls still have a bounded deadline.
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "5")
         retry_messages = _run(agent, _call("call-retry", "op-1"))
         assert json.loads(retry_messages[0]["content"])["success"] is True
 

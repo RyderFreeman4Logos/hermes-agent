@@ -17,6 +17,8 @@ so transport-side mutation cannot leak back into config.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     _merge_request_overrides,
     _resolve_delegation_credentials,
@@ -36,6 +38,14 @@ def _cfg(**overrides):
 def _parent(**attrs):
     parent = MagicMock()
     parent._delegate_depth = 0
+    parent.model = "parent-model"
+    parent.provider = "openrouter"
+    parent.requested_provider = "openrouter"
+    parent.base_url = "https://openrouter.ai/api/v1"
+    parent.api_key = "test-key"
+    parent.api_mode = "chat_completions"
+    parent.acp_command = None
+    parent.acp_args = []
     # MagicMock attributes are MagicMocks (non-dict) by default; set real
     # values for the ones the resolution path inspects.
     parent.request_overrides = attrs.pop("request_overrides", None)
@@ -68,13 +78,11 @@ def test_direct_branch_absent_request_overrides_stays_none():
     assert creds["request_overrides"] is None
 
 
-def test_direct_branch_non_dict_request_overrides_stays_none():
-    """Garbage in config (string/list) must not crash or forward junk."""
+def test_direct_branch_non_dict_request_overrides_fails_closed():
+    """Typed route admission rejects malformed overrides before child dispatch."""
     for bad in ("throughput", ["extra_body"], 42):
-        creds = _resolve_delegation_credentials(
-            _cfg(request_overrides=bad), parent_agent=None
-        )
-        assert creds["request_overrides"] is None
+        with pytest.raises(ValueError, match="invalid request_overrides; expected a mapping"):
+            _resolve_delegation_credentials(_cfg(request_overrides=bad), parent_agent=None)
 
 
 def test_direct_branch_deep_copies_nested_extra_body():

@@ -365,7 +365,7 @@ def _is_xai_bad_credentials_403(
     provider: str,
     status_code: Any,
     api_error: Any,
-    error_context: Optional[Dict[str, Any]] = None,
+    error_context: Optional[dict[str, Any]] = None,
 ) -> bool:
     """xAI reports an expired or invalid OAuth access token as HTTP 403 with
     body code ``unauthenticated:bad-credentials`` rather than 401, so the

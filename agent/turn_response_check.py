@@ -262,6 +262,8 @@ def check_api_response(
     from agent import relay_llm
 
     relay_llm.complete_logical_call(api_request_id, outcome="success", agent=agent)
+    if hasattr(agent, "_delegate_successful_llm_route"):
+        agent._delegate_successful_llm_route = (agent.model, agent.provider)
     agent._touch_activity(f"API call #{api_call_count} completed")
     return _verdict("break")
 

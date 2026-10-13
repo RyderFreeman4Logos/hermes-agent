@@ -21,7 +21,11 @@ RPC_BUDGET_S = 5.0
 
 def _hold_write_lock(db_path: Path) -> subprocess.Popen:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    db_path.touch()
+    # Initialize a valid database before holding its write lock. An empty file
+    # races upstream startup quarantine instead of exercising heartbeat writes.
+    from hermes_state import SessionDB
+
+    SessionDB(db_path).close()
     holder = subprocess.Popen(
         [
             sys.executable, "-c",

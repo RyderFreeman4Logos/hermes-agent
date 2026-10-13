@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent.custom_entry_pool import SNAPSHOT_OWNER_KEY, runtime_entry_owner
+from agent.agent_runtime_helpers import _copy_request_overrides
 
 
 def _snapshot_primary_runtime(agent):
@@ -25,7 +26,7 @@ def _snapshot_primary_runtime(agent):
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "request_overrides": _copy_request_overrides(getattr(agent, "request_overrides", {}) or {}),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
@@ -65,7 +66,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
         # Overrides must travel with the switched-to identity or a later recovery/restore resurrects
         # PRE-switch overrides from the stale init snapshot.
         # See #75091.
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "request_overrides": _copy_request_overrides(getattr(agent, "request_overrides", {}) or {}),
         "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
         "compressor_model": getattr(cc, "model", agent.model),
         "compressor_base_url": getattr(cc, "base_url", agent.base_url),

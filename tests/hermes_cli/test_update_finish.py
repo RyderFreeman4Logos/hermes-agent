@@ -377,7 +377,7 @@ def _npm_graph(source):
     tools = {}
     node = shutil.which("node")
     assert node, "source completion acceptance requires Node and npm"
-    for name in ("esbuild", "typescript", "vite"):
+    for name in ("esbuild", "typescript", "vite", "react"):
         probe = subprocess.run([node, "-p", f"require.resolve('{name}/package.json')"],
                                cwd=ROOT, capture_output=True, text=True, check=False)
         if probe.returncode:
@@ -407,7 +407,7 @@ def _npm_graph(source):
         import {{ execFileSync }} from 'node:child_process';
         const tools = {json.dumps(tools)};
         for (const [name, target] of Object.entries(tools)) {{
-          const workspace = name === 'esbuild' ? 'ui-tui' : 'web';
+          const workspace = ['esbuild', 'react'].includes(name) ? 'ui-tui' : 'web';
           mkdirSync(workspace + '/node_modules', {{recursive: true}});
           symlinkSync(target, workspace + '/node_modules/' + name, 'dir');
         }}

@@ -3263,6 +3263,56 @@ class ContextCompressor(
             )
         return demoted
 
+    def _demote_post_summary_protected_tail(
+        self,
+        messages: list[dict[str, Any]],
+        tail_start: int,
+    ) -> int:
+        """Demote bulky retained-tail tools before the single compression commit.
+
+        Bounded to the final protected tail. The compressor already invalidates the
+        prompt prefix once, so this rewrite is coalesced into that same durable
+        commit (Unit C). Unlike pre-compress pressure demote, this uses the raw
+        tail budget (1.0x), not the 1.5x soft ceiling.
+        """
+        if tail_start >= len(messages):
+            return 0
+
+        def _tail_tokens() -> int:
+            return sum(
+                _estimate_msg_budget_tokens(messages[idx])
+                for idx in range(tail_start, len(messages))
+            )
+
+        if _tail_tokens() <= self.tail_token_budget:
+            return 0
+
+        call_id_to_tool = _tool_calls_by_id(messages)
+        protected_skills = _collect_protected_skill_names(messages, tail_start)
+        demote_end = max(tail_start, len(messages) - _PRESSURE_KEEP_RECENT_MESSAGES)
+        demoted = 0
+        for idx in range(tail_start, demote_end):
+            if self._is_context_summary_message(messages[idx]):
+                continue
+            if self._demote_tool_result_at(
+                messages,
+                idx,
+                call_id_to_tool,
+                _PRUNE_MIN_CHARS,
+                protected_skills,
+            ):
+                demoted += 1
+                if _tail_tokens() <= self.tail_token_budget:
+                    break
+        if demoted and not self.quiet_mode:
+            logger.info(
+                "Post-summary protected-tail demotion: reclaimed %d tool result(s) "
+                "before the compression commit (tail now ~%s tokens)",
+                demoted,
+                f"{_tail_tokens():,}",
+            )
+        return demoted
+
     def _spared_pending_tool_round(self, messages: list[dict[str, Any]]) -> range:
         """Return the pending round, owning assistant(tool_calls) row included, only when it fits the input window's
         hard share. The call's args are part of the unread round: the model reads its result next to them."""
@@ -5182,12 +5232,16 @@ Write only the summary body. Do not include any preamble or prefix."""
                 cut_idx = asst_anchored_cut
 
         # Optional multi-user anchor; n<=1 is gated here (not delegated): re-running the single-user anchor after
-        # the assistant anchor could re-trigger its forward turn-pair push. Runs even under the split: the
-        # N-user promise (#70250) is a user-facing setting and must outrank the budget, so it pulls the cut
-        # back to the Nth user turn — which is why the split only ever relaxes the single-user anchor.
+        # the assistant anchor could re-trigger its forward turn-pair push. The N-user promise
+        # (#70250) is a user-facing setting and must outrank the single-user budget exception,
+        # so it also runs under the split.
         # getattr: plugin engines and __new__ doubles skip __init__.
         _min_tail_users = getattr(self, "min_tail_user_messages", 1)
-        if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
+        if (
+            isinstance(_min_tail_users, int)
+            and not isinstance(_min_tail_users, bool)
+            and _min_tail_users > 1
+        ):
             cut_idx = self._ensure_last_n_user_messages_in_tail(messages, cut_idx, head_end, _min_tail_users)
 
         # Floor guarantees progress (>= 1 message claimed); re-align FORWARD only so a raised cut
@@ -5661,6 +5715,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Default carrier is tail[0]: an exempt row absorbs the summary invisibly. The forced repair
         # path needs a non-empty role=user row, so it targets the template-visible row.
         merge_target_idx = first_tail_visible_idx if force_user_leading and first_tail_visible_idx is not None else 0
+        post_summary_tail_start = len(compressed)
         for tail_idx, msg in enumerate(tail_messages):
             # Tag carried-forward tail rows so archive_and_compact treats their originals as
             # superseded duplicates (#86366).
@@ -5669,6 +5724,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             if merge_into_tail and tail_idx == merge_target_idx:
                 self._merge_summary_into_tail_row(msg, summary, summary_role, force_user_leading)
             compressed.append(msg)
+        self._demote_post_summary_protected_tail(compressed, post_summary_tail_start)
         return compressed
 
 

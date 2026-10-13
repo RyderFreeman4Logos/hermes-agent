@@ -27,6 +27,8 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 class _FakeRegistry:
     """Return pre-canned sessions, then None once exhausted."""
 
+    _child_owned_terminal_completion = staticmethod(ProcessRegistry._child_owned_terminal_completion)
+
     def __init__(self, sessions):
         self._sessions = list(sessions)
         self._completion_consumed: set = set()

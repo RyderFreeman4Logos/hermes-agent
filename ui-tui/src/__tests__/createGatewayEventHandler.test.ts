@@ -2302,7 +2302,7 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
 
-    it('keeps identical interim and terminal replies as separate messages without response_previewed', () => {
+    it('collapses identical interim and terminal replies in one turn', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))
 
@@ -2311,7 +2311,7 @@ describe('createGatewayEventHandler', () => {
       onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
 
       const assistantMsgs = appended.filter(m => m.role === 'assistant' && m.text)
-      expect(assistantMsgs).toHaveLength(2)
+      expect(assistantMsgs).toEqual([{ role: 'assistant', text: 'same reply' }])
     })
 
     it('settles identical terminal reply onto interim when response_previewed', () => {

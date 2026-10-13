@@ -10,6 +10,9 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 from __future__ import annotations
 
 import logging
+import hashlib
+import subprocess
+from pathlib import Path
 import os
 import re
 import sys
@@ -1940,7 +1943,58 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     return _config_context_length, _custom_providers, _effective_context_length, _model_cfg
 
 
-def _select_context_engine(_agent_cfg):
+def _capture_checkpoint_code_snapshot() -> dict[str, Any]:
+    """Capture code identity once at engine construction, never per checkpoint."""
+    root = Path(__file__).resolve().parents[1]
+    try:
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", str(root), *args], check=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            ).stdout.strip()
+        head = git("rev-parse", "HEAD")
+        tree = git("rev-parse", "HEAD^{tree}")
+        diff = git("diff", "--no-ext-diff")
+        return {"head": head, "tree": tree, "dirty": bool(diff),
+                "dirty_diff_hash": hashlib.sha256(diff.encode()).hexdigest()}
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+
+def _build_checkpoint_map_caller(agent: Any) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """Bind checkpoint Map calls to the configured auxiliary provider route."""
+    code_snapshot = _capture_checkpoint_code_snapshot()
+
+    def call(request: dict[str, Any]) -> dict[str, Any]:
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+        from agent.checkpoint_engine import CheckpointMapCallRejected
+
+        attempts: list[dict[str, Any]] = []
+
+        def identities() -> tuple[dict[str, Any], ...]:
+            return tuple({**attempt, "code_snapshot": code_snapshot} for attempt in attempts)
+
+        try:
+            response = call_llm(
+                task="checkpoint", model=request.get("model"), messages=request["messages"],
+                max_tokens=int(request["max_tokens"]),
+                extra_body={"response_format": request["response_format"]},
+                main_runtime={
+                    "provider": getattr(agent, "provider", ""), "model": getattr(agent, "model", ""),
+                    "base_url": getattr(agent, "base_url", ""), "api_key": getattr(agent, "api_key", ""),
+                    "api_mode": getattr(agent, "api_mode", ""),
+                }, checkpoint_attempts=attempts, structured_output_required=True,
+            )
+        except Exception as exc:
+            raise CheckpointMapCallRejected({"_checkpoint_attempt_identities": identities()}, exc) from exc
+        return {
+            "content": extract_content_or_reasoning(response),
+            "_checkpoint_attempt_identities": identities(),
+        }
+    return call
+
+
+def _select_context_engine(_agent_cfg, agent=None):
     """Config-driven context engine: ``context.engine`` → plugins/context_engine/<name>/ →
     general plugin system → None (built-in ContextCompressor)."""
     _engine_name = "compressor"
@@ -1953,7 +2007,15 @@ def _select_context_engine(_agent_cfg):
     _copy_failed = False
     try:
         from plugins.context_engine import load_context_engine
-        _selected_engine = load_context_engine(_engine_name)
+        if _engine_name == "checkpoint":
+            from agent.checkpoint_engine import CheckpointContextEngine
+            _selected_engine = CheckpointContextEngine(
+                _ctx_cfg.get("checkpoint", {}),
+                session_id=getattr(agent, "session_id", "default") or "default",
+                map_caller=_build_checkpoint_map_caller(agent),
+            )
+        else:
+            _selected_engine = load_context_engine(_engine_name)
     except Exception as _ce_load_err:
         _ra().logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
 
@@ -2007,7 +2069,7 @@ def _compressor_max_tokens(agent):
 
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
-    _selected_engine = _select_context_engine(_agent_cfg)
+    _selected_engine = _select_context_engine(_agent_cfg, agent)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex

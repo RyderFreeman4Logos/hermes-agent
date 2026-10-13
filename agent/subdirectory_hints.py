@@ -18,14 +18,11 @@ logger = logging.getLogger(__name__)
 
 # Same filenames as prompt_builder.py, in priority order (first match wins per dir).
 _HINT_FILENAMES = ["AGENTS.override.md", "AGENTS.md", "agents.md", "CLAUDE.md", "claude.md", ".cursorrules"]
-# Per-file / aggregate insertion-time hint caps match live 4b8b7109:
-# 8_000 per file, 16_000 combined. Official 32_000 is the stray-huge-file
-# guard; live still truncates area AGENTS.md at 8k before it lands in a
-# tool result. Over the per-file ceiling: reuse ``_truncate_content``
-# (head+tail + warning). Combined overflow uses the live 16k marker.
-_MAX_HINT_CHARS = 8_000
-_MAX_TOTAL_HINT_CHARS = 16_000
-_TOTAL_HINT_TRUNCATION_MARKER = "\n\n[...subdirectory hints truncated to 16,000 characters]"
+# Keep official area instructions intact while bounding multi-directory insertion.
+# Oversized individual files retain the official head/tail truncation and warning.
+_MAX_HINT_CHARS = 32_000
+_MAX_TOTAL_HINT_CHARS = 64_000
+_TOTAL_HINT_TRUNCATION_MARKER = "\n\n[...subdirectory hints truncated to 64,000 characters]"
 _PATH_ARG_KEYS = {"path", "file_path", "workdir"}
 _COMMAND_TOOLS = {"terminal"}
 _MAX_ANCESTOR_WALK = 5  # ancestor levels walked per path — bounds deep-path scans

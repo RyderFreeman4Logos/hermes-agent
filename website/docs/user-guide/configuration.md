@@ -3100,3 +3100,23 @@ dashboard:
 - `ws_orphan_reap_grace_s` — how long a WS-detached session waits before the orphan reaper collects it. Raise alongside the keepalive values if clients reconnect slowly. Periodic session maintenance also completes cleanup for closed sockets and re-arms a missing orphan timer, so a detached chat cannot keep its ownership lease solely because its initial cleanup or timer was lost. Reconnecting cancels that timer; active delegated work and healthy running turns remain protected by the normal orphan-reaper checks. (`HERMES_TUI_WS_ORPHAN_REAP_GRACE_S` remains as an internal override.)
 - `ws_orphan_activity_stale_s` (default `600`) — how long a detached **running** turn's activity clock (the same clock the `agent.turn_liveness` watchdog samples: API waits, stream tokens, tool heartbeats) must be idle before the orphan reaper interrupts it. A client-absent turn that is still actively producing keeps running to completion detached — closing the laptop, backgrounding the mobile app, or a desktop update no longer cancels healthy long turns; only a genuinely wedged turn is interrupted. Set `0` to interrupt at the grace window regardless of activity (old behavior).
 - `startup_orphan_sweep` (default `true`) — the WS-orphan reap timer above is in-process, so a gateway restart (update, crash, systemd) before it fires leaves the session row open forever — phantom "active" work in `/resume` and dashboards. On every gateway boot — both the stdio TUI (`entry.main`) and the desktop/dashboard WebSocket sidecar (`handle_ws`) — rows with source `tui` / `desktop` / `subagent` / `unknown` (a row the token-accounting guard had to materialize itself) whose start time **and** newest message are both older than the session TTL (`HERMES_TUI_SESSION_TTL_S`, default 6 hours) are closed with `end_reason: startup_orphan_reap`. Messaging-platform sessions (Telegram, Discord, …) are never touched, live in-memory sessions (a client that already resumed) are excluded, and swept sessions remain resumable.
+
+## Loop timing, cache diagnostics, and checkpoint context
+
+`agent.loop_timing_context` defaults to `true`. It appends the current loop start time and, when available, the previous successful loop end time to the model-facing input. Display text and automatic session titles retain the original user input. Set it to `false` to disable this timing context.
+
+`agent.codex_cache_diagnostics.enabled` defaults to `false`. Enable it to record local, opaque cache-prefix evidence for Codex Responses attempts in `cache/codex-cache-prefix.jsonl` under the active Hermes home. These diagnostics do not change provider requests or results; storage failures discard diagnostic records.
+
+`terminal.auto_background_timeout_threshold` defaults to `200` seconds. When a terminal call omits `background` and its effective timeout exceeds this threshold, Hermes starts a managed background process with completion notification. An explicit `background: false` keeps foreground behavior, subject to the foreground timeout cap. Values must be positive integers.
+
+The optional `context.engine: checkpoint` engine accepts these settings under `context.checkpoint`:
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `context.checkpoint.mode` | `shadow` | `shadow` builds and validates checkpoints while returning the existing messages; `live` uses the validated candidate and requires retained raw history. |
+| `context.checkpoint.target_wire_tokens` | `48000` | Positive target size for the compacted provider context. |
+| `context.checkpoint.hard_max_wire_tokens` | `60000` | Hard wire-token limit; must be at least the target. |
+| `context.checkpoint.map_concurrency` | `2` | Maximum concurrent map calls; must be at least one. |
+| `context.checkpoint.map.max_output_tokens` | `16384` | Positive output-token cap per map call; the effective cap cannot exceed 16384. |
+| `context.checkpoint.structured_output` | `required` | `required`, `preferred`, or `disabled`; a required structured response must be supported by the selected route. |
+| `context.checkpoint.trace` | `false` | Record checkpoint trace evidence in the checkpoint store when enabled. |

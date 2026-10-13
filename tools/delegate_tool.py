@@ -305,6 +305,7 @@ def _build_child_agent(
     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
     # reference), and no parent teardown can close it out from under a background child (#81267).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+    child_session_ref["child"] = child
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id

@@ -468,8 +468,9 @@ def offline_file_access(path: Path | str, *, what: str = "read", handoff=None):
         claim = _reservation(key, handoff)
         main = _live_main_key(key)
         if main is not None:
+            subject = "it" if main == key else f"its main database {main}"
             raise LiveConnectionError(
-                f"Refusing to {what} {path}: a connection to {main} is still open "
+                f"Refusing to {what} {path}: a connection to {subject} is still open "
                 "in this process, and raw file access would cancel its POSIX locks. "
                 "Close all database handles and retry.")
         temporary = claim is None

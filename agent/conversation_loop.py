@@ -361,6 +361,41 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
     agent._stream_needs_break = True
 
 
+def _is_xai_bad_credentials_403(
+    provider: str,
+    status_code: Any,
+    api_error: Any,
+    error_context: Optional[dict[str, Any]] = None,
+) -> bool:
+    """xAI reports an expired or invalid OAuth access token as HTTP 403 with
+    body code ``unauthenticated:bad-credentials`` rather than 401, so the
+    401-only refresh trigger never fires and a long-lived worker keeps its
+    dead in-memory token (#82052). Scoped to xai-oauth: other providers'
+    403s remain non-retryable authorization failures.
+    """
+    if provider != "xai-oauth" or status_code != 403:
+        return False
+    if error_context is None:
+        from agent.agent_runtime_helpers import extract_api_error_context
+
+        error_context = extract_api_error_context(api_error)
+    reason = str((error_context or {}).get("reason") or "").strip().casefold()
+    if reason == "unauthenticated:bad-credentials":
+        return True
+    exact_messages = {
+        "oauth2 access token could not be validated",
+        "the oauth2 access token could not be validated",
+    }
+    for value in (
+        (error_context or {}).get("message"),
+        getattr(api_error, "message", None),
+    ):
+        message = str(value or "").strip().casefold().removesuffix(".")
+        if message in exact_messages:
+            return True
+    return False
+
+
 def _is_copilot_provider(agent: Any) -> bool:
     """Delegate to ``AIAgent._is_copilot_provider``; the fallback keeps the ``github-copilot`` /
     ``github`` aliases so credential recovery is not skipped for them."""
@@ -523,6 +558,18 @@ def _is_nous_inference_route(provider: str, base_url: str) -> bool:
     return (provider or "").strip().lower() == "nous" or base_url_host_matches(
         str(base_url or ""), "inference-api.nousresearch.com"
     )
+
+
+def _is_standard_profile_child(agent) -> bool:
+    return getattr(agent, "_delegate_model_profile", None) == "standard"
+
+
+def _standard_child_can_fallback(agent, *, reason=None) -> bool:
+    """A standard child may switch after a provider failure, not a content-policy denial."""
+    if not _is_standard_profile_child(agent):
+        return True
+    from agent.error_classifier import FailoverReason
+    return reason != FailoverReason.content_policy_blocked
 
 
 def _billing_or_entitlement_message(
@@ -1630,6 +1677,7 @@ def _run_conversation_turn(
     agent._compression_adoption_failed = False
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
+    agent._codex_auth_retry_attempted = False
     agent._last_turn_usage = None
 
     s = _LoopState(

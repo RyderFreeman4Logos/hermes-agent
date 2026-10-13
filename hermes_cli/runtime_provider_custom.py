@@ -109,6 +109,8 @@ def _lift_common_custom_fields(entry: dict[str, Any], result: dict[str, Any], *,
     extra_body = entry.get("extra_body")
     if isinstance(extra_body, dict):
         result["extra_body"] = dict(extra_body)
+    if isinstance(entry.get("send_session_id"), bool):
+        result["send_session_id"] = entry["send_session_id"]
     _lift_extra_headers(entry, result)
     if api_mode:
         result["api_mode"] = api_mode
@@ -574,7 +576,7 @@ def _resolve_named_custom_runtime(*, requested_provider: str, explicit_api_key: 
         if token_provider is not None:
             api_key = token_provider
     result = _custom_runtime(rp, base_url, api_key, custom_provider.get("api_mode"),
-                             source=f"custom_provider:{custom_provider.get('name', requested_provider)}",
+                             source=f"custom_provider:{custom_provider.get('provider_key') or custom_provider.get('name', requested_provider)}",
                              requested_provider=requested_provider)
     _apply_custom_provider_extras(custom_provider, target_model, result)
     # OpenCode-family custom providers (opencode-go/zen names, or opencode.ai hosts) serve models

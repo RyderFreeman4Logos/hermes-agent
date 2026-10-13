@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 
 from run_agent import AIAgent
+from agent.credential_pool import CredentialPool, PooledCredential
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -309,9 +310,7 @@ class TestRestorePrimaryRuntime:
         agent._credential_pool = _DeepseekPool()
         agent._swap_credential = MagicMock()
 
-        primary_pool = MagicMock()
-        primary_pool.provider = primary_provider
-        primary_pool.has_available.return_value = False
+        primary_pool = CredentialPool(primary_provider, [])
         with (
             patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
             patch("agent.credential_pool.load_pool", return_value=primary_pool) as load_pool,
@@ -354,27 +353,14 @@ class TestRestorePrimaryRuntime:
         """Custom primary + custom:<name> entry whose base_url resolves to the
         SAME custom key must swap (legitimate same-endpoint rotation)."""
 
-        class _Entry:
-            provider = "custom:myllm"
-            id = "custom-entry"
-            label = "myllm"
-            runtime_api_key = "custom-key"
-            runtime_base_url = "https://my-llm.example.com/v1"
-            access_token = "custom-key"
-
-        class _Pool:
-            provider = "custom:myllm"
-
-            def has_available(self, **_kwargs):
-                return True
-
-            def select(self, **_kwargs):
-                return _Entry()
-
+        entry = PooledCredential(
+            provider="custom:myllm", id="custom-entry", label="myllm",
+            auth_type="api_key", priority=0, source="manual", access_token="custom-key",
+            base_url="https://my-llm.example.com/v1",
+        )
         agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
         agent._fallback_activated = True
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
+        agent._credential_pool = CredentialPool(entry.provider, [entry])
 
         with (
             patch(
@@ -386,20 +372,17 @@ class TestRestorePrimaryRuntime:
             result = agent._restore_primary_runtime()
 
         assert result is True
-        agent._swap_credential.assert_called_once()
+        assert agent._credential_pool_entry_id == entry.id
+        assert agent.api_key == entry.runtime_api_key
+        assert agent._credential_pool.current().request_count == 1
 
     def test_restore_reloads_named_custom_pool_by_scoped_key(self):
-        class _Entry:
-            provider = "custom:gemini-display"
-            id = "gemini-key"
-            label = "gemini"
-            runtime_api_key = "gemini-key"
-            access_token = "gemini-key"
-
-        primary_pool = MagicMock()
-        primary_pool.provider = "custom:gemini-display"
-        primary_pool.has_available.return_value = True
-        primary_pool.select.return_value = _Entry()
+        entry = PooledCredential(
+            provider="custom:gemini-display", id="gemini-key", label="gemini",
+            auth_type="api_key", priority=0, source="manual", access_token="gemini-key",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        primary_pool = CredentialPool(entry.provider, [entry])
 
         fallback_pool = MagicMock()
         fallback_pool.provider = "openrouter"
@@ -409,7 +392,6 @@ class TestRestorePrimaryRuntime:
         )
         agent._fallback_activated = True
         agent._credential_pool = fallback_pool
-        agent._swap_credential = MagicMock()
         config = {
             "custom_providers": [
                 {
@@ -435,7 +417,9 @@ class TestRestorePrimaryRuntime:
         assert result is True
         assert agent._credential_pool is primary_pool
         load_pool.assert_called_once_with("gemini-no-filter")
-        agent._swap_credential.assert_called_once_with(primary_pool.select.return_value)
+        assert agent._credential_pool_entry_id == entry.id
+        assert agent.api_key == entry.runtime_api_key
+        assert primary_pool.current().request_count == 1
 
     def test_restore_named_custom_pool_wrong_endpoint_fails_closed(self):
         pool = MagicMock()
@@ -676,10 +660,16 @@ class TestSwitchModelRequestOverridesSnapshot:
     so a post-switch transport recovery or fallback restore reinstates the
     switched-to identity's overrides, not a stale or empty set."""
 
-    def _switch(self, agent, **kwargs):
+    def _switch(self, agent, *, extra_body, **kwargs):
         from agent.agent_runtime_helpers import switch_model
 
         with (
+            patch("hermes_cli.config.load_config", return_value={
+                "custom_providers": [{
+                    "name": "switch-target", "model": kwargs["new_model"],
+                    "base_url": kwargs["base_url"], "extra_body": extra_body,
+                }],
+            }),
             patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
             patch(
                 "agent.model_metadata.get_model_context_length",
@@ -697,11 +687,12 @@ class TestSwitchModelRequestOverridesSnapshot:
 
     def test_switch_then_recover_restores_current_overrides(self):
         """After /model switch, a transport recovery must reinstate the
-        overrides that were live at switch time — not drop them."""
+        destination config overrides, not the pre-switch caller overrides."""
         overrides = {"extra_body": {"reasoning": {"effort": "high"}}}
-        agent = _make_agent(provider="custom", request_overrides=overrides)
+        agent = _make_agent(provider="custom", request_overrides={"extra_body": {"old_only": True}})
         self._switch(
             agent,
+            extra_body=overrides["extra_body"],
             new_model="local-model",
             new_provider="custom",
             base_url="https://my-llm.example.com/v1",
@@ -720,9 +711,10 @@ class TestSwitchModelRequestOverridesSnapshot:
 
     def test_switch_then_restore_restores_current_overrides(self):
         overrides = {"extra_body": {"reasoning": {"effort": "high"}}}
-        agent = _make_agent(provider="custom", request_overrides=overrides)
+        agent = _make_agent(provider="custom", request_overrides={"extra_body": {"old_only": True}})
         self._switch(
             agent,
+            extra_body=overrides["extra_body"],
             new_model="local-model",
             new_provider="custom",
             base_url="https://my-llm.example.com/v1",

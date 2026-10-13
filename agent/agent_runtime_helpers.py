@@ -1113,6 +1113,10 @@ def recover_with_credential_pool(
     if effective_reason == FailoverReason.billing:
         # A separate pool instance may have resolved runtime credentials, leaving no ``current_id``;
         # match the key that failed, not a different account.
+        # Unverified billing (xAI OAuth spending-limit 403) is not proof the session is spent.
+        # One same-session retry, then the short-cooldown rotation. A second hit still rotates.
+        if billing_unverified and not has_retried_429:
+            return False, True
         return (True, False) if _rotate_and_swap(402, "billing") else (False, has_retried_429)
     if effective_reason == FailoverReason.rate_limit:
         return _recover_rate_limit(
@@ -1133,6 +1137,64 @@ def recover_with_credential_pool(
     return False, has_retried_429
 
 
+_MISSING = object()
+
+
+def _copy_request_overrides(value: Any) -> Any:
+    """Structurally copy supported override containers without invoking value hooks.
+
+    Request overrides are plain configuration data.  Calling arbitrary ``__deepcopy__``
+    hooks while a switch snapshot is being made lets a rejected switch mutate the live
+    graph before there is anything safe to restore.  Copy only dict/list structure and
+    retain opaque leaves as values; route configuration does not promise to clone them.
+    """
+    memo: dict[int, Any] = {}
+    active: set[int] = set()
+    remaining = 10_000
+
+    def copy_plain(item: Any, depth: int = 0) -> Any:
+        nonlocal remaining
+        if item is _MISSING:
+            return item
+        item_type = type(item)
+        if item_type is not dict and item_type is not list:
+            if issubclass(item_type, (dict, list)):
+                raise ValueError("request_overrides containers must be plain built-in dict/list values")
+            return item
+        if depth >= 100:
+            raise ValueError("request_overrides nesting exceeds 100 containers")
+        oid = id(item)
+        if oid in active:
+            raise ValueError("request_overrides contains a cyclic container graph")
+        if oid in memo:
+            return memo[oid]
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError("request_overrides exceeds 10000 containers")
+        active.add(oid)
+        try:
+            if item_type is dict:
+                copied: Any = {}
+                memo[oid] = copied
+                for key, child in dict.items(item):
+                    if type(key) is not str:
+                        raise ValueError("request_overrides mapping keys must be plain strings")
+                    copied[key] = copy_plain(child, depth + 1)
+            else:
+                copied = []
+                memo[oid] = copied
+                for child in list.__iter__(item):
+                    copied.append(copy_plain(child, depth + 1))
+            return copied
+        except Exception:
+            memo.pop(oid, None)
+            raise
+        finally:
+            active.remove(oid)
+
+    return copy_plain(value)
+
+
 def _apply_primary_runtime_fields(agent, rt: dict[str, Any]) -> None:
     """Copy the identity/transport fields of a ``_primary_runtime`` snapshot onto ``agent``
     (shared by transport recovery and turn-start restore; the caller rebuilds the client)."""
@@ -1146,7 +1208,7 @@ def _apply_primary_runtime_fields(agent, rt: dict[str, Any]) -> None:
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]
     agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
-    agent.request_overrides = dict(rt.get("request_overrides") or {})
+    agent.request_overrides = _copy_request_overrides(rt.get("request_overrides") or {})
     agent._client_kwargs = dict(rt["client_kwargs"])
 
 
@@ -1290,6 +1352,9 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
     future reset; fails open on any error/None. Returns ``(blocked, prefetched_pool, prefetched)``
     so the rebind step reuses the loaded pool (one auth.json read at most)."""
     prefetched_pool, prefetched = None, False
+    from agent.route_binding import _primary_pool_owner
+    if _primary_pool_owner(agent, primary_provider) is None:
+        return False, prefetched_pool, prefetched
     try:
         pool = getattr(agent, "_credential_pool", None)
         if not matches_primary(pool):
@@ -1298,6 +1363,38 @@ def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base
         primary_model = str(rt.get("model") or "").strip()
         next_at = getattr(pool, "next_available_at", lambda **_kwargs: None)(model=primary_model or None)
         if next_at is not None and next_at > time.time():
+            # next_available_at does not run the early Codex quota probe select()
+            # uses, so a weekly stamp can outlive an already-open window.
+            # Optional probe: a pool that only has next_available_at must stay blocked.
+            # Lookup, current(), and the probe share one negative-answer boundary.
+            # A raising descriptor is not an unrelated gate error.
+            probe = None
+            try:
+                if primary_provider == "openai-codex" and pool is not None:
+                    probe = getattr(pool, "_codex_quota_restored_upstream", None)
+                reopened = False
+                if probe is not None:
+                    entry = pool.current()
+                    if entry is not None:
+                        reopened = bool(probe(entry))
+                    if not reopened and entry is None:
+                        # Ordinary 429 rotation clears the cursor. select() is the path
+                        # that probes and clears a future stamp; has_available() does not.
+                        entry = pool.select(model=primary_model or None)
+                        reopened = entry is not None
+                    elif reopened and entry is not None and pool is not None:
+                        # The probe admitted this entry without select(). One select()
+                        # records that same entry. A second select() rotates it away.
+                        entry = pool.select(model=primary_model or None)
+                        reopened = entry is not None
+                    if reopened and entry is not None:
+                        agent._restore_selected_entry_id = getattr(entry, "id", None)
+            except Exception:
+                logger.debug("Codex quota-restored probe failed; keeping the reset block", exc_info=True)
+                reopened = False
+                agent._restore_selected_entry_id = None
+            if probe is not None and reopened:
+                return False, prefetched_pool, prefetched
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
                 logger.info(
@@ -1319,46 +1416,6 @@ def _restore_runtime_capabilities(agent, rt: dict[str, Any]) -> None:
         agent.runtime_capabilities = dict(raw)
     elif "runtime_capabilities" in rt:
         logger.warning("Ignoring malformed runtime capabilities snapshot")
-
-
-def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched) -> None:
-    """Rebind and re-select the primary credential pool after a fallback turn. A cross-provider
-    fallback attaches its own pool, which would trip the provider-mismatch guard on the next
-    401/429: reload the primary pool, else clear it. The snapshot api_key may be stale after
-    rotation; re-select the pool's best entry, keeping the snapshot key when none is usable."""
-    pool = getattr(agent, "_credential_pool", None)
-    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
-    if pool is not None and pool_provider and not matches_primary(pool):
-        agent._credential_pool = None
-        agent._credential_pool_entry_id = None
-        try:
-            # Reuse the pool the reset-aware gate already loaded (avoids a second auth.json read).
-            agent._credential_pool = prefetched_pool if prefetched else load_primary_pool()
-        except Exception as exc:
-            logger.warning(
-                "Restore could not reload primary credential pool for %s: %s", primary_provider, exc
-            )
-    agent._credential_pool_entry_id = None
-    pool = getattr(agent, "_credential_pool", None)
-    entry = pool.select(model=primary_model or None) if pool is not None and pool.has_available(model=primary_model or None) else None
-    if entry is None or not (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")):
-        return
-    if matches_primary(entry):
-        # _swap_credential rebuilds the client and reapplies base-url-scoped headers.
-        # ``_swap_credential`` rebuilds the OpenAI/Anthropic client, reapplies base-url-scoped headers, and
-        # carries the accumulated base_url / OAuth-detection fixes (#33163).
-        agent._swap_credential(entry)
-        logger.info(
-            "Restore re-selected pool entry %s (%s)",
-            getattr(entry, "id", "?"), getattr(entry, "label", "?"),
-        )
-    else:
-        logger.info(
-            "Restore skipped pool entry %s (%s): provider %s does not match primary provider %s",
-            getattr(entry, "id", "?"), getattr(entry, "label", "?"),
-            str(getattr(entry, "provider", "") or "").strip().lower() or "?",
-            primary_provider or "?",
-        )
 
 
 def _revert_credential_rotation(agent) -> None:
@@ -1427,6 +1484,7 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
+    agent._runtime_failed_backend_identities = set()
     if not agent._fallback_activated:
         # Reset the index even without activation: a failed _try_activate_fallback() can strand
         # _fallback_index past the chain end and silently block future fallbacks (#20465).
@@ -1446,17 +1504,20 @@ def restore_primary_runtime(agent) -> bool:
         # that was never verified and re-fail every turn. Stay on the fallback.
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
+    from agent.route_binding import _primary_pool_owner
+    primary_pool_owner = _primary_pool_owner(agent, primary_provider)
 
     def _matches_primary(candidate) -> bool:
-        return credential_pool_matches_provider(candidate, primary_provider, base_url=primary_runtime_base_url)
+        return credential_pool_matches_provider(candidate, primary_pool_owner, base_url=primary_runtime_base_url)
 
     def _load_primary_pool():
         """Load the primary provider's pool; None when absent or provider-mismatched."""
         from agent.credential_pool import load_pool
-        key = resolve_runtime_pool_key(primary_provider, primary_runtime_base_url)
+        key = resolve_runtime_pool_key(primary_pool_owner, primary_runtime_base_url)
         loaded = load_pool(key) if key else None
         return loaded if loaded is not None and _matches_primary(loaded) else None
-    if _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool):
+    if (getattr(agent, "_rate_limited_until", 0) > time.monotonic()
+            and _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool)):
         agent._rate_limited_until = 0
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
@@ -1473,9 +1534,12 @@ def restore_primary_runtime(agent) -> bool:
     provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
     try:
         from agent.route_binding import reinstall_primary_runtime
-        reinstall_primary_runtime(
+        if not reinstall_primary_runtime(
             agent, rt, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
-        )
+        ):
+            return False
+        if primary_pool_owner is None:
+            agent._credential_pool = agent._credential_pool_entry_id = None
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
@@ -1490,6 +1554,7 @@ def restore_primary_runtime(agent) -> bool:
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
+
 
 
 # Transient transport failures worth one more attempt with a rebuilt client / connection pool.
@@ -2091,7 +2156,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     client = process_bootstrap.OpenAI(**client_kwargs)
     # Routing proxies name the deployment they served in a response header (#54864).
     from agent.served_model import install_served_model_capture
-    install_served_model_capture(agent, client)
+    install_served_model_capture(vars(agent).get("_client_owner", agent), client)
     _ra().logger.info("OpenAI client created (%s, shared=%s) %s", reason, shared, agent._client_log_context())
     return client
 
@@ -2117,7 +2182,7 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     overrides = dict(getattr(agent, "request_overrides", {}) or {})
     overrides.pop("extra_body", None)  # always drop the previous provider's extra_body
     if new_extra_body:
-        overrides["extra_body"] = dict(new_extra_body)
+        overrides["extra_body"] = _copy_request_overrides(new_extra_body)
     agent.request_overrides = overrides
 
 
@@ -2129,7 +2194,6 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_credential_pool", "_credential_pool_entry_id",
     "_codex_reasoning_replay_enabled", "_codex_reasoning_replay_rejected",
 )
-_MISSING = object()
 
 
 def _snapshot_switch_state(agent) -> dict[str, Any]:
@@ -2139,6 +2203,11 @@ def _snapshot_switch_state(agent) -> dict[str, Any]:
     snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
     # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
     snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    # Override provenance is not in _SWITCH_SNAPSHOT_FIELDS: official re-derives extra_body on
+    # success, but a failed swap must restore the original nested graph, not an aliased dict.
+    snapshot["request_overrides"] = _copy_request_overrides(
+        getattr(agent, "request_overrides", _MISSING)
+    )
     return snapshot
 
 
@@ -2351,7 +2420,7 @@ def _resolve_switch_context_length(agent, snapshot):
 
 
 def _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot) -> None:
-    """Point the context compressor at the new model (rolls back the switch on failure)."""
+    """Point compression at the new model; only pre-publication failures reject the switch."""
     from agent.model_metadata import get_model_context_length
     if custom_providers is None:
         try:
@@ -2362,6 +2431,7 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
     # agent.api_key may be a callable (Azure Foundry Entra ID); get_model_context_length expects a
     # string for live probes, so coerce defensively.
     ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+    compressor_update_token = getattr(agent.context_compressor, "_model_update_token", None)
     try:
         new_context_length = get_model_context_length(
             agent.model, base_url=agent.base_url, api_key=ctx_api_key, provider=agent.provider,
@@ -2375,9 +2445,11 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
-    except Exception:
-        _restore_switch_snapshot(agent, snapshot)
-        raise
+    except Exception as exc:
+        if getattr(agent.context_compressor, "_model_update_token", None) is compressor_update_token:
+            _restore_switch_snapshot(agent, snapshot)
+            raise
+        logger.warning("Model switch is active; post-publication compression update failed: %s", exc)
     # Outside the rollback guard: a probe hiccup must not undo a good switch. Eager, so the aux
     # clamp lands before the first compaction on the new window, not after it (#114707).
     from agent.conversation_compression import revalidate_compression_feasibility
@@ -2401,8 +2473,10 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         # Overrides must travel with the switched-to identity or a later recovery/restore resurrects
         # PRE-switch overrides from the stale init snapshot.
-        # See #75091.
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        # See #75091. Deep-copy so later mutation of agent.request_overrides cannot poison restore.
+        "request_overrides": _copy_request_overrides(
+            getattr(agent, "request_overrides", {}) or {}
+        ),
         "runtime_capabilities": dict(getattr(agent, "runtime_capabilities", {}) or {}),
         "compressor_model": getattr(cc, "model", agent.model),
         "compressor_base_url": getattr(cc, "base_url", agent.base_url),
@@ -2519,8 +2593,8 @@ def switch_model(
     # short-circuiting the freshly selected healthy provider.
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
-    agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
     _finish_switch(agent, new_provider, old_norm, new_norm)
+    agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,

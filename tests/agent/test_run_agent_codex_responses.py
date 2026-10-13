@@ -10,7 +10,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
-from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE, _is_xai_bad_credentials_403
 
 
 @pytest.fixture(autouse=True)
@@ -712,6 +712,75 @@ def test_consume_codex_stream_collects_refusal_deltas_as_text(monkeypatch):
     assert response.output_text == "I can't help with that."
     # Synthesized message item so downstream normalization has content.
     assert response.output and response.output[0].type == "message"
+    part = response.output[0].content[0]
+    assert part.type == "refusal" and part.refusal == response.output_text
+
+
+def test_consume_codex_stream_keeps_refusal_provenance():
+    """Explicit refusal provenance survives with or without a done item.
+
+    Ordinary text and mixed output/refusal stay ordinary message text. A
+    nonstandard terminal status is preserved. Duplicate delta and terminal
+    text is not concatenated.
+    """
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    def consume(events):
+        return _consume_codex_event_stream(_FakeCreateStream(events), model="gpt-5-codex")
+
+    def terminal(output, status="completed"):
+        return SimpleNamespace(
+            type="response." + status,
+            response=SimpleNamespace(status=status, output=output),
+        )
+
+    sole = [SimpleNamespace(type="refusal", refusal="I can't help with that.")]
+    done = SimpleNamespace(
+        type="response.output_item.done",
+        item=SimpleNamespace(type="message", role="assistant", status="completed", content=sole),
+    )
+    with_done = consume([
+        SimpleNamespace(type="response.refusal.delta", delta="I can't help with that."),
+        done,
+        terminal(sole),
+    ])
+    omitted = consume([
+        SimpleNamespace(type="response.refusal.delta", delta="I can't"),
+        SimpleNamespace(type="response.refusal.delta", delta=" help with that."),
+        terminal(sole),
+    ])
+    for response in (with_done, omitted):
+        part = response.output[0].content[0]
+        assert part.type == "refusal" and part.refusal == "I can't help with that."
+        assert response.output_text == part.refusal
+
+    ordinary = consume([
+        SimpleNamespace(type="response.output_text.delta", delta="hello"),
+        terminal([SimpleNamespace(type="output_text", text="hello")]),
+    ])
+    assert ordinary.output[0].content[0].type == "output_text"
+
+    mixed_done = SimpleNamespace(
+        type="response.output_item.done",
+        item=SimpleNamespace(type="message", content=[
+            SimpleNamespace(type="output_text", text="Hello. "),
+            SimpleNamespace(type="refusal", refusal="But no more."),
+        ]),
+    )
+    mixed = consume([
+        SimpleNamespace(type="response.output_text.delta", delta="Hello. "),
+        SimpleNamespace(type="response.refusal.delta", delta="But no more."),
+        mixed_done,
+        terminal([]),
+    ])
+    assert [part.type for part in mixed.output[0].content] == ["output_text", "refusal"]
+
+    failed = consume([
+        SimpleNamespace(type="response.refusal.delta", delta="blocked"),
+        terminal(sole, status="failed"),
+    ])
+    assert failed.status == "failed"
+    assert failed.output[0].content[0].type == "refusal"
 
 
 def test_extract_responses_message_text_reads_refusal_parts():
@@ -2729,3 +2798,156 @@ def test_codex_text_only_max_output_incomplete_keeps_codex_continuation(monkeypa
     assert result["completed"] is True
     assert not any(m.get("_length_continuation_nudge") for m in result["messages"])
     assert any(m.get("finish_reason") == "incomplete" for m in result["messages"] if m["role"] == "assistant")
+
+
+class _XaiForbidden403(Exception):
+    status_code = 403
+
+    def __init__(self, body, text="Error code: 403"):
+        self.body = body
+        super().__init__(text)
+
+
+class _Unauthorized401(Exception):
+    status_code = 401
+
+
+@pytest.mark.parametrize(
+    ("body", "text", "expected"),
+    [
+        ({"code": "unauthenticated:bad-credentials"}, "Error code: 403", True),
+        (
+            {"error": "bad-credentials is not the cause"},
+            "HTTP 403: bad-credentials is not the cause",
+            False,
+        ),
+        ({"code": "unauthenticated:bad-credentials-extra"}, "Error code: 403", False),
+        (
+            {"code": "other", "message": "OAuth2 access token could not be validated"},
+            "Error code: 403",
+            True,
+        ),
+        (
+            {"code": "other", "message": "not OAuth2 access token could be validated"},
+            "Error code: 403",
+            False,
+        ),
+    ],
+)
+def test_xai_403_marker_matching_is_structured_and_exact(body, text, expected):
+    assert _is_xai_bad_credentials_403(
+        "xai-oauth", 403, _XaiForbidden403(body, text)
+    ) is expected
+
+
+def test_run_conversation_xai_403_body_only_refreshes_and_retries(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403(
+                {
+                    "code": "unauthenticated:bad-credentials",
+                    "message": "OAuth2 access token could not be validated",
+                }
+            )
+        return _codex_message_response("OK")
+
+    refreshes = {"count": 0}
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        assert force is True
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 1
+    assert calls["api"] == 2
+    assert result["completed"] is True
+    assert result["final_response"] == "OK"
+
+
+def test_run_conversation_xai_403_shares_one_shot_budget_across_api_iterations(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+    refreshes = {"count": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403({"code": "unauthenticated:bad-credentials"})
+        if calls["api"] == 2:
+            return _codex_tool_call_response()
+        raise _XaiForbidden403({"code": "unauthenticated:bad-credentials"})
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, *_args):
+        for call in assistant_message.tool_calls:
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": "{}"})
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+    result = agent.run_conversation("Run a command")
+
+    assert refreshes["count"] == 1
+    assert calls["api"] == 3
+    assert result.get("completed") is not True
+
+
+def test_run_conversation_xai_403_shares_one_shot_budget_with_401(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0}
+    refreshes = {"count": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XaiForbidden403({"code": "unauthenticated:bad-credentials"})
+        raise _Unauthorized401("HTTP 401: unauthorized")
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 1
+    assert result.get("completed") is not True
+
+
+@pytest.mark.parametrize(
+    ("builder", "body"),
+    [
+        (_build_xai_oauth_agent, {"code": "personal-team-blocked:spending-limit"}),
+        (_build_xai_oauth_agent, {"error": "forbidden by policy"}),
+        (_build_agent, {"code": "unauthenticated:bad-credentials"}),
+    ],
+)
+def test_run_conversation_unrelated_403_does_not_refresh(monkeypatch, builder, body):
+    agent = builder(monkeypatch)
+    refreshes = {"count": 0}
+
+    def _refresh(force=False):
+        refreshes["count"] += 1
+        return True
+
+    def _api_call(_api_kwargs):
+        raise _XaiForbidden403(body)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+    result = agent.run_conversation("Say OK")
+
+    assert refreshes["count"] == 0
+    assert result.get("completed") is not True

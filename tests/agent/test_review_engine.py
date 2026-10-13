@@ -163,6 +163,7 @@ def test_delegate_task_credentials_cfg_overrides_delegation_config(monkeypatch):
 
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
+    fake_child.model = "m"
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", fake_resolve)
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(
@@ -204,6 +205,7 @@ def test_start_review_dispatches_background_and_completes(monkeypatch):
 
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
+    fake_child.model = "m"
     creds = {
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
@@ -322,6 +324,7 @@ def test_start_review_threads_loaded_skills_into_context(monkeypatch):
 
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
+    fake_child.model = "m"
     creds = {
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,

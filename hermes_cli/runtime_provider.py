@@ -195,6 +195,13 @@ def _resolve_plain_custom_api_mode(model_cfg: dict[str, Any], base_url: str) -> 
 
 def _same_registered_provider(provider: str, configured_provider: str) -> bool:
     """Profile aliases share an auth registry ID; unrelated routes must stay distinct."""
+    from hermes_cli.auth import _plugin_aliases
+
+    aliases = _plugin_aliases()
+    provider_key = (provider or "").strip().lower()
+    configured_key = (configured_provider or "").strip().lower()
+    provider = aliases.get(provider_key, provider_key)
+    configured_provider = aliases.get(configured_key, configured_key)
     if provider == configured_provider:
         return True
     pconfig = PROVIDER_REGISTRY.get(provider)
@@ -1130,9 +1137,9 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
             kwargs: dict[str, Any] = {"requested": provider, "target_model": model}
             if entry.get("base_url"):
                 kwargs["explicit_base_url"] = entry["base_url"]
-            if entry_key := resolve_entry_api_key(entry):
-                kwargs["explicit_api_key"] = entry_key
             try:
+                if entry_key := resolve_entry_api_key(entry):
+                    kwargs["explicit_api_key"] = entry_key
                 runtime = resolve_runtime_provider(**kwargs)
             except AuthError as fb_exc:
                 logger.debug("Fallback entry %s/%s failed: %s", provider, model, fb_exc)

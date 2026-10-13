@@ -78,6 +78,7 @@ def _patch_delegate(monkeypatch):
     import tools.delegate_tool as dt
 
     fake_child = MagicMock()
+    fake_child.model = "m"
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
 

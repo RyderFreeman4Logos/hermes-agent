@@ -42,6 +42,7 @@ def child(**kw):
     blocked.wait(60)
 def build(**kw):
     c = MagicMock()
+    c.model = "m"
     c._delegate_role = "leaf"
     c._subagent_id = "diagnostic-child"
     return c

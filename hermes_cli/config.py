@@ -967,7 +967,7 @@ _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 # runtime_provider.py and auxiliary_client.py).
 _VALID_CUSTOM_PROVIDER_FIELDS = {
     "name", "base_url", "api_key", "api_mode", "model", "models",
-    "context_length", "rate_limit_delay", "extra_body",
+    "context_length", "rate_limit_delay", "extra_body", "send_session_id",
     "ssl_ca_cert", "ssl_verify", "key_env", "catalog_provider"}
 
 # Fields that look like they should be inside custom_providers, not at root
@@ -1182,9 +1182,9 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
     issues: list[ConfigIssue] = []
     _validate_voice(config, issues)
     _validate_timezone(config, issues)
-    cp = config.get("custom_providers")
-    fb = config.get("fallback_model")
-    for value, validator in ((cp, _validate_custom_providers), (fb, _validate_fallback_model)):
+    cp, fb = config.get("custom_providers"), config.get("fallback_model")
+    from tools.delegate_tool_config import record_model_pool_issues
+    for value, validator in ((cp, _validate_custom_providers), (fb, _validate_fallback_model), (config, record_model_pool_issues)):
         if value is not None:
             validator(value, issues)
 

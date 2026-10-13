@@ -2506,7 +2506,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
     finally:
         from agent import relay_llm
-        relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
+        relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome, agent=agent)
 
     return final_response
 

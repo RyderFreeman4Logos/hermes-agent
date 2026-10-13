@@ -986,7 +986,9 @@ class SessionMessagesMixin:
         lock_holder: Optional[str] = None, tail_count: int = 0,
         carried_messages: Optional[list[dict[str, Any]]] = None,
         covered_ids: Optional[list[int]] = None,
-        unresolved_held: Optional[list[dict[str, Any]]] = None) -> int:
+        unresolved_held: Optional[list[dict[str, Any]]] = None,
+        source_ids: Optional[list[int]] = None, source_signature: Optional[str] = None,
+        source_watermark: Optional[int] = None) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -1010,7 +1012,7 @@ class SessionMessagesMixin:
         the compacted set by a pure-SQL column clone (every column except ``id`` — content, api_content,
         platform_message_id, token counts, reasoning sidecars all survive byte-exact, and the FTS triggers
         index the clones naturally), and the originals are archived. NOTE: re-sequencing assigns the tail
-        rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
+        rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610). A set *source_signature* must match the active pre-watermark source; a rewrite aborts.
         """
         from hermes_state import SessionCompressionInProgressError
         def _do(conn):
@@ -1019,6 +1021,8 @@ class SessionMessagesMixin:
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
+            self._assert_pre_watermark_source_unchanged(
+                conn, session_id, watermark, source_ids, source_signature, source_watermark)
             patch = model_config_patch is not None
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(

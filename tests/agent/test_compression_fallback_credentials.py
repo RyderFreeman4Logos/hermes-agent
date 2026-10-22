@@ -87,7 +87,7 @@ def test_refused_only_hop_never_starts_a_retry(field, reference, monkeypatch, ca
         assert resolve_compression_fallback_route() is None
         assert _retry_compression_on_fallback_chain(
             worker=worker, messages=[], system_prompt_fallback="unchanged",
-            idle_timeout_seconds=2, total_ceiling_seconds=5,
+            idle_timeout_seconds=2, total_ceiling_seconds=5, precommit_deadline_monotonic=None,
         ) is None
     finally:
         reset_secret_scope(token)

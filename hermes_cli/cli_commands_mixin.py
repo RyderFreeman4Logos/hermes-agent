@@ -855,6 +855,11 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         # One session.resume, before anything changes: it subscribes the target and names its receipt
         # owner; a target the gateway refuses this viewer stops the switch, so the current session is
         # neither ended nor swapped for one whose next prompt would be refused.
+        from hermes_state import SessionResumeTooLargeError, resolved_max_resume_messages
+        try:
+            self._session_db.assert_resume_safe(target_id, tip_only=True)
+        except SessionResumeTooLargeError as exc:
+            return _cp(f"  Cannot resume session: {exc}")
         read_id, (target_id, refusal) = target_id, _gateway_open(self._session_db, target_id)
         if refusal:
             return _cp(f"  {_gt('resume.switch_failed')} {target_id} ({refusal})")
@@ -866,7 +871,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         _sync_process_session_id(target_id)
         # One lineage SELECT, two projections: model_history is alternation-repaired for live
         # replay (heals a durable user;user once); display_history is verbatim (as startup --resume).
-        model_history, display_history = self._session_db.get_resume_conversations(read_id)
+        model_history, display_history = self._session_db.get_resume_conversations(
+            read_id, max_display_messages=resolved_max_resume_messages() or None)
         self.conversation_history = _without_session_meta(model_history)
         self._resume_display_history = _without_session_meta(display_history)
         with suppress(Exception):  # re-open the target session so it's not marked as ended

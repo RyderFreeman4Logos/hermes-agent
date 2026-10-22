@@ -37,7 +37,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
         "_current_runtime_session_record": contextvars.ContextVar("refused_turn"),
         "_TurnRun": prompt_turn._TurnRun,
         "_record_turn_marker": lambda *args, **kwargs: "marker",
-        "_prepare_turn_input": lambda *args: None,
+        "_prepare_turn_input": lambda *args, **kwargs: None,
         "_release_turn_scopes": noop, "_post_turn_housekeeping": noop,
         "_clear_inflight_turn": noop,
         # Hosted room member sessions drop their bot_room slot at turn end (#106847); a canonical chat is not one.
@@ -48,6 +48,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
         "_reopen_routed_session_row": noop,
         # Every dispatch binds the session's own row before the turn writes (#111999).
         "_ensure_session_db_row": noop,
+        "_run_post_turn_followups": noop,
     })
     def terminal(outcome):
         mailbox.complete_delivery(tmp_path, queued["id"], status=outcome["status"],
@@ -88,6 +89,8 @@ def test_viewer_poller_never_discovers_or_claims_bot_execution(monkeypatch, tmp_
         '_maybe_fire_tui_loop_tick': lambda *a: None,
         '_maybe_fire_tui_heartbeat_tick': lambda *a: None,
         '_notif_poll_kanban': lambda *a: None,
+        '_flush_pending_completions_if_idle': lambda *a: None,
+        '_completion_ownership_lock': lambda session: session['history_lock'],
         '_session_profile_runtime_scope': lambda session: contextlib.nullcontext(),
         '_session_home': lambda session: tmp_path,
         '_notif_handle_ready': lambda sid, session, ready, *a, **kw: (delivered.extend(ready), stop.set()),

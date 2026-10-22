@@ -272,11 +272,16 @@ def _tool_defs_cache_key(
         cfg_fp = file_signature(cfg_stat)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
+    try:
+        from tools.memory_tool import memory_surface_cache_key
+        memory_surface = memory_surface_cache_key()
+    except Exception:
+        memory_surface = None
     return (
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
-        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope, memory_surface,
     )
 
 
@@ -870,6 +875,25 @@ def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
 
 
+def _emit_checkpoint_receipt(
+    callback, *, tool_call_id: Optional[str], tool_name: str, status: str,
+    error_type: Optional[str] = None, source_event_ids: tuple[int, ...] = (),
+) -> None:
+    """Send typed host authority to an optional checkpoint observer."""
+    if callback is None:
+        return
+    try:
+        from agent.checkpoint_engine import ToolExecutionReceipt
+
+        effect_class = "observation" if tool_name in _READ_SEARCH_TOOLS else "workspace_mutation"
+        callback(ToolExecutionReceipt(
+            tool_call_id or "", tool_name, effect_class, status, None,
+            error_type, (), tuple(source_event_ids),
+        ))
+    except Exception as exc:
+        logger.debug("checkpoint receipt callback error: %s", exc)
+
+
 def handle_function_call(
     function_name: str, function_args: dict[str, Any], task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
@@ -877,6 +901,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
     enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
+    receipt_callback=None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -896,6 +921,13 @@ def handle_function_call(
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
+        observed_status, observed_error_type, _ = _tool_result_observer_fields(function_name, result)
+        status = extra.get("status", observed_status)
+        _emit_checkpoint_receipt(
+            receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+            status="blocked" if status == "blocked" else "failed" if status == "error" else "succeeded",
+            error_type=extra.get("error_type", observed_error_type),
+        )
         _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result
@@ -920,6 +952,7 @@ def handle_function_call(
             skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
             skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            receipt_callback=receipt_callback,
         )
 
     from tools.connectors import is_connector_name
@@ -936,6 +969,10 @@ def handle_function_call(
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
+            _emit_checkpoint_receipt(
+                receipt_callback, tool_call_id=tool_call_id, tool_name=function_name,
+                status="skipped", error_type="agent_loop_owned",
+            )
             return tool_error(f"{function_name} must be handled by the agent loop")
 
         function_args, blocked = _pre_dispatch_guards(function_name, function_args, skip_pre_tool_call_hook, ids, trace)

@@ -91,7 +91,7 @@ def test_persist_user_message_override_rewrites_text_turns(agent):
 
     agent._apply_persist_user_message_override(messages)
 
-    assert messages == [{"role": "user", "content": "hello"}]
+    assert messages == [{"role": "user", "content": "hello", "api_content": "API-only synthetic prefix\nhello"}]
 
 
 def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
@@ -2588,7 +2588,7 @@ class TestHandleMaxIterations:
         assert all(call["defer_logical_completion"] is True for call in relay_calls)
         complete_logical.assert_called_once_with(
             relay_calls[0]["metadata"]["api_request_id"],
-            outcome="success",
+            outcome="success", agent=agent,
         )
 
     def test_suppress_status_output_keeps_iteration_warning_off_stdout(self, agent, capsys):
@@ -2638,7 +2638,7 @@ class TestHandleMaxIterations:
         assert result.strip()
         assert "API down" not in result
         complete_logical.assert_called_once()
-        assert complete_logical.call_args.kwargs == {"outcome": "failed"}
+        assert complete_logical.call_args.kwargs == {"outcome": "failed", "agent": agent}
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -3217,9 +3217,7 @@ class TestRunConversation:
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
             patch(
                 "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
-                    (request_id, outcome)
-                ),
+                side_effect=lambda request_id, *, outcome, agent: logical_completions.append((request_id, outcome, agent)),
             ),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -3235,7 +3233,7 @@ class TestRunConversation:
         assert hook_events[0]["retryable"] is False
         assert hook_events[0]["reason"] == FailoverReason.content_policy_blocked.value
         assert logical_completions == [
-            (hook_events[0]["api_request_id"], "success")
+            (hook_events[0]["api_request_id"], "success", agent)
         ]
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
@@ -3320,7 +3318,11 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        user_inputs = [msg["content"] for msg in pre_request_calls[0]["request_messages"] if msg.get("role") == "user"]
+        assert len(user_inputs) == 1
+        clean_input, separator, timing = user_inputs[0].partition("\n\n[Agent loop timing]\n")
+        assert clean_input == "search something"
+        assert separator and timing.startswith("Current loop started: ")
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
@@ -3927,9 +3929,29 @@ class TestRunConversation:
     def test_redirect_wins_race_with_response_completion(self, agent):
         """If the provider returns as redirect lands, discard the stale answer."""
         self._setup_agent(agent)
-        stale = _mock_response(content="Using SQLite.", finish_reason="stop")
-        corrected = _mock_response(content="Using Postgres.", finish_reason="stop")
+        stale = _mock_response(
+            content="Using SQLite.",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 2_000,
+                "completion_tokens": 10,
+                "total_tokens": 2_010,
+                "prompt_tokens_details": SimpleNamespace(cached_tokens=0),
+            },
+        )
+        corrected = _mock_response(
+            content="Using Postgres.",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 2_000,
+                "completion_tokens": 10,
+                "total_tokens": 2_010,
+                "prompt_tokens_details": SimpleNamespace(cached_tokens=1_900),
+            },
+        )
         calls = 0
+        cache_events = []
+        agent._tui_cache_callback = lambda *args: cache_events.append(args)
 
         def _fake_api_call(_api_kwargs):
             nonlocal calls
@@ -3949,6 +3971,9 @@ class TestRunConversation:
 
         assert calls == 2
         assert result["final_response"] == "Using Postgres."
+        assert [event[0] for event in cache_events] == ["miss"]
+        assert cache_events[0][4]["request_index"] == 1
+        assert agent._first_turn_usage["cache_read_tokens"] == 0
         assert all(
             message.get("content") != "Using SQLite."
             for message in result["messages"]
@@ -5204,9 +5229,7 @@ class TestRetryExhaustion:
             patch("agent.relay_llm.execute", side_effect=execute),
             patch(
                 "agent.relay_llm.complete_logical_call",
-                side_effect=lambda request_id, *, outcome: logical_completions.append(
-                    (request_id, outcome)
-                ),
+                side_effect=lambda request_id, *, outcome, agent: logical_completions.append((request_id, outcome, agent)),
             ),
         ):
             result = agent.run_conversation("hello")
@@ -5221,7 +5244,7 @@ class TestRetryExhaustion:
             attempt["metadata"]["api_request_id"] for attempt in relay_attempts
         }
         assert len(request_ids) == 1
-        assert logical_completions == [(request_ids.pop(), "success")]
+        assert logical_completions == [(request_ids.pop(), "success", agent)]
 
     def test_content_filter_refusal_surfaced_not_retried(self, agent):
         """A model refusal must be surfaced immediately, NOT laundered into

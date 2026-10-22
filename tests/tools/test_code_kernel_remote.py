@@ -18,6 +18,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.code_kernel_remote import (
+    _REGISTRY,
     _REMOTE_KERNELS,
     RemoteKernel,
     execute_in_remote_kernel,
@@ -273,6 +274,47 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
             self.assertIn("owner-1", owners)
             self.assertIn("owner-2", owners)
 
+    def test_acquisition_reserves_kernel_before_competing_eviction(self):
+        """A selected kernel is busy even before its first cell starts."""
+        from tools import code_kernel_remote as remote
+
+        env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+        competitor = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+        acquire = remote._acquire_remote_kernel
+
+        def compete_after_acquire(*args, **kwargs):
+            acquired = acquire(*args, **kwargs)
+            with patch.object(remote, "_acquire_remote_kernel", acquire):
+                _run(competitor, task="competitor")
+            return acquired
+
+        with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)), \
+             patch.object(remote, "_acquire_remote_kernel", side_effect=compete_after_acquire):
+            result = _run(env, task="selected")
+        self.assertEqual(result["status"], "success")
+        self.assertIn("selected", {key[0] for key in _REMOTE_KERNELS})
+        self.assertFalse(any("kill 4242" in c for c in env.commands))
+        self.assertTrue(all(kernel.attached == 0 for kernel in _REMOTE_KERNELS.values()))
+
+    def test_reuse_reserves_kernel_before_liveness_probe(self):
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
+        competitor = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+        with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
+            _run(env, task="selected")
+            kernel = next(iter(_REMOTE_KERNELS.values()))
+            probe = kernel.is_alive
+
+            def compete_during_probe():
+                _run(competitor, task="competitor")
+                return probe()
+
+            with patch.object(kernel, "is_alive", side_effect=compete_during_probe):
+                result = _run(env, task="selected")
+        self.assertTrue(result["kernel"]["reused"])
+        self.assertIn("selected", {key[0] for key in _REMOTE_KERNELS})
+        self.assertFalse(any("kill 4242" in c for c in env.commands))
+        self.assertEqual(kernel.attached, 0)
+
     def test_eviction_skips_kernels_with_a_running_cell(self):
         """Cap eviction must never kill a kernel mid-cell (the local-kernel
         race from hermes-agent#101861): a busy kernel stays put and a
@@ -293,10 +335,17 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
             worker = threading.Thread(target=_run, args=(busy_env,), kwargs={"task": "busy"})
             worker.start()
-            # Snapshot: the worker thread inserts into the registry concurrently and a live
-            # dict iteration raises "dictionary changed size during iteration".
-            while not any(k.attached for k in list(_REMOTE_KERNELS.values())):
+            deadline = time.monotonic() + 5
+            attached = False
+            while time.monotonic() < deadline:
+                # Snapshot under the registry lock: the worker inserts concurrently
+                # and a live dict iteration raises "dictionary changed size during iteration".
+                with _REGISTRY.lock:
+                    attached = any(k.attached for k in list(_REMOTE_KERNELS.values()))
+                if attached:
+                    break
                 time.sleep(0.005)
+            self.assertTrue(attached, "busy kernel never attached")
             env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
             _run(env, task="settled")
             owners = {key[0] for key in _REMOTE_KERNELS}

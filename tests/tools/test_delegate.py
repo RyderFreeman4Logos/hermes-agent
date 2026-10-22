@@ -36,7 +36,8 @@ def _make_mock_parent(depth=0):
     parent.base_url = "https://openrouter.ai/api/v1"
     parent.api_key="***"
     parent.provider = "openrouter"
-    parent.api_mode = "chat_completions"
+    parent.api_mode, parent.request_overrides = "chat_completions", None
+    parent.requested_provider, parent.acp_command, parent.acp_args = "openrouter", None, []
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"
     parent.providers_allowed = None
@@ -421,22 +422,28 @@ class TestDelegateObservability(unittest.TestCase):
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.model = "claude-sonnet-4-6"
+            mock_child.provider = "anthropic"
             mock_child.session_prompt_tokens = 5000
             mock_child.session_completion_tokens = 1200
-            mock_child.run_conversation.return_value = {
-                "final_response": "done",
-                "completed": True,
-                "interrupted": False,
-                "api_calls": 3,
-                "messages": [
-                    {"role": "user", "content": "do something"},
-                    {"role": "assistant", "tool_calls": [
-                        {"id": "tc_1", "function": {"name": "web_search", "arguments": '{"query": "test"}'}}
-                    ]},
-                    {"role": "tool", "tool_call_id": "tc_1", "content": '{"results": [1,2,3]}'},
-                    {"role": "assistant", "content": "done"},
-                ],
-            }
+
+            def _accepted(*_a, **_k):
+                mock_child._delegate_successful_llm_route = ("claude-sonnet-4-6", "anthropic")
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 3,
+                    "messages": [
+                        {"role": "user", "content": "do something"},
+                        {"role": "assistant", "tool_calls": [
+                            {"id": "tc_1", "function": {"name": "web_search", "arguments": '{"query": "test"}'}}
+                        ]},
+                        {"role": "tool", "tool_call_id": "tc_1", "content": '{"results": [1,2,3]}'},
+                        {"role": "assistant", "content": "done"},
+                    ],
+                }
+
+            mock_child.run_conversation.side_effect = _accepted
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test observability", parent_agent=parent))

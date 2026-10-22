@@ -129,6 +129,19 @@ def handle_api_error(
         reason=classified.reason.value,
     )
 
+    # A standard child must stop on a policy denial before pool recovery,
+    # eager fallback, or the later unrecovered-error fallback can resend it.
+    from agent.conversation_loop import _standard_child_can_fallback
+
+    if not _standard_child_can_fallback(agent, reason=classified.reason):
+        _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        return _verdict("return", nonretryable_client_error_result(
+            agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
+            api_messages=api_messages, messages=messages, conversation_history=conversation_history,
+            api_call_count=api_call_count, approx_tokens=approx_tokens, provider=agent.provider,
+            base_url=agent.base_url, model=agent.model, delivered=_delivered,
+        ))
+
     _recovered, recovered_with_pool = recover_after_classification(
         agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
         messages=messages, api_messages=api_messages,

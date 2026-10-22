@@ -8,6 +8,7 @@ import type { MessageDeltaPayload, SubagentStatus, Usage } from '@hermes/shared/
 import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
 import { STREAM_BATCH_MS } from '../config/timing.js'
 import { buildSetupRequiredSections, setupRequiredTitle } from '../content/setup.js'
+import { replyEndLine } from '../domain/messages.js'
 import { usageFromTick } from '../domain/usage.js'
 import type {
   AnyGatewayEvent,
@@ -885,7 +886,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     thinkingStatusTimer = setTimeout(() => {
       thinkingStatusTimer = null
-      patchUiState({ status: pendingThinkingStatus || statusFromBusy() })
+      setStatus(pendingThinkingStatus || statusFromBusy())
     }, STREAM_BATCH_MS)
   }
 
@@ -893,7 +894,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     turnController.clearStatusTimer()
     turnController.statusTimer = setTimeout(() => {
       turnController.statusTimer = null
-      patchUiState({ status: statusFromBusy() })
+      setStatus(statusFromBusy())
     }, ms)
   }
 
@@ -1180,6 +1181,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'message.start':
         resetAgentsNudgeTurnState()
+        patchUiState({ cacheStatus: null })
         turnController.startMessage()
 
         return
@@ -1203,6 +1205,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
           setStatus(brief)
           restoreStatusAfter(6000)
+
+          return
+        }
+
+        if (p.kind === 'cache_hit') {
+          patchUiState({ cacheStatus: p.text })
+          setStatus(p.text)
 
           return
         }
@@ -1764,6 +1773,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             : finalMessages.length
               ? finalMessages
               : [{ role: 'assistant', text: finalText }]
+
+          const replyEnd = payload.status === 'complete' ? replyEndLine(payload.usage) : undefined
+
+          if (replyEnd) {
+            const at = msgs.findLastIndex(message => message.role === 'assistant' && message.text.trim())
+
+            if (at >= 0) {
+              msgs[at] = { ...msgs[at], replyEnd }
+            }
+          }
 
           msgs.forEach(appendMessage)
 

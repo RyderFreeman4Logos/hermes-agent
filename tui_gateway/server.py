@@ -722,6 +722,11 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
     from agent.notification_presentation import event_presentation_muted
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
+        stamp = globals().get("_stamp_loop_cache_info")
+        if callable(stamp):
+            stamp(sid, payload)
     if event_presentation_muted(event, sid):
         return False
     return write_json(_event_frame(event, sid, payload))
@@ -995,16 +1000,13 @@ def _load_cfg_raw() -> dict:
     """The active profile's config.yaml EXACTLY as written — the write-back primitive, ONLY for
     read→mutate→``_save_cfg`` round-trips and raw inspection (defaults / managed overlay / ``${VAR}``
     expansion applied here would be persisted on the next save). Behavioral reads use :func:`_load_cfg`.
-    Cache keyed on the resolved path so profiles don't clobber."""
+    Always reread the file: raw write-back must preserve external edits even when stat fields match."""
     global _cfg_cache, _cfg_sig, _cfg_path
     from hermes_cli.config import read_user_config_raw
     from hermes_cli.config_read_errors import FailedConfigRead
     try:
         p = _active_config_path()
         sig = file_signature(p.stat()) if p.exists() else None
-        with _cfg_lock:
-            if _cfg_cache is not None and _cfg_sig == sig and _cfg_path == p:
-                return copy.deepcopy(_cfg_cache)
         data = read_user_config_raw(p) if p.exists() else {}
     except Exception as exc:
         return FailedConfigRead(error=exc)  # readable as {}, refused by _save_cfg
@@ -1412,6 +1414,19 @@ def _get_usage(agent) -> dict:
         _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
         if _prompt_total > 0 and _cache_read > 0:
             usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+        _reply_elapsed = getattr(agent, "_reply_elapsed_s", None)
+        if (
+            isinstance(_reply_elapsed, (int, float))
+            and not isinstance(_reply_elapsed, bool)
+            and _reply_elapsed == _reply_elapsed
+            and 0 <= _reply_elapsed < 1e6
+        ):
+            usage["reply_elapsed_s"] = float(_reply_elapsed)
+            from agent.turn_usage import _reply_cache_counts
+            _reply_read, _reply_total = _reply_cache_counts(agent)
+            if _reply_read is not None and _reply_total is not None:
+                usage["reply_cache_read"] = _reply_read
+                usage["reply_prompt_tokens"] = _reply_total
     with contextlib.suppress(Exception):  # a status-bar readout must never break usage reporting
         _lhist = list(getattr(agent, "_api_latency_history", []) or [])
         _ohist = list(getattr(agent, "_api_output_history", []) or [])
@@ -2156,7 +2171,7 @@ from . import (
     session_compression as _session_compression, model_switch as _model_switch,
     compute_host_bridge as _compute_host_bridge, session_workdir as _session_workdir,
     session_lifecycle as _session_lifecycle, session_reaper as _session_reaper,
-    session_transports as _session_transports, prompt_turn as _prompt_turn, billing_view as _billing_view,
+    session_transports as _session_transports, prompt_turn as _prompt_turn, cache_telemetry as _cache_telemetry, billing_view as _billing_view,
     methods_browser_control as _methods_browser_control, methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete, methods_config as _methods_config,
     methods_config_set as _methods_config_set, methods_images as _methods_images,
@@ -2178,7 +2193,7 @@ for _m in (
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,
     _methods_browser_control, _methods_session, _methods_prompt, _methods_config,
     _methods_config_set, _methods_complete, _methods_tools, _methods_tools_plugin_servers, _methods_profiles, _methods_images,
-    _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
+    _methods_bot_relay, _prompt_turn, _cache_telemetry, _billing_view, _methods_projects, _methods_session_foreign,
     _methods_session_control, _methods_subagents, _methods_vault, _methods_free_tier, _methods_connectors,
     _methods_connectors_account, _methods_display, _methods_display_watch, _methods_onboarding,
     _methods_i18n, _methods_machine, _methods_shared_metrics, _methods_plugin_catalog):

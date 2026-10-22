@@ -34,10 +34,17 @@ def test_compression_child_keeps_parent_source(db, parent_source):
     db.append_message("parent", "assistant", "world")
     agent = _agent(db, "parent")
 
+    lease = cc._CompressionLease(
+        agent, db=db, sid="parent", ttl=60.0, refresh_interval=None,
+        commit_fence=None, lifecycle=cc._CompactionLifecycle(agent, False),
+    )
+    lease.watermark, lease.source_signature = db.get_active_message_source_snapshot("parent")
+    lease.signed_watermark = lease.watermark
+
     cc._publish_rotated_compaction(
         agent, [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}],
         [{"role": "user", "content": "[handoff]"}], new_system_prompt="sys",
-        lease=types.SimpleNamespace(holder=None, ttl=60.0, watermark=None),
+        lease=lease,
         old_session_id="parent", compressed_user_turn_outcome="none",
     )
 

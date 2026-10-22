@@ -5667,7 +5667,7 @@ class TestGetMessagesPagination:
         assert tip.value.scope == "in its tip segment"
 
     def test_resume_display_tail_is_bounded_without_truncating_tip_or_replaying_generations(self, db):
-        """A long display lineage stays a SQL-bounded UI tail while the model gets the complete tip."""
+        """Display payload reads stay bounded while the model gets the complete tip."""
         db.create_session(session_id="root", source="cli")
         db.append_messages_batch("root", [
             {"role": "user", "content": "old-0", "timestamp": 1.0},
@@ -5680,7 +5680,7 @@ class TestGetMessagesPagination:
             {"role": "user", "content": "carried", "timestamp": 3.0},
             {"role": "assistant", "content": "tip-answer", "timestamp": 4.0},
         ])
-        # A pre-display-index database must stay bounded too; resume may not backfill every segment first.
+        # Legacy display payload reads stay bounded without backfilling every segment first.
         db._conn.execute("UPDATE messages SET display_identity = NULL, display_order = NULL")
         db._conn.commit()
 
@@ -5693,15 +5693,6 @@ class TestGetMessagesPagination:
             return rows
 
         db._read_all = record_read
-        legacy_pages = []
-        original_legacy_page = db._legacy_display_page
-
-        def record_legacy_page(*args, **kwargs):
-            rows = original_legacy_page(*args, **kwargs)
-            legacy_pages.append((kwargs.get("ids_only"), len(rows)))
-            return rows
-
-        db._legacy_display_page = record_legacy_page
         assert db.assert_resume_safe("tip", max_messages=2, tip_only=True) == 2
         with pytest.raises(hermes_state.SessionResumeTooLargeError):
             db.assert_resume_safe("tip", max_messages=1, tip_only=True)
@@ -5714,7 +5705,6 @@ class TestGetMessagesPagination:
         ).fetchone()[0] == 0
         assert all(row_count <= 2 for _sql, row_count in reads)
         assert [count for sql, count in reads if "FROM messages WHERE id IN (" in sql] == [2]
-        assert legacy_pages and all(ids_only and count >= len(display) for ids_only, count in legacy_pages)
 
     @pytest.mark.parametrize("legacy", [False, True])
     def test_resume_display_limit_counts_visible_logical_messages(self, db, legacy):

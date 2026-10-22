@@ -324,6 +324,64 @@ class TestPreloadResumedSession:
         assert "limit 20000" in output.getvalue()
         mock_db.get_resume_conversations.assert_not_called()
 
+    def test_long_compression_lineage_resumes_with_bounded_display(self, tmp_path, monkeypatch):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("root", source="cli")
+        db.append_messages_batch("root", [
+            {"role": "user", "content": f"old-{i}", "timestamp": float(i)} for i in range(4)
+        ])
+        db.end_session("root", "compression")
+        db.create_session("tip", source="compression", parent_session_id="root")
+        db.append_messages_batch("tip", [
+            {"role": "user", "content": "current", "timestamp": 4.0},
+            {"role": "assistant", "content": "answer", "timestamp": 5.0},
+        ])
+        monkeypatch.setattr("hermes_state.resolved_max_resume_messages", lambda: 2)
+        cli = _make_cli(resume="tip")
+        cli._session_db = db
+        cli.console.file = StringIO()
+        try:
+            assert cli._preload_resumed_session() is True
+            assert [m["content"] for m in cli.conversation_history] == ["current", "answer"]
+            assert [m["content"] for m in cli._resume_display_history] == ["current", "answer"]
+        finally:
+            db.close()
+
+    def test_real_20k_lineage_uses_small_tip_and_refuses_oversized_current_tip(self, tmp_path):
+        """Historical rows do not consume the current-segment resume admission budget."""
+        from hermes_state import SessionDB
+
+        with SessionDB(tmp_path / "state.db") as db:
+            db.create_session("root", source="cli")
+            db.append_messages_batch("root", [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"old-{i}"}
+                for i in range(20_002)
+            ])
+            db.end_session("root", "compression")
+            db.create_session("tip", source="compression", parent_session_id="root")
+            db.append_messages_batch("tip", [
+                {"role": "user", "content": "current"},
+                {"role": "assistant", "content": "answer"},
+            ])
+            cli = _make_cli(resume="tip")
+            cli._session_db = db
+            cli.console.file = StringIO()
+            assert cli._preload_resumed_session() is True
+            assert [m["content"] for m in cli.conversation_history] == ["current", "answer"]
+            assert len(cli._resume_display_history) <= 20_000
+            assert cli._resume_display_history[-1]["content"] == "answer"
+            db.append_messages_batch("tip", [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"tip-{i}"}
+                for i in range(20_000)
+            ])
+            oversized = _make_cli(resume="tip")
+            oversized._session_db = db
+            oversized.console.file = StringIO()
+            assert oversized._preload_resumed_session() is False
+            assert "too long to reload safely" in oversized.console.file.getvalue()
+
 
 
 

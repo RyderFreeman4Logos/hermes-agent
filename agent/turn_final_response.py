@@ -33,6 +33,27 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 )
 
 
+def _persist_final_text_response(agent, messages, final_response, conversation_history) -> None:
+    from agent.turn_finalizer import _attach_reply_end_metadata, _persist_reply_end_metadata
+
+    reply_end_attachment = _attach_reply_end_metadata(
+        agent, messages, final_response,
+        completed=not getattr(agent, "_interrupt_requested", False),
+    )
+    # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
+    # _persist_session idempotent). Failure must NOT abort the turn: finalize retries.
+    try:
+        agent._flush_messages_to_session_db(messages, conversation_history)
+    except Exception:
+        logger.warning(
+            "final text-turn flush failed (session=%s) — reply is "
+            "not yet durable; relying on finalize_turn retry",
+            getattr(agent, "session_id", None) or "none",
+            exc_info=True,
+        )
+    _persist_reply_end_metadata(agent, reply_end_attachment, logger)
+
+
 @dataclass
 class FinalResponseVerdict:
     """``action``: ``"break"`` (turn ends with ``final_response``), ``"continue"`` (a
@@ -66,11 +87,6 @@ def finish_text_response(
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
     iteration-limit summarization; the final message is appended and flushed only after the
     stop gates accept it."""
-    from agent.conversation_loop import (
-        _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
-        _join_truncated_parts
-    )
-
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> FinalResponseVerdict:
         return FinalResponseVerdict(
             action=action, active_system_prompt=active_system_prompt, final_response=final_response,
@@ -215,6 +231,10 @@ def finish_text_response(
     else:
         _continuation_kind = None
     if _continuation_kind:
+        from agent.conversation_loop import (
+            _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE,
+        )
+
         if _continuation_kind == "stall":
             logger.info(
                 "Stall guard: turn ending on trailing continue-"
@@ -251,6 +271,8 @@ def finish_text_response(
     codex_ack_continuations = 0
 
     if truncated_response_parts:
+        from agent.conversation_loop import _join_truncated_parts
+
         final_response = _join_truncated_parts([*truncated_response_parts, (final_response, False)])
         truncated_response_parts = []
         length_continue_retries = 0
@@ -308,6 +330,8 @@ def finish_text_response(
         # and the finalization pop strips an unanswered tail pair.
         final_msg["_dropped_toolcall_nudge"] = True
         append_message(messages, final_msg)
+        from agent.conversation_loop import _DROPPED_TOOLCALL_NUDGE_CONTENT
+
         append_message(messages, {
             "role": "user",
             "content": _DROPPED_TOOLCALL_NUDGE_CONTENT,
@@ -358,17 +382,7 @@ def finish_text_response(
             final_msg["content"] = final_response
 
     append_message(messages, final_msg)
-    # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
-    # _persist_session idempotent). Failure must NOT abort the turn: finalize retries.
-    try:
-        agent._flush_messages_to_session_db(messages, conversation_history)
-    except Exception:
-        logger.warning(
-            "final text-turn flush failed (session=%s) — reply is "
-            "not yet durable; relying on finalize_turn retry",
-            getattr(agent, "session_id", None) or "none",
-            exc_info=True,
-        )
+    _persist_final_text_response(agent, messages, final_response, conversation_history)
 
     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
     if not agent.quiet_mode:

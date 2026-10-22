@@ -172,9 +172,12 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
     # Mirror built-in memory writes to external providers; gating lives in
     # MemoryManager.notify_memory_tool_write. Authoritative mode never mirrors.
     if getattr(agent, "_memory_provider_mode", "hybrid") != "authoritative" and agent._memory_manager:
+        from agent.memory_provider import current_memory_provider_execution_context
+
         agent._memory_manager.notify_memory_tool_write(
             result,
             args,
+            execution_context=current_memory_provider_execution_context(),
             build_metadata=lambda: agent._build_memory_write_metadata(
                 task_id=ctx.effective_task_id,
                 tool_call_id=ctx.tool_call_id,

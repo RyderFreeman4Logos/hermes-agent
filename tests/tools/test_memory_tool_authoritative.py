@@ -546,3 +546,24 @@ def test_authoritative_agent_init_keeps_core_route_without_memory_store(monkeypa
     config["memory"]["provider_mode"] = "hybrid"
     assert agent._memory_provider_mode == "authoritative"
     assert agent._memory_manager.provider_mode == "authoritative"
+
+
+def test_authoritative_capability_receives_original_execution_context():
+    from agent.memory_provider import MemoryProviderExecutionContext, bind_memory_provider_execution_context
+
+    class ContextProvider(RecordingAuthoritativeProvider):
+        def authoritative_memory_write(self, request, *, execution_context=None):
+            self.context = execution_context
+            return {"success": True, "operation_id": "kept"}
+
+    provider = ContextProvider()
+    manager = MemoryManager(provider_mode="authoritative")
+    manager.add_provider(provider)
+    context = MemoryProviderExecutionContext(operation_key="caller-owned", deadline=123.0)
+    with bind_memory_provider_execution_context(context):
+        result = json.loads(manager.authoritative_memory_write({
+            "action": "add", "target": "memory", "content": "fixture", "operation_key": "caller-owned",
+        }))
+    assert result["success"] is True
+    assert provider.context is context
+    assert provider.context.operation_key == "caller-owned"

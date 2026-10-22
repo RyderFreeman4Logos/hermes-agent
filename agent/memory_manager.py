@@ -25,6 +25,7 @@ from agent.memory_caller_scope import bound_scope, caller_scope, claim_instance,
 from agent.memory_context import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.memory_manager_tools import (inject_memory_provider_tools, memory_provider_tools_enabled,
                                         memory_provider_tools_exposed, normalize_tool_schema)
+from agent.memory_provider import MemoryProviderExecutionContext, current_memory_provider_execution_context
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from hermes_constants import hermes_home_key
@@ -434,6 +435,16 @@ class MemoryManager:
         ), kind="prefetch")
 
     @staticmethod
+    def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+        """Whether a callable accepts ``keyword`` (uninspectable -> assume yes)."""
+        params = _signature_params(fn)
+        return params is None or _has_var_kwargs(params) or keyword in params
+
+    @staticmethod
+    def _provider_accepts_keyword(provider: MemoryProvider, hook_name: str, keyword: str) -> bool:
+        return MemoryManager._accepts_keyword(getattr(provider, hook_name), keyword)
+
+    @staticmethod
     def _provider_sync_accepts(provider: MemoryProvider, keyword: str) -> bool:
         """Whether ``sync_turn`` accepts ``keyword`` (uninspectable → assume yes)."""
         params = _signature_params(provider.sync_turn)
@@ -698,6 +709,9 @@ class MemoryManager:
                     success=False,
                     error_class="provider_capability_missing",
                 )
+            execution_context = kwargs.pop("execution_context", None) or current_memory_provider_execution_context()
+            if execution_context is not None and self._accepts_keyword(capability, "execution_context"):
+                kwargs["execution_context"] = execution_context
             params = _signature_params(capability)
             if params is not None and not _has_var_kwargs(params):
                 kwargs = {k: v for k, v in kwargs.items() if k in params}
@@ -779,6 +793,11 @@ class MemoryManager:
         args = _redact_for_provider(args)
         from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
         try:
+            execution_context = kwargs.pop("execution_context", None) or current_memory_provider_execution_context()
+            if execution_context is not None and self._provider_accepts_keyword(
+                provider, "handle_tool_call", "execution_context"
+            ):
+                kwargs["execution_context"] = execution_context
             result = provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
             logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
@@ -918,21 +937,43 @@ class MemoryManager:
         accepted = sum(p.kind is not inspect.Parameter.VAR_POSITIONAL for p in params.values())
         return "positional" if accepted >= 4 else "legacy"
 
-    def on_memory_write(self, action: str, target: str, content: str,
-                        metadata: Optional[dict[str, Any]] = None) -> None:
-        """Notify external providers when the built-in memory tool writes (skips builtin, the source)."""
+    @staticmethod
+    def _provider_memory_write_context_mode(provider: MemoryProvider) -> bool:
+        return MemoryManager._provider_accepts_keyword(provider, "on_memory_write", "execution_context")
+
+    def on_memory_write(
+        self, action: str, target: str, content: str,
+        metadata: Optional[dict[str, Any]] = None,
+        execution_context: Optional[MemoryProviderExecutionContext] = None,
+    ) -> None:
+        """Notify external providers after a built-in memory write commits."""
         if not self._owner_allows("on_memory_write"):
             return
         content, metadata = _redact_for_provider(content, dict(metadata or {}))
+        execution_context = execution_context or current_memory_provider_execution_context()
+        base_metadata = dict(metadata or {})
+        if execution_context is not None and execution_context.operation_key is not None:
+            base_metadata.setdefault("operation_key", execution_context.operation_key)
 
         def _notify(provider: MemoryProvider) -> None:
+            provider_metadata = dict(base_metadata)
             mode = self._provider_memory_write_metadata_mode(provider)
+            context = execution_context if self._provider_memory_write_context_mode(provider) else None
             if mode == "legacy":
                 provider.on_memory_write(action, target, content)
             elif mode == "positional":
-                provider.on_memory_write(action, target, content, dict(metadata or {}))
+                if context is None:
+                    provider.on_memory_write(action, target, content, provider_metadata)
+                else:
+                    provider.on_memory_write(
+                        action, target, content, provider_metadata, execution_context=context,
+                    )
+            elif context is None:
+                provider.on_memory_write(action, target, content, metadata=provider_metadata)
             else:
-                provider.on_memory_write(action, target, content, metadata=dict(metadata or {}))
+                provider.on_memory_write(
+                    action, target, content, metadata=provider_metadata, execution_context=context,
+                )
 
         external = [p for p in self._providers if p.name != "builtin"]
         self._each_provider("on_memory_write failed", _notify, providers=external)
@@ -952,8 +993,11 @@ class MemoryManager:
                 return False
         return isinstance(result, dict) and result.get("success") is True and result.get("staged") is not True
 
-    def notify_memory_tool_write(self, tool_result: Any, tool_args: dict[str, Any], *,
-                                 build_metadata: Optional[Callable[[], dict[str, Any]]] = None) -> None:
+    def notify_memory_tool_write(
+        self, tool_result: Any, tool_args: dict[str, Any], *,
+        build_metadata: Optional[Callable[[], dict[str, Any]]] = None,
+        execution_context: Optional[MemoryProviderExecutionContext] = None,
+    ) -> None:
         """Mirror a built-in memory tool call to external providers.
 
         Gates on a committed write, expands single-op and batched ``operations`` shapes, keeps only
@@ -965,6 +1009,7 @@ class MemoryManager:
             return
         if not self._memory_tool_result_succeeded(tool_result):
             return
+        execution_context = execution_context or current_memory_provider_execution_context()
         result = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
         target = str(tool_args.get("target") or "memory")
         operations = tool_args.get("operations")
@@ -976,6 +1021,8 @@ class MemoryManager:
             try:
                 metadata = dict(build_metadata() if build_metadata else {})
                 metadata.pop("previous_content", None)
+                if execution_context is None and tool_args.get("operation_key") is not None:
+                    metadata["operation_key"] = tool_args["operation_key"]
                 old_text = op.get("old_text")
                 if old_text:
                     metadata["old_text"] = str(old_text)
@@ -1001,7 +1048,10 @@ class MemoryManager:
                     else:
                         after = result.get("patched_entry_after")
                     mirrored_action, content = "replace", str(after or "")
-                self.on_memory_write(mirrored_action, target, content, metadata=metadata)
+                call_kwargs = {"metadata": metadata}
+                if self._accepts_keyword(self.on_memory_write, "execution_context"):
+                    call_kwargs["execution_context"] = execution_context
+                self.on_memory_write(mirrored_action, target, content, **call_kwargs)
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
 

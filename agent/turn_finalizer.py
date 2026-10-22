@@ -44,6 +44,64 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
+def _attach_reply_end_metadata(agent, messages, final_response, *, completed):
+    """Attach display-only completion metadata to this turn's assistant row, never an older reply."""
+    if not completed or not final_response:
+        return None
+    started = getattr(agent, "_reply_started_monotonic", None)
+    if not isinstance(started, (int, float)) or isinstance(started, bool):
+        return None
+    elapsed_s = time.monotonic() - float(started)
+    if elapsed_s < 0:
+        return None
+
+    reply = None
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            break
+        if message.get("role") == "assistant":
+            reply = message
+            break
+    if reply is None:
+        return None
+
+    display_metadata = reply.get("display_metadata")
+    display_metadata = dict(display_metadata) if isinstance(display_metadata, dict) else {}
+    if isinstance(display_metadata.get("reply_end"), dict):
+        return None
+    reply_end = {"elapsed_s": elapsed_s}
+    from agent.turn_usage import _reply_cache_counts
+
+    cache_read, prompt_total = _reply_cache_counts(agent)
+    if cache_read is not None and prompt_total is not None:
+        reply_end.update(cache_read=cache_read, prompt_total=prompt_total)
+    display_metadata["reply_end"] = reply_end
+    reply["display_metadata"] = display_metadata
+    agent._reply_elapsed_s = elapsed_s
+    return reply, reply_end, bool(reply.get(_DB_PERSISTED_MARKER))
+
+
+def _persist_reply_end_metadata(agent, attachment, logger) -> None:
+    """Update only the exact row when it was durable before the metadata was attached."""
+    if not attachment or not attachment[2]:
+        return
+    message, reply_end, _was_persisted = attachment
+    row_id = message.get("_row_id")
+    if not isinstance(row_id, int) or isinstance(row_id, bool) or row_id <= 0:
+        return
+    db = getattr(agent, "_session_db", None)
+    merge_metadata = getattr(db, "_merge_assistant_display_metadata", None)
+    if not callable(merge_metadata):
+        return
+    try:
+        if not merge_metadata(row_id, {"reply_end": reply_end}):
+            logger.warning("reply_end metadata update found no assistant row (row_id=%s)", row_id)
+    except Exception:
+        logger.warning("reply_end metadata update failed (row_id=%s)", row_id, exc_info=True)
+
+
 def _record_kanban_budget_exhausted(
     kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
 ) -> None:
@@ -496,7 +554,7 @@ def apply_llm_output_transform(
     turn's not-yet-written text is touched — earlier turns and the system prompt are never
     rewritten (prompt-cache invariant)."""
     if logger is None:
-        from agent.conversation_loop import logger
+        logger = logging.getLogger("agent.conversation_loop")
     recorded = getattr(agent, "_llm_output_transform", None)
     if isinstance(recorded, tuple) and len(recorded) == 3 and recorded[0] == turn_id:
         _, transformed, pre_transform = recorded
@@ -529,7 +587,7 @@ def finalize_turn(
     _pending_verification_response_previewed=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
-    from agent.conversation_loop import logger
+    logger = logging.getLogger("agent.conversation_loop")
 
     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
@@ -632,7 +690,11 @@ def finalize_turn(
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
+        reply_end_attachment = _attach_reply_end_metadata(
+            agent, messages, final_response, completed=completed,
+        )
         agent._persist_session(messages, conversation_history)
+        _persist_reply_end_metadata(agent, reply_end_attachment, logger)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
 

@@ -11,12 +11,12 @@ from __future__ import annotations
 from typing import Any
 
 from agent.custom_entry_pool import SNAPSHOT_OWNER_KEY, runtime_entry_owner
-from agent.agent_runtime_helpers import _copy_request_overrides
 
 
 def _snapshot_primary_runtime(agent):
     # Per-turn restoration snapshot: after a fallback, the next turn restores these so the
     # preferred model gets a fresh attempt.
+    from agent.agent_runtime_helpers import _copy_request_overrides
     _cc = agent.context_compressor
     agent._primary_runtime = {
         "model": agent.model,
@@ -49,6 +49,7 @@ def _snapshot_primary_runtime(agent):
 
 def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
     """The ``_primary_runtime`` record that persists a switch across turns."""
+    from agent.agent_runtime_helpers import _copy_request_overrides
     cc = getattr(agent, "context_compressor", None) or None
     rt = {
         "model": agent.model,

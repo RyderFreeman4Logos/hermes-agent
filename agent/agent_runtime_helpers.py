@@ -1514,7 +1514,7 @@ def restore_primary_runtime(agent) -> bool:
     def _load_primary_pool():
         """The primary's pool (entry-scoped for a custom entry); None when absent or provider-mismatched."""
         from agent.custom_entry_pool import load_runtime_pool
-        loaded = load_runtime_pool(primary_provider, primary_runtime_base_url, (rt or {}).get("requested_provider"), rt or {})
+        loaded = load_runtime_pool(primary_pool_owner, primary_runtime_base_url, (rt or {}).get("requested_provider"), rt or {})
         return loaded if loaded is not None and _matches_primary(loaded) else None
     if (getattr(agent, "_rate_limited_until", 0) > time.monotonic()
             and _primary_quota_reopened_early(agent, primary_provider, primary_model, _matches_primary, _load_primary_pool)):

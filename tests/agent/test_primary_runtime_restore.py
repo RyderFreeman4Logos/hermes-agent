@@ -408,7 +408,6 @@ class TestRestorePrimaryRuntime:
             )
         agent._fallback_activated = True
         agent._credential_pool = fallback_pool
-        agent._swap_credential = MagicMock()
 
         with (
             patch("agent.credential_pool._load_config_safe", return_value=config),

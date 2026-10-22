@@ -605,6 +605,16 @@ class MemoryManager:
         "error_class",
     }
 
+    def _authoritative_write_keywords(self, capability: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Admit caller scope and operation context only where the capability accepts them."""
+        execution_context = kwargs.pop("execution_context", None) or current_memory_provider_execution_context()
+        if execution_context is not None and self._accepts_keyword(capability, "execution_context"):
+            kwargs["execution_context"] = execution_context
+        params = _signature_params(capability)
+        if params is not None and not _has_var_kwargs(params):
+            kwargs = {k: v for k, v in kwargs.items() if k in params}
+        return kwargs
+
     def authoritative_memory_write(self, args: dict[str, Any], *, authorization_callback=None, **kwargs) -> str:
         """Route the core ``memory`` write shape to the external provider.
 
@@ -709,13 +719,7 @@ class MemoryManager:
                     success=False,
                     error_class="provider_capability_missing",
                 )
-            execution_context = kwargs.pop("execution_context", None) or current_memory_provider_execution_context()
-            if execution_context is not None and self._accepts_keyword(capability, "execution_context"):
-                kwargs["execution_context"] = execution_context
-            params = _signature_params(capability)
-            if params is not None and not _has_var_kwargs(params):
-                kwargs = {k: v for k, v in kwargs.items() if k in params}
-            raw_result = capability(request, **kwargs)
+            raw_result = capability(request, **self._authoritative_write_keywords(capability, kwargs))
         except NotImplementedError:
             return tool_error(
                 "Authoritative memory provider lacks core write capability.",

@@ -169,7 +169,7 @@ def _preamble(evt: dict, title: str, intro: str, completed_at: float, *, with_go
         lines.append(f"Context you provided: {evt['context']}")
     if evt.get("toolsets"):
         lines.append(f"Toolsets: {', '.join(evt['toolsets'])}")
-    lines.append(f"Role: {evt.get('role') or 'leaf'}   Model: {evt.get('model') or '?'}")
+    lines.append(f"Role: {evt.get('role') or 'leaf'}")
     return lines
 
 

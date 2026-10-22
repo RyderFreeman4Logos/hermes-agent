@@ -352,7 +352,7 @@ class _SelectedRouteFailureChild:
 
 
 @pytest.mark.parametrize(("outcome", "expected_status"), [("exception", "error"), ("timeout", "timeout")])
-def test_public_background_route_errors_keep_selected_provenance(
+def test_public_background_route_errors_keep_unaccepted_identity_private(
     tmp_path, monkeypatch, outcome, expected_status,
 ):
     """Public result, durable completion, and formatter keep the route selected before the run."""
@@ -405,20 +405,19 @@ def test_public_background_route_errors_keep_selected_provenance(
             assert event is not None
             (result,) = event["results"]
             assert (result["status"], result["model"], result["provider"]) == (
-                expected_status, "fast-model", "custom",
+                expected_status, None, None,
             )
 
             durable = ad.get_durable_delegation(event["delegation_id"])
             assert durable is not None
             (persisted,) = durable["result"]["results"]
             assert (persisted["status"], persisted["model"], persisted["provider"]) == (
-                expected_status, "fast-model", "custom",
+                expected_status, None, None,
             )
 
             rendered = format_process_notification(event)
-            assert "Model: fast-model" in rendered
-            assert "Provider: custom" in rendered
-            assert rendered.index("Model: fast-model") < rendered.index("(no summary")
+            assert "Model: fast-model" not in rendered
+            assert "Provider: custom" not in rendered
     finally:
         deadline = time.monotonic() + 2.0
         while ad.active_count() and time.monotonic() < deadline:

@@ -316,6 +316,19 @@ export const MessageLine = memo(function MessageLine({
 
         <Box width={transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)}>{content}</Box>
       </Box>
+
+      {msg.role === 'assistant' && msg.replyEnd && (
+        <Box>
+          <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
+            <Text> </Text>
+          </NoSelect>
+          <Box width={transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)}>
+            <Text color={t.color.muted} dim>
+              {msg.replyEnd}
+            </Text>
+          </Box>
+        </Box>
+      )}
     </Box>
   )
 })

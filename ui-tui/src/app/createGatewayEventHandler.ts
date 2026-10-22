@@ -8,6 +8,7 @@ import type { MessageDeltaPayload, SubagentStatus, Usage } from '@hermes/shared/
 import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
 import { STREAM_BATCH_MS } from '../config/timing.js'
 import { buildSetupRequiredSections, setupRequiredTitle } from '../content/setup.js'
+import { replyEndLine } from '../domain/messages.js'
 import { usageFromTick } from '../domain/usage.js'
 import type {
   AnyGatewayEvent,
@@ -1772,6 +1773,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             : finalMessages.length
               ? finalMessages
               : [{ role: 'assistant', text: finalText }]
+
+          const replyEnd = payload.status === 'complete' ? replyEndLine(payload.usage) : undefined
+
+          if (replyEnd) {
+            const at = msgs.findLastIndex(message => message.role === 'assistant' && message.text.trim())
+
+            if (at >= 0) {
+              msgs[at] = { ...msgs[at], replyEnd }
+            }
+          }
 
           msgs.forEach(appendMessage)
 

@@ -904,7 +904,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         carried_messages: Optional[list[dict[str, Any]]] = None,
         covered_ids: Optional[list[int]] = None,
         unresolved_held: Optional[list[dict[str, Any]]] = None,
-        held_for_cas: Optional[list[dict[str, Any]]] = None) -> int:
+        held_for_cas: Optional[list[dict[str, Any]]] = None,
+        source_ids: Optional[list[int]] = None, source_signature: Optional[str] = None,
+        source_watermark: Optional[int] = None) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -939,7 +941,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             conn, session_id, compacted_messages, model_config_patch=model_config_patch,
             watermark=watermark, lock_holder=lock_holder, tail_count=tail_count,
             carried_messages=carried_messages, covered_ids=covered_ids,
-            unresolved_held=unresolved_held, held_for_cas=held_for_cas), compacted_messages)
+            unresolved_held=unresolved_held, held_for_cas=held_for_cas, source_ids=source_ids,
+            source_signature=source_signature, source_watermark=source_watermark), compacted_messages)
 
     def _archive_and_compact_on_conn(
             self, conn, session_id: str, compacted_messages: list[dict[str, Any]], *,
@@ -948,7 +951,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             carried_messages: Optional[list[dict[str, Any]]] = None,
             covered_ids: Optional[list[int]] = None,
             unresolved_held: Optional[list[dict[str, Any]]] = None,
-            held_for_cas: Optional[list[dict[str, Any]]] = None) -> int:
+            held_for_cas: Optional[list[dict[str, Any]]] = None,
+        source_ids: Optional[list[int]] = None, source_signature: Optional[str] = None,
+        source_watermark: Optional[int] = None) -> int:
         """:meth:`archive_and_compact` on the caller's write transaction (never commits). The owner
         and the worker/canonical-mutation verbs share this one body so they cannot drift."""
         from hermes_state import SessionCompressionInProgressError
@@ -957,6 +962,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                 raise SessionCompressionInProgressError(
                     f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
+        self._assert_pre_watermark_source_unchanged(
+            conn, session_id, watermark, source_ids, source_signature, source_watermark)
         patch = model_config_patch is not None
         # on_missing="raise": never commit against a vanished session row (caller keeps the original).
         patched_model_config = self._merge_model_config_json(

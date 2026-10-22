@@ -349,6 +349,39 @@ class TestPreloadResumedSession:
         finally:
             db.close()
 
+    def test_real_20k_lineage_uses_small_tip_and_refuses_oversized_current_tip(self, tmp_path):
+        """Historical rows do not consume the current-segment resume admission budget."""
+        from hermes_state import SessionDB
+
+        with SessionDB(tmp_path / "state.db") as db:
+            db.create_session("root", source="cli")
+            db.append_messages_batch("root", [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"old-{i}"}
+                for i in range(20_002)
+            ])
+            db.end_session("root", "compression")
+            db.create_session("tip", source="compression", parent_session_id="root")
+            db.append_messages_batch("tip", [
+                {"role": "user", "content": "current"},
+                {"role": "assistant", "content": "answer"},
+            ])
+            cli = _make_cli(resume="tip")
+            cli._session_db = db
+            cli.console.file = StringIO()
+            assert cli._preload_resumed_session() is True
+            assert [m["content"] for m in cli.conversation_history] == ["current", "answer"]
+            assert len(cli._resume_display_history) <= 20_000
+            assert cli._resume_display_history[-1]["content"] == "answer"
+            db.append_messages_batch("tip", [
+                {"role": "user" if i % 2 == 0 else "assistant", "content": f"tip-{i}"}
+                for i in range(20_000)
+            ])
+            oversized = _make_cli(resume="tip")
+            oversized._session_db = db
+            oversized.console.file = StringIO()
+            assert oversized._preload_resumed_session() is False
+            assert "too long to reload safely" in oversized.console.file.getvalue()
+
 
 
 

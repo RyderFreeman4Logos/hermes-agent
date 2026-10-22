@@ -7827,6 +7827,62 @@
         "title": "BrowserProgressPayload",
         "type": "object"
       },
+      "CacheInfo": {
+        "additionalProperties": false,
+        "description": "First-response cache observation on ``message.complete``.",
+        "properties": {
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "pct": {
+            "default": 0,
+            "title": "Pct",
+            "type": "integer"
+          },
+          "read_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Read Tokens"
+          },
+          "prompt_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prompt Tokens"
+          },
+          "compression_bound": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Compression Bound"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "CacheInfo",
+        "type": "object"
+      },
       "CanonicalApprovalParams": {
         "additionalProperties": false,
         "properties": {
@@ -23671,6 +23727,29 @@
               }
             ],
             "default": null
+          },
+          "cache_info": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CacheInfo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Completed At"
           }
         },
         "title": "MessageCompletePayload",
@@ -41774,6 +41853,19 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "cache_record": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cache Record"
           }
         },
         "required": [

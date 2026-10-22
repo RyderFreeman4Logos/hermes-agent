@@ -879,8 +879,8 @@ def resolve_compression_fallback_route() -> Optional[dict]:
         try:
             api_key = _fallback_entry_api_key(entry)
         except Exception:
-            logger.debug("compression fallback_chain[%d] api key resolution failed", index, exc_info=True)
-            api_key = None
+            logger.debug("compression fallback_chain[%d] api key resolution failed; skipping entry", index)
+            continue
         from agent.auxiliary_client import _coerce_positive_timeout
         timeout = _coerce_positive_timeout(entry.get("timeout"))
         return {
@@ -3276,8 +3276,6 @@ def _publish_rotated_compaction(
         _foreign_tail_ceiling = agent._session_db.get_active_message_watermark(agent.session_id)
     with contextlib.suppress(Exception):  # best-effort — don't block compression on a flush error
         agent._flush_messages_to_session_db(messages, conversation_history=persisted_history)
-    # Publish closure + child + handoff in one transaction so no reader sees an empty child. Child stays on the
-    # parent's profile ("default" persists as NULL) and keeps a live /yolo; publish COALESCEs from the parent row.
     _profile_for_child = None
     with contextlib.suppress(Exception):
         from hermes_cli.profiles import get_active_profile_name
@@ -3287,10 +3285,11 @@ def _publish_rotated_compaction(
     new_session_id = mint_session_id()
     from agent.context_compressor import _DB_PERSISTED_MARKER
     from tools.approval_yolo import with_session_yolo
+    from agent.loop_timing import model_config_for_compression_child as _child_cfg  # one txn; child keeps parent profile (default NULL), live /yolo, COALESCE
     agent._session_db.publish_compression_child(
         parent_session_id=old_session_id, child_session_id=new_session_id,
         source=_compression_child_source(agent, old_session_id), model=agent.model,
-        model_config=with_session_yolo(agent._session_init_model_config, old_session_id),
+        model_config=_child_cfg(agent, with_session_yolo(agent._session_init_model_config, old_session_id)),
         system_prompt=new_system_prompt, messages=compressed,
         cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,

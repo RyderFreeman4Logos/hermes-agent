@@ -35,6 +35,10 @@ class FakeAgent:
         self._persist_user_message_idx: int | None = None
         self._persist_user_message_override: Any = None
         self._persist_user_message_timestamp: float | None = None
+        self._reply_usage: Any = None
+        self._reply_usage_complete = True
+        self._reply_started_monotonic: float | None = None
+        self._reply_elapsed_s: float | None = None
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -130,12 +134,49 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == result["messages"][-1]
 
 
+def test_completed_reply_metadata_keeps_missing_cache_usage_unknown(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr("agent.turn_finalizer.time.monotonic", lambda: 12.5)
+    agent = FakeAgent()
+    agent._reply_started_monotonic = 10.0
+    agent._reply_usage = {"prompt_tokens": 20}
+    agent._reply_usage_complete = False
+    messages = [{"role": "user", "content": "do it"}]
+
+    finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="fallback_prior_turn_content",
+    )
+
+    assert agent.persisted_messages is not None
+    metadata = agent.persisted_messages[-1]["display_metadata"]
+    assert metadata["reply_end"] == {"elapsed_s": 2.5}
+    from agent.message_metadata import without_persistence_fields
+    assert "display_metadata" not in without_persistence_fields(agent.persisted_messages[-1])
+
+
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(
     monkeypatch, tmp_path
 ):
     """The durable row records message creation, not the later DB flush."""
+    from agent.context_compressor import ContextCompressor
     from hermes_state import SessionDB
 
+    monkeypatch.setattr(
+        ContextCompressor, "_is_synthetic_compression_user_turn",
+        classmethod(lambda _cls, _message: False),
+    )
     created_at = 1_781_976_577.25
     persisted_at = created_at + 600
     monkeypatch.setattr("agent.message_metadata.wall_time", lambda: created_at)
@@ -145,6 +186,10 @@ def test_fallback_timestamp_survives_delayed_sqlite_persistence(
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("sess-test", source="cli")
     agent = FakeAgent()
+    agent._reply_started_monotonic = 100.0
+    agent._reply_usage = {"cache_read_tokens": 12, "prompt_tokens": 30}
+    agent._reply_usage_complete = True
+    monkeypatch.setattr("agent.turn_finalizer.time.monotonic", lambda: 103.25)
 
     def persist_to_sqlite(messages, _conversation_history):
         db.replace_messages(agent.session_id, messages)
@@ -172,8 +217,130 @@ def test_fallback_timestamp_survives_delayed_sqlite_persistence(
         _turn_exit_reason="fallback_prior_turn_content",
     )
 
+    assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1]["timestamp"] == created_at
     assert agent.persisted_messages[-1]["timestamp"] != persisted_at
+    assert agent.persisted_messages[-1]["display_metadata"]["reply_end"] == {
+        "elapsed_s": 3.25,
+        "cache_read": 12,
+        "prompt_total": 30,
+    }
+
+
+def test_finalizer_updates_preflushed_reply_and_history_projection(monkeypatch, tmp_path):
+    from types import MethodType
+
+    from agent.context_compressor import ContextCompressor
+    from agent.compaction_display import project_compaction_message_for_display
+    from agent.message_metadata import without_persistence_fields
+    from agent.skill_commands import describe_skill_invocation
+    from agent.session_persistence import SessionPersistenceMixin
+    from hermes_state import SessionDB
+    from tui_gateway import session_history
+
+    monkeypatch.setattr(
+        ContextCompressor, "_is_synthetic_compression_user_turn",
+        classmethod(lambda _cls, _message: False),
+    )
+    monkeypatch.setattr(
+        session_history, "project_compaction_message_for_display",
+        project_compaction_message_for_display, raising=False,
+    )
+    monkeypatch.setattr(
+        session_history, "describe_skill_invocation", describe_skill_invocation, raising=False,
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr("agent.turn_finalizer.time.monotonic", lambda: 103.25)
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session("sess-test", source="cli")
+    agent: Any = FakeAgent()
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._persist_disabled = False
+    agent._flushed_db_message_ids = set()
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_session_id = None
+    agent._db_flush_scan_prefix = None
+    agent._session_row_replay_pending = None
+    agent._flush_messages_to_session_db = MethodType(
+        SessionPersistenceMixin._flush_messages_to_session_db, agent,
+    )
+    agent._flush_messages_to_session_db_unlocked = MethodType(
+        SessionPersistenceMixin._flush_messages_to_session_db_unlocked, agent,
+    )
+    agent._persist_session = lambda rows, history: agent._flush_messages_to_session_db(rows, history)
+    agent._reply_started_monotonic = 100.0
+    agent._reply_usage = {"cache_read_tokens": 12, "prompt_tokens": 30}
+    agent._reply_usage_complete = True
+    messages = [
+        {"role": "user", "content": "older question"},
+        {"role": "assistant", "content": "older answer", "display_metadata": {"old": True}},
+        {"role": "user", "content": "current question"},
+        {"role": "assistant", "content": "Done.", "display_metadata": {"keep": True}},
+    ]
+
+    # The normal text path can flush this assistant row before finalization.
+    assert agent._flush_messages_to_session_db(messages) is True
+    reply_row_id = messages[-1]["_row_id"]
+    prior = db.get_messages_as_conversation(agent.session_id, include_row_ids=True)
+    stored_reply = next(row for row in prior if row.get("_row_id") == reply_row_id)
+    assert stored_reply["display_metadata"] == {"keep": True}
+
+    finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="current question",
+        original_user_message="current question",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert messages[-1]["_row_id"] == reply_row_id
+    assert "display_metadata" not in without_persistence_fields(messages[-1])
+    stored = db.get_messages_as_conversation(agent.session_id, include_row_ids=True)
+    older_reply = next(row for row in stored if row.get("content") == "older answer")
+    current_reply = next(row for row in stored if row.get("_row_id") == reply_row_id)
+    assert older_reply["display_metadata"] == {"old": True}
+    assert current_reply["display_metadata"] == {
+        "keep": True,
+        "reply_end": {"elapsed_s": 3.25, "cache_read": 12, "prompt_total": 30},
+    }
+
+    db.close()
+    db = SessionDB(db_path=db_path)
+    reloaded = db.get_messages_as_conversation(agent.session_id, include_row_ids=True)
+    projected = session_history._history_to_messages(reloaded, image_urls=False)
+    assert projected[-1]["display_metadata"]["reply_end"] == {
+        "elapsed_s": 3.25, "cache_read": 12, "prompt_total": 30,
+    }
+    db.close()
+
+
+def test_finalizer_does_not_attach_metadata_when_current_reply_is_absent():
+    from agent.turn_finalizer import _attach_reply_end_metadata
+
+    agent = FakeAgent()
+    agent._reply_started_monotonic = 10.0
+    agent._reply_usage = {"cache_read_tokens": 4, "prompt_tokens": 10}
+    agent._reply_usage_complete = True
+    messages = [
+        {"role": "user", "content": "older question"},
+        {"role": "assistant", "content": "older answer", "display_metadata": {"old": True}},
+        {"role": "user", "content": "current question"},
+    ]
+    historical_reply = dict(messages[1])
+
+    assert _attach_reply_end_metadata(agent, messages, "Done.", completed=True) is None
+    assert messages[1] == historical_reply
+    assert agent._reply_elapsed_s is None
 
 
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):
@@ -283,8 +450,13 @@ def test_empty_final_response_recovers_stream_buffer_into_blank_assistant_row(
     still holds the delivered text, that blank row is the durable transcript —
     Desktop reload shows nothing even though the user already saw the answer.
     """
+    from agent.context_compressor import ContextCompressor
     from hermes_state import SessionDB
 
+    monkeypatch.setattr(
+        ContextCompressor, "_is_synthetic_compression_user_turn",
+        classmethod(lambda _cls, _message: False),
+    )
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
 
     db = SessionDB(db_path=tmp_path / "state.db")

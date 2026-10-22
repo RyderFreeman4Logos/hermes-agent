@@ -570,3 +570,62 @@ def test_bounded_resume_readonly_schema_capabilities(tmp_path, monkeypatch, shap
     finally:
         ro.close()
         assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_bounded_resume_hides_rewound_compression_copy(tmp_path, legacy):
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        db.create_session('parent', source='cli')
+        rows = [dict(role='user', content='kept', timestamp=1.0),
+                dict(role='assistant', content='kept reply', timestamp=2.0),
+                dict(role='user', content='withdrawn', timestamp=3.0),
+                dict(role='assistant', content='withdrawn reply', timestamp=4.0)]
+        db.append_messages_batch('parent', rows)
+        db.end_session('parent', 'compression')
+        db.create_session('tip', source='cli', parent_session_id='parent')
+        db.append_messages_batch('tip', rows)
+        target = next(m['id'] for m in db.get_messages('tip') if m['content'] == 'withdrawn')
+        db.rewind_to_message('tip', target)
+        if legacy:
+            db._conn.execute('UPDATE messages SET display_identity=NULL, display_order=NULL')
+            db._conn.commit()
+        full_model, full_display = db.get_resume_conversations('tip')
+        bounded_model, bounded_display = db.get_resume_conversations('tip', max_display_messages=20)
+        assert not any(m['content'] == 'withdrawn' for m in full_display)
+        assert bounded_model == full_model
+        assert bounded_display == full_display
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("kind", ["summary", "absorbed"])
+@pytest.mark.parametrize("removed", [False, True])
+def test_bounded_resume_preserves_uid_carriers(tmp_path, legacy, kind, removed):
+    """Changed-body summary copies and absorbed identities share the official display projection."""
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("parent", source="cli")
+        db.append_messages_batch("parent", [
+            {"role": "user", "content": "original", "timestamp": 1.0, "message_uid": "a" * 32},
+            {"role": "assistant", "content": "answer", "timestamp": 2.0},
+        ])
+        db.end_session("parent", "compression")
+        db.create_session("tip", source="cli", parent_session_id="parent")
+        carrier = {"role": "user", "content": "changed carrier", "timestamp": 3.0,
+                   "message_uid": "a" * 32 if kind == "summary" else "b" * 32}
+        if kind == "summary":
+            carrier["_compressed_summary"] = True
+        else:
+            carrier["_absorbed_message_uids"] = ["a" * 32]
+        db.append_messages_batch("tip", [carrier])
+        if removed:
+            db.deactivate_message("tip", db.get_messages("tip")[0]["id"])
+        if legacy:
+            db._conn.execute("UPDATE messages SET display_identity=NULL, display_order=NULL")
+            db._conn.commit()
+        model, full = db.get_resume_conversations("tip")
+        if removed or kind == "summary":
+            assert not any(row["content"] == "original" for row in full)
+        for limit in (1, 20):
+            assert db.get_resume_conversations("tip", max_display_messages=limit) == (model, full[-limit:])

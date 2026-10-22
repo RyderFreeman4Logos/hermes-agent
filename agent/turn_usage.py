@@ -41,7 +41,6 @@ def _turn_usage_snapshot(canonical_usage) -> dict[str, int | str]:
         "cache_write_tokens": canonical_usage.cache_write_tokens,
         "reasoning_tokens": canonical_usage.reasoning_tokens,
         "cache_telemetry": canonical_usage.cache_telemetry,
-        "cache_telemetry": canonical_usage.cache_telemetry,
     }
 
 

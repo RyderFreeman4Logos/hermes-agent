@@ -1121,7 +1121,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         first_by_uid.setdefault(uid, key)
         return key
 
-    def _dedupe_display_generations(self, rows, *, drop_removed: bool = False):
+    def _dedupe_display_generations(self, rows, *, drop_removed: bool = False, identity_rows: bool = False):
         """Collapse compaction generations so each logical message appears once (the protected tail is copied
         into each generation: same role/content/timestamp, different ``active``/id); prefer the live row, then
         the newest. The ONE definition every display projection shares. *rows* must be ordered by ``id``.
@@ -1130,6 +1130,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
         newer copy) and ``compacted``. A message whose newest copy is removed is not shown, so a rewind in a
         compression child never brings back the parent's copy. Copies share the display key or ``message_uid``
         (a micro-compaction merge also stands for the rows it absorbed)."""
+        # Bounded resume projects only hashed keys and identity metadata through SQLite;
+        # it uses this same selection algorithm without transferring historical bodies.
+        key_for = (lambda row: row["_display_key"]) if identity_rows else self._display_dedupe_key
+        hash_key = (lambda key: key) if identity_rows else self._display_identity
         seen: dict[tuple[Any, ...], Any] = {}
         first_id: dict[tuple[Any, ...], int] = {}
         uid_key: dict[Any, tuple[Any, ...]] = {}  # message_uid -> the display key of its first copy
@@ -1149,8 +1153,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                 # A removed row is read without its body (``_removed_identity_rows``): its stored display identity.
                 gone = not row["active"] and not row["compacted"]
                 stored = row["display_identity"] if gone else None
-                key = None if stored else self._display_dedupe_key(row)
-                hashed = stored or (self._display_identity(key) if key is not None and (
+                key = None if stored else key_for(row)
+                hashed = stored or (hash_key(key) if key is not None and (
                     gone or row["timestamp"] in removed_ts) else None)
                 copies = [*((hashed,) if hashed else ()), *(
                     ("uid", uid) for uid in (row["message_uid"], *_uid_list(row["absorbed_message_uids"])) if uid)]
@@ -1159,7 +1163,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                     continue
             if self._is_model_only_row(row):
                 continue
-            key = key or self._display_dedupe_key(row)
+            key = key or key_for(row)
             # Only the summary carrier folds by uid: other rewritten copies (a pruned tool stub) must keep
             # their archived original visible.
             key = self._fold_summary_carrier(row, key, uid_key)
@@ -1688,12 +1692,6 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                 # Read-only stores may predate either display-index column.
                 with self._read_ctx() as conn:
                     columns = set(self._message_column_names(conn))
-                indexed = {"display_identity", "display_order"} <= columns and self._read_one(
-                    f"""SELECT 1 FROM messages
-                        WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)
-                          AND (display_identity IS NULL OR display_order IS NULL) LIMIT 1""",
-                    tuple(session_ids),
-                ) is None
             if max_display_messages:
                 # Select replay representatives over fixed-width keys before transferring payload.
                 # Expanding a payload page across dense adjacent replays is unbounded in their count.
@@ -1717,39 +1715,32 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                     return json.dumps([digest, composite, False,
                                        _is_background_review_harness_message(msg), isinstance(canonical, str)])
 
-                # The read-only fallback uses the writer's non-reentrant lock; finish its
-                # identity scan before borrowing a connection for the metadata projection.
-                ids = None if indexed else self._legacy_display_page(
-                    session_ids, active_clause=_DISPLAY_ACTIVE_CLAUSE,
-                    limit=None, offset=0, latest=False, ids_only=True)
+                def display_key(role, content, timestamp, tool_call_id, tool_calls, tool_name, kind, metadata):
+                    row = dict(role=role, content=content, timestamp=timestamp, tool_call_id=tool_call_id,
+                               tool_calls=tool_calls, tool_name=tool_name, display_kind=kind, display_metadata=metadata)
+                    return self._display_identity(self._display_dedupe_key(row))
+
                 with self._read_ctx() as conn:
                     conn.create_function("resume_key", 6, replay_key)
-                    conn.create_function("resume_visible", 1, lambda raw:
-                        int(not bool((self._decode_display_metadata(raw) or {}).get(MODEL_ONLY_DISPLAY_METADATA_KEY))))
+                    conn.create_function("resume_identity", 8, display_key)
+                    conn.create_function("resume_metadata", 1, lambda raw: json.dumps({
+                        MODEL_ONLY_DISPLAY_METADATA_KEY: bool((self._decode_display_metadata(raw) or {}).get(
+                            MODEL_ONLY_DISPLAY_METADATA_KEY))}))
                     try:
-                        if indexed:
-                            metadata_rows = conn.execute(f"""WITH ranked AS (
-                                SELECT id, display_identity,
-                                       MIN(id) OVER (PARTITION BY display_identity) AS logical_order,
-                                       ROW_NUMBER() OVER (PARTITION BY display_identity
-                                           ORDER BY active DESC, id DESC) AS generation_rank
-                                FROM messages WHERE session_id IN ({placeholders})
-                                  AND (active = 1 OR compacted = 1) AND resume_visible(display_metadata)
-                            )
-                            SELECT m.id, m.role, m.timestamp,
-                                   resume_key(m.role,m.content,m.timestamp,m.display_kind,
-                                              m.display_metadata,m.tool_calls) AS replay
-                            FROM ranked r JOIN messages m ON m.id=r.id
-                            WHERE r.generation_rank=1 ORDER BY r.logical_order""", tuple(session_ids)).fetchall()
-                        else:
-                            metadata_rows = []
-                            for start in range(0, len(ids), 900):
-                                chunk = ids[start:start + 900]
-                                metadata_rows.extend(conn.execute(f"""SELECT id,role,timestamp,
-                                    resume_key(role,content,timestamp,display_kind,display_metadata,tool_calls)
-                                    AS replay FROM messages WHERE id IN ({_placeholders(chunk)})""", chunk))
-                            by_id = {row["id"]: row for row in metadata_rows}
-                            metadata_rows = [by_id[id_] for id_ in ids]
+                        identity = "display_identity" if "display_identity" in columns else "NULL"
+                        metadata_rows = conn.execute(f"""SELECT id, role, timestamp, active, compacted,
+                            message_uid, absorbed_message_uids, _compressed_summary,
+                            {identity} AS display_identity,
+                            resume_metadata(display_metadata) AS display_metadata,
+                            CASE WHEN active=0 AND compacted=0 AND {identity} IS NOT NULL THEN {identity}
+                                 ELSE resume_identity(role,content,timestamp,tool_call_id,tool_calls,tool_name,
+                                                      display_kind,display_metadata) END AS _display_key,
+                            CASE WHEN active=1 OR compacted=1 THEN
+                                resume_key(role,content,timestamp,display_kind,display_metadata,tool_calls)
+                            END AS replay
+                            FROM messages WHERE session_id IN ({placeholders}) ORDER BY id""", tuple(session_ids)).fetchall()
+                        metadata_rows = self._dedupe_display_generations(
+                            metadata_rows, drop_removed=True, identity_rows=True)
                         from hermes_state import _REVIEW_HARNESS_PREFIXES, _strip_background_review_harness
                         selected = []
                         exact = {}
@@ -1772,7 +1763,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
                                _strip_background_review_harness(selected)[-max_display_messages:]]
                     finally:
                         conn.create_function("resume_key", 6, None)
-                        conn.create_function("resume_visible", 1, None)
+                        conn.create_function("resume_identity", 8, None)
+                        conn.create_function("resume_metadata", 1, None)
                 rows_by_id = {}
                 for start in range(0, len(ids), 900):
                     chunk = ids[start:start + 900]

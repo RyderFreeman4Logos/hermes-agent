@@ -415,6 +415,9 @@ def _npm_graph(source):
         writeFileSync('npm-python.json', execFileSync(process.env.HERMES_PYTHON,
           ['-I', '-c', 'import json, os, sys, selected_dependency; print(json.dumps(dict(python=sys.executable, configured=os.environ["PYTHON"])))']));
     '''))
+    # Current TUI products package both Python helpers beside the bundle.
+    for helper in ("gateway_bootstrap.py", "clipboard_image.py"):
+        _put(source, f"ui-tui/scripts/{helper}", (ROOT / "ui-tui/scripts" / helper).read_text())
     _put(source, "packages/value/index.js", "export const value = 'compiled local graph';\n")
     _put(source, "packages/value/index.d.ts", "export const value: string;\n")
     _put(source, "ui-tui/src/entry.tsx", "import { value } from 'fixture-value'; console.log(value);\n")

@@ -857,7 +857,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         # neither ended nor swapped for one whose next prompt would be refused.
         from hermes_state import SessionResumeTooLargeError, resolved_max_resume_messages
         try:
-            self._session_db.assert_resume_safe(target_id, tip_only=True)
+            if callable(guard := getattr(self._session_db, "assert_resume_safe", None)):
+                guard(target_id, tip_only=True)
         except SessionResumeTooLargeError as exc:
             return _cp(f"  Cannot resume session: {exc}")
         read_id, (target_id, refusal) = target_id, _gateway_open(self._session_db, target_id)

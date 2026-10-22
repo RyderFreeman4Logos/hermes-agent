@@ -67,7 +67,7 @@ def test_public_tier_mode_reaches_constructor(tmp_path, direct, fixed, provider,
 
     def build(**kw):
         captured.append(kw)
-        return SimpleNamespace(**kw, _credential_pool=None, session_id="offline-child")
+        return SimpleNamespace(**{**kw, "session_id": kw.get("session_id") or "offline-child"}, _credential_pool=None)
 
     with ExitStack() as stack:
         if provider != "owner-b":
@@ -219,7 +219,7 @@ def test_public_fallback_ownership_across_scopes(tmp_path, monkeypatch, credenti
 
             def build(**kwargs):
                 captured.append(kwargs)
-                return SimpleNamespace(**kwargs, _credential_pool=None, session_id="offline-child")
+                return SimpleNamespace(**{**kwargs, "session_id": kwargs.get("session_id") or "offline-child"}, _credential_pool=None)
 
             try:
                 with ExitStack() as stack:
@@ -270,7 +270,7 @@ def test_public_fallback_diagnostic_is_actionable_without_error_payload(tmp_path
 
     def build(**kwargs):
         captured.append(kwargs)
-        return SimpleNamespace(**kwargs, _credential_pool=None, session_id="offline-child")
+        return SimpleNamespace(**{**kwargs, "session_id": kwargs.get("session_id") or "offline-child"}, _credential_pool=None)
 
     fault = {
         "auth": {"side_effect": AuthError(f"Bearer {canary} https://user:{canary}@private.invalid", code=canary)},

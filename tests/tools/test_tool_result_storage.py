@@ -26,7 +26,6 @@ from tools.tool_result_storage import (
     extract_persisted_path,
     generate_preview,
     get_spillover_dir,
-    extract_persisted_path,
     maybe_persist_tool_result,
 )
 

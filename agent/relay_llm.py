@@ -132,7 +132,7 @@ def _note_dispatch(context: _PhysicalDiagnosticContext, http_request: Any) -> No
     context.ordinal += 1
     try:
         _finish_diagnostic(context, error=RuntimeError("dispatch superseded; outcome unknown"))
-        if _api_mode(context.metadata) != "codex_responses":
+        if str((context.metadata or {}).get("physical_api_mode") or _api_mode(context.metadata)) != "codex_responses":
             return
         from agent.cache_prefix_diagnostics import _enabled
         if not _enabled():
@@ -190,7 +190,7 @@ def _record_attempt(
     """Bind the Codex digest to the final kwargs. The ordinal is a dispatch hook, not this call."""
     del count
     context = _PHYSICAL_DIAGNOSTICS.get()
-    if str((metadata or {}).get("api_mode") or "") != "codex_responses":
+    if str((metadata or {}).get("physical_api_mode") or (metadata or {}).get("api_mode") or "") != "codex_responses":
         return None
     context = _PHYSICAL_DIAGNOSTICS.get()
     if context is not None and context.codex_token is not None:

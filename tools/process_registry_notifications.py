@@ -67,6 +67,16 @@ def should_surface_notification(evt: dict, *, surface_child: bool | None = None)
         from tools.process_registry import ProcessRegistry
         if not ProcessRegistry._child_owned_terminal_completion(evt):
             return True  # Malformed terminal outcomes fail open to one parent notice.
+    return should_surface_notification_preview(evt, surface_child=surface_child)
+
+
+def should_surface_notification_preview(evt: dict, *, surface_child: bool | None = None) -> bool:
+    """Judge prospective ownership without treating absent terminal fields as corrupt.
+
+    Only actual terminal outcomes may use the malformed-completion fail-open path.
+    """
+    if not is_child_process_notification(evt):
+        return True
     if surface_child is None:
         from tools.process_registry import ProcessRegistry
         surface_child = ProcessRegistry._surface_child_process_notifications()

@@ -2139,11 +2139,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             return _not_found(session_id)
         self._reconcile_local_exit(session)  # orphaned-pipe reader guard
         if session.notify_on_complete and not session.exited:
-            from agent.delegation_context import is_delegated_child_context
+            from tools.process_registry_wait_policy import _can_deliver_completion, _caller_receives_completion
 
-            # A native child has no parent notification drain. Deferring its
-            # wait leaves the child looping on wait_deferred until interrupt.
-            if not is_delegated_child_context():
+            # Defer only when this caller can receive the promised completion.
+            # Use the same authority as repeated wait/poll promotion.
+            if _can_deliver_completion() and _caller_receives_completion(session):
                 return {
                     "status": "running",
                     "session_id": session.id,

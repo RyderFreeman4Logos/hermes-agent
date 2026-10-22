@@ -100,18 +100,18 @@ def _can_deliver_completion() -> bool:
 def _caller_receives_completion(session) -> bool:
     """Whether the completion this process would publish is routed to the CALLER, judged by the
     consumers' own predicates: ``ProcessRegistry._owns_event`` (session-key routing; another session's
-    process stays with its owner) and ``should_surface_notification`` (a subagent-owned process is
+    process stays with its owner) and ``should_surface_notification_preview`` (a subagent-owned process is
     suppressed unless handed off or ``delegation.surface_child_process_notifications`` is on). Fails
     closed: an unbound caller cannot prove ownership of a keyed process."""
     from gateway.session_context import get_session_env
     from tools.process_registry import ProcessRegistry
-    from tools.process_registry_notifications import should_surface_notification
+    from tools.process_registry_notifications import should_surface_notification_preview
     caller_key = get_session_env("HERMES_SESSION_KEY", "")
     evt = {"type": "completion", "session_id": session.id, "session_key": session.session_key,
            "task_id": session.task_id, "owner_task_id": session.owner_task_id}
     if session.session_key and not caller_key:
         return False
-    return ProcessRegistry._owns_event(evt, caller_key, None, False) and should_surface_notification(evt)
+    return ProcessRegistry._owns_event(evt, caller_key, None, False) and should_surface_notification_preview(evt)
 
 
 def _claim_notify_if_running(registry, session) -> bool:

@@ -3824,6 +3824,10 @@ def _prepare_same_provider_retry(
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url, task=task,
+        no_progress_timeout=(
+            _get_task_no_progress_timeout(task or "")
+            if isinstance(retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None
+        ),
     )
     # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
     # Caller values win, including an explicit session_id; generated opt-in headers stay.

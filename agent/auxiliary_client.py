@@ -6414,7 +6414,7 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     raw = _get_auxiliary_task_config(task).get("timeout")
     if raw is None:
         return default
-    from agent.conversation_compression_timeouts import _positive_finite
+    from agent.conversation_compression_deadline import _positive_finite
     return _positive_finite(raw) or default
 
 

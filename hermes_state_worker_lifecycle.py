@@ -146,13 +146,12 @@ def worker_billing_route(db, conn, session_id, payload):
 
 
 def worker_api_content(db, conn, session_id, payload):
-    from hermes_state_messages import _scrub_surrogates
-    if set(payload) != {'content', 'api_content'} or not isinstance(payload['api_content'], str):
+    if set(payload) != {'content', 'api_content'} or not isinstance(payload['api_content'], (str, list, dict)):
         raise RuntimeStoreError('invalid_params')
     value = conn.execute(
         "UPDATE messages SET api_content=? WHERE id=(SELECT id FROM messages WHERE session_id=? "
         "AND role='user' AND active=1 ORDER BY id DESC LIMIT 1) AND content IS ?",
-        (_scrub_surrogates(payload['api_content']), session_id, db._encode_content(payload['content']))).rowcount
+        (db._encode_content(payload['api_content']), session_id, db._encode_content(payload['content']))).rowcount
     return {'value': value}
 
 
@@ -165,12 +164,11 @@ def _row_id(payload):
 
 def worker_message_api_content(db, conn, session_id, payload):
     """Row-addressed sidecar backfill, same guards as ``SessionDB.set_message_api_content``."""
-    from hermes_state_messages import _scrub_surrogates
-    if set(payload) != {'row_id', 'content', 'api_content'} or not isinstance(payload['api_content'], str):
+    if set(payload) != {'row_id', 'content', 'api_content'} or not isinstance(payload['api_content'], (str, list, dict)):
         raise RuntimeStoreError('invalid_params')
     return {'value': conn.execute(
         "UPDATE messages SET api_content=? WHERE id=? AND session_id=? AND role='user' AND active=1 AND content IS ?",
-        (_scrub_surrogates(payload['api_content']), _row_id(payload), session_id,
+        (db._encode_content(payload['api_content']), _row_id(payload), session_id,
          db._encode_content(payload['content']))).rowcount}
 
 

@@ -324,6 +324,31 @@ class TestPreloadResumedSession:
         assert "limit 20000" in output.getvalue()
         mock_db.get_resume_conversations.assert_not_called()
 
+    def test_long_compression_lineage_resumes_with_bounded_display(self, tmp_path, monkeypatch):
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("root", source="cli")
+        db.append_messages_batch("root", [
+            {"role": "user", "content": f"old-{i}", "timestamp": float(i)} for i in range(4)
+        ])
+        db.end_session("root", "compression")
+        db.create_session("tip", source="compression", parent_session_id="root")
+        db.append_messages_batch("tip", [
+            {"role": "user", "content": "current", "timestamp": 4.0},
+            {"role": "assistant", "content": "answer", "timestamp": 5.0},
+        ])
+        monkeypatch.setattr("hermes_state.resolved_max_resume_messages", lambda: 2)
+        cli = _make_cli(resume="tip")
+        cli._session_db = db
+        cli.console.file = StringIO()
+        try:
+            assert cli._preload_resumed_session() is True
+            assert [m["content"] for m in cli.conversation_history] == ["current", "answer"]
+            assert [m["content"] for m in cli._resume_display_history] == ["current", "answer"]
+        finally:
+            db.close()
+
 
 
 

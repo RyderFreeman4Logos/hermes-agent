@@ -209,3 +209,32 @@ def test_deferred_hydration_uses_the_bounded_display_window(tmp_path, monkeypatc
     finally:
         server._sessions.pop("hyd-window", None)
         db.close()
+
+
+@pytest.mark.parametrize("surface", ["deferred", "resume"])
+def test_legacy_adapter_never_materializes_oversized_lineage(monkeypatch, surface):
+    from hermes_state import SessionResumeTooLargeError
+    from tui_gateway.methods_session import _Resume
+
+    tip = [{"role": "user", "content": "current", "_row_id": 900}]
+
+    class LegacyStore:
+        def get_resume_conversations(self, session_id):
+            pytest.fail("oversized legacy lineage must not be materialized")
+
+        def assert_resume_safe(self, session_id):
+            raise SessionResumeTooLargeError(900, 2)
+
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            assert session_id == "tip"
+            assert kwargs == {"repair_alternation": True, "include_row_ids": True}
+            return tip
+
+    monkeypatch.setattr("hermes_state.resolved_max_resume_messages", lambda: 2)
+    db = LegacyStore()
+    if surface == "deferred":
+        assert server._load_resume_transcript(db, "tip") == (tip, tip, [])
+    else:
+        ctx = object.__new__(_Resume)
+        ctx.db, ctx.target, ctx.omit_messages = db, "tip", False
+        assert ctx.read_history() == (tip, tip)

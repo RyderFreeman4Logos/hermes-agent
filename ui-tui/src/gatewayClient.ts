@@ -393,7 +393,6 @@ export class GatewayClient extends EventEmitter {
       }
 
       const stderrTail = this.getLogTail(20)
-      const proc = this.proc
 
       this.lifecycle(`[startup] timed out waiting for gateway.ready (python=${python}, cwd=${cwd})`)
       this.publish({
@@ -401,15 +400,6 @@ export class GatewayClient extends EventEmitter {
         payload: { cwd, python, stderr_tail: stderrTail }
       })
 
-      // Spawn mode owns this child. A warning leaves it running after the
-      // parent is killed (issue #352). Attached sockets belong to another
-      // process, so this path must not signal them.
-      if (proc && this.proc === proc && proc.exitCode === null && !proc.killed) {
-        this.disposed = true
-        this.proc = null
-        proc.kill()
-        this.handleTransportExit(null, 'gateway startup timeout')
-      }
     }, STARTUP_TIMEOUT_MS)
   }
 

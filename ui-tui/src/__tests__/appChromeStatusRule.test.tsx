@@ -1,6 +1,11 @@
+import { PassThrough } from 'stream'
+
+import { renderSync, stringWidth } from '@hermes/ink'
+import { stripAnsi } from '@hermes/shared/ansi'
 import React from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
+import { getDelegationState, patchDelegationState } from '../app/delegationStore.js'
 import { StatusRule } from '../components/appChrome.js'
 import { DEFAULT_THEME } from '../theme.js'
 
@@ -102,6 +107,31 @@ const baseProps = {
   turnStartedAt: null,
   usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 },
   voiceLabel: ''
+}
+
+const renderStatus = (props: Parameters<typeof StatusRule>[0]): string => {
+  const stdout = Object.assign(new PassThrough(), { columns: props.cols, isTTY: false, rows: 24 })
+  const stdin = Object.assign(new PassThrough(), { isTTY: false })
+  const stderr = new PassThrough()
+  let output = ''
+
+  stdout.on('data', chunk => {
+    output += chunk.toString()
+  })
+
+  const instance = renderSync(React.createElement(StatusRule, props), {
+    patchConsole: false,
+    stderr: stderr as NodeJS.WriteStream,
+    stdin: stdin as NodeJS.ReadStream,
+    stdout: stdout as NodeJS.WriteStream
+  })
+
+  const frame = output
+
+  instance.unmount()
+  instance.cleanup()
+
+  return stripAnsi(frame).replace(/\r/g, '').trim()
 }
 
 describe('StatusRule model label', () => {
@@ -478,5 +508,69 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     })
 
     expect(textContent(element)).not.toContain('weekly-digest')
+  })
+})
+
+describe('StatusRule wrapped rows', () => {
+  it('wraps the narrow status line without dropping filtered pinned fields', () => {
+    const lines = renderStatus({
+      ...baseProps,
+      cols: 44,
+      sessionTitle: 'weekly-digest',
+      statusBarFields: new Set(['model', 'context_detail', 'context_pct', 'title'])
+    })
+      .split('\n')
+      .filter(Boolean)
+
+    const rendered = lines.join(' ')
+
+    expect(lines.length).toBeGreaterThan(1)
+    expect(lines.every(line => stringWidth(line) <= 44)).toBe(true)
+    expect(rendered).toContain('ready')
+    expect(rendered).toContain('opus 4.8')
+    expect(rendered).toContain('50k tok')
+    expect(rendered).toContain('weekly-digest')
+    expect(rendered.indexOf('ready')).toBeLessThan(rendered.indexOf('opus 4.8'))
+    expect(rendered.indexOf('opus 4.8')).toBeLessThan(rendered.indexOf('50k tok'))
+    expect(rendered.indexOf('50k tok')).toBeLessThan(rendered.indexOf('weekly-digest'))
+  })
+
+  it('retains wide sibling fields, their order, and cache/voice colors', () => {
+    const props = {
+      ...baseProps,
+      cols: 160,
+      sessionTitle: 'weekly-digest',
+      statusBarFields: new Set(['model', 'context_detail', 'context_pct', 'cache_hit', 'voice', 'title']),
+      usage: { ...baseProps.usage, avg_latency_s: 3.2, avg_tps: 50.4, cache_hit_pct: 87 },
+      voiceLabel: '◉ voice'
+    }
+
+    const lines = renderStatus(props).split('\n').filter(Boolean)
+    const rendered = lines.join(' ')
+    const tree = StatusRule(props)
+    const cache = findElementWithText(tree, '◎ 87%')
+    const voice = findElementWithText(tree, '◉ voice')
+
+    expect(lines.every(line => stringWidth(line) <= 160)).toBe(true)
+    expect(rendered).toContain('◎ 87%')
+    expect(rendered).toContain('◉ voice')
+    expect(rendered).toContain('weekly-digest')
+    expect(rendered).not.toContain('◷ 3.2s')
+    expect(rendered).not.toContain('50 t/s')
+    expect(rendered.indexOf('◎ 87%')).toBeLessThan(rendered.indexOf('◉ voice'))
+    expect(rendered.indexOf('◉ voice')).toBeLessThan(rendered.indexOf('weekly-digest'))
+    expect(cache?.props.color).toBe(DEFAULT_THEME.color.statusGood)
+    expect(voice?.props.color).toBe(DEFAULT_THEME.color.warn)
+  })
+
+  it('keeps the live SpawnHud tail visible after wrapped fields', () => {
+    const previous = getDelegationState()
+    patchDelegationState({ paused: true })
+
+    try {
+      expect(renderStatus({ ...baseProps, cols: 160 })).toContain('paused')
+    } finally {
+      patchDelegationState(previous)
+    }
   })
 })

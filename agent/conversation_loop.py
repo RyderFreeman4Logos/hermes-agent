@@ -1722,6 +1722,15 @@ def _run_conversation_turn(
     agent._held_transforms = held_stream_transforms()
     agent._hold_stream = bool(agent._held_transforms)
 
+    # Clear this turn's display aggregate before preflight. The timeout return
+    # below never reaches the later reset, and both footers would otherwise
+    # print the previous turn as this one.
+    agent._last_turn_usage = None
+    agent._reply_usage = None
+    agent._reply_usage_complete = True
+    agent._reply_started_monotonic = time.monotonic()
+    agent._reply_elapsed_s = None
+
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
         _ctx = build_turn_context(
@@ -1745,6 +1754,13 @@ def _run_conversation_turn(
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
+    except InterruptedError:
+        # A reclaimed completion never inserted a row; finish as cancellation,
+        # without a crash frame, provider call or turn-end persistence.
+        from agent.agent_runtime_helpers import note_turn_persisted
+        note_turn_persisted(agent)
+        return _partial_turn_result("", list(conversation_history or []), 0, interrupted=True,
+                                    turn_exit_reason="input_admission_interrupted")
     # Voice turns may run on auxiliary.voice_chat: bound after the prompt/row/compaction were settled
     # against the main model, undone in finalize_turn (and run_conversation's finally on early exits).
     from agent.voice_turn_route import begin_voice_turn_route
@@ -1763,7 +1779,6 @@ def _run_conversation_turn(
     agent._compression_adoption_failed = False
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
-    agent._last_turn_usage = None
     agent._codex_auth_retry_attempted = False
 
     s = _LoopState(

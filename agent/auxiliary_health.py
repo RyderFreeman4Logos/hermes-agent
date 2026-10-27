@@ -62,6 +62,7 @@ def fallback_candidate_unavailable_reason(exc: Exception) -> Optional[str]:
 _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS = 60.0
 _CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
     "rate limit": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
+    "request timed out": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "connection error": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
     "invalid provider response": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
 }

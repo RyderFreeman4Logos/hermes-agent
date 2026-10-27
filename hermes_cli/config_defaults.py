@@ -82,7 +82,7 @@ DEFAULT_CONFIG = {
         # Wall-clock budget (seconds) per run. null = off. When set: one-time wrap-up notice at 80%
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
-        "run_budget_seconds": None,
+        "run_budget_seconds": None, "loop_timing_context": True,  # budget: hermes chat --run-budget N; timing: start + last successful stop
         # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
@@ -314,6 +314,7 @@ DEFAULT_CONFIG = {
         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.
         "font_family": "",
         "timeout": 180,
+        "auto_background_timeout_threshold": 200,
         # Seconds between SIGTERM and escalated SIGKILL for host process trees (browser daemons). 0
         # = SIGTERM only.
         "daemon_term_grace_seconds": 2.0,
@@ -1300,6 +1301,17 @@ DEFAULT_CONFIG = {
     # plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        "checkpoint": {
+            "mode": "shadow",
+            "trace": False,
+            "structured_output": "required",
+            "target_wire_tokens": 48000,
+            "hard_max_wire_tokens": 60000,
+            "map_concurrency": 2,
+            "map": {
+                "max_output_tokens": 16384,
+            },
+        },
         # Return freed glibc pages at agent/TUI cleanup boundaries (no-op elsewhere).
         "memory_trim": {
             "enabled": True,

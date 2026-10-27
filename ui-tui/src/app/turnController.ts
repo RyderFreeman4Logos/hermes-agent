@@ -131,6 +131,7 @@ const finalTail = (finalText: string, segments: Msg[]) => {
 // transform_llm_output plugin rewrote the reply: the tail is the raw text the rewrite replaces.
 const keepsStreamedTail = (tail: string, completionText: null | string | undefined, transformed?: boolean | null) =>
   Boolean(tail && completionText != null && !transformed && !completionText.includes(tail))
+
 // Byte-identical sealed commentary collapses. Anything else keeps prefix dedupe.
 const commentaryFinalText = (
   projection: string,

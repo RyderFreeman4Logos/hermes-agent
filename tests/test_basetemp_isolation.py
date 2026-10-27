@@ -69,9 +69,29 @@ def test_explicit_temp_root_is_shared_by_basetemp_relocation(tmp_path, monkeypat
     monkeypatch.setattr(test_temp_root, "SOCKET_TMPDIR_MAX_LEN", len(os.fsencode(str(root))) + 11)
     monkeypatch.setenv("HERMES_TEST_TMP_ROOT", str(root))
     config = _config_with_basetemp(native / ".repro")
+    # An old caller-owned entry must survive the real relocation path. Intercept
+    # both destructive boundaries so a regression cannot signal unrelated PIDs.
+    import time
+    from unittest.mock import Mock
+    import hermes_constants_scratch as scratch
+
+    protected = root / "unrelated"
+    protected.mkdir()
+    marker = protected / "keep"
+    marker.write_text("caller data", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for path in (protected, marker):
+        os.utime(path, (ancient, ancient))
+    prune = Mock()
+    reap = Mock()
+    monkeypatch.setattr(scratch, "prune_idle_entries", prune)
+    monkeypatch.setattr(scratch, "reap_processes_rooted_in", reap)
 
     suite_conftest._relocate_basetemp_outside_operator_home(config)
 
+    prune.assert_not_called()
+    reap.assert_not_called()
+    assert marker.read_text(encoding="utf-8") == "caller data"
     relocated = config._tmp_path_factory._given_basetemp
     assert relocated is not None and relocated.parent == root
     assert config.option.basetemp == str(relocated)

@@ -390,15 +390,10 @@ export class GatewayClient extends EventEmitter {
 
   private startReadyTimer(python: string, cwd: string) {
     this.readyTimer = setTimeout(() => {
-      if (this.ready) {
+      if (this.ready || this.disposed) {
         return
       }
 
-      // Append the most recent gateway stderr/log lines to the timeout
-      // event so users can tell apart "wrong python", "missing dep",
-      // and "config parse failure" from one glance instead of having
-      // to dig through `/logs`.  Capped to keep the activity feed
-      // readable on slow boots.
       const stderrTail = this.getLogTail(20)
 
       this.lifecycle(`[startup] timed out waiting for gateway.ready (python=${python}, cwd=${cwd})`)
@@ -406,6 +401,7 @@ export class GatewayClient extends EventEmitter {
         type: 'gateway.start_timeout',
         payload: { cwd, python, stderr_tail: stderrTail }
       })
+
     }, STARTUP_TIMEOUT_MS)
   }
 

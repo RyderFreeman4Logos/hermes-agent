@@ -26,6 +26,8 @@ Route vocabulary (:meth:`DelegationProvider.route_task` returns a dict with any 
   primary model and credentials, skills, ``SOUL.md`` and terminal policy, bound through the same
   scope helpers a multiplexed gateway uses for a routed turn. A profile route ignores the other
   route keys; the profile's own config decides them.
+* ``exclusive_route`` - isolate credential and fallback ownership from the parent;
+  ``fallback_chain`` carries this route's explicitly admitted fallback entries.
 * ``label`` - short text shown with the child's progress and result (e.g. the option title).
 
 A backend's own settings live under ``delegation.backends.<backend name>`` (:meth:`DelegationProvider.settings`),
@@ -51,6 +53,7 @@ RESERVED_TASK_PARAMETERS = frozenset({
 ROUTE_KEYS = frozenset({
     "model", "provider", "base_url", "api_key", "api_mode", "request_overrides",
     "reasoning_effort", "service_tier", "fallback_providers", "profile", "label",
+    "exclusive_route", "fallback_chain",
 })
 
 
@@ -82,6 +85,14 @@ class DelegationProvider(ProviderBase):
         """Whether this provider can run here. MUST NOT make network calls. False fails delegation closed: a
         ``delegate_task`` call under this backend is a tool error naming it, never a run on another route."""
         return True
+
+    def atomic_routes(self, config: Mapping[str, Any]) -> bool:
+        """Whether any route refusal rejects the whole batch before child or transcript creation.
+
+        False preserves independent per-task refusal. A backend whose configured options form
+        one admission unit can opt in; this does not change the child execution lifecycle.
+        """
+        return False
 
     def task_parameters(self, config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         """Extra per-task JSON-schema properties, ``{name: schema}``, merged into

@@ -597,6 +597,9 @@ export interface Usage {
   context_source?: string | null
   context_estimated?: boolean | null
   cache_hit_pct?: number | null
+  reply_cache_read?: number | null
+  reply_prompt_tokens?: number | null
+  reply_elapsed_s?: number | null
   cache_read?: number | null
   cache_write?: number | null
   avg_latency_s?: number | null
@@ -3491,6 +3494,9 @@ export interface SessionUsageResult {
   context_source?: string | null
   context_estimated?: boolean | null
   cache_hit_pct?: number | null
+  reply_cache_read?: number | null
+  reply_prompt_tokens?: number | null
+  reply_elapsed_s?: number | null
   cache_read?: number | null
   cache_write?: number | null
   avg_latency_s?: number | null
@@ -5662,6 +5668,8 @@ export interface MessageCompletePayload {
   error_surface?: ErrorSurface | null
   partial?: boolean | null
   persisted_turn?: PersistedTurn | null
+  cache_info?: CacheInfo | null
+  completed_at?: number | null
 }
 /** ``prompt_turn._result_status``. */
 export type TurnStatus = 'complete' | 'error' | 'interrupted'
@@ -5717,10 +5725,19 @@ export interface PersistedTurn {
   user_row_ids?: number[] | null
   submission_id?: string | null
 }
+/** First-response cache observation on ``message.complete``. */
+export interface CacheInfo {
+  state: string
+  pct?: number
+  read_tokens?: number | null
+  prompt_tokens?: number | null
+  compression_bound?: boolean | null
+}
 /** ``server._status_update`` and the direct emitters (goal / loop / heartbeat / process). */
 export interface StatusUpdatePayload {
   kind: string
   text: string
+  cache_record?: Record<string, unknown> | null
 }
 /** ``usage``: the status-bar view (``server._get_usage``), sent by the embedded backend's ticker (``server._start_usage_ticker``) and by a canonical local viewer's gateway after every API call and at turn end (``gateway/session_usage.py::usage_frame``). Read this. Deprecated: the top-level session-cumulative counters (``usage_stats``, the ``session.stats`` dict) that the gateway frame also carries. They are kept for existing readers; new readers use ``usage``, or ``session.stats`` for the raw counters. The embedded ticker never sends them. */
 export interface SessionUsagePayload {

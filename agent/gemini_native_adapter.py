@@ -628,7 +628,7 @@ def _usage_from_metadata(usage_meta: dict[str, Any]) -> SimpleNamespace:
                "initial_cached_tokens": count("initialCachedContentTokenCount")} if "initialPromptTokenCount" in usage_meta else {}
     return SimpleNamespace(
         prompt_tokens=count("promptTokenCount"), completion_tokens=count("candidatesTokenCount") + reasoning_tokens,
-        total_tokens=count("totalTokenCount"), prompt_tokens_details=SimpleNamespace(cached_tokens=count("cachedContentTokenCount")),
+        total_tokens=count("totalTokenCount"), prompt_tokens_details=SimpleNamespace(**({"cached_tokens": usage_meta["cachedContentTokenCount"]} if "cachedContentTokenCount" in usage_meta else {})),
         completion_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens), **initial,
     )
 

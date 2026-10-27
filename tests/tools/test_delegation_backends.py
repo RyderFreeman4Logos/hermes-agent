@@ -180,7 +180,9 @@ def test_a_missing_backend_fails_closed_and_default_keeps_todays_route(tmp_path,
                                                      parent_agent=_parent())))
         finally:
             manager.unload()
-    assert len(set(definitions)) == 1 and '"option"' not in definitions[0]
+    assert definitions[0] == definitions[1] and '"option"' not in definitions[0]
+    assert '"model_profile"' in definitions[0]
+    assert '"model_profile"' not in definitions[2]
     assert [(b["model"], b["override_base_url"]) for b in recorded] == [("pinned-model", "http://127.0.0.1:9/v1")] * 2
     error = outcomes[2]["error"]
     assert "'not-installed' is not installed" in error and "hermes config set delegation.backend default" in error
@@ -510,3 +512,24 @@ def test_an_unavailable_replacement_default_falls_back_to_the_bundled_strategy(m
         if current is not None:
             _registry.restore_registration("default", current, previous)
 
+
+
+def test_custom_backend_refuses_default_pool_parameter_without_starting_that_task(tmp_path, monkeypatch, recorded):
+    """A carried default tier never silently overrides a different session backend."""
+    from tools.delegate_tool import delegate_task
+    _, manager = _home(tmp_path, monkeypatch, {
+        "backend": "probe-options", "backends": {"probe-options": {"options": OPTIONS}},
+        "model_pool": {"standard": {"provider": "custom", "model": "pool-model",
+                                   "base_url": "http://127.0.0.1:9/v1", "api_key": "pool-key"}},
+    })
+    try:
+        assert "model_profile" not in _task_props(_definition())
+        result = json.loads(delegate_task(tasks=[
+            {"goal": "valid sibling", "option": "fast"},
+            {"goal": "invalid tier", "model_profile": "standard"},
+        ], parent_agent=_parent()))
+        assert len(recorded) == 1 and recorded[0]["model"] == "fast-model"
+        assert "model_profile" in json.dumps(result)
+        assert "does not take" in json.dumps(result)
+    finally:
+        manager.unload()

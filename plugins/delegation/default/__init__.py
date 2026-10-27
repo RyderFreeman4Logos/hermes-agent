@@ -60,6 +60,13 @@ class DefaultDelegationProvider(DelegationProvider):
         name = name or "standard"
         if name not in names:
             raise DelegationRouteError(f"Unknown {name!r}. Configured: {', '.join(names) or '(none)'}.")
+        # A tier's explicit effort is its own contract, even when it happens to equal
+        # the legacy section value (whose unknown values warn and inherit).
+        effort = pool[name].get("reasoning_effort")
+        if effort not in (None, ""):
+            from hermes_constants import parse_reasoning_effort
+            if parse_reasoning_effort(effort) is None:
+                raise DelegationRouteError(f"{name!r} has an invalid reasoning_effort {effort!r}.")
         return {**pool[name], "exclusive_route": True, "label": name,
                 "reasoning_effort": pool[name].get("reasoning_effort", config.get("reasoning_effort")),
                 "fallback_providers": []}

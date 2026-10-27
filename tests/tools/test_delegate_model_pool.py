@@ -123,6 +123,32 @@ class TestModelProfileResolution:
         assert kwargs["provider"] == "custom"
         assert kwargs["model"] != "gpt-5.6-terra"
 
+    def test_explicit_pool_effort_equal_to_invalid_global_refuses_before_spawn(self):
+        with patch.dict(PINNED_CFG, {"reasoning_effort": "unsupported-effort"}), patch.dict(
+            STANDARD_POOL["standard"], {"reasoning_effort": "unsupported-effort"}
+        ), patch("tools.delegation_live_log.create_live_transcripts") as transcripts:
+            payload, kwargs = _child_kwargs(model_profile="standard")
+        assert "reasoning_effort" in payload.get("error", "")
+        assert "unsupported-effort" in payload["error"]
+        assert kwargs == {}
+        transcripts.assert_not_called()
+
+    def test_explicit_pool_effort_preserves_xhigh(self):
+        with patch.dict(STANDARD_POOL["standard"], {"reasoning_effort": "xhigh"}):
+            payload, kwargs = _child_kwargs(model_profile="standard")
+        assert "error" not in payload
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
+    def test_pool_without_explicit_effort_keeps_legacy_global_warn_and_inherit(self):
+        parent = _parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        with patch.dict(PINNED_CFG, {"reasoning_effort": "unsupported-effort"}), patch(
+            f"{__name__}._parent", return_value=parent
+        ):
+            payload, kwargs = _child_kwargs(model_profile="standard")
+        assert "error" not in payload
+        assert kwargs["reasoning_config"] == parent.reasoning_config
+
     def test_profile_fallback_chain_not_parent_or_global_pin(self):
         _, kwargs = _child_kwargs(model_profile="standard")
         chain = kwargs["fallback_model"]

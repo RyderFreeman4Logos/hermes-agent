@@ -95,8 +95,8 @@ def test_foreground_optimize_never_sleeps_and_chunks_by_rows_across_id_gaps(lega
     monkeypatch.setattr(SessionDB, "_FTS_REBUILD_CHUNK_MAX_ROWS", 500)
     markers, real_step = [0], legacy_db.fts_rebuild_step
 
-    def observed_step(*args):
-        more = real_step(*args)
+    def observed_step(*args, **kwargs):
+        more = real_step(*args, **kwargs)
         status = legacy_db.fts_rebuild_status()
         markers.append(status["indexed"] if status else GAP_IDS + 1200)
         return more
@@ -115,13 +115,13 @@ def test_chunk_that_keeps_failing_ends_the_run_and_a_rerun_resumes(legacy_db, mo
     monkeypatch.setattr(time, "sleep", lambda _s: None)  # the retry backoff
     calls, real_step = [], legacy_db.fts_rebuild_step
 
-    def disk_fills_during_backfill(*args):
+    def disk_fills_during_backfill(*args, **kwargs):
         if not calls:
             pages = legacy_db._conn.execute("PRAGMA page_count").fetchone()[0]
             legacy_db._conn.execute(f"PRAGMA max_page_count = {pages + 5}")
         calls.append(1)
         assert len(calls) < 50, "optimize kept retrying a chunk that can never succeed"
-        return real_step(*args)
+        return real_step(*args, **kwargs)
 
     legacy_db.fts_rebuild_step = disk_fills_during_backfill
     with pytest.raises(sqlite3.OperationalError, match="full"):
@@ -151,8 +151,8 @@ def test_writer_that_opens_the_store_mid_run_gets_the_paced_cycle(legacy_db, mon
     monkeypatch.setattr(legacy_db, "_foreign_state_db_holders", holder_scan)
     real_step = legacy_db.fts_rebuild_step
 
-    def step_then_writer_opens(*args):
-        more = real_step(*args)
+    def step_then_writer_opens(*args, **kwargs):
+        more = real_step(*args, **kwargs)
         assert writer_opened.wait(10)  # e.g. Desktop launched after the first chunk
         return more
 

@@ -4,8 +4,7 @@
   "parameters": {
     "properties": {
       "background": {
-        "default": false,
-        "description": "Keep running after this call returns; returns a session_id.",
+        "description": "Run in the background, returning a session_id. When omitted, Hermes keeps the command in the foreground unless its effective timeout exceeds terminal.auto_background_timeout_threshold; then it uses managed background execution with completion notification. Explicit background=false always keeps the command in the foreground (subject to the foreground timeout cap). Pair background=true with notify=true for bounded work; leave notifications off only for servers, watchers, and daemons.",
         "type": "boolean"
       },
       "command": {
@@ -43,7 +42,7 @@
         "type": "boolean"
       },
       "timeout": {
-        "description": "Max seconds (default 180, foreground max 600). Finishing early returns at once, so set it generously. Above 600s the command runs as a tracked background process with notify_on_complete=true (the result says so; do not re-run it).",
+        "description": "Max seconds to wait (default: 180, foreground max: 600). When background is omitted, Hermes promotes the call to managed background execution with completion notification only when the effective timeout exceeds terminal.auto_background_timeout_threshold. A timeout above 600s also runs as a tracked background process with notify_on_complete=true instead (the result says so; do not re-run it). Explicit background=false still rejects a foreground timeout above 600s; use background=true for longer commands.",
         "minimum": 1,
         "type": "integer"
       },

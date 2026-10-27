@@ -1,11 +1,13 @@
-"""#103840: a ``sqlite3 .recover`` restore re-emits FTS5 shadow tables as ordinary tables
-but cannot re-emit the ``CREATE VIRTUAL TABLE`` row. The next SessionDB open then failed
-in ``_ensure_fts_schema`` with "fts5: error creating shadow table messages_fts_data: table
-already exists". Only families whose vtable row is absent may be repaired; a healthy family's
-shadows must survive untouched.
+"""An orphan name/layout does not prove derived ownership.
+
+The previous #103840 automatic cleanup contract is deliberately fail-closed: a
+`.recover` residue is indistinguishable from a canonical extension table without
+its owning virtual-table declaration. Proven families still recover normally.
 """
 
+import contextlib
 import sqlite3
+import pytest
 
 from hermes_state import SessionDB
 
@@ -35,7 +37,24 @@ def _fts_master_rows(db_path, prefix: str) -> list:
         raw.close()
 
 
-def test_orphaned_base_family_is_repaired_and_healthy_trigram_untouched(tmp_path):
+def _orphan_contents(db_path):
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        names = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('messages_fts_data','messages_fts_idx','messages_fts_docsize','messages_fts_config')"
+        )]
+        schema = conn.execute("SELECT rowid,type,name,tbl_name,sql,rootpage FROM sqlite_master ORDER BY rowid").fetchall()
+        # sqlite rows preserve BLOB bytes and storage classes; sorting preserves multiplicity.
+        contents = {name: conn.execute(f'SELECT * FROM "{name}" ORDER BY 1').fetchall() for name in names}
+        for name in ('messages_fts_data', 'messages_fts_docsize'):
+            if name in names:
+                contents[name + ':rowids'] = conn.execute(f'SELECT rowid,* FROM "{name}" ORDER BY rowid').fetchall()
+        contents['messages'] = conn.execute('SELECT rowid,* FROM messages ORDER BY rowid').fetchall()
+        contents['sequence'] = conn.execute('SELECT rowid,* FROM sqlite_sequence ORDER BY rowid').fetchall()
+        return schema, contents
+
+
+def test_orphaned_base_family_refuses_without_ownership_proof(tmp_path):
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
     db.create_session("s1", source="cli", model="m")
@@ -53,15 +72,25 @@ def test_orphaned_base_family_is_repaired_and_healthy_trigram_untouched(tmp_path
     raw.close()
     assert orphan_shadows == 2, "fixture must leave the base shadows behind"
 
-    reopened = SessionDB(db_path=db_path)
-    try:
-        assert reopened._fts_enabled is True
-        with reopened._lock:
-            hits = reopened._conn.execute(
-                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'orphan'"
-            ).fetchone()[0]
-        assert hits == 3, "recreated index must be rebuilt from the canonical messages table"
-    finally:
-        reopened.close()
+    base_before = _fts_master_rows(db_path, "messages_fts")
+    canonical_before = _orphan_contents(db_path)
+    with pytest.raises(sqlite3.OperationalError, match="ownership"):
+        SessionDB(db_path=db_path)
+    assert _fts_master_rows(db_path, "messages_fts") == base_before
+    assert _orphan_contents(db_path) == canonical_before
+    with contextlib.closing(sqlite3.connect(db_path)) as raw:
+        assert raw.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3
     # Same rowids: the healthy family was neither dropped nor recreated.
     assert _fts_master_rows(db_path, "messages_fts_trigram") == trigram_before
+
+
+def test_normal_shadow_name_table_is_not_disposable(tmp_path):
+    from hermes_state_fts import _drop_orphan_fts_shadow_tables
+    with contextlib.closing(sqlite3.connect(tmp_path / "canonical.db")) as conn:
+        conn.execute("CREATE TABLE messages_fts_data(id INTEGER PRIMARY KEY, block BLOB)")
+        conn.execute("INSERT INTO messages_fts_data VALUES(100,X'CAFE')")
+        before = conn.execute("SELECT rowid,type,name,tbl_name,sql,rootpage FROM sqlite_master").fetchall()
+        with pytest.raises(sqlite3.OperationalError, match="ownership"):
+            _drop_orphan_fts_shadow_tables(conn.cursor(), ("messages_fts",))
+        assert conn.execute("SELECT * FROM messages_fts_data").fetchall() == [(100, b'\xca\xfe')]
+        assert conn.execute("SELECT rowid,type,name,tbl_name,sql,rootpage FROM sqlite_master").fetchall() == before

@@ -30,4 +30,4 @@ def relay_chat_metadata(metadata: dict) -> dict:
     Relay intercepts ``client.chat.completions.create``, so it decodes a chat-completions
     request even when the adapter speaks Responses or Messages to its provider.
     """
-    return {**metadata, "api_mode": "chat_completions"}
+    return {**metadata, "physical_api_mode": metadata.get("api_mode"), "api_mode": "chat_completions"}

@@ -7,6 +7,8 @@ branch of ``_execute_write`` probed outside it and could observe the mid-teardow
 unlinked, identity not yet cleared), setting the sticky ``_db_wal_generation_lost`` flag on a
 healthy handle. ``normal`` is the control.
 """
+from contextlib import contextmanager
+
 import sqlite3
 import threading
 import pytest
@@ -22,6 +24,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
     conn = db._conn
     assert db._db_sidecar_identity and path.with_name(path.name + "-wal").exists()
     lock, close, guard = db._lock, db._close_connection_quietly, db._raise_if_db_replaced
+    admission = db._advisory_write_lock
     closed, progress, second = threading.Event(), threading.Event(), threading.Event()
     calls = 0
     errors = []
@@ -32,16 +35,31 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
         return threading.current_thread().name == "synthetic-writer"
 
     class ObservedLock:
-        def __enter__(self):
+        def acquire(self, *args, **kwargs):
             if is_writer():
                 progress.set()
-            lock.acquire()
-            return self
+            return lock.acquire(*args, **kwargs)
 
-        def __exit__(self, *args):
+        def release(self):
             lock.release()
             if is_writer() and entry == "error_branch" and calls == 1:
                 second.set()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+    @contextmanager
+    def observed_admission(*args, **kwargs):
+        # Shared writer admission precedes the in-process mutex and may wait
+        # for close itself. Observe arrival without bypassing either lock.
+        if is_writer():
+            progress.set()
+        with admission(*args, **kwargs):
+            yield
 
     def observed_guard():
         nonlocal calls
@@ -61,6 +79,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
             assert progress.wait(10), "writer reached neither guard nor lock"
 
     monkeypatch.setattr(db, "_lock", ObservedLock())
+    monkeypatch.setattr(db, "_advisory_write_lock", observed_admission)
     monkeypatch.setattr(db, "_close_connection_quietly", paused_close)
     monkeypatch.setattr(db, "_raise_if_db_replaced", observed_guard)
 

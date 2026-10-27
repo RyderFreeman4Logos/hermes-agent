@@ -13,10 +13,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
-from hermes_state_errors import is_malformed_db_error
+from hermes_state_errors import is_malformed_db_error, is_sqlite_io_error, is_sqlite_lock_error
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
@@ -409,7 +409,8 @@ class SessionSearchMixin:
             _delete_meta(conn, f"{prefix}_high_water", f"{prefix}_progress")
         self._execute_write(_do)
 
-    def fts_rebuild_step(self, progress: Optional[_BackfillProgress] = None) -> bool:
+    def fts_rebuild_step(self, progress: Optional[_BackfillProgress] = None, *,
+                         deadline: Optional[float] = None) -> bool | Literal["retry"]:
         """Backfill one chunk (``_fts_chunk_rows`` messages) of the deferred FTS rebuild; True while
         work remains. Chunks are claimed atomically inside the write transaction, so concurrent
         processes interleave instead of duplicating rows. A failed chunk raises (nothing committed;
@@ -420,17 +421,19 @@ class SessionSearchMixin:
         if self._trigram_available:
             inserts.append(self._TRIGRAM_CHUNK_INSERT_SQL)
         return self._rebuild_step("fts_rebuild", inserts, finish=self._fts_rebuild_finish, finish_when_empty=True,
-                                  progress=progress)
+                                  progress=progress, deadline=deadline)
 
-    def fts_cjk_rebuild_step(self, progress: Optional[_BackfillProgress] = None) -> bool:
+    def fts_cjk_rebuild_step(self, progress: Optional[_BackfillProgress] = None, *,
+                             deadline: Optional[float] = None) -> bool | Literal["retry"]:
         """Backfill one chunk of the CJK index. True while work remains."""
         if not self._fts_enabled or not self._fts_cjk_loaded:
             return False
         insert = self._CHUNK_INSERT_SQL.format(table="messages_fts_cjk", extra=" AND role <> 'tool'")
-        return self._rebuild_step("fts_cjk_rebuild", [insert], finish=self._fts_cjk_rebuild_finish, progress=progress)
+        return self._rebuild_step("fts_cjk_rebuild", [insert], finish=self._fts_cjk_rebuild_finish, progress=progress, deadline=deadline)
 
     def _rebuild_step(self, prefix: str, insert_sqls: list[str], *, finish, finish_when_empty: bool = False,
-                      progress: Optional[_BackfillProgress] = None) -> bool:
+                      progress: Optional[_BackfillProgress] = None, deadline: Optional[float] = None,
+                      fail_msg: str = "FTS rebuild chunk failed: %s") -> bool | Literal["retry"]:
         """Shared chunk engine for the base and CJK deferred backfills. ``finish_when_empty``
         finalizes a high_water <= 0 marker (empty messages table) instead of leaving it pending."""
         high_water_raw = self.get_meta(f"{prefix}_high_water")
@@ -463,7 +466,10 @@ class SessionSearchMixin:
             conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (str(upper), f"{prefix}_progress"))
             return upper < high_water, covered
 
-        more, covered = self._execute_write(_do)
+        try:
+            more, covered = self._execute_write(_do, deadline=deadline)
+        except sqlite3.OperationalError as exc:
+            return self._fts_chunk_error(exc, fail_msg)
         if progress is not None:
             # Counted after the commit: _execute_write may replay _do on contention.
             progress.indexed += covered
@@ -472,11 +478,21 @@ class SessionSearchMixin:
             if (finish_when_empty and high_water <= 0) or (
                 status is not None and status["indexed"] >= status["total"]
             ):
+                # The chunk committed; finalization is a new write, not a retry.
                 finish()
             return False
         return bool(more)
 
-    def _fts_teardown_trash_step(self, progress: Optional[_TeardownProgress] = None) -> bool:
+    def _fts_chunk_error(self, exc: sqlite3.OperationalError, fail_msg: str) -> Literal["retry"]:
+        """Only lock/busy may retry; never confuse it with committed progress."""
+        if is_sqlite_lock_error(exc) and not is_sqlite_io_error(exc):
+            logger.debug(fail_msg, exc)
+            return "retry"
+        logger.warning(fail_msg, exc)
+        raise exc
+
+    def _fts_teardown_trash_step(self, progress: Optional[_TeardownProgress] = None, *,
+                                 deadline: Optional[float] = None) -> bool | Literal["retry"]:
         """Tear down one chunk (``_fts_chunk_rows`` rows) of a demoted v22 FTS shadow table (a PLAIN
         table now); True while work remains. A failed chunk raises (nothing committed).
 
@@ -539,7 +555,10 @@ class SessionSearchMixin:
             logger.info("Old FTS shadow table %s torn down.", tbl)
             return True
 
-        more, deleted = self._execute_write(_do)
+        try:
+            more, deleted = self._execute_write(_do, deadline=deadline)
+        except sqlite3.OperationalError as exc:
+            return self._fts_chunk_error(exc, "FTS trash teardown chunk failed: %s")
         if progress is not None:
             # Counted after the commit: _execute_write may replay _do on contention.
             progress.drained += deleted
@@ -742,42 +761,42 @@ class SessionSearchMixin:
                                        (st["indexed"], st["total"])).fetchone()
         return _BackfillProgress(phase=phase, total=int(total), indexed=int(done))
 
-    # A chunk that fails this many times in a row ends the run (each lock failure already waited out
-    # _execute_write's patience); a full disk or I/O error never heals by retrying.
-    _OPTIMIZE_CHUNK_ATTEMPTS = 3
     _VACUUM_TICK_S = 1.0
     # How often the side thread re-scans for another process holding state.db (~15 ms on Linux).
     _HOLDER_SCAN_INTERVAL_S = 2.0
 
-    def _optimize_drive(self, step: Callable[[], bool], info: Optional[Callable[[], dict[str, Any]]],
-                        emit: Callable[[dict[str, Any]], None], watch: _HolderWatch) -> None:
+    def _optimize_drive(self, step: Callable[..., bool | Literal["retry"]], info: Optional[Callable[[], dict[str, Any]]],
+                        emit: Callable[[dict[str, Any]], None], watch: _HolderWatch) -> Optional[str]:
         """Run *step* to completion, emitting ``info()`` (plus ``paced``) after every chunk. Back to
         back while no other process holds state.db (see the chunk engine note in hermes_state_fts);
         while *watch* sees a holder, the duty cycle (short chunks + a pause) keeps its writes moving.
         Chunk size adapts to its measured cost; a step may restart it (teardown on each new table)."""
         self._fts_chunk_rows = self._FTS_REBUILD_CHUNK_ROWS
-        failures = 0
+        deadline = None
         while True:
             t0 = time.monotonic()
-            try:
-                more = step()
-            except sqlite3.OperationalError as exc:
-                failures += 1
-                if failures >= self._OPTIMIZE_CHUNK_ATTEMPTS:
-                    raise
-                logger.warning("FTS optimize chunk failed (attempt %d, retrying): %s", failures, exc)
-                time.sleep(0.25 * failures)
-                continue
-            failures = 0
-            if not more:
-                return
+            if deadline is None:
+                deadline = t0 + self._WRITE_PATIENCE_S
+            elif t0 >= deadline:
+                return "fts_error"
+            # Chunk engines turn only transient lock errors into retry. Preserve
+            # fatal SQLite error provenance for the CLI instead of hiding it.
+            more = step(deadline=deadline)
+            if more is False:
+                return None
             cost, paced = time.monotonic() - t0, watch.held
             if info is not None:
                 emit({**info(), "paced": paced})
-            target = self._FTS_REBUILD_PACED_TARGET_S if paced else self._FTS_REBUILD_CHUNK_TARGET_S
-            self._fts_chunk_rows = self._next_chunk_rows(self._fts_chunk_rows, cost, target)
-            if paced:
-                time.sleep(max(self._FTS_REBUILD_MIN_PAUSE, cost * self._FTS_REBUILD_DUTY_FACTOR))
+            pause = max(self._FTS_REBUILD_MIN_PAUSE, cost * self._FTS_REBUILD_DUTY_FACTOR)
+            if more is True:
+                # Only committed progress earns fresh patience; preserve adaptive official chunking.
+                deadline = None
+                target = self._FTS_REBUILD_PACED_TARGET_S if paced else self._FTS_REBUILD_CHUNK_TARGET_S
+                self._fts_chunk_rows = self._next_chunk_rows(self._fts_chunk_rows, cost, target)
+                if paced:
+                    time.sleep(pause)
+            else:
+                time.sleep(min(pause, max(0.0, deadline - time.monotonic())))
 
     def _optimize_vacuum(self, tick: Optional[Callable[[dict[str, Any]], None]] = None) -> bool:
         """Phase 3: reclaim freed pages to the OS. False when VACUUM failed (usually no free disk
@@ -892,9 +911,13 @@ class SessionSearchMixin:
                 bf = self._backfill_progress(phase, prefix) if progress_cb else None
                 if bf is not None:
                     emit({**bf.info(), "paced": watch.held})
-                self._optimize_drive(partial(step, bf) if bf else step, bf.info if bf else None, emit, watch)
+                reason = self._optimize_drive(partial(step, bf) if bf else step, bf.info if bf else None, emit, watch)
+                if reason is not None:
+                    return {"ok": False, "reason": reason, "vacuumed": None}
             # Phase 2: tear down the demoted legacy shadow tables in chunks.
-            self._optimize_drive(partial(self._fts_teardown_trash_step, teardown), teardown.info, emit, watch)
+            reason = self._optimize_drive(partial(self._fts_teardown_trash_step, teardown), teardown.info, emit, watch)
+            if reason is not None:
+                return {"ok": False, "reason": reason, "vacuumed": None}
         with self._read_ctx() as conn:
             still_pending = _meta_row(conn, "fts_rebuild_high_water") is not None
             still_trash = self._has_fts_trash(conn)

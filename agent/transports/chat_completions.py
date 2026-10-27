@@ -42,6 +42,7 @@ _STRIP_MSG_KEYS = (
     # (JSONL transcript compat); both are delivery bookkeeping, never model input.
     "platform_message_id", "message_id", "api_content", "anthropic_content_blocks", "bedrock_content_blocks",
     MESSAGE_UID, DATA_USE,
+    "display_kind", "display_metadata",
 )
 _STRIP_TC_KEYS = ("call_id", "response_item_id")
 _HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}

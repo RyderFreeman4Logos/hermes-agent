@@ -7,7 +7,7 @@ import pytest
 from agent.auxiliary_codex_response import _parse_codex_final_response
 from agent.codex_responses_adapter import _chat_messages_to_responses_input, _normalize_codex_response
 from agent.codex_runtime import _consume_codex_event_stream
-from agent.history_commentary import _commentary_items
+from agent.history_commentary import commentary_items
 from agent.stream_delivery import StreamDeliveryMixin
 
 
@@ -75,5 +75,5 @@ def test_refusal_text_survives_all_consumers(shape):
     display = StreamDeliveryMixin()
     display._strip_think_blocks = lambda value: value
     expected_commentary = [expected.strip()] if shape == "commentary" else []
-    assert _commentary_items(history) == expected_commentary
+    assert commentary_items(history) == expected_commentary
     assert display._extract_codex_interim_visible_parts(history) == expected_commentary

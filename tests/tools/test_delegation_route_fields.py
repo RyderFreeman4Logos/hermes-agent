@@ -37,6 +37,8 @@ def _parent(request_overrides=None):
     parent = MagicMock()
     parent.base_url, parent.api_key, parent.provider = "https://openrouter.ai/api/v1", "parent-key", "openrouter"
     parent.api_mode, parent.model, parent.platform = "chat_completions", "anthropic/claude-sonnet-4", "cli"
+    parent.requested_provider = parent.provider
+    parent.acp_command, parent.acp_args = None, []
     parent.request_overrides = request_overrides or {}
     parent.reasoning_config = {"enabled": True, "effort": "medium"}
     parent.providers_allowed = parent.providers_ignored = parent.providers_order = parent.provider_sort = None
@@ -73,7 +75,9 @@ def _spawn(routes, *, cfg=None, parent=None, construct=_construct, provider=None
 
 
 def test_route_tier_reaches_the_child_and_its_sibling_keeps_the_default():
-    result, (fast, plain), _ = _spawn([{**CODEX, "service_tier": "fast"}, None])
+    result, built, _ = _spawn([{**CODEX, "service_tier": "fast"}, None])
+    assert len(built) == 2, result
+    fast, plain = built
     assert result == {"status": "built"}
     assert fast["request_overrides"]["service_tier"] == "priority" and fast["service_tier"] == "priority"
     assert "service_tier" not in plain["request_overrides"] and plain.get("service_tier") is None
@@ -160,12 +164,13 @@ def test_labelled_route_result_reports_what_the_child_ran_on():
 
     _, _, (deep, local) = _spawn([{**CODEX, "reasoning_effort": "high", "service_tier": "fast", "label": "deep"},
                                   {**LOCAL, "reasoning_effort": "none", "label": "local"}])
+    deep._delegate_successful_llm_route = (deep.model, deep.provider)
     entry = _build_result_entry(deep, {"final_response": "ok", "completed": True}, 0, 1.0,
                                 _SchemaOutcome(None, None, [], 0))
     assert entry["route"] == {"backend": "route-fields", "label": "deep", "provider": "openai-codex",
                               "model": "gpt-6-astra", "reasoning_effort": "high", "service_tier": "fast"}
     assert _fabricated_entry(1, "error", "boom", local)["route"] == {
-        "backend": "route-fields", "label": "local", "provider": "custom", "model": "qwen3-local",
+        "backend": "route-fields", "label": "local", "provider": None, "model": None,
         "reasoning_effort": "none", "service_tier": "normal"}
 
 
@@ -176,6 +181,7 @@ def test_every_backend_routed_result_names_its_backend_and_the_default_keeps_its
     from tools.delegate_tool_child_run import _SchemaOutcome, _build_result_entry
 
     def entry_of(child):
+        child._delegate_successful_llm_route = (child.model, child.provider)
         return _build_result_entry(child, {"final_response": "ok", "completed": True}, 0, 1.0,
                                    _SchemaOutcome(None, None, [], 0))
 

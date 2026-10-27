@@ -234,7 +234,11 @@ def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> Ta
     if route.get("profile"):
         return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
-    creds = _resolve_delegation_credentials(route, parent_agent)
+    if route.get("exclusive_route"):
+        from tools.delegate_tool import _credentials_for_exclusive_route
+        creds = _credentials_for_exclusive_route(route, parent_agent, route)
+    else:
+        creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):
         from tools.delegate_tool_tuning import task_service_tier
         creds = {**creds, **task_service_tier(str(route["service_tier"]), creds, parent_agent)}
@@ -310,7 +314,8 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
                         ) -> tuple[list[TaskRoute], Optional[str]]:
     """One :class:`TaskRoute` per task from the backend the session's ``delegate_task`` was built from (else
     ``delegation.backend``), or ``([], error)`` when that backend cannot run (fails closed, never another backend).
-    A task the backend cannot route gets a route with ``error`` set; its siblings are unaffected. Identical routes
+    A task the backend cannot route gets a route with ``error`` set; its siblings are unaffected
+    unless that backend explicitly requests atomic batch admission. Identical routes
     resolve credentials once per call (the default backend resolves exactly once)."""
     from agent.delegation_backends import pinned_backend
     if pinned := pinned_backend(parent_agent):
@@ -329,6 +334,10 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
             routes.append(_route_to_task_route(route, parent_agent, cache, config, provider.name))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
             routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
+    errors = [route.error for route in routes if route.error]
+    atomic_routes = getattr(provider, "atomic_routes", None)
+    if errors and callable(atomic_routes) and atomic_routes(config):
+        return [], " ".join(dict.fromkeys(errors))
     return routes, None
 
 

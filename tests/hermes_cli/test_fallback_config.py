@@ -1,5 +1,7 @@
 """Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
 
+import pytest
+
 from agent.secret_scope import reset_secret_scope, set_secret_scope
 from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
 
@@ -37,6 +39,26 @@ class TestResolveEntryApiKey:
         # secret scope installed, resolution still reads os.environ.
         monkeypatch.setenv("FB_KEY", "env-key")
         assert resolve_entry_api_key({"key_env": "FB_KEY"}) == "env-key"
+
+
+@pytest.mark.parametrize("field", ["key_env", "api_key_env"])
+@pytest.mark.parametrize("value", [[], {}, False, ["fixture-canary"], {"fixture-canary": 1}, 0, 23, True, None, "", "   "])
+@pytest.mark.parametrize("inline", [False, True])
+def test_invalid_reference_policy(field, value, inline):
+    # Even a valid sibling alias cannot hide an invalid declaration; inline wins.
+    other = "api_key_env" if field == "key_env" else "key_env"
+    entry = {field: value, other: "FALLBACK_KEY"}
+    if inline:
+        entry["api_key"] = "inline-key"
+    token = set_secret_scope({"FALLBACK_KEY": "scoped-key"})
+    try:
+        if inline:
+            assert resolve_entry_api_key(entry) == "inline-key"
+        else:
+            with pytest.raises(ValueError, match="^Invalid fallback credential reference$"):
+                resolve_entry_api_key(entry)
+    finally:
+        reset_secret_scope(token)
 
 
 class TestEffectiveRuntimeProvider:

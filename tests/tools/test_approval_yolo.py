@@ -64,10 +64,16 @@ def test_compression_rotation_publishes_the_child_row_with_the_live_flag(db):
         working_directory=None, _memory_manager=None, context_compressor=types.SimpleNamespace(),
         _flush_messages_to_session_db=lambda *a, **k: None, _persist_user_message_idx=None,
         _session_messages=None, _gateway_session_key=None, _cached_system_prompt="sys")
+    lease = cc._CompressionLease(
+        agent, db=db, sid="s1", ttl=60.0, refresh_interval=None,
+        commit_fence=None, lifecycle=cc._CompactionLifecycle(agent, False),
+    )
+    lease.watermark, lease.source_signature = db.get_active_message_source_snapshot("s1")
+    lease.signed_watermark = lease.watermark
     cc._publish_rotated_compaction(
         agent, [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}],
         [{"role": "user", "content": "[handoff]"}],
-        new_system_prompt="sys", lease=types.SimpleNamespace(holder=None, ttl=60.0, watermark=None),
+        new_system_prompt="sys", lease=lease,
         old_session_id="s1", compressed_user_turn_outcome="none")
     assert agent.session_id != "s1"
     assert SessionDB.session_yolo_enabled(db.get_session(agent.session_id))

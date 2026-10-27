@@ -135,9 +135,12 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         str(composer_profile.get("model") or "").strip(),
         str(composer_profile.get("provider") or "").strip(),
     ) == _config_model_target()
-    if room_plumbing or (_row_follows_profile(row) and not composer_profile_matches):
-        return {}
     overrides: dict = {}
+    memory_provider_mode = model_config.get("memory_provider_mode")
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        overrides["memory_provider_mode_override"] = memory_provider_mode
+    if room_plumbing or (_row_follows_profile(row) and not composer_profile_matches):
+        return overrides
     model = str(row.get("model") or model_config.get("model") or "").strip()
     # Canonical route reader shared with CLI --resume: nested ``gateway_runtime`` (the route the messaging
     # gateway last ran) before the TUI's top-level keys, then a routable ``billing_provider`` (#125942).
@@ -178,6 +181,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
+    memory_provider_mode = model_config.get("memory_provider_mode")
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        overrides["memory_provider_mode_override"] = memory_provider_mode
     return overrides
 
 
@@ -211,6 +217,9 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
             config[key] = value
         else:
             config.pop(key, None)
+    memory_provider_mode = getattr(agent, "_memory_provider_mode", None)
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        config["memory_provider_mode"] = memory_provider_mode
     return config
 
 
@@ -630,7 +639,8 @@ def _make_agent(
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
     platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
-    cwd_override: str | None = None, auth_user_id: str | None = None):
+    cwd_override: str | None = None, auth_user_id: str | None = None,
+    memory_provider_mode_override: str | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -682,6 +692,7 @@ def _make_agent(
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
         # The resolved provider's request body (a custom entry's extra_body), as the CLI/cron/gateway pass it.
         request_overrides=runtime.get("request_overrides"),
+        memory_provider_mode_override=memory_provider_mode_override,
         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)

@@ -3633,8 +3633,8 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
     build_started = threading.Event()
     history_calls = []
     auto_continue_calls = []
-    ancestor = {"role": "assistant", "content": "ancestor"}
-    loaded = {"role": "user", "content": "loaded"}
+    ancestor = {"role": "assistant", "content": "ancestor", "_row_id": 11}
+    loaded = {"role": "user", "content": "loaded", "_row_id": 12}
 
     class FakeDB:
         def get_session(self, target):
@@ -3643,19 +3643,24 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         def resolve_resume_session_id(self, target):
             return target
 
+        def assert_resume_safe(self, target, *, tip_only):
+            assert target == "large-session" and tip_only is True
+            return 1
+
         def reopen_session(self, target):
             assert target == "large-session"
 
-        def get_resume_conversations(self, target):
+        def get_resume_conversations(self, target, *, max_display_messages):
+            assert max_display_messages == 2
             history_calls.append(("resume", target))
             history_started.set()
             assert release_history.wait(timeout=2.0)
             return [loaded], [ancestor, loaded]
 
         def get_ancestor_display_prefix(self, target):
-            history_calls.append(("prefix", target))
-            return [ancestor]
+            pytest.fail("bounded resume must not scan ancestor history a second time")
 
+    monkeypatch.setattr("hermes_state.resolved_max_resume_messages", lambda: 2)
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
@@ -3699,10 +3704,7 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         sid = first["result"]["session_id"]
         assert server._sessions[sid]["resume_history_ready"].wait(timeout=1.0)
         assert build_started.wait(timeout=1.0)
-        assert history_calls == [
-            ("resume", "large-session"),
-            ("prefix", "large-session"),
-        ]
+        assert history_calls == [("resume", "large-session")]
         assert server._sessions[sid]["history"] == [loaded]
         assert server._sessions[sid]["display_history_prefix"] == [ancestor]
         assert server._sessions[sid]["resume_message_count"] == 2
@@ -8254,7 +8256,13 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path), "explicit_cwd": True})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": str(tmp_path),
+        }
     ]
 
 
@@ -8273,7 +8281,13 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     server._ensure_session_db_row({"session_key": "k1", "source": "tool"})
 
     assert created == [
-        {"key": "k1", "source": "tool", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "tool",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": None,
+        }
     ]
 
 
@@ -8300,7 +8314,13 @@ def test_ensure_session_db_row_records_a_terminal_workspace(monkeypatch, tmp_pat
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": str(tmp_path),
+        }
     ]
 
 
@@ -8321,7 +8341,13 @@ def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp
     server._ensure_session_db_row({"session_key": "k1", "source": "desktop", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "desktop", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "desktop",
+            "model": "test-model",
+            "model_config": {"memory_provider_mode": "hybrid"},
+            "cwd": None,
+        }
     ]
 
 
@@ -8365,7 +8391,7 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
 
 def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
     """A chat that made no explicit pick falls back to the global model and
-    writes no model_config (so it tracks the profile default)."""
+    still stamps memory_provider_mode=hybrid (default provider mode)."""
     created = []
 
     class _FakeDB:
@@ -8377,7 +8403,9 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
 
     server._ensure_session_db_row({"session_key": "k1", "model_override": None})
 
-    assert created == [{"model": "global/default", "model_config": None}]
+    assert created == [
+        {"model": "global/default", "model_config": {"memory_provider_mode": "hybrid"}}
+    ]
 
 
 def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
@@ -17225,10 +17253,10 @@ def test_model_save_key_reconciles_the_launch_profiles_stale_setup_record(monkey
 
 
 def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_path):
-    """The post-turn heap trim must run after the turn's pre-turn history snapshots are dropped:
-    malloc_trim cannot return pages still referenced, so a retained snapshot of a large tool
-    result pins them for the life of the process. Observed through a weak reference to the old
-    message, not by reading the finisher's local variable names."""
+    """The old large message must be reclaimable before heap trim.
+
+    Observe its weak reference without retaining the finisher's local frame.
+    """
     import contextlib
     import gc
     import weakref
@@ -17241,6 +17269,7 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
 
     class _Agent:
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kw):
+            observed["persist_user_message"] = _kw.get("persist_user_message")
             return {"final_response": "reply", "messages": [{"role": "assistant", "content": "reply"}]}
 
     def _trim(**_kwargs):
@@ -17272,7 +17301,8 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
             {"id": "1", "method": "prompt.submit", "params": {"session_id": "sid_trim", "text": "hi"}})
 
         assert resp is not None and resp.get("result")
-        assert order == ["trim", "reset_home"]
+        assert observed["persist_user_message"] == "hi"
+        assert order[-2:] == ["trim", "reset_home"]
         assert observed["alive_at_trim"] is False, "a pre-turn history snapshot survived to the heap trim"
     finally:
         server._sessions.pop("sid_trim", None)

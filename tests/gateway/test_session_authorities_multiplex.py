@@ -36,11 +36,17 @@ def _runner(root, homes):
 
 
 @pytest.mark.asyncio
-async def test_multiplex_builds_one_authority_per_reserved_home(tmp_path, monkeypatch):
+@pytest.mark.parametrize("relocated", [False, True])
+async def test_multiplex_builds_one_authority_per_reserved_home(tmp_path, monkeypatch, relocated):
     from gateway.run_runtime import initialize_gateway_runtime
     from gateway.runtime_ownership import process_ownership
     from hermes_constants import hermes_home_key
     root, homes = _reserve_homes(tmp_path, monkeypatch)
+    if relocated:
+        storage = tmp_path / 'external-storage'
+        storage.mkdir()
+        for name, home in homes:
+            (home / 'state.db').symlink_to(storage / f'{name}.db')
     process_ownership.reserve([home for _, home in homes])
     try:
         runner = _runner(root, homes)
@@ -52,7 +58,7 @@ async def test_multiplex_builds_one_authority_per_reserved_home(tmp_path, monkey
         for _name, home in homes:
             authority = registry.for_home(home)
             assert authority is not None
-            assert Path(authority.db.db_path).resolve().parent == home.resolve()
+            assert Path(authority.db.db_path).resolve() == (home / 'state.db').resolve()
             assert (home / 'state.db').exists()
         epochs = {hermes_home_key(h): registry.for_home(h).epoch for _, h in homes}
         assert all(epoch >= 1 for epoch in epochs.values())

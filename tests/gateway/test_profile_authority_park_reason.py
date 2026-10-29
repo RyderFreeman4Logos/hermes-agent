@@ -52,3 +52,41 @@ async def test_the_park_reason_never_creates_the_store(tmp_path, monkeypatch):
         await run_runtime._build_profile_authority(_runner(RecoverableHandleCache()), 'worker', home, register=False)
     assert 'is unavailable' in str(exc.value)
     assert not (home / 'state.db').exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrong_path", ["other.db", "../foreign/state.db"])
+async def test_authority_refuses_a_different_database(tmp_path, monkeypatch, wrong_path):
+    home = (tmp_path / 'profile').resolve()
+    home.mkdir()
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    runner = _runner(RecoverableHandleCache())
+    runner._session_db = SimpleNamespace(db_path=home / wrong_path)
+    with pytest.raises(RuntimeError, match='does not belong'):
+        await run_runtime._build_profile_authority(runner, 'default', home, register=True)
+
+
+@pytest.mark.parametrize("relocated", [False, True])
+def test_profile_store_consumers_accept_its_file_and_refuse_other_stores(tmp_path, monkeypatch, relocated):
+    from gateway.session_authorities import authority_for_home
+    from gateway import session_ingress_media
+    home = tmp_path / 'profile'
+    home.mkdir()
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    target = tmp_path / 'relocated.db' if relocated else home / 'state.db'
+    target.touch()
+    if relocated:
+        (home / 'state.db').symlink_to(target)
+    db = SimpleNamespace(db_path=target)
+    authority = SimpleNamespace(db=db)
+    runner = SimpleNamespace(session_authority=authority)
+    assert authority_for_home(runner, home) is authority
+    monkeypatch.setattr(session_ingress_media, '_media_root', lambda: home / 'media')
+    monkeypatch.setattr(session_ingress_media, 'release_unheld_media', lambda db, refs: 7)
+    assert session_ingress_media.collect_unheld_api_images(db) == 7
+    for wrong in (home / 'other.db', tmp_path / 'foreign' / 'state.db'):
+        db.db_path = wrong
+        assert authority_for_home(runner, home) is None
+        assert session_ingress_media.collect_unheld_api_images(db) == 0

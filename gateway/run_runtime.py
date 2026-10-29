@@ -45,7 +45,8 @@ async def _build_profile_authority(runner, name, home, *, register):
         db = getattr(runner._session_db, '_db', runner._session_db)
         if db is None:
             raise RuntimeError(_store_open_failure(runner, home))
-        if (await asyncio.to_thread(Path(db.db_path).resolve)).parent != home:
+        # A profile's state.db may be symlinked to another volume.
+        if await asyncio.to_thread(Path(db.db_path).resolve) != await asyncio.to_thread((home / 'state.db').resolve):
             raise RuntimeError(f'session authority database does not belong to the reserved profile {home}')
         registry.add(home, None, name=name)
         try:
